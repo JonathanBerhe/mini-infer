@@ -5,29 +5,68 @@
   "samples": [
     {
       "prompt": "The capital of France is",
-      "max_new_tokens": 3,
+      "max_new_tokens": 16,
       "expected_tokens": [
         12095,
         13,
-        1084
+        1084,
+        374,
+        279,
+        7772,
+        3283,
+        304,
+        4505,
+        323,
+        279,
+        4843,
+        7772,
+        3283,
+        304,
+        279
       ]
     },
     {
       "prompt": "Once upon a time",
-      "max_new_tokens": 3,
+      "max_new_tokens": 16,
       "expected_tokens": [
         11,
         1052,
-        572
+        572,
+        264,
+        3908,
+        883,
+        6941,
+        3757,
+        879,
+        12163,
+        304,
+        264,
+        2613,
+        14126,
+        13,
+        3757
       ]
     },
     {
       "prompt": "def fibonacci(n):",
-      "max_new_tokens": 3,
+      "max_new_tokens": 16,
       "expected_tokens": [
         715,
         262,
-        421
+        421,
+        308,
+        2651,
+        220,
+        16,
+        25,
+        715,
+        286,
+        470,
+        308,
+        715,
+        262,
+        770,
+        25
       ]
     }
   ]
