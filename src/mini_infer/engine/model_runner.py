@@ -97,18 +97,3 @@ class ModelRunner:
                 use_cache=True,
             )
         return cache, out.logits[0, -1, :]
-
-    def generate(self, prompt: str, *, max_tokens: int) -> str:
-        """Greedy decode with KV cache; sampling lands in Slice 3."""
-        prompt_ids = self._tokenizer.encode(prompt)
-        cache, logits = self.prefill(prompt_ids)
-        new_tokens: list[int] = []
-
-        for _ in range(max_tokens):
-            next_token = int(torch.argmax(logits).item())
-            if next_token == self._tokenizer.eos_token_id:
-                break
-            new_tokens.append(next_token)
-            cache, logits = self.decode(cache, next_token)
-
-        return self._tokenizer.decode(new_tokens)

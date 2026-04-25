@@ -17,15 +17,6 @@ def test_device_resolves_to_supported_backend(qwen_runner: ModelRunner) -> None:
 
 
 @pytest.mark.requires_model
-def test_greedy_generation_knows_capital_of_france(qwen_runner: ModelRunner) -> None:
-    output = qwen_runner.generate(
-        "The capital of France is",
-        max_tokens=8,
-    )
-    assert "Paris" in output
-
-
-@pytest.mark.requires_model
 def test_prefill_then_decode_advances_cache_by_one(qwen_runner: ModelRunner) -> None:
     prompt_ids = qwen_runner.tokenizer.encode("Hello, world!")
     cache, logits = qwen_runner.prefill(prompt_ids)
