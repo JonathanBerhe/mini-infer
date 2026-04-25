@@ -50,47 +50,56 @@ Expected output: both `True` on M1 Pro / Apple Silicon with PyTorch 2.4+. Verifi
 
 ---
 
-## Stage 2: Cloud CUDA (Phase 2 onward)
+## Stage 2: Cloud CUDA on Modal
 
-Provision when the next item on the roadmap is one of:
+**Provider chosen: Modal** (per-second billing, no idle cost, serverless containers). Picked 2026-04-25 because the workload is intermittent: short runs to validate CUDA-specific code paths, then occasional benchmarks. We avoid paying for an idle hourly instance.
 
-- PagedAttention benchmarks (need real CUDA kernels).
-- Quantization with bitsandbytes.
-- Tensor parallelism (also requires multi-GPU).
-- Speculative decoding throughput benchmarks (Phase 3).
+### Cost discipline (read this before running anything)
 
-### Candidate providers
+Every `modal run` bills the account. There is no free tier. See the project's local memory note `feedback_modal_costs_money.md` for the rule we've adopted: state GPU + duration + cost estimate before each invocation, and get explicit approval. Smoke tests are not benchmarks; benchmarks need their own cost budget.
 
-No recommendation yet. Pick based on usage shape.
+### One-time setup
 
-| Provider | Pricing model | Idle cost | Best fit |
-|---|---|---|---|
-| **Modal** | Per-second, serverless | None | Intermittent benchmarks; cold-start tolerable |
-| **Lambda Labs** | Per-hour, dedicated instance | Yes (instance keeps running) | Long interactive sessions |
-| **RunPod** | Per-hour, can stop/start; spot pricing available | Only while running | Middle ground; spot is very cheap when preemption is tolerable |
+1. Create the Modal account (done).
+2. `uv add --dev modal` (already in `pyproject.toml`).
+3. `uv run modal token new` to authenticate the CLI against the account.
 
-Approximate H100 80GB pricing (verify before signing up):
+### Smoke test
 
-- Modal: ~$3.60/hr equivalent on-demand.
-- Lambda Labs: ~$1.10 to $2.50/hr.
-- RunPod: ~$2 to $3/hr on-demand; spot can drop below $1/hr.
+`scripts/modal_smoke.py` spins up an A10 24GB container, installs the project's runtime deps, mounts the `mini_infer` package, loads `Qwen/Qwen2.5-0.5B-Instruct`, runs greedy generation, asserts the output contains "Paris", and exits. Run with:
 
-For Phase 2 starting work (a 0.5B model with PagedAttention, then quantized variants), an A100 40GB or even an L4 / 4090 is plenty and significantly cheaper. Step up to H100 / H200 only if Phase 3 brings larger models or multi-GPU TP.
+```bash
+uv run modal run scripts/modal_smoke.py
+```
 
-### Provisioning checklist
+Expected cost: roughly $0.02 once the image is cached. First run includes ~2 minutes of image build (also billed but cheaper); the built image is reused on subsequent runs.
 
-Fill in provider-specific steps when one is picked.
+The smoke verified on 2026-04-25:
 
-- [ ] Account and billing; credit limit configured to cap runaway spend.
-- [ ] GPU type chosen (A100 40-80GB is the default target; smaller is fine for Phase 1's 0.5B model if you stretch local-only further).
-- [ ] CUDA-compatible OS image (Ubuntu 22.04 + CUDA 12.x is the safe baseline).
-- [ ] On the instance: clone the repo, run `uv sync`.
-- [ ] Smoke test: `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name())"` returns `True` and the expected device.
-- [ ] Document repeatable access (SSH config block, `modal` CLI commands, RunPod template ID) in this file, replacing the stub.
-- [ ] Optional: a script that runs the integration suite on the cloud instance from the laptop.
+```
+OK | torch=2.11.0+cu130 | gpu=NVIDIA A10 | runner.device=cuda |
+output=' Paris. It is the largest city in'
+```
 
-### Open questions to resolve before picking
+CUDA path produces the same tokens as the CPU/fp32 reference path, confirming the device-aware design works without code changes.
 
-- Expected weekly GPU usage (hours)? Drives the Modal vs reserved-instance cost math.
-- Need persistent disk between sessions (cached HF models, intermediate state)? Lambda + RunPod handle this naturally; Modal needs a `modal.Volume`.
-- Comfort with vendor-specific Python integration (Modal) vs vanilla SSH (Lambda)? Affects how invasive the provider choice is on the codebase.
+### Image / dep notes
+
+- Modal's `debian_slim(python_version="3.11")` + `pip_install("torch>=2.4", ...)` resolves the CUDA torch wheel from PyPI on Linux x86_64 (cu130 currently). No special index URLs needed.
+- mini-infer is mounted via `add_local_python_source("mini_infer")` rather than installed editable, since the smoke doesn't need a build step.
+- HF model downloads happen inside the container's ephemeral filesystem; each cold run re-downloads Qwen. **For repeated runs**, add a `modal.Volume` keyed on the HF cache directory so the model survives between invocations. This is a Phase 2 task when we start running benchmarks.
+
+### Recommended GPU tiers
+
+| Workload | GPU | Approx cost |
+|---|---|---|
+| CUDA smoke / correctness checks | A10 24GB | ~$1.10/hr equivalent |
+| Phase 2 functional dev + small benchmarks | A100 40GB | ~$1.30/hr equivalent |
+| Phase 3 / Phase 4 publishable benchmarks | H100 80GB | ~$3.60/hr equivalent |
+
+For the 0.5B starter model, an A10 is plenty. Step up to A100 when measuring throughput meaningfully or running quantized variants.
+
+### Open follow-ups
+
+- Add a `modal.Volume` for the HF cache so benchmark runs don't re-download model weights every cold start.
+- A `scripts/modal_benchmarks.py` skeleton that runs a measurable workload (e.g., throughput/TTFT for the Phase 2 PagedAttention vs the Phase 1 baseline). Designed to require explicit confirmation before each run.
