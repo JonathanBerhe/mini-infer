@@ -1,49 +1,96 @@
 # GPU access setup
 
-> **Status: Decision deferred.** Pick a provider before Phase 1 Week 5; `model_runner.py` cannot be exercised end-to-end without one. CI's CPU-only checks do not validate model loading or kernel correctness.
+> **Status: M1 Pro / MPS for Phase 0 + Phase 1; cloud CUDA from Phase 2 onward.** No paid GPU until then.
 
-## Why we need GPU access
+The plan is two-stage:
 
-Phases 1 onward require a real GPU for:
+1. **Phase 0 + Phase 1**: develop on Apple Silicon with PyTorch's MPS backend (`device="mps"`). Free, fast iteration, no cloud setup.
+2. **Phase 2 onward**: provision a cloud CUDA instance when the next item on the roadmap needs CUDA-only kernels (PagedAttention, bitsandbytes quantization, NCCL tensor parallelism, or speculative decoding benchmarks). Provider pick is a Phase-2 entry condition, not a Phase-0 blocker.
 
-- Running the Hugging Face reference model and our `model_runner` side-by-side for golden tests (the `.gitkeep`'d `tests/golden/` and `tests/integration/` directories will fill in here).
-- Verifying KV cache correctness, then Phase 2 PagedAttention behavior.
-- Throughput benchmarks under `tests/benchmarks/`. CLAUDE.md is explicit: unmeasured improvements do not count, so we need a stable GPU to take numbers on.
+This file documents both stages. Stage 2 is intentionally a stub for now; fill it in when a provider is picked.
 
-Phase 1's starter model is `Qwen/Qwen2.5-0.5B-Instruct`, which fits on essentially any modern GPU with >= 8 GB of VRAM. Picking a more powerful card (H100, A100) is a future-proofing choice for Phase 2 and 3 workloads.
+---
 
-## Candidate providers
+## Stage 1: Local development on Apple Silicon (MPS)
 
-No recommendation yet. Facts only; pick based on your usage shape.
+PyTorch's MPS backend covers everything needed for Phase 1 (skeleton, golden tests, end-to-end smoke).
 
-| Provider | Pricing model | Idle cost | Best fit | Friction |
-|---|---|---|---|---|
-| **Modal** | Per-second, serverless | None | Intermittent benchmarks, cold-start tolerable | Decorator-based Python integration; need to learn `modal` CLI and deployment model |
-| **Lambda Labs** | Per-hour, dedicated instance | Yes (instance keeps running) | Long interactive sessions, batched work | SSH into a Linux box; familiar but you pay while you think |
-| **RunPod** | Per-hour, can stop/start; spot pricing available | Only while running | Middle ground; spot can be very cheap if you tolerate preemption | Slightly more setup than Lambda; API + CLI well documented |
+### What works on MPS
 
-Approximate H100 80GB pricing (subject to change, verify before signing up):
+- Loading `Qwen/Qwen2.5-0.5B-Instruct` via HF Transformers (`device_map="mps"` or explicit `.to("mps")`).
+- Token generation with greedy / temperature / top-k / top-p sampling.
+- Naive scheduler (single-request loop).
+- Contiguous KV cache (the simplest Phase 1 layout).
+- FastAPI server with SSE streaming (no GPU at the API layer).
+- Golden tests at `temperature=0`. Run mini-infer and the HF reference both on MPS so any MPS-specific numerical drift cancels in the comparison.
 
-- Modal: ~$0.001/sec (~$3.60/hr equivalent) on-demand.
-- Lambda Labs: ~$1.10-$2.50/hr depending on availability.
-- RunPod: ~$2-$3/hr on-demand; spot can drop below $1/hr.
+### What does NOT work on MPS
 
-For Phase 1 (a single 0.5B model, occasional runs), an A100 40GB or even a smaller card (L4, 4090) is plenty and will be cheaper.
+These are the techniques that gate the Phase-2 transition:
 
-## Provisioning checklist (provider-agnostic)
+- **PagedAttention kernels**: vLLM's CUDA kernels have no Metal port. The block-manager bookkeeping can be implemented on MPS, but the actual kernel speedup needs CUDA.
+- **Quantization via `bitsandbytes`**: CUDA-only.
+- **Tensor parallelism via NCCL**: CUDA-only; also moot on M1 (single GPU).
+- **Fused FlashAttention through `F.scaled_dot_product_attention`**: MPS dispatches to slower math or memory-efficient kernels; no fused FA.
+- **Custom Triton kernels** (Stretch Goal D): Triton's Metal backend is minimal.
 
-When a provider is picked, fill in the provider-specific steps and remove this stub.
+### Local smoke test
 
-- [ ] Account created, billing set up, credit limit configured to avoid runaway spend.
-- [ ] GPU type chosen (default target: A100 80GB or H100 80GB; smaller acceptable for Phase 1).
-- [ ] CUDA-compatible OS image (Ubuntu 22.04 + CUDA 12.x is the safe baseline as of 2026-04).
-- [ ] On the instance: `git clone` the repo and run `uv sync`.
-- [ ] Smoke test: `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name())"` returns `True` and the expected device name.
-- [ ] Document repeatable access: SSH config block, or `modal` CLI commands, or RunPod template ID. Goes in this file, replacing the stub.
-- [ ] Optional but useful: a `Makefile` or `scripts/gpu_run.sh` so `make gpu-test` (or equivalent) runs the integration suite remotely.
+From the project root:
 
-## Open questions to resolve before picking
+```bash
+uv run python -c "import torch; print('mps available:', torch.backends.mps.is_available()); print('mps built:', torch.backends.mps.is_built())"
+```
 
-- Expected weekly GPU usage (hours per week)? Drives Modal vs reserved-instance cost math.
+Expected output: both `True` on M1 Pro / Apple Silicon with PyTorch 2.4+. Verified locally on 2026-04-25 with torch 2.11.
+
+### Design implication
+
+`ModelRunner` (Phase 1) accepts a `device: str` argument with `auto` as default. Resolution order: MPS if available, else CUDA, else CPU. Hardware-specific code is confined to clearly marked modules per CLAUDE.md ("don't write code that only works on NVIDIA GPUs"). The orchestration layer (scheduler, API, KV cache bookkeeping) stays device-agnostic.
+
+---
+
+## Stage 2: Cloud CUDA (Phase 2 onward)
+
+Provision when the next item on the roadmap is one of:
+
+- PagedAttention benchmarks (need real CUDA kernels).
+- Quantization with bitsandbytes.
+- Tensor parallelism (also requires multi-GPU).
+- Speculative decoding throughput benchmarks (Phase 3).
+
+### Candidate providers
+
+No recommendation yet. Pick based on usage shape.
+
+| Provider | Pricing model | Idle cost | Best fit |
+|---|---|---|---|
+| **Modal** | Per-second, serverless | None | Intermittent benchmarks; cold-start tolerable |
+| **Lambda Labs** | Per-hour, dedicated instance | Yes (instance keeps running) | Long interactive sessions |
+| **RunPod** | Per-hour, can stop/start; spot pricing available | Only while running | Middle ground; spot is very cheap when preemption is tolerable |
+
+Approximate H100 80GB pricing (verify before signing up):
+
+- Modal: ~$3.60/hr equivalent on-demand.
+- Lambda Labs: ~$1.10 to $2.50/hr.
+- RunPod: ~$2 to $3/hr on-demand; spot can drop below $1/hr.
+
+For Phase 2 starting work (a 0.5B model with PagedAttention, then quantized variants), an A100 40GB or even an L4 / 4090 is plenty and significantly cheaper. Step up to H100 / H200 only if Phase 3 brings larger models or multi-GPU TP.
+
+### Provisioning checklist
+
+Fill in provider-specific steps when one is picked.
+
+- [ ] Account and billing; credit limit configured to cap runaway spend.
+- [ ] GPU type chosen (A100 40-80GB is the default target; smaller is fine for Phase 1's 0.5B model if you stretch local-only further).
+- [ ] CUDA-compatible OS image (Ubuntu 22.04 + CUDA 12.x is the safe baseline).
+- [ ] On the instance: clone the repo, run `uv sync`.
+- [ ] Smoke test: `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name())"` returns `True` and the expected device.
+- [ ] Document repeatable access (SSH config block, `modal` CLI commands, RunPod template ID) in this file, replacing the stub.
+- [ ] Optional: a script that runs the integration suite on the cloud instance from the laptop.
+
+### Open questions to resolve before picking
+
+- Expected weekly GPU usage (hours)? Drives the Modal vs reserved-instance cost math.
 - Need persistent disk between sessions (cached HF models, intermediate state)? Lambda + RunPod handle this naturally; Modal needs a `modal.Volume`.
-- Comfort with a vendor-specific Python integration (Modal) vs vanilla SSH (Lambda)? Affects how invasive the provider choice is on the codebase.
+- Comfort with vendor-specific Python integration (Modal) vs vanilla SSH (Lambda)? Affects how invasive the provider choice is on the codebase.
