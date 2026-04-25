@@ -34,6 +34,11 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.per-file-ignores]
+# Triton kernels conventionally use uppercase pointer args (Q_ptr) and constexpr
+# constants (HEAD_DIM, BLOCK_SIZE). Allow it in the kernel module.
+"src/mini_infer/cache/paged_attention.py" = ["N803"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
@@ -43,10 +48,16 @@ files = ["src/mini_infer"]
 module = ["transformers", "transformers.*"]
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+module = ["triton", "triton.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "gpu: requires a GPU",
     "slow: marked slow",
     "requires_model: requires downloading a real HF model (~1GB); runs locally, skipped in CI",
+    "requires_cuda: requires a CUDA GPU (e.g. for Triton kernels); skipped in CI and on MPS/CPU",
 ]

@@ -4,7 +4,9 @@ import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from mini_infer.cache.block_pool import BlockPool
+from mini_infer.cache.paged_attention import supports_paged_kernel
 from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.engine.attention_patch import patch_model_attention
 from mini_infer.engine.tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,7 @@ class ModelRunner:
         dtype: torch.dtype | None = None,
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
+        use_paged_kernel: bool = True,
     ) -> "ModelRunner":
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
@@ -75,6 +78,15 @@ class ModelRunner:
             dtype=actual_dtype,
             device=resolved,
         )
+
+        # On kernel-capable devices, patch the model's attention layers so decode
+        # steps use the paged kernel and skip the materialization fallback. Other
+        # devices (MPS / CPU) keep using the materialization path. Benchmarks can
+        # set use_paged_kernel=False to A/B against the materialization path on
+        # the same hardware.
+        if use_paged_kernel and supports_paged_kernel(resolved):
+            patch_model_attention(model)
+
         return cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)
 
     @property

@@ -33,10 +33,22 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         cache_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # key_states / value_states shape: (1, num_kv_heads, new_seq_len, head_dim).
-        new_seq_len = key_states.shape[2]
+        # HF Cache contract: write the new K/V and return full materialized history.
+        self.append_kv(key_states, value_states, layer_idx)
+        return self._materialize(layer_idx)
 
-        # Allocate any new blocks needed; advance the running token count once per step
-        # (on layer 0 only, since update() is called per layer per step).
+    def append_kv(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> None:
+        """Write new K/V into block storage without materializing.
+
+        Used by the paged-attention-kernel path (Slice 2.2): the kernel reads K/V
+        from blocks directly, so we skip the contiguous materialization in update().
+        """
+        new_seq_len = key_states.shape[2]
         if layer_idx == 0:
             new_total = self._num_tokens + new_seq_len
             block_size = self._pool.block_size
@@ -44,9 +56,13 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             while len(self._block_ids) < required_blocks:
                 self._block_ids.append(self._pool.allocate())
             self._num_tokens = new_total
-
         self._write_new_kv(layer_idx, key_states, value_states, new_seq_len)
-        return self._materialize(layer_idx)
+
+    def block_table_tensor(
+        self, device: torch.device | str, dtype: torch.dtype = torch.int32
+    ) -> torch.Tensor:
+        """Return the current block table as a tensor on the requested device."""
+        return torch.tensor(self._block_ids, device=device, dtype=dtype)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return self._num_tokens

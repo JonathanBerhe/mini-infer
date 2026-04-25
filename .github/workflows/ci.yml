@@ -24,5 +24,5 @@ jobs:
         run: uv run ruff format --check .
       - name: Mypy
         run: uv run mypy src/
-      - name: Pytest (non-GPU, no model downloads)
-        run: uv run pytest -m "not gpu and not requires_model"
+      - name: Pytest (non-GPU, no model downloads, no CUDA-only tests)
+        run: uv run pytest -m "not gpu and not requires_model and not requires_cuda"
