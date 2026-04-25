@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 DEVICE = "cpu"
 DTYPE = torch.float32
-MAX_NEW_TOKENS = 3  # floor of the divergence point across all prompts; see memory note
+MAX_NEW_TOKENS = 16
 
 PROMPTS = [
     "The capital of France is",
@@ -32,11 +32,16 @@ def main() -> None:
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         input_tensor = torch.tensor([prompt_ids], device=DEVICE)
         with torch.inference_mode():
+            # Override Qwen's default generation_config: disable repetition_penalty
+            # so the reference is raw model output (our prefill+decode math), not
+            # post-processed via logits processors. Phase 3 will add processors
+            # as a separate concern.
             output = model.generate(
                 input_tensor,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.0,
             )
         new_tokens = output[0][len(prompt_ids) :].tolist()
         samples.append(
