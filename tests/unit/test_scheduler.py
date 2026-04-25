@@ -37,3 +37,34 @@ def test_run_respects_max_tokens(scheduler: Scheduler) -> None:
         )
     )
     assert len(result.tokens) <= 2
+
+
+@pytest.mark.requires_model
+def test_run_records_prompt_tokens(scheduler: Scheduler) -> None:
+    result = scheduler.run(
+        Request(
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+            max_tokens=2,
+        )
+    )
+    assert result.prompt_tokens > 0
+
+
+@pytest.mark.requires_model
+def test_stream_yields_text_then_finish(scheduler: Scheduler) -> None:
+    steps = list(
+        scheduler.stream(
+            Request(
+                prompt="The capital of France is",
+                sampling_params=SamplingParams(),
+                max_tokens=8,
+            )
+        )
+    )
+    text_steps = [s for s in steps if s.finish_reason is None]
+    finish_steps = [s for s in steps if s.finish_reason is not None]
+    assert len(text_steps) > 0
+    assert len(finish_steps) == 1
+    full_text = "".join(s.text for s in text_steps)
+    assert "Paris" in full_text
