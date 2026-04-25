@@ -1,0 +1,34 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "device": "cpu",
+  "dtype": "float32",
+  "samples": [
+    {
+      "prompt": "The capital of France is",
+      "max_new_tokens": 3,
+      "expected_tokens": [
+        12095,
+        13,
+        1084
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_new_tokens": 3,
+      "expected_tokens": [
+        11,
+        1052,
+        572
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):",
+      "max_new_tokens": 3,
+      "expected_tokens": [
+        715,
+        262,
+        421
+      ]
+    }
+  ]
+}

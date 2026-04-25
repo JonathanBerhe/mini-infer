@@ -3,6 +3,7 @@ import logging
 import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
+from mini_infer.cache.kv_cache import KVCache
 from mini_infer.engine.tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ def _dtype_for(device: str) -> torch.dtype:
 
 
 class ModelRunner:
-    """Loads a HF causal LM; Slice 1 wraps HF .generate(), Slice 2 replaces with prefill+decode."""
+    """Loads a HF causal LM and runs prefill + decode against our own KV cache."""
 
     def __init__(
         self,
@@ -41,34 +42,73 @@ class ModelRunner:
         self.device = device
 
     @classmethod
-    def from_pretrained(cls, model_name: str, *, device: str = "auto") -> "ModelRunner":
+    def from_pretrained(
+        cls,
+        model_name: str,
+        *,
+        device: str = "auto",
+        dtype: torch.dtype | None = None,
+    ) -> "ModelRunner":
         resolved = _resolve_device(device)
-        dtype = _dtype_for(resolved)
-        logger.info("Loading %s on %s with dtype=%s", model_name, resolved, dtype)
+        actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
+        logger.info("Loading %s on %s with dtype=%s", model_name, resolved, actual_dtype)
         tokenizer = Tokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(resolved)
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=actual_dtype).to(resolved)
         model.eval()
         return cls(model=model, tokenizer=tokenizer, device=resolved)
 
+    @property
+    def tokenizer(self) -> Tokenizer:
+        return self._tokenizer
+
+    def prefill(self, prompt_tokens: list[int]) -> tuple[KVCache, torch.Tensor]:
+        """Process the full prompt, return populated KV cache and last-position logits."""
+        cache = KVCache()
+        input_ids = torch.tensor([prompt_tokens], device=self.device)
+        seq_len = input_ids.shape[1]
+        attention_mask = torch.ones_like(input_ids)
+        position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
+        cache_position = torch.arange(seq_len, device=self.device)
+        with torch.inference_mode():
+            out = self._model(
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=cache,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+        return cache, out.logits[0, -1, :]
+
+    def decode(self, cache: KVCache, last_token: int) -> tuple[KVCache, torch.Tensor]:
+        """Run one decode step against the cache, return updated cache and next-token logits."""
+        input_ids = torch.tensor([[last_token]], device=self.device)
+        cache_len = cache.get_seq_length()
+        attention_mask = torch.ones((1, cache_len + 1), device=self.device, dtype=torch.long)
+        position_ids = torch.tensor([[cache_len]], device=self.device)
+        cache_position = torch.tensor([cache_len], device=self.device)
+        with torch.inference_mode():
+            out = self._model(
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=cache,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+        return cache, out.logits[0, -1, :]
+
     def generate(self, prompt: str, *, max_tokens: int) -> str:
-        """Greedy decode without KV cache; sampling lands in Slice 3, KV cache in Slice 2."""
-        # Manual loop instead of HF model.generate() because the latter crashes on MPS in
-        # transformers 5.x (the logits-processor pipeline allocates a tensor > 4 GB,
-        # exceeding the MPSTemporaryNDArray limit). Plain forward passes are fine.
+        """Greedy decode with KV cache; sampling lands in Slice 3."""
         prompt_ids = self._tokenizer.encode(prompt)
-        input_ids = torch.tensor([prompt_ids], device=self.device)
+        cache, logits = self.prefill(prompt_ids)
         new_tokens: list[int] = []
 
-        with torch.inference_mode():
-            for _ in range(max_tokens):
-                logits = self._model(input_ids).logits[0, -1, :]
-                next_token = int(torch.argmax(logits).item())
-                if next_token == self._tokenizer.eos_token_id:
-                    break
-                new_tokens.append(next_token)
-                input_ids = torch.cat(
-                    [input_ids, torch.tensor([[next_token]], device=self.device)],
-                    dim=1,
-                )
+        for _ in range(max_tokens):
+            next_token = int(torch.argmax(logits).item())
+            if next_token == self._tokenizer.eos_token_id:
+                break
+            new_tokens.append(next_token)
+            cache, logits = self.decode(cache, next_token)
 
         return self._tokenizer.decode(new_tokens)
