@@ -38,9 +38,14 @@ python_version = "3.11"
 strict = true
 files = ["src/mini_infer"]
 
+[[tool.mypy.overrides]]
+module = ["transformers", "transformers.*"]
+follow_imports = "skip"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "gpu: requires a GPU",
     "slow: marked slow",
+    "requires_model: requires downloading a real HF model (~1GB); runs locally, skipped in CI",
 ]
