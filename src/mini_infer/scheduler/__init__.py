@@ -1,8 +1,17 @@
-from mini_infer.scheduler.scheduler import (
+from mini_infer.scheduler.continuous_scheduler import ContinuousScheduler
+from mini_infer.scheduler.request_state import (
     GenerationResult,
     GenerationStep,
     Request,
-    Scheduler,
+    RequestHandle,
+    RequestState,
 )
 
-__all__ = ["GenerationResult", "GenerationStep", "Request", "Scheduler"]
+__all__ = [
+    "ContinuousScheduler",
+    "GenerationResult",
+    "GenerationStep",
+    "Request",
+    "RequestHandle",
+    "RequestState",
+]

@@ -27,7 +27,7 @@ def smoke() -> str:
     from mini_infer.cache.paged_attention import supports_paged_kernel
     from mini_infer.engine.model_runner import ModelRunner
     from mini_infer.engine.sampler import SamplingParams
-    from mini_infer.scheduler import Request, Scheduler
+    from mini_infer.scheduler import ContinuousScheduler, Request
 
     assert torch.cuda.is_available(), "CUDA not available in Modal container"
     gpu_name = torch.cuda.get_device_name()
@@ -37,14 +37,18 @@ def smoke() -> str:
     assert runner.device == "cuda"
 
     pool_before = runner.block_pool.num_free_blocks
-    scheduler = Scheduler(runner)
-    result = scheduler.run(
-        Request(
-            prompt="The capital of France is",
-            sampling_params=SamplingParams(),
-            max_tokens=8,
+    scheduler = ContinuousScheduler(runner)
+    scheduler.start()
+    try:
+        result = scheduler.run(
+            Request(
+                prompt="The capital of France is",
+                sampling_params=SamplingParams(),
+                max_tokens=8,
+            )
         )
-    )
+    finally:
+        scheduler.stop()
     pool_after = runner.block_pool.num_free_blocks
 
     assert "Paris" in result.text, f"unexpected output: {result.text!r}"
