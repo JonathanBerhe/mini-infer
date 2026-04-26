@@ -48,8 +48,11 @@ def paged_attention_decode_torch(
 ) -> torch.Tensor:
     """Pure PyTorch reference: gather K/V from blocks, compute attention.
 
+    Single-request shape; for the multi-request batched form see
+    `paged_attention_decode_torch_batched`.
+
     Shapes:
-      q             : (batch, num_q_heads, head_dim) — single decode token's queries
+      q             : (batch, num_q_heads, head_dim) — batch is normally 1 here
       k_pool_layer  : (num_blocks, block_size, num_kv_heads, head_dim) — this layer's K
       v_pool_layer  : same shape — this layer's V
       block_table   : (num_blocks_used,) int — block IDs in order
@@ -84,6 +87,42 @@ def paged_attention_decode_torch(
     out = torch.einsum("bhs,shd->bhd", weights, v_f)
 
     return out.to(q.dtype)
+
+
+def paged_attention_decode_torch_batched(
+    q: torch.Tensor,
+    k_pool_layer: torch.Tensor,
+    v_pool_layer: torch.Tensor,
+    block_tables: list[torch.Tensor],
+    seq_lens: list[int],
+) -> torch.Tensor:
+    """Pure PyTorch batched reference: each batch entry is one request.
+
+    Loops over the batch dim and runs the single-request reference per request,
+    then stacks. Trivially correct; serves as the oracle for the batched
+    Triton kernel.
+
+    Shapes:
+      q             : (B, num_q_heads, head_dim) — one decode token per request
+      k_pool_layer  : (num_blocks, block_size, num_kv_heads, head_dim) — shared pool
+      v_pool_layer  : same — shared pool
+      block_tables  : list of length B, each a 1D tensor of block IDs for that request
+      seq_lens      : list of length B, each the current cached length for that request
+
+    Returns: (B, num_q_heads, head_dim).
+    """
+    if len(block_tables) != q.shape[0] or len(seq_lens) != q.shape[0]:
+        raise ValueError(
+            f"q has B={q.shape[0]} but got {len(block_tables)} block_tables and "
+            f"{len(seq_lens)} seq_lens"
+        )
+    outs = [
+        paged_attention_decode_torch(
+            q[b : b + 1], k_pool_layer, v_pool_layer, block_tables[b], seq_lens[b]
+        )
+        for b in range(q.shape[0])
+    ]
+    return torch.cat(outs, dim=0)
 
 
 if _TRITON_AVAILABLE:
@@ -193,6 +232,104 @@ if _TRITON_AVAILABLE:
         out_offsets = b * stride_o_b + h * stride_o_h + d_offsets * stride_o_d
         tl.store(Out_ptr + out_offsets, out)
 
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _paged_attention_decode_batched_kernel(  # type: ignore[no-untyped-def]
+        Q_ptr,
+        K_pool_ptr,
+        V_pool_ptr,
+        block_tables_ptr,  # (B, MAX_BLOCKS), int32
+        seq_lens_ptr,  # (B,), int32
+        Out_ptr,
+        num_q_heads,
+        num_kv_heads,
+        max_blocks_per_req,
+        stride_q_b,
+        stride_q_h,
+        stride_q_d,
+        stride_kv_blk,
+        stride_kv_pos,
+        stride_kv_h,
+        stride_kv_d,
+        stride_o_b,
+        stride_o_h,
+        stride_o_d,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        SCALE: tl.constexpr,
+    ) -> None:
+        # One program per (request, q_head) pair; the request dimension generalizes
+        # the single-request kernel. Each program reads its own seq_len and its own
+        # row of the padded block_tables, then runs the same online-softmax loop.
+        pid = tl.program_id(0)
+        req_idx = pid // num_q_heads
+        h = pid % num_q_heads
+        kv_h = h // (num_q_heads // num_kv_heads)
+
+        # Per-request seq_len: the kernel masks past it, so padded block_table
+        # entries beyond this length are never read meaningfully.
+        seq_len = tl.load(seq_lens_ptr + req_idx)
+
+        # Load this request's Q vector. fp32 cast is for the same numerical-stability
+        # reason as in the single-request kernel.
+        d_offsets = tl.arange(0, HEAD_DIM)
+        q_offsets = req_idx * stride_q_b + h * stride_q_h + d_offsets * stride_q_d
+        q = tl.load(Q_ptr + q_offsets).to(tl.float32)
+
+        # Online-softmax accumulators (running max, running normalizer, weighted V sum).
+        m_i = -float("inf")
+        l_i = 0.0
+        acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+
+        num_blocks_used = tl.cdiv(seq_len, BLOCK_SIZE)
+        pos_in_block = tl.arange(0, BLOCK_SIZE)
+
+        # Where this request's block_table row starts in the padded (B, max_blocks) buffer.
+        block_table_offset = req_idx * max_blocks_per_req
+
+        for block_index in range(0, num_blocks_used):
+            # Look up the physical block ID for this logical block, then mask out
+            # positions past seq_len within the (possibly partial) last block.
+            block_id = tl.load(block_tables_ptr + block_table_offset + block_index)
+            global_pos = block_index * BLOCK_SIZE + pos_in_block
+            mask = global_pos < seq_len
+
+            # Gather a (BLOCK_SIZE, HEAD_DIM) tile of K from the shared pool.
+            k_offsets = (
+                block_id * stride_kv_blk
+                + pos_in_block[:, None] * stride_kv_pos
+                + kv_h * stride_kv_h
+                + d_offsets[None, :] * stride_kv_d
+            )
+            k = tl.load(K_pool_ptr + k_offsets, mask=mask[:, None], other=0.0).to(tl.float32)
+
+            # Scores: q . k_row, scaled. -inf for masked positions so they get zero weight.
+            scores = tl.sum(q[None, :] * k, axis=1) * SCALE
+            scores = tl.where(mask, scores, -float("inf"))
+
+            # Online softmax update: rescale prior accumulators against the new running max.
+            m_new = tl.maximum(m_i, tl.max(scores))
+            scale_factor = tl.exp(m_i - m_new)
+            scores_norm = tl.exp(scores - m_new)
+            l_new = l_i * scale_factor + tl.sum(scores_norm)
+
+            # V uses identical indexing as K; same rescale keeps acc consistent with l_i.
+            v_offsets = (
+                block_id * stride_kv_blk
+                + pos_in_block[:, None] * stride_kv_pos
+                + kv_h * stride_kv_h
+                + d_offsets[None, :] * stride_kv_d
+            )
+            v = tl.load(V_pool_ptr + v_offsets, mask=mask[:, None], other=0.0).to(tl.float32)
+            acc = acc * scale_factor + tl.sum(scores_norm[:, None] * v, axis=0)
+
+            m_i = m_new
+            l_i = l_new
+
+        # Final normalize and store at this request's slot in the output buffer.
+        out = acc / l_i
+        out_offsets = req_idx * stride_o_b + h * stride_o_h + d_offsets * stride_o_d
+        tl.store(Out_ptr + out_offsets, out)
+
 
 def paged_attention_decode_triton(
     q: torch.Tensor,
@@ -259,3 +396,91 @@ def paged_attention_decode(
     if supports_paged_kernel(q.device):
         return paged_attention_decode_triton(q, k_pool_layer, v_pool_layer, block_table, seq_len)
     return paged_attention_decode_torch(q, k_pool_layer, v_pool_layer, block_table, seq_len)
+
+
+def paged_attention_decode_batched(
+    q: torch.Tensor,
+    k_pool_layer: torch.Tensor,
+    v_pool_layer: torch.Tensor,
+    block_tables: list[torch.Tensor],
+    seq_lens: list[int],
+) -> torch.Tensor:
+    """Batched dispatcher: Triton on CUDA when available, PyTorch reference otherwise.
+
+    The Triton path packs the per-request `block_tables` into a padded 2D tensor
+    so a single kernel launch handles all requests. The reference path loops on
+    the host and stacks; same outputs, much slower, but device-agnostic and the
+    numerical oracle the kernel is validated against.
+    """
+    if supports_paged_kernel(q.device):
+        return _paged_attention_decode_batched_triton(
+            q, k_pool_layer, v_pool_layer, block_tables, seq_lens
+        )
+    return paged_attention_decode_torch_batched(
+        q, k_pool_layer, v_pool_layer, block_tables, seq_lens
+    )
+
+
+def _paged_attention_decode_batched_triton(
+    q: torch.Tensor,
+    k_pool_layer: torch.Tensor,
+    v_pool_layer: torch.Tensor,
+    block_tables: list[torch.Tensor],
+    seq_lens: list[int],
+) -> torch.Tensor:
+    """CUDA-only batched Triton launcher. Same single-request kernel reused per program.
+
+    We pad the per-request `block_tables` into a (B, max_blocks) tensor; the kernel
+    looks up each program's request via `pid // num_q_heads`, reads its `seq_len` and
+    its row of `block_tables`. Rows are padded with zeros — the per-request `seq_len`
+    causes the kernel to mask out positions beyond the real sequence length, so
+    padding is never read meaningfully.
+    """
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("triton not available; use paged_attention_decode_torch_batched instead")
+    if q.device.type != "cuda":
+        raise RuntimeError("Triton paged attention requires a CUDA tensor for q")
+
+    batch, num_q_heads, head_dim = q.shape
+    if len(block_tables) != batch or len(seq_lens) != batch:
+        raise ValueError(
+            f"q has B={batch} but got {len(block_tables)} tables and {len(seq_lens)} seq_lens"
+        )
+    _, block_size, num_kv_heads, _ = k_pool_layer.shape
+    assert k_pool_layer.shape == v_pool_layer.shape
+    assert num_q_heads % num_kv_heads == 0
+
+    max_blocks = max((block_table.numel() for block_table in block_tables), default=1)
+    block_tables_padded = torch.zeros((batch, max_blocks), dtype=torch.int32, device=q.device)
+    for request_index, block_table in enumerate(block_tables):
+        block_tables_padded[request_index, : block_table.numel()] = block_table.to(torch.int32)
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
+
+    out_fp32 = torch.empty((batch, num_q_heads, head_dim), dtype=torch.float32, device=q.device)
+    grid = (batch * num_q_heads,)
+
+    _paged_attention_decode_batched_kernel[grid](
+        q.contiguous(),
+        k_pool_layer,
+        v_pool_layer,
+        block_tables_padded,
+        seq_lens_t,
+        out_fp32,
+        num_q_heads,
+        num_kv_heads,
+        max_blocks,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_pool_layer.stride(0),
+        k_pool_layer.stride(1),
+        k_pool_layer.stride(2),
+        k_pool_layer.stride(3),
+        out_fp32.stride(0),
+        out_fp32.stride(1),
+        out_fp32.stride(2),
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=block_size,
+        SCALE=1.0 / math.sqrt(head_dim),
+    )
+    return out_fp32.to(q.dtype)
