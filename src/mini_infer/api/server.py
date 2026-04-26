@@ -1,6 +1,6 @@
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
@@ -17,7 +17,7 @@ from mini_infer.api.schemas import (
 )
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import SamplingParams
-from mini_infer.scheduler import Request, Scheduler
+from mini_infer.scheduler import ContinuousScheduler, Request
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -26,8 +26,13 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_name = os.environ.get("MINI_INFER_MODEL", DEFAULT_MODEL)
     runner = ModelRunner.from_pretrained(model_name)
-    app.state.scheduler = Scheduler(runner)
-    yield
+    scheduler = ContinuousScheduler(runner)
+    scheduler.start()
+    app.state.scheduler = scheduler
+    try:
+        yield
+    finally:
+        scheduler.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -38,7 +43,7 @@ async def completions(
     req: CompletionRequest,
     fastapi_req: FastAPIRequest,
 ) -> StreamingResponse | CompletionResponse:
-    scheduler: Scheduler = fastapi_req.app.state.scheduler
+    scheduler: ContinuousScheduler = fastapi_req.app.state.scheduler
     internal = Request(
         prompt=req.prompt,
         sampling_params=SamplingParams(
@@ -52,8 +57,9 @@ async def completions(
     created = int(time.time())
 
     if req.stream:
-
-        async def event_stream() -> AsyncIterator[str]:
+        # Sync generator so Starlette runs it in a threadpool: blocking queue.get()
+        # in the scheduler doesn't stall the event loop when other requests are in flight.
+        def event_stream() -> Iterator[str]:
             for step in scheduler.stream(internal):
                 chunk = CompletionChunk(
                     id=completion_id,

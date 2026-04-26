@@ -26,7 +26,7 @@ def smoke() -> str:
 
     from mini_infer.engine.model_runner import ModelRunner
     from mini_infer.engine.sampler import SamplingParams
-    from mini_infer.scheduler import Request, Scheduler
+    from mini_infer.scheduler import ContinuousScheduler, Request
 
     assert torch.cuda.is_available(), "CUDA not available in Modal container"
     gpu_name = torch.cuda.get_device_name()
@@ -34,14 +34,18 @@ def smoke() -> str:
     runner = ModelRunner.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
     assert runner.device == "cuda", f"expected cuda, got {runner.device!r}"
 
-    scheduler = Scheduler(runner)
-    result = scheduler.run(
-        Request(
-            prompt="The capital of France is",
-            sampling_params=SamplingParams(),
-            max_tokens=8,
+    scheduler = ContinuousScheduler(runner)
+    scheduler.start()
+    try:
+        result = scheduler.run(
+            Request(
+                prompt="The capital of France is",
+                sampling_params=SamplingParams(),
+                max_tokens=8,
+            )
         )
-    )
+    finally:
+        scheduler.stop()
     assert "Paris" in result.text, f"unexpected output: {result.text!r}"
 
     return (
