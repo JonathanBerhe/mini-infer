@@ -4,15 +4,11 @@ import dataclasses
 import enum
 import queue
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 
 from mini_infer.engine.sampler import SamplingParams
-
-if TYPE_CHECKING:
-    from mini_infer.cache.paged_kv_cache import PagedKVCache
-
 
 FinishReason = Literal["stop", "length"]
 
@@ -57,14 +53,15 @@ class RunningRequest:
     final GenerationStep gives the API-side handle a happens-before edge to
     read the final tokens_generated / finish_reason fields safely.
 
-    `cache` is None until prefill runs; the engine populates it from
-    `runner.prefill()`'s return value.
+    `batch_idx` is the request's slot in the scheduler's shared batched
+    `PagedKVCache`. None until prefill is merged in; shifts down by one each
+    time an earlier-slot request finishes and is removed from the cache.
     """
 
     request: Request
     output_queue: queue.Queue[GenerationStep]
-    cache: "PagedKVCache | None" = None
     state: RequestState = RequestState.WAITING
+    batch_idx: int | None = None
     prompt_token_ids: list[int] = dataclasses.field(default_factory=list)
     tokens_generated: list[int] = dataclasses.field(default_factory=list)
     last_logits: torch.Tensor | None = None

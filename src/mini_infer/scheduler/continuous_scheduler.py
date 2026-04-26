@@ -5,9 +5,10 @@ has room, drives them through prefill and decode, and frees blocks when each
 completes. A single engine thread owns the model and the running batch; API
 threads only enqueue requests and drain per-request output queues.
 
-The current implementation processes one request per forward pass within a step;
-when a batched-decode attention path is available, the same scheduler structure
-can dispatch a single batched call without changing the public API.
+Each step issues ONE batched forward over all currently DECODING requests via
+`runner.decode_batch(...)`. Newly admitted requests are prefilled one at a time
+into a temporary single-request cache, then merged into the scheduler's shared
+batched cache.
 """
 
 import logging
@@ -16,6 +17,7 @@ import queue
 import threading
 from collections.abc import Iterator
 
+from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample
 from mini_infer.scheduler.request_state import (
@@ -32,12 +34,14 @@ logger = logging.getLogger(__name__)
 
 
 class ContinuousScheduler:
-    """FIFO multi-request scheduler with admission control.
+    """FIFO multi-request scheduler with admission control and batched decode.
 
-    A single engine thread owns the model and the running batch. Submitted
-    requests join a waiting queue; each engine step admits new requests if the
-    block pool has capacity, prefills new admits, decodes each running request
-    by one token, and reaps any that have finished.
+    A single engine thread owns the model and one shared `PagedKVCache` for the
+    running batch. Submitted requests join a waiting queue; each engine step
+    admits new requests if the block pool has capacity, prefills new admits and
+    merges their cache state into the shared batched cache, runs ONE forward
+    pass over all DECODING requests, samples a token per request, and reaps any
+    that have finished.
 
     Lifecycle: call `start()` once before `submit()`; call `stop()` at shutdown
     to join the engine thread. The FastAPI lifespan does this for the HTTP
@@ -76,6 +80,7 @@ class ContinuousScheduler:
         self._decode_headroom = decode_headroom_blocks
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._running: list[RunningRequest] = []
+        self._batched_cache: PagedKVCache | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -128,19 +133,14 @@ class ContinuousScheduler:
             raise
 
     def _step(self) -> None:
-        """One scheduler iteration: admit, prefill new admits, decode running, reap done."""
+        """One scheduler iteration: admit, prefill new admits, batched decode, reap done."""
         self._admit_waiting()
-        for req in list(self._running):
-            if req.state == RequestState.PREFILLING:
-                self._prefill(req)
-        for req in list(self._running):
-            if req.state == RequestState.DECODING:
-                self._decode_one(req)
-        # Reap completed requests and return their blocks to the pool.
-        for req in [r for r in self._running if r.state == RequestState.DONE]:
-            if req.cache is not None:
-                req.cache.free()
-            self._running.remove(req)
+        for req in [r for r in self._running if r.state == RequestState.PREFILLING]:
+            self._prefill_and_merge(req)
+        decoding = [r for r in self._running if r.state == RequestState.DECODING]
+        if decoding:
+            self._batched_decode_step(decoding)
+        self._reap_done()
 
     def _admit_waiting(self) -> None:
         """Move waiting requests into the running batch while the block pool has room."""
@@ -167,38 +167,100 @@ class ContinuousScheduler:
             running.state = RequestState.PREFILLING
             self._running.append(running)
 
-    def _prefill(self, req: RunningRequest) -> None:
-        """Run prefill once for a newly admitted request, then transition to DECODING."""
-        cache, logits = self._runner.prefill(req.prompt_token_ids)
-        req.cache = cache
+    def _prefill_and_merge(self, req: RunningRequest) -> None:
+        """Run prefill into a temp 1-batch cache, merge into the shared batched cache."""
+        prefill_cache, logits = self._runner.prefill(req.prompt_token_ids)
+        if self._batched_cache is None:
+            # First request: adopt the prefill cache as the shared batched cache directly.
+            self._batched_cache = prefill_cache
+            req.batch_idx = 0
+        else:
+            req.batch_idx = self._batched_cache.merge_request(prefill_cache)
         req.last_logits = logits
         req.state = RequestState.DECODING
 
-    def _decode_one(self, req: RunningRequest) -> None:
-        """Sample one token, emit a streaming step, advance the cache for the next step."""
-        assert req.cache is not None
-        assert req.last_logits is not None
+    def _batched_decode_step(self, decoding: list[RunningRequest]) -> None:
+        """Sample-and-emit for each request, then ONE batched forward over the survivors.
+
+        Sampling is per-request (each draws from its own logits + sampling params);
+        emission is per-request (decode-and-diff streaming). After sampling, any
+        request that hit EOS or max_tokens transitions to DONE here. The forward
+        runs over the rest in batched form via `runner.decode_batch`, producing
+        each survivor's logits for the next step.
+        """
+        assert self._batched_cache is not None
         tokenizer = self._runner.tokenizer
-        next_token = sample(req.last_logits, req.request.sampling_params)
 
-        if next_token == tokenizer.eos_token_id:
-            self._finish(req, "stop")
+        survivors: list[RunningRequest] = []
+        survivor_tokens: list[int] = []
+        for req in decoding:
+            assert req.last_logits is not None
+            next_token = sample(req.last_logits, req.request.sampling_params)
+            if next_token == tokenizer.eos_token_id:
+                self._finish(req, "stop")
+                continue
+            req.tokens_generated.append(next_token)
+            # Decode-and-diff: re-decode all tokens so far and emit the new suffix.
+            # Handles multi-byte UTF-8 sequences correctly at the cost of O(n) work
+            # per step (one tokenizer call, one string slice).
+            current_text = tokenizer.decode(req.tokens_generated)
+            delta = current_text[len(req.last_text) :]
+            req.last_text = current_text
+            req.output_queue.put(GenerationStep(text=delta))
+            if len(req.tokens_generated) >= req.request.max_tokens:
+                self._finish(req, "length")
+                continue
+            survivors.append(req)
+            survivor_tokens.append(next_token)
+
+        if not survivors:
             return
 
-        req.tokens_generated.append(next_token)
-        # Decode-and-diff: re-decode all tokens so far and emit the new suffix.
-        # Handles multi-byte UTF-8 sequences correctly (one tokenizer call,
-        # one string slice) at the cost of O(n) work per step.
-        current_text = tokenizer.decode(req.tokens_generated)
-        delta = current_text[len(req.last_text) :]
-        req.last_text = current_text
-        req.output_queue.put(GenerationStep(text=delta))
+        # The cache still holds slots for any just-finished requests until
+        # `_reap_done()` runs. Build a token list for ALL slots; survivors get
+        # their sampled token, others get a placeholder. We discard their logits.
+        last_tokens_full = self._build_full_token_list(survivors, survivor_tokens)
+        _, all_logits = self._runner.decode_batch(self._batched_cache, last_tokens_full)
+        for req in survivors:
+            assert req.batch_idx is not None
+            req.last_logits = all_logits[req.batch_idx]
 
-        if len(req.tokens_generated) >= req.request.max_tokens:
-            self._finish(req, "length")
-            return
+    def _build_full_token_list(
+        self, survivors: list[RunningRequest], survivor_tokens: list[int]
+    ) -> list[int]:
+        """Build a length-batch_size token list; placeholder for soon-to-be-reaped slots."""
+        assert self._batched_cache is not None
+        tokens: list[int] = [0] * self._batched_cache.batch_size
+        for req, token in zip(survivors, survivor_tokens, strict=True):
+            assert req.batch_idx is not None
+            tokens[req.batch_idx] = token
+        return tokens
 
-        req.cache, req.last_logits = self._runner.decode(req.cache, next_token)
+    def _reap_done(self) -> None:
+        """Free blocks for finished requests; shift batch_idx for survivors."""
+        # Process highest batch_idx first so each removal shifts only indices we
+        # haven't yet processed; the survivor decrement keeps tracking variables
+        # in sync.
+        done = sorted(
+            [r for r in self._running if r.state == RequestState.DONE],
+            key=lambda r: r.batch_idx if r.batch_idx is not None else -1,
+            reverse=True,
+        )
+        for finished in done:
+            if finished.batch_idx is not None and self._batched_cache is not None:
+                self._batched_cache.remove_request(finished.batch_idx)
+                for surviving in self._running:
+                    if (
+                        surviving is not finished
+                        and surviving.batch_idx is not None
+                        and surviving.batch_idx > finished.batch_idx
+                    ):
+                        surviving.batch_idx -= 1
+            self._running.remove(finished)
+
+        if not self._running and self._batched_cache is not None:
+            # Nothing in flight: drop the empty cache so the next admit starts clean.
+            self._batched_cache = None
 
     def _finish(self, req: RunningRequest, reason: FinishReason) -> None:
         """Mark a request DONE and emit the terminal step with its finish_reason."""
