@@ -61,9 +61,7 @@ def bench() -> str:
     for label, chunk_size in chunk_settings:
         for concurrency in concurrencies:
             # Mixed workload: alternate short/long up to the requested concurrency.
-            workload = [
-                short_prompt if i % 2 == 0 else long_prompt for i in range(concurrency)
-            ]
+            workload = [short_prompt if i % 2 == 0 else long_prompt for i in range(concurrency)]
 
             scheduler = ContinuousScheduler(
                 runner, max_concurrent=concurrency, chunk_size=chunk_size
@@ -110,10 +108,7 @@ def bench() -> str:
                 }
             )
 
-    header = (
-        f"{'config':<14} {'C':>3} {'elapsed_s':>10} "
-        f"{'tokens':>8} {'tok/s':>10} {'lat_s':>8}"
-    )
+    header = f"{'config':<14} {'C':>3} {'elapsed_s':>10} {'tokens':>8} {'tok/s':>10} {'lat_s':>8}"
     lines = [header, "-" * len(header)]
     for row in rows:
         lines.append(
