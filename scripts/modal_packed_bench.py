@@ -123,7 +123,10 @@ def bench() -> str:
         )
     table = "\n".join(lines)
 
-    return f"\nGPU: {gpu_name}\nModel: Qwen/Qwen2.5-0.5B-Instruct (bf16, FlashAttention varlen)\n\n{table}\n"
+    header_lines = (
+        f"GPU: {gpu_name}\nModel: Qwen/Qwen2.5-0.5B-Instruct (bf16, FlashAttention varlen)"
+    )
+    return f"\n{header_lines}\n\n{table}\n"
 
 
 @app.local_entrypoint()
