@@ -4,14 +4,11 @@ import dataclasses
 import enum
 import queue
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 
 from mini_infer.engine.sampler import SamplingParams
-
-if TYPE_CHECKING:
-    from mini_infer.cache.paged_kv_cache import PagedKVCache
 
 FinishReason = Literal["stop", "length"]
 
@@ -78,7 +75,6 @@ class RunningRequest:
     batch_idx: int | None = None
     prompt_token_ids: list[int] = dataclasses.field(default_factory=list)
     tokens_prefilled: int = 0
-    prefill_cache: "PagedKVCache | None" = None
     tokens_generated: list[int] = dataclasses.field(default_factory=list)
     last_logits: torch.Tensor | None = None
     last_text: str = ""
