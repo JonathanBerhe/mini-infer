@@ -15,6 +15,14 @@ dependencies = [
     "pydantic>=2.5",
 ]
 
+[project.optional-dependencies]
+# CUDA-only extras. Installed in Modal images and on machines with CUDA;
+# omitted on M1 / CPU where flash-attn cannot build. Imports of `flash_attn`
+# in the codebase MUST be try/except guarded so non-CUDA installs still work.
+cuda = [
+    "flash-attn>=2.6",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mini_infer"]
 
@@ -50,6 +58,11 @@ follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 module = ["triton", "triton.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = ["flash_attn", "flash_attn.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
