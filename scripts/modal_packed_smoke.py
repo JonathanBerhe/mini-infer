@@ -65,9 +65,7 @@ def smoke() -> str:
     sched.start()
     try:
         handles = [
-            sched.submit(
-                Request(prompt=p, sampling_params=SamplingParams(), max_tokens=max_tokens)
-            )
+            sched.submit(Request(prompt=p, sampling_params=SamplingParams(), max_tokens=max_tokens))
             for p in prompts
         ]
         concurrent_results = [h.wait() for h in handles]
@@ -104,18 +102,13 @@ def smoke() -> str:
                 f"concurrent={c.tokens[0]} vs serial={s.tokens[0]}"
             )
         elif c.tokens != s.tokens:
-            n_match = sum(
-                1 for ct, st in zip(c.tokens, s.tokens, strict=True) if ct == st
-            )
-            drifts.append(
-                f"  {prompt[:40]!r}: {n_match}/{len(c.tokens)} tokens match (tail drift)"
-            )
+            n_match = sum(1 for ct, st in zip(c.tokens, s.tokens, strict=True) if ct == st)
+            drifts.append(f"  {prompt[:40]!r}: {n_match}/{len(c.tokens)} tokens match (tail drift)")
     if hard_fails:
         raise AssertionError("HARD FAILS on CUDA:\n" + "\n".join(hard_fails))
 
     summary = " | ".join(
-        f"{p[:24]!r}->{r.text[:24]!r}"
-        for p, r in zip(prompts, concurrent_results, strict=True)
+        f"{p[:24]!r}->{r.text[:24]!r}" for p, r in zip(prompts, concurrent_results, strict=True)
     )
     drift_note = ""
     if drifts:
