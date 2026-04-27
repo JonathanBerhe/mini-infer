@@ -1,14 +1,22 @@
 """Continuous batching scheduler with a dedicated engine thread.
 
 The scheduler accepts requests asynchronously, admits them when the KV block pool
-has room, drives them through prefill and decode, and frees blocks when each
-completes. A single engine thread owns the model and the running batch; API
-threads only enqueue requests and drain per-request output queues.
+has room, drives them through chunked prefill and decode, and frees blocks when
+each completes. A single engine thread owns the model and the running batch;
+API threads only enqueue requests and drain per-request output queues.
 
-Each step issues ONE batched forward over all currently DECODING requests via
-`runner.decode_batch(...)`. Newly admitted requests are prefilled one at a time
-into a temporary single-request cache, then merged into the scheduler's shared
-batched cache.
+Each step does:
+1. Admit any newly arrived requests that fit in the block pool.
+2. For each prefilling request, advance its prefill by ONE chunk (default 256
+   tokens) into its own temporary single-slot cache. This is the head-of-line
+   blocking fix: a long prompt's prefill is amortized across many steps so
+   short decoders aren't blocked behind it for the entire prefill cost.
+3. Run ONE batched decode forward over all currently-decoding requests.
+4. Reap finished requests (free blocks, shift batch indices).
+
+When the last chunk of a prefill lands, the request's prefill cache is merged
+into the scheduler's shared batched cache and the request transitions to
+DECODING. The first decode token is sampled from the last chunk's logits.
 """
 
 import logging
@@ -69,15 +77,25 @@ class ContinuousScheduler:
     # but adds complexity for negligible payoff at our scale.
     IDLE_SLEEP_SECONDS = 0.005
 
+    # Prompt tokens processed per prefilling request per scheduler step. 256 is
+    # vLLM/SGLang's default and balances two concerns: small enough that a long
+    # prefill doesn't monopolize the engine for too long (so decoders make
+    # progress), large enough that the per-step overhead (Python-side input
+    # build + model.forward call) doesn't dominate the per-token cost. Tuneable
+    # via the constructor; benchmarks should sweep this value.
+    DEFAULT_CHUNK_SIZE = 256
+
     def __init__(
         self,
         runner: ModelRunner,
         max_concurrent: int = 16,
         decode_headroom_blocks: int = DEFAULT_DECODE_HEADROOM_BLOCKS,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
         self._runner = runner
         self._max_concurrent = max_concurrent
         self._decode_headroom = decode_headroom_blocks
+        self._chunk_size = chunk_size
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._running: list[RunningRequest] = []
         self._batched_cache: PagedKVCache | None = None
@@ -133,10 +151,15 @@ class ContinuousScheduler:
             raise
 
     def _step(self) -> None:
-        """One scheduler iteration: admit, prefill new admits, batched decode, reap done."""
+        """One scheduler iteration: admit, advance prefills, batched decode, reap."""
         self._admit_waiting()
-        for req in [r for r in self._running if r.state == RequestState.PREFILLING]:
-            self._prefill_and_merge(req)
+        prefilling = [
+            r
+            for r in self._running
+            if r.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING)
+        ]
+        for req in prefilling:
+            self._advance_chunked_prefill(req)
         decoding = [r for r in self._running if r.state == RequestState.DECODING]
         if decoding:
             self._batched_decode_step(decoding)
@@ -164,20 +187,44 @@ class ContinuousScheduler:
                 self._waiting.put(running)
                 return
 
+            # Allocate the per-request prefill cache eagerly so subsequent chunk
+            # dispatches just call prefill_chunk against an existing single-slot cache.
+            running.prefill_cache = PagedKVCache(self._runner.block_pool)
+            running.prefill_cache.add_request_slot()
             running.state = RequestState.PREFILLING
             self._running.append(running)
 
-    def _prefill_and_merge(self, req: RunningRequest) -> None:
-        """Run prefill into a temp 1-batch cache, merge into the shared batched cache."""
-        prefill_cache, logits = self._runner.prefill(req.prompt_token_ids)
-        if self._batched_cache is None:
-            # First request: adopt the prefill cache as the shared batched cache directly.
-            self._batched_cache = prefill_cache
-            req.batch_idx = 0
+    def _advance_chunked_prefill(self, req: RunningRequest) -> None:
+        """Dispatch one chunk's worth of prefill; merge + transition to DECODING on the last chunk.
+
+        The chunk size is fixed at `self._chunk_size` (configurable on the
+        scheduler). On the final chunk (the one that brings `tokens_prefilled`
+        up to `len(prompt_token_ids)`), the request's temp prefill cache is
+        merged into the shared batched cache and the last-position logits are
+        retained as the seed for the next decode step.
+        """
+        assert req.prefill_cache is not None
+        chunk_start = req.tokens_prefilled
+        chunk_end = min(chunk_start + self._chunk_size, len(req.prompt_token_ids))
+        chunk_tokens = req.prompt_token_ids[chunk_start:chunk_end]
+
+        _, logits = self._runner.prefill_chunk(
+            req.prefill_cache, chunk_tokens, position_offset=chunk_start
+        )
+        req.tokens_prefilled = chunk_end
+
+        if chunk_end == len(req.prompt_token_ids):
+            # Final chunk: merge prefill cache into the shared batched cache.
+            if self._batched_cache is None:
+                self._batched_cache = req.prefill_cache
+                req.batch_idx = 0
+            else:
+                req.batch_idx = self._batched_cache.merge_request(req.prefill_cache)
+            req.prefill_cache = None
+            req.last_logits = logits
+            req.state = RequestState.DECODING
         else:
-            req.batch_idx = self._batched_cache.merge_request(prefill_cache)
-        req.last_logits = logits
-        req.state = RequestState.DECODING
+            req.state = RequestState.CHUNKED_PREFILLING
 
     def _batched_decode_step(self, decoding: list[RunningRequest]) -> None:
         """Sample-and-emit for each request, then ONE batched forward over the survivors.

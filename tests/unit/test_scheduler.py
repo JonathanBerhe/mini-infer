@@ -163,3 +163,45 @@ def test_short_request_finishing_first_does_not_corrupt_others(
     assert long_concurrent.tokens == long_solo.tokens, (
         "long-request output diverged after short-request finish; batch_idx drift bug"
     )
+
+
+@pytest.mark.requires_model
+def test_chunked_prefill_matches_unchunked() -> None:
+    """A long prompt processed in multiple chunks must produce identical output to
+    the same prompt processed in a single shot.
+
+    Uses two separately-instantiated schedulers so each has its own engine state:
+    one with a small chunk_size that forces multi-step prefill, one with a chunk
+    big enough to fit the prompt in a single chunk. Greedy sampling so outputs
+    are deterministic — token-for-token equality proves chunked prefill is a
+    no-op on output.
+    """
+    runner = ModelRunner.from_pretrained(MODEL_NAME)
+    prompt = "The capital of France is one of the most popular tourist destinations"
+    sampling = SamplingParams()
+    max_tokens = 8
+
+    # Get the prompt length in tokens to choose chunk sizes that actually chunk.
+    prompt_len = len(runner.tokenizer.encode(prompt))
+    chunk_size_small = max(prompt_len // 3, 2)  # forces 3 or 4 chunks
+    chunk_size_big = prompt_len + 10  # fits the whole prompt in one chunk
+
+    sched_small = ContinuousScheduler(runner, chunk_size=chunk_size_small)
+    sched_big = ContinuousScheduler(runner, chunk_size=chunk_size_big)
+    sched_small.start()
+    sched_big.start()
+    try:
+        out_small = sched_small.run(
+            Request(prompt=prompt, sampling_params=sampling, max_tokens=max_tokens)
+        )
+        out_big = sched_big.run(
+            Request(prompt=prompt, sampling_params=sampling, max_tokens=max_tokens)
+        )
+    finally:
+        sched_small.stop()
+        sched_big.stop()
+
+    assert out_small.tokens == out_big.tokens, (
+        f"chunked prefill diverged from unchunked: "
+        f"chunked={out_small.tokens}, unchunked={out_big.tokens}"
+    )
