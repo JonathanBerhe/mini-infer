@@ -68,9 +68,34 @@ What changes vs the short workload:
 
 This last point is worth dwelling on: **on this synthetic-batch workload the chunked configuration looks worse**, and that's expected. Chunking is a head-of-line-blocking fix, not a throughput optimization for batches that arrive together. The benefit shows up in mixed workloads where short decoders are running when a long prompt lands; the chunked path keeps the decoders flowing while the un-chunked path freezes them for the full prefill duration. We'd need a microbenchmark that explicitly times decoder inter-token latency during a concurrent long prefill to show that effect — flagged as a follow-up.
 
+## Head-of-line blocking microbench
+
+To check whether chunked prefill actually delivers its claimed benefit (decoders keep flowing while a long prompt is being prefilled), I ran a focused microbench. Setup: start a short decoder, let it emit 4 tokens at steady-state ITL (~55-58ms). Then submit a 3065-token long prompt. Measure: the time from long-submit to the short decoder's next token. Reproducer: `scripts/modal_packed_bench_hol.py`.
+
+| Config | Baseline ITL (ms) | First short token after long-submit (ms) | Long total (ms) |
+|---|---:|---:|---:|
+| chunked-256 | 58.2 | 61.8 | 4666 |
+| un-chunked  | 55.7 | 65.8 | 3251 |
+
+**The result wasn't what a vLLM-style two-forward analysis would predict.** With a classic two-forward design (one model.forward for prefill, another for decode), an un-chunked 3k-token prefill would freeze the decoder for the full prefill duration — somewhere around 800-1000ms on this hardware. Chunked prefill exists to break that pause into small steps so the decoder gets a token in between.
+
+But on Slice B's packed-varlen design, the decoder's first token after long-submit lands in **~60ms regardless of chunk size**. Effectively no pause. That's because the packed forward processes ALL in-flight work in one step: the long prompt's first chunk (or the whole long prompt, in the un-chunked case) and the short decoder's next token are concatenated into a single varlen forward, so the decoder can't be "blocked" by the prefill in the time-domain sense. They share the same forward.
+
+There's a measurement caveat — `first_short_token_after_long` likely captures the tail of the in-flight step (the engine was already mid-forward when long was submitted), not the duration of the first long-aware step. The cleaner metric would be the *maximum* short-decoder ITL across the post-long window. That said, the broader signal is consistent: Slice B doesn't experience HOL blocking the way a two-forward design would.
+
+The interesting metric is `long_total_ms`: **chunked is 44% slower than un-chunked at completing the long prefill** (4666ms vs 3251ms). 12 small chunked forwards have meaningfully more per-step Python + materialization overhead than 1 big un-chunked forward. With packed varlen as the substrate, chunked prefill stops being a HOL fix (the packed design already solved that) and starts being pure overhead for prefills without competing decode work.
+
+**What this changes about the chunked-prefill story**: chunking still has a real reason to exist — bounded per-step memory pressure (the un-chunked 3k-token prefill materializes all 3k positions at once at every layer; chunked materializes one chunk at a time). At 4k or 16k+ contexts on the same model, the un-chunked path would OOM before the chunked path. But the throughput-vs-latency story we'd been telling ("chunking is the HOL fix") was specific to two-forward designs. For Slice B's packed design, **the architecture is the HOL fix**, and chunking is a memory tool.
+
 ## Bottom line
 
-The architecture is in place — one model.forward per scheduler step over a packed varlen sequence on real CUDA via FlashAttention. Correctness is validated, throughput scales (3.3× at C=8 on short, 1.4× at C=4 on 4k contexts). The 30% gap vs ADR-005's decode-only kernel is the per-layer materialization tax we knew we'd take on. Two clear follow-ups:
+Three findings, all measured:
 
-1. **Close the materialization gap** via FlashAttention's paged-aware varlen API (`flash_attn_with_kvcache`, FA 2.7+) or a custom Triton kernel. The interface in `cache/packed_attention.py::packed_attention_forward` is the abstraction boundary; only that file changes.
-2. **Demonstrate the chunked-prefill win** with a head-of-line-blocking microbenchmark: short decoders running while a long prompt's prefill is in flight, ITL measured separately. That's the scenario chunking is designed for, and neither the short nor the long synthetic-batch workload exercises it.
+1. **Throughput scales with concurrency on short workloads** (3.3× at C=8) but degrades at long context (1.4× at C=4 on 4k prompts). Long-context throughput is bottlenecked by attention compute that scales with `kv_len`, not by our scheduling.
+2. **Slice B is ~30% slower than ADR-005's decode-only kernel** at short workloads (122 vs 187 tok/s at C=8). The cost is per-layer K/V materialization for `flash_attn_varlen_func`. We did not benchmark ADR-005 at long context, so we can't say whether the gap closes there.
+3. **Slice B's packed-forward design eliminates HOL blocking by construction**. Chunked vs un-chunked makes ~no difference to decoder ITL when a long prompt arrives; un-chunked is actually faster for the prefill itself (no chunk overhead). Chunking remains useful for memory pressure at very long contexts but is no longer the HOL solution it was in the two-forward design.
+
+Two follow-ups, in priority order:
+
+1. **Close the materialization gap** via `flash_attn_with_kvcache` (FA 2.7+ paged-aware varlen) or a custom Triton kernel. The interface in `cache/packed_attention.py::packed_attention_forward` is the abstraction boundary. This is the path back to (or past) ADR-005 numbers.
+2. **Re-bench at very long contexts** (16k+) to find where the chunked path's memory advantage starts to matter. The current 3k workload is too small to surface that.
