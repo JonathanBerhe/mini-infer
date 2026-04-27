@@ -1,32 +1,36 @@
-"""Qwen2 family attention patch for the paged decode kernel."""
+"""Qwen2 family attention patch for the packed varlen forward path."""
 
 from typing import Any
 
 import torch
 
-from mini_infer.cache.paged_attention import (
-    paged_attention_decode_batched,
-    supports_paged_kernel,
-)
+from mini_infer.cache.packed_attention import packed_attention_forward
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 
 
 def patch_qwen2(model: Any) -> None:
-    """Replace each Qwen2Attention.forward with our paged-decode-aware wrapper."""
+    """Replace each Qwen2Attention.forward with our packed-attention wrapper."""
     # transformers Qwen2ForCausalLM has model.model.layers; each layer has self_attn.
     for layer in model.model.layers:
         attn = layer.self_attn
         original_forward = attn.forward
-        attn.forward = _make_paged_forward(attn, original_forward)
+        attn.forward = _make_packed_forward(attn, original_forward)
 
 
-def _make_paged_forward(attn_module: Any, original_forward: Any) -> Any:
-    """Build the patched forward closure that owns the decode fast path.
+def _make_packed_forward(attn_module: Any, original_forward: Any) -> Any:
+    """Build the patched forward closure for varlen packed attention.
 
-    Mirrors transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward up to
-    Q/K/V projections and RoPE; then either calls the batched paged kernel
-    (decode, q_len=1, B>=1) or delegates to original_forward (prefill,
-    q_len > 1) which uses materialization through `update()`.
+    When the caller passes `cu_seqlens_q` in kwargs and the cache is a
+    `PagedKVCache`, we run the unified packed path: Q/K/V projections + RoPE,
+    write new K/V to the right per-request slots via `append_kv_packed`,
+    materialize the full per-request K/V history into packed form, and
+    dispatch `packed_attention_forward` (FlashAttention varlen on CUDA, the
+    PyTorch reference elsewhere). One forward per scheduler step, regardless
+    of whether the in-flight requests are prefilling or decoding.
+
+    Without `cu_seqlens_q`, we fall through to HF's stock attention so non-
+    scheduler entry points (golden tests via the older `prefill`/`decode`
+    style) keep working unchanged.
     """
     # Imported here so transformers internals aren't pulled at module import time.
     from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
@@ -38,51 +42,18 @@ def _make_paged_forward(attn_module: Any, original_forward: Any) -> Any:
         past_key_values: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        q_len = hidden_states.shape[1]
-
-        # Decode fast path: single-token query per request, populated paged cache,
-        # kernel-capable device. The device check is defensive — the runner only
-        # installs this patch on kernel-capable devices today, but the explicit
-        # gate documents intent and survives any future change to that policy.
-        if (
-            q_len == 1
-            and isinstance(past_key_values, PagedKVCache)
-            and past_key_values.batch_size > 0
-            and all(n > 0 for n in past_key_values.seq_lens_list())
-            and supports_paged_kernel(hidden_states.device)
-        ):
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, attn_module.head_dim)
-            query_states = attn_module.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            key_states = attn_module.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            value_states = attn_module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-            # Append the new K/V to blocks; do NOT materialize.
-            past_key_values.append_kv(key_states, value_states, attn_module.layer_idx)
-
-            # Slice this layer's K/V pool: (num_blocks, block_size, num_kv_heads, head_dim).
-            pool_storage = past_key_values._pool.storage
-            k_pool_layer = pool_storage[attn_module.layer_idx, 0]
-            v_pool_layer = pool_storage[attn_module.layer_idx, 1]
-            block_tables = past_key_values.block_tables_per_request_tensor(hidden_states.device)
-            seq_lens = past_key_values.seq_lens_list()
-
-            # query_states is (B, num_q_heads, q_len=1, head_dim); kernel wants
-            # (B, num_q_heads, head_dim).
-            q_decode = query_states.squeeze(2)
-            attn_decode = paged_attention_decode_batched(
-                q_decode, k_pool_layer, v_pool_layer, block_tables, seq_lens
+        cu_seqlens_q = kwargs.get("cu_seqlens_q")
+        if cu_seqlens_q is not None and isinstance(past_key_values, PagedKVCache):
+            return _packed_attention_path(
+                attn_module,
+                apply_rotary_pos_emb,
+                hidden_states,
+                position_embeddings,
+                past_key_values,
+                cu_seqlens_q,
+                kwargs,
             )
-            # Restore q_len dim so the standard reshape below produces
-            # (B, q_len, num_q_heads * head_dim).
-            attn_output = attn_decode.unsqueeze(1)
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = attn_module.o_proj(attn_output)
-            return attn_output, None
 
-        # Prefill or empty-cache: defer to the original HF attention path.
         return original_forward(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -92,3 +63,64 @@ def _make_paged_forward(attn_module: Any, original_forward: Any) -> Any:
         )
 
     return patched_forward
+
+
+def _packed_attention_path(
+    attn_module: Any,
+    apply_rotary_pos_emb: Any,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    past_key_values: PagedKVCache,
+    cu_seqlens_q: torch.Tensor,
+    kwargs: dict[str, Any],
+) -> tuple[torch.Tensor, None]:
+    """Compute Q/K/V, append new K/V to cache, run packed varlen attention."""
+    # hidden_states is (1, total_q, hidden). The "batch" dim is always 1 here —
+    # all per-request boundaries live in cu_seqlens_q.
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, attn_module.head_dim)
+    query_states = attn_module.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = attn_module.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = attn_module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    # Shapes: query_states (1, num_q_heads, total_q, head_dim);
+    #         key/value_states (1, num_kv_heads, total_q, head_dim).
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    # Reshape to packed (total_q, num_*_heads, head_dim) for both the cache
+    # append and the varlen attention call.
+    new_keys_packed = key_states.transpose(1, 2).squeeze(0).contiguous()
+    new_values_packed = value_states.transpose(1, 2).squeeze(0).contiguous()
+    queries_packed = query_states.transpose(1, 2).squeeze(0).contiguous()
+
+    past_key_values.append_kv_packed(
+        new_keys_packed, new_values_packed, cu_seqlens_q, attn_module.layer_idx
+    )
+
+    # Materialize the full per-request K/V history (now including the just-
+    # appended K/V) into packed form for varlen attention.
+    keys_full, values_full, cu_seqlens_k, max_seqlen_k = past_key_values.materialize_packed_kv(
+        attn_module.layer_idx
+    )
+
+    max_seqlen_q = int(kwargs.get("max_seqlen_q", 0))
+    if max_seqlen_q == 0:
+        # Compute on the fly if the caller didn't pass it.
+        max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+
+    attn_packed = packed_attention_forward(
+        queries_packed,
+        keys_full,
+        values_full,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+    )
+    # attn_packed: (total_q, num_q_heads, head_dim).
+
+    # Reshape back to (1, total_q, num_q_heads * head_dim) for o_proj.
+    attn_output = attn_packed.unsqueeze(0).reshape(*input_shape, -1).contiguous()
+    attn_output = attn_module.o_proj(attn_output)
+    return attn_output, None

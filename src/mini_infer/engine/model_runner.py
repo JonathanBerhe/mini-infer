@@ -4,7 +4,6 @@ import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from mini_infer.cache.block_pool import BlockPool
-from mini_infer.cache.paged_attention import supports_paged_kernel
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.attention_patch import patch_model_attention
 from mini_infer.engine.tokenizer import Tokenizer
@@ -35,7 +34,14 @@ def _dtype_for(device: str) -> torch.dtype:
 
 
 class ModelRunner:
-    """Loads a HF causal LM and runs prefill + batched decode against a paged KV cache."""
+    """Loads a HF causal LM and runs packed-varlen forwards against a paged KV cache.
+
+    All forwards (prefill, decode, chunked-prefill) flow through `forward_step`,
+    which packs per-request q-tokens into a single sequence and dispatches the
+    patched attention layer's varlen path. The convenience wrappers (`prefill`,
+    `decode`, `decode_batch`, `prefill_chunk`) build the right packed inputs
+    for their single-request / uniform-q-len cases and call `forward_step`.
+    """
 
     def __init__(
         self,
@@ -79,12 +85,12 @@ class ModelRunner:
             device=resolved,
         )
 
-        # On kernel-capable devices, patch the model's attention layers so decode
-        # steps use the batched paged kernel and skip the materialization fallback.
-        # Other devices (MPS / CPU) keep using the materialization path through
-        # `cache.update()`, which is now batch-aware. Benchmarks can set
-        # use_paged_kernel=False to A/B against materialization on the same hardware.
-        if use_paged_kernel and supports_paged_kernel(resolved):
+        # Apply the architecture-specific attention patch. The patched forward
+        # dispatches `packed_attention_forward`, which uses FlashAttention varlen
+        # on CUDA and a PyTorch reference elsewhere — so the patch is correct on
+        # every device. Set use_paged_kernel=False to A/B against HF's stock
+        # attention path.
+        if use_paged_kernel:
             patch_model_attention(model)
 
         return cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)
@@ -97,11 +103,94 @@ class ModelRunner:
     def block_pool(self) -> BlockPool:
         return self._block_pool
 
-    def prefill(self, prompt_tokens: list[int]) -> tuple[PagedKVCache, torch.Tensor]:
-        """Process the full prompt; return a single-request KV cache and last-position logits.
+    def forward_step(
+        self,
+        cache: PagedKVCache,
+        packed_input_ids: list[int],
+        cu_seqlens_q: list[int],
+        position_offsets: list[int],
+    ) -> list[torch.Tensor]:
+        """Run ONE packed-varlen forward over `cache.batch_size` requests.
 
-        The returned cache has `batch_size=1` and is intended to be merged into the
-        scheduler's long-lived multi-request cache via `merge_request()`.
+        Args:
+            cache: shared `PagedKVCache` whose `batch_size` matches the number
+                of in-flight requests. The forward writes new K/V into each
+                request's slot in place.
+            packed_input_ids: every request's q-tokens flattened into one list,
+                in cache-slot order. Total length equals `cu_seqlens_q[-1]`.
+            cu_seqlens_q: cumulative q-length boundaries; `cu_seqlens_q[-1]` is
+                the packed total length.
+            position_offsets: per-request absolute position of each request's
+                first new q-token. Equals `cache.seq_lens_list()[batch_idx]`
+                BEFORE this step's append.
+
+        Returns:
+            A list of `(vocab_size,)` tensors, one per request, holding the
+            last-position logits.
+        """
+        batch_size = cache.batch_size
+        if len(position_offsets) != batch_size:
+            raise ValueError(
+                f"position_offsets has length {len(position_offsets)} but "
+                f"cache.batch_size={batch_size}"
+            )
+        if len(cu_seqlens_q) != batch_size + 1:
+            raise ValueError(
+                f"cu_seqlens_q has {len(cu_seqlens_q)} entries; expected batch_size+1="
+                f"{batch_size + 1}"
+            )
+
+        device = self.device
+        input_ids = torch.tensor([packed_input_ids], device=device, dtype=torch.long)
+
+        # Per-request position ids: positions reset per request so RoPE applies
+        # the right rotation for each request's absolute position.
+        position_ids_flat: list[int] = []
+        max_seqlen_q = 0
+        for batch_idx in range(batch_size):
+            q_len = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
+            if q_len > max_seqlen_q:
+                max_seqlen_q = q_len
+            position_ids_flat.extend(
+                range(position_offsets[batch_idx], position_offsets[batch_idx] + q_len)
+            )
+        position_ids = torch.tensor([position_ids_flat], device=device, dtype=torch.long)
+
+        cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
+
+        # `attention_mask` and `cache_position` are required by HF's outer
+        # forward to size some internal computations, but our patched attention
+        # ignores them (it uses cu_seqlens_q + the cache's per-slot seq_lens).
+        max_kv_after = max(
+            position_offsets[batch_idx] + cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
+            for batch_idx in range(batch_size)
+        )
+        attention_mask = torch.ones((1, max_kv_after), device=device, dtype=torch.long)
+        cache_position = torch.tensor([max(position_offsets)], device=device, dtype=torch.long)
+
+        with torch.inference_mode():
+            out = self._model(
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=cache,
+                cache_position=cache_position,
+                use_cache=True,
+                cu_seqlens_q=cu_seqlens_q_t,
+                max_seqlen_q=max_seqlen_q,
+            )
+
+        # out.logits is (1, total_q, vocab_size). Pull each request's last-position slice.
+        per_request_logits: list[torch.Tensor] = []
+        for batch_idx in range(batch_size):
+            last_pos = cu_seqlens_q[batch_idx + 1] - 1
+            per_request_logits.append(out.logits[0, last_pos, :])
+        return per_request_logits
+
+    def prefill(self, prompt_tokens: list[int]) -> tuple[PagedKVCache, torch.Tensor]:
+        """Process the full prompt in one forward; return single-request cache + last logits.
+
+        Convenience wrapper for golden tests and the decode-latency benchmark.
         """
         cache = PagedKVCache(self._block_pool)
         cache.add_request_slot()
@@ -113,99 +202,36 @@ class ModelRunner:
         chunk_tokens: list[int],
         position_offset: int,
     ) -> tuple[PagedKVCache, torch.Tensor]:
-        """Process one chunk of a prompt against an existing single-slot cache.
+        """Process one chunk against an existing single-slot cache.
 
-        Used for chunked prefill: the same cache accumulates K/V across multiple
-        chunks, with `position_offset` advancing by `chunk_size` each call. After
-        the final chunk, the cache holds the full prompt's K/V state and the
-        returned last-position logits are the seed for decoding.
-
-        Args:
-            cache: A `PagedKVCache` with `batch_size == 1`. Must already contain
-                the K/V state for the first `position_offset` tokens of the prompt
-                (zero on the first chunk).
-            chunk_tokens: This chunk's input token IDs.
-            position_offset: Number of prompt tokens already processed (and present
-                in the cache). On the first chunk this is 0.
-
-        Returns:
-            (cache, logits) — same cache, mutated in-place; logits is the
-            `(vocab_size,)` slice for the chunk's last position.
+        Same packed forward as `forward_step`, with batch_size=1 enforced. Used
+        as a convenience by tests; the scheduler builds packed inputs directly.
         """
         if cache.batch_size != 1:
             raise ValueError(f"prefill_chunk expects cache.batch_size == 1, got {cache.batch_size}")
-        input_ids = torch.tensor([chunk_tokens], device=self.device)
-        chunk_len = input_ids.shape[1]
-        # attention_mask covers all prior cached tokens plus this chunk's tokens —
-        # the model needs to see the full history when computing causal attention
-        # for the new positions.
-        attention_mask = torch.ones(
-            (1, position_offset + chunk_len), device=self.device, dtype=torch.long
-        )
-        position_ids = torch.arange(
-            position_offset, position_offset + chunk_len, device=self.device
-        ).unsqueeze(0)
-        cache_position = torch.arange(
-            position_offset, position_offset + chunk_len, device=self.device
-        )
-        with torch.inference_mode():
-            out = self._model(
-                input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=cache,
-                cache_position=cache_position,
-                use_cache=True,
-            )
-        return cache, out.logits[0, -1, :]
+        cu_seqlens_q = [0, len(chunk_tokens)]
+        logits_list = self.forward_step(cache, chunk_tokens, cu_seqlens_q, [position_offset])
+        return cache, logits_list[0]
 
     def decode(self, cache: PagedKVCache, last_token: int) -> tuple[PagedKVCache, torch.Tensor]:
-        """Single-request convenience wrapper around `decode_batch`.
-
-        Used by golden tests and the decode-latency benchmark, both of which
-        iterate prefill -> decode in a loop with `cache.batch_size == 1`.
-        """
+        """Single-request convenience wrapper around `decode_batch`."""
         cache, logits_list = self.decode_batch(cache, [last_token])
         return cache, logits_list[0]
 
     def decode_batch(
         self, cache: PagedKVCache, last_tokens: list[int]
     ) -> tuple[PagedKVCache, list[torch.Tensor]]:
-        """Run one batched decode step over `cache.batch_size` requests.
+        """Run one batched decode step (q_len=1 per request) via `forward_step`.
 
-        `last_tokens[b]` is the most recently sampled token for batch slot `b`. The
-        forward writes its K/V into the cache and produces next-token logits per
-        request. Returns the (mutated) cache and a list of per-request logit
-        tensors, each shape `(vocab_size,)`.
+        Each request contributes one new token; positions come from the cache's
+        per-slot seq_lens (the absolute position of the new token).
         """
         batch_size = cache.batch_size
         if len(last_tokens) != batch_size:
             raise ValueError(
                 f"last_tokens has length {len(last_tokens)} but cache batch_size={batch_size}"
             )
-        seq_lens_before = cache.seq_lens_list()
-        input_ids = torch.tensor([[token] for token in last_tokens], device=self.device)
-        position_ids = torch.tensor([[seq_len] for seq_len in seq_lens_before], device=self.device)
-        # Attention mask shape (B, max_seq + 1) with 1s up to each request's
-        # current seq_len + 1. The patched attention path ignores the values but
-        # HF's outer Qwen2Model.forward inspects the shape; non-patched layers
-        # use the mask to ignore the padded tail of shorter requests.
-        max_after = max(seq_lens_before) + 1
-        attention_mask = torch.zeros((batch_size, max_after), device=self.device, dtype=torch.long)
-        for b, seq_len in enumerate(seq_lens_before):
-            attention_mask[b, : seq_len + 1] = 1
-        cache_position = torch.tensor([max(seq_lens_before)], device=self.device)
-        with torch.inference_mode():
-            out = self._model(
-                input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=cache,
-                cache_position=cache_position,
-                use_cache=True,
-            )
-        # out.logits has shape (B, q_len=1, vocab_size). Slice off the q_len dim
-        # and split along batch so each request gets its own (vocab_size,) tensor.
-        last_position_logits = out.logits[:, -1, :]  # (B, vocab_size)
-        per_request_logits = list(last_position_logits.unbind(dim=0))
-        return cache, per_request_logits
+        cu_seqlens_q = list(range(batch_size + 1))  # [0, 1, 2, ..., B] — q_len=1 per request
+        position_offsets = cache.seq_lens_list()
+        logits_list = self.forward_step(cache, last_tokens, cu_seqlens_q, position_offsets)
+        return cache, logits_list

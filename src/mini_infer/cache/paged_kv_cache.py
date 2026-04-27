@@ -78,6 +78,63 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
     def seq_lens_list(self) -> list[int]:
         return list(self._num_tokens)
 
+    def materialize_packed_kv(
+        self, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Gather per-request K/V from blocks into packed (varlen) form.
+
+        Returns `(K_packed, V_packed, cu_seqlens_k, max_seqlen_k)`:
+          K_packed, V_packed : `(total_k, num_kv_heads, head_dim)` — every request's
+              full K/V history concatenated along dim 0, no padding.
+          cu_seqlens_k       : `(batch_size + 1,)` int32 cumulative K boundaries on
+              the same device as the pool storage.
+          max_seqlen_k       : longest per-request seq_len (used by FlashAttention).
+
+        This is the packed counterpart of `_materialize`, which pads to a 4D
+        rectangular tensor for HF's stock attention. The packed form is what
+        `flash_attn_varlen_func` and our PyTorch reference both consume.
+        """
+        device = self._pool.storage.device
+        dtype = self._pool.storage.dtype
+        num_kv_heads = self._pool.num_kv_heads
+        head_dim = self._pool.head_dim
+        block_size = self._pool.block_size
+
+        seq_lens = self._num_tokens
+        if not seq_lens or all(seq_len == 0 for seq_len in seq_lens):
+            empty_kv = torch.empty((0, num_kv_heads, head_dim), dtype=dtype, device=device)
+            cu_seqlens_k = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+            return empty_kv, empty_kv, cu_seqlens_k, 0
+
+        cu_seqlens_k_list = [0]
+        running = 0
+        for seq_len in seq_lens:
+            running += seq_len
+            cu_seqlens_k_list.append(running)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, device=device)
+        total_k = cu_seqlens_k_list[-1]
+
+        key_packed = torch.empty((total_k, num_kv_heads, head_dim), dtype=dtype, device=device)
+        value_packed = torch.empty_like(key_packed)
+
+        for batch_idx in range(self.batch_size):
+            seq_len = seq_lens[batch_idx]
+            if seq_len == 0:
+                continue
+            offset = cu_seqlens_k_list[batch_idx]
+            positions = torch.arange(seq_len, device=device)
+            block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
+            block_ids_per_pos = block_ids_lookup[positions // block_size]
+            slots_per_pos = positions % block_size
+            key_packed[offset : offset + seq_len] = self._pool.storage[
+                layer_idx, 0, block_ids_per_pos, slots_per_pos
+            ]
+            value_packed[offset : offset + seq_len] = self._pool.storage[
+                layer_idx, 1, block_ids_per_pos, slots_per_pos
+            ]
+
+        return key_packed, value_packed, cu_seqlens_k, max(seq_lens)
+
     def update(
         self,
         key_states: torch.Tensor,
