@@ -4,11 +4,14 @@ import dataclasses
 import enum
 import queue
 from collections.abc import Iterator
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from mini_infer.engine.sampler import SamplingParams
+
+if TYPE_CHECKING:
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
 
 FinishReason = Literal["stop", "length"]
 
@@ -37,10 +40,21 @@ class GenerationStep:
 
 
 class RequestState(enum.StrEnum):
-    """Engine-side state machine for a request in flight."""
+    """Engine-side state machine for a request in flight.
+
+    Lifecycle:
+        WAITING -> PREFILLING (admitted, slot allocated, no tokens processed)
+                -> CHUNKED_PREFILLING (one or more chunks dispatched, more remain)
+                -> DECODING (entire prompt processed, last_logits ready)
+                -> DONE
+    PREFILLING is a transient one-step state set on admission; the actual prefill
+    work happens in CHUNKED_PREFILLING, possibly across many engine steps. A
+    request leaves CHUNKED_PREFILLING when `tokens_prefilled == len(prompt_token_ids)`.
+    """
 
     WAITING = "waiting"
     PREFILLING = "prefilling"
+    CHUNKED_PREFILLING = "chunked_prefilling"
     DECODING = "decoding"
     DONE = "done"
 
@@ -63,6 +77,8 @@ class RunningRequest:
     state: RequestState = RequestState.WAITING
     batch_idx: int | None = None
     prompt_token_ids: list[int] = dataclasses.field(default_factory=list)
+    tokens_prefilled: int = 0
+    prefill_cache: "PagedKVCache | None" = None
     tokens_generated: list[int] = dataclasses.field(default_factory=list)
     last_logits: torch.Tensor | None = None
     last_text: str = ""

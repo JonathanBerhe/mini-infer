@@ -101,9 +101,13 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
     ) -> None:
         """Write new K/V into block storage without materializing.
 
-        Shape: `(B, num_kv_heads, new_seq_len, head_dim)`. For prefill, B=1 and
-        new_seq_len=prompt_len. For batched decode, B=batch_size and new_seq_len=1.
-        Block allocation only happens on layer 0 (counts advance once per step).
+        Uniform-length wrapper around `append_kv_packed`. Input shape
+        `(B, num_kv_heads, new_seq_len, head_dim)` with B == cache.batch_size and
+        the same `new_seq_len` for every request. For prefill, B=1 and
+        new_seq_len=prompt_len; for batched decode, B=batch_size and new_seq_len=1.
+
+        Use `append_kv_packed` directly when slots receive different numbers of
+        new tokens in the same step (chunked prefill mixed with decoders).
         """
         b_in = key_states.shape[0]
         new_seq_len = key_states.shape[2]
@@ -111,15 +115,60 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             raise ValueError(
                 f"append_kv: input batch={b_in} but cache batch_size={self.batch_size}"
             )
+        # Convert (B, num_kv_heads, new_seq_len, head_dim) to packed
+        # (B * new_seq_len, num_kv_heads, head_dim) with batch-major ordering, so
+        # request b's tokens occupy packed indices [b*N, (b+1)*N).
+        num_kv_heads = key_states.shape[1]
+        head_dim = key_states.shape[3]
+        packed_k = key_states.transpose(1, 2).reshape(-1, num_kv_heads, head_dim)
+        packed_v = value_states.transpose(1, 2).reshape(-1, num_kv_heads, head_dim)
+        cu_seqlens_q_new = torch.arange(
+            0,
+            (self.batch_size + 1) * new_seq_len,
+            new_seq_len,
+            dtype=torch.int32,
+            device=key_states.device,
+        )
+        self.append_kv_packed(packed_k, packed_v, cu_seqlens_q_new, layer_idx)
+
+    def append_kv_packed(
+        self,
+        packed_k: torch.Tensor,
+        packed_v: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
+        layer_idx: int,
+    ) -> None:
+        """Write new K/V to per-slot positions in packed (varlen) form.
+
+        Each batch slot receives `cu_seqlens_q_new[batch_idx + 1] -
+        cu_seqlens_q_new[batch_idx]` new tokens this step (zero is allowed and
+        means "no append for that slot"). The packed K/V tensors have all new
+        tokens concatenated along the leading dim; `cu_seqlens_q_new` slices
+        them per-slot.
+
+        Shapes:
+          packed_k, packed_v : (total_new_tokens, num_kv_heads, head_dim)
+          cu_seqlens_q_new   : (batch_size + 1,) int, monotonically non-decreasing
+
+        Block allocation only happens on layer 0 (counts advance once per step).
+        """
+        if cu_seqlens_q_new.shape[0] != self.batch_size + 1:
+            raise ValueError(
+                f"cu_seqlens_q_new has {cu_seqlens_q_new.shape[0]} entries; "
+                f"expected batch_size+1 = {self.batch_size + 1}"
+            )
         if layer_idx == 0:
             block_size = self._pool.block_size
             for batch_idx in range(self.batch_size):
-                new_total = self._num_tokens[batch_idx] + new_seq_len
+                new_tokens = int(cu_seqlens_q_new[batch_idx + 1] - cu_seqlens_q_new[batch_idx])
+                if new_tokens == 0:
+                    continue
+                new_total = self._num_tokens[batch_idx] + new_tokens
                 required_blocks = (new_total + block_size - 1) // block_size
                 while len(self._block_ids[batch_idx]) < required_blocks:
                     self._block_ids[batch_idx].append(self._pool.allocate())
                 self._num_tokens[batch_idx] = new_total
-        self._write_new_kv(layer_idx, key_states, value_states, new_seq_len)
+        self._write_packed_kv(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Returns max seq_len across the batch (HF assumes a single value).
@@ -132,6 +181,24 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             return 0
         return max(self._num_tokens)
 
+    def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
+        """Return (kv_length, kv_offset) for HF's causal-mask construction.
+
+        HF calls this BEFORE the attention forward to size the 4D causal mask.
+        `kv_length` must be the size of the K/V that attention will see AFTER
+        this step's append (existing cached tokens + the new query_length tokens).
+        `kv_offset` is the absolute starting position of the K/V tensor (always 0
+        for us — we materialize from position 0 every call).
+
+        We override DynamicCache's default because DynamicCache infers the sizes
+        from `self.layers`, which is empty for us (we store K/V in `BlockPool`,
+        not in DynamicCache's per-layer tensor list). Without this override HF
+        builds a mask with `kv_length == query_length`, which truncates attention
+        to only the new chunk's K/V and produces wrong outputs for chunked prefill.
+        """
+        existing = max(self._num_tokens) if self._num_tokens else 0
+        return existing + query_length, 0
+
     def free(self) -> None:
         for ids in self._block_ids:
             for block_id in ids:
@@ -139,27 +206,32 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._block_ids.clear()
         self._num_tokens.clear()
 
-    def _write_new_kv(
+    def _write_packed_kv(
         self,
         layer_idx: int,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        new_seq_len: int,
+        packed_k: torch.Tensor,
+        packed_v: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
     ) -> None:
         block_size = self._pool.block_size
         for batch_idx in range(self.batch_size):
+            packed_start = int(cu_seqlens_q_new[batch_idx])
+            packed_end = int(cu_seqlens_q_new[batch_idx + 1])
+            new_tokens = packed_end - packed_start
+            if new_tokens == 0:
+                continue
             # _num_tokens[batch_idx] reflects the post-append count; subtract
-            # new_seq_len to find where this step's tokens start.
-            start_token = self._num_tokens[batch_idx] - new_seq_len
-            for token_offset in range(new_seq_len):
+            # new_tokens to find where this step's tokens start in the slot.
+            start_token = self._num_tokens[batch_idx] - new_tokens
+            for token_offset in range(new_tokens):
                 position = start_token + token_offset
                 block_id = self._block_ids[batch_idx][position // block_size]
                 slot_in_block = position % block_size
-                self._pool.storage[layer_idx, 0, block_id, slot_in_block] = key_states[
-                    batch_idx, :, token_offset, :
+                self._pool.storage[layer_idx, 0, block_id, slot_in_block] = packed_k[
+                    packed_start + token_offset
                 ]
-                self._pool.storage[layer_idx, 1, block_id, slot_in_block] = value_states[
-                    batch_idx, :, token_offset, :
+                self._pool.storage[layer_idx, 1, block_id, slot_in_block] = packed_v[
+                    packed_start + token_offset
                 ]
 
     def _materialize(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:

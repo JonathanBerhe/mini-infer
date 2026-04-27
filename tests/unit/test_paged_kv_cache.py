@@ -256,6 +256,114 @@ def test_append_kv_rejects_batch_mismatch() -> None:
         cache.append_kv(key, value, layer_idx=0)
 
 
+def test_append_kv_packed_uniform_matches_append_kv() -> None:
+    """Calling append_kv_packed with uniform per-slot lengths matches append_kv."""
+    pool_a = make_pool(block_size=4, num_blocks=8)
+    pool_b = make_pool(block_size=4, num_blocks=8)
+
+    cache_via_append = PagedKVCache(pool_a)
+    cache_via_append.add_request_slot()
+    cache_via_append.add_request_slot()
+    key, value = make_kv(num_tokens=3, batch=2)
+    cache_via_append.append_kv(key, value, layer_idx=0)
+
+    cache_via_packed = PagedKVCache(pool_b)
+    cache_via_packed.add_request_slot()
+    cache_via_packed.add_request_slot()
+    # Packed layout: (B*N, num_kv_heads, head_dim) with batch-major order.
+    packed_k = key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[3])
+    packed_v = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[3])
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    cache_via_packed.append_kv_packed(packed_k, packed_v, cu_seqlens, layer_idx=0)
+
+    assert cache_via_append.seq_lens_list() == cache_via_packed.seq_lens_list()
+    assert pool_a.num_free_blocks == pool_b.num_free_blocks
+    out_a, _ = cache_via_append._materialize(layer_idx=0)
+    out_b, _ = cache_via_packed._materialize(layer_idx=0)
+    assert torch.equal(out_a, out_b)
+
+
+def test_append_kv_packed_ragged_writes_to_correct_slots() -> None:
+    """Different per-slot lengths in one packed call write to the correct positions."""
+    pool = make_pool(block_size=4, num_blocks=8)
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cache.add_request_slot()
+    cache.add_request_slot()
+
+    # Per-slot distinguishable values: slot 0 -> 1.0 (3 tokens), slot 1 -> 2.0 (5 tokens),
+    # slot 2 -> 3.0 (1 token). Total packed length = 9.
+    packed_k = torch.cat(
+        [
+            torch.full((3, 2, 4), 1.0),
+            torch.full((5, 2, 4), 2.0),
+            torch.full((1, 2, 4), 3.0),
+        ],
+        dim=0,
+    )
+    packed_v = packed_k + 100.0
+    cu_seqlens = torch.tensor([0, 3, 8, 9], dtype=torch.int32)
+    cache.append_kv_packed(packed_k, packed_v, cu_seqlens, layer_idx=0)
+    assert cache.seq_lens_list() == [3, 5, 1]
+
+    out_key, out_value = cache._materialize(layer_idx=0)
+    # max_seq=5; slot 0 has 3 valid positions then padding; slot 2 has 1 valid then padding.
+    assert out_key.shape == (3, 2, 5, 4)
+    assert torch.allclose(out_key[0, :, :3, :], torch.full_like(out_key[0, :, :3, :], 1.0))
+    assert torch.allclose(out_key[1, :, :5, :], torch.full_like(out_key[1, :, :5, :], 2.0))
+    assert torch.allclose(out_key[2, :, :1, :], torch.full_like(out_key[2, :, :1, :], 3.0))
+    # Values use +100 offset.
+    assert torch.allclose(out_value[1, :, :5, :], torch.full_like(out_value[1, :, :5, :], 102.0))
+
+
+def test_append_kv_packed_zero_length_skips_slot() -> None:
+    """Slots with diff=0 in cu_seqlens are not modified."""
+    pool = make_pool(block_size=4, num_blocks=8)
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cache.add_request_slot()
+
+    # Pre-populate slot 0 with 2 tokens; leave slot 1 empty.
+    initial_k = torch.full((1, 2, 2, 4), 7.0)
+    initial_v = torch.full((1, 2, 2, 4), 7.0)
+    # Use packed API directly to write only to slot 0.
+    cache.append_kv_packed(
+        initial_k.transpose(1, 2).reshape(-1, 2, 4),
+        initial_v.transpose(1, 2).reshape(-1, 2, 4),
+        torch.tensor([0, 2, 2], dtype=torch.int32),
+        layer_idx=0,
+    )
+    assert cache.seq_lens_list() == [2, 0]
+    free_after_init = pool.num_free_blocks
+
+    # Now write to slot 1 only; slot 0 must be untouched.
+    new_k = torch.full((3, 2, 4), 9.0)
+    new_v = torch.full((3, 2, 4), 9.0)
+    cache.append_kv_packed(new_k, new_v, torch.tensor([0, 0, 3], dtype=torch.int32), layer_idx=0)
+    assert cache.seq_lens_list() == [2, 3]
+
+    out_key, _ = cache._materialize(layer_idx=0)
+    # Slot 0 still has 7.0 in its 2 valid positions.
+    assert torch.allclose(out_key[0, :, :2, :], torch.full_like(out_key[0, :, :2, :], 7.0))
+    # Slot 1 has 9.0 in its 3 valid positions.
+    assert torch.allclose(out_key[1, :, :3, :], torch.full_like(out_key[1, :, :3, :], 9.0))
+    # Slot 1 needed one block; slot 0 unchanged.
+    assert pool.num_free_blocks == free_after_init - 1
+
+
+def test_append_kv_packed_rejects_wrong_cu_seqlens_length() -> None:
+    """cu_seqlens_q_new must have batch_size+1 entries."""
+    pool = make_pool()
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cache.add_request_slot()
+    packed_k = torch.zeros(2, 2, 4)
+    packed_v = torch.zeros(2, 2, 4)
+    bad_cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)  # only 2 entries, need 3
+    with pytest.raises(ValueError, match="cu_seqlens_q_new has 2 entries"):
+        cache.append_kv_packed(packed_k, packed_v, bad_cu_seqlens, layer_idx=0)
+
+
 def test_materialize_batched_pads_to_max_seq() -> None:
     """Two requests with different seq_lens: materialize pads shorter to max_seq with zeros."""
     pool = make_pool(block_size=4, num_blocks=8)

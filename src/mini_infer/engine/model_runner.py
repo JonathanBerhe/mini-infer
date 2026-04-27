@@ -105,11 +105,49 @@ class ModelRunner:
         """
         cache = PagedKVCache(self._block_pool)
         cache.add_request_slot()
-        input_ids = torch.tensor([prompt_tokens], device=self.device)
-        seq_len = input_ids.shape[1]
-        attention_mask = torch.ones_like(input_ids)
-        position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
-        cache_position = torch.arange(seq_len, device=self.device)
+        return self.prefill_chunk(cache, prompt_tokens, position_offset=0)
+
+    def prefill_chunk(
+        self,
+        cache: PagedKVCache,
+        chunk_tokens: list[int],
+        position_offset: int,
+    ) -> tuple[PagedKVCache, torch.Tensor]:
+        """Process one chunk of a prompt against an existing single-slot cache.
+
+        Used for chunked prefill: the same cache accumulates K/V across multiple
+        chunks, with `position_offset` advancing by `chunk_size` each call. After
+        the final chunk, the cache holds the full prompt's K/V state and the
+        returned last-position logits are the seed for decoding.
+
+        Args:
+            cache: A `PagedKVCache` with `batch_size == 1`. Must already contain
+                the K/V state for the first `position_offset` tokens of the prompt
+                (zero on the first chunk).
+            chunk_tokens: This chunk's input token IDs.
+            position_offset: Number of prompt tokens already processed (and present
+                in the cache). On the first chunk this is 0.
+
+        Returns:
+            (cache, logits) — same cache, mutated in-place; logits is the
+            `(vocab_size,)` slice for the chunk's last position.
+        """
+        if cache.batch_size != 1:
+            raise ValueError(f"prefill_chunk expects cache.batch_size == 1, got {cache.batch_size}")
+        input_ids = torch.tensor([chunk_tokens], device=self.device)
+        chunk_len = input_ids.shape[1]
+        # attention_mask covers all prior cached tokens plus this chunk's tokens —
+        # the model needs to see the full history when computing causal attention
+        # for the new positions.
+        attention_mask = torch.ones(
+            (1, position_offset + chunk_len), device=self.device, dtype=torch.long
+        )
+        position_ids = torch.arange(
+            position_offset, position_offset + chunk_len, device=self.device
+        ).unsqueeze(0)
+        cache_position = torch.arange(
+            position_offset, position_offset + chunk_len, device=self.device
+        )
         with torch.inference_mode():
             out = self._model(
                 input_ids,
