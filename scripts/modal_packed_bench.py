@@ -8,10 +8,13 @@ Configurations (selected via the `config` arg of the local entrypoint):
   long prefill mid-stream, measures decoder ITL.
 - **sweep**: smoke + short-throughput + long-throughput in one Modal call.
   Used for the cross-platform comparison (A10 vs H100, materialized vs paged FA).
+- **prefix**: shared-system-prompt workload with prefix cache OFF vs ON.
+  Reports per-request TTFT (cold vs warm) and aggregate throughput at
+  several concurrencies. The system prompt is intentionally large
+  (`target_prompt_tokens`, default 12000) so the cache hit pays off visibly.
 
 CLI flags:
 
-- `gpu`: Modal GPU type (e.g. `A10`, `H100`). Default `A10`.
 - `model`: HF model ID. Default Qwen2.5-0.5B-Instruct.
 - `block_size`: 16 routes to materialized FA varlen (default), 256 routes to
   paged FA varlen on CUDA. See ADR-008.
@@ -21,17 +24,23 @@ CLI flags:
   (`workload=long`) overrides this with a synthetic ~3k-token prompt.
 - `max_tokens`, `concurrencies` (comma-sep), `chunk_size`, `workload`
   (`short`|`long`).
+- `target_prompt_tokens`: prompt length for the `prefix` config (default 12000).
+
+GPU selection: set `MINI_INFER_BENCH_GPU` (e.g. `A10`, `H100`); default `A10`.
+Modal 1.4 removed runtime gpu overrides, so this is read at decorator time.
 
 Examples:
 
-    uv run modal run scripts/modal_packed_bench.py --config smoke --gpu A10
-    uv run modal run scripts/modal_packed_bench.py --config throughput \
-        --gpu H100 --workload long --max-tokens 64 --concurrencies 1,2,4
-    uv run modal run scripts/modal_packed_bench.py --config sweep --gpu H100
-    uv run modal run scripts/modal_packed_bench.py --config holb --gpu A10
+    uv run modal run scripts/modal_packed_bench.py --config smoke
+    MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/modal_packed_bench.py \
+        --config throughput --workload long --max-tokens 64 --concurrencies 1,2,4
+    MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/modal_packed_bench.py --config sweep
+    uv run modal run scripts/modal_packed_bench.py --config holb
+    uv run modal run scripts/modal_packed_bench.py --config prefix
 """
 
 import itertools
+import os
 import statistics
 import threading
 import time
@@ -40,6 +49,11 @@ from typing import Any
 import modal
 
 app = modal.App("mini-infer-packed-bench")
+
+# Modal 1.4 removed `Function.with_options(...)`; gpu is fixed at decorator
+# evaluation time. Read it from an env var so callers can switch via
+# `MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/modal_packed_bench.py ...`.
+_BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "A10")
 
 # Pinned to a known-working torch + flash-attn combo. The wheel install is fast
 # (precompiled); fresh image build is ~1 min. flash-attn 2.8+ is required for
@@ -304,7 +318,172 @@ def _run_holb(runner: Any) -> str:
     return f"prompt_len={long_prompt_len}\n" + "\n".join(lines)
 
 
-@app.function(image=image, gpu="A10", timeout=1800)
+def _run_prefix_bench(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+    target_prompt_tokens: int,
+    max_tokens: int,
+    concurrencies: list[int],
+) -> str:
+    """Shared-system-prompt workload; prefix cache OFF vs ON.
+
+    Builds a single very-long system prompt (~target_prompt_tokens), pairs it
+    with several unique short user questions, and runs the workload twice:
+    once with prefix caching disabled (every request pays the full prefill
+    cost) and once with prefix caching enabled (the system prompt is computed
+    on the first request and reused for the rest).
+
+    Two measurements per cache mode:
+      - Sequential per-request TTFT (one request at a time) — surfaces
+        cold-vs-warm asymmetry: with cache ON the first prompt is cold, the
+        rest are warm.
+      - Aggregate concurrent throughput at several concurrencies — the
+        end-user-visible win.
+    """
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    system = _build_long_prompt(target_tokens=target_prompt_tokens)
+    user_questions = [
+        "What is the capital of France?",
+        "Name three primary colors.",
+        "How many planets are in the solar system?",
+        "Who wrote Hamlet?",
+        "What is 7 times 8?",
+        "What is the chemical symbol for gold?",
+        "List three programming languages.",
+        "What is the freezing point of water in Celsius?",
+    ]
+    prompts = [f"{system}\n\nQ: {q}\nA:" for q in user_questions]
+
+    per_mode: dict[str, dict[str, Any]] = {}
+
+    for cache_on in (False, True):
+        label = "cache_on" if cache_on else "cache_off"
+        runner = ModelRunner.from_pretrained(
+            model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            prefix_cache=cache_on,
+        )
+        prompt_len = len(runner.tokenizer.encode(prompts[0]))
+
+        # Sequential TTFT: submit one at a time, time the first emitted step.
+        sched = ContinuousScheduler(runner, max_concurrent=1, chunk_size=256)
+        sched.start()
+        ttfts_ms: list[float] = []
+        try:
+            for prompt_text in prompts:
+                t0 = time.perf_counter()
+                handle = sched.submit(
+                    Request(
+                        prompt=prompt_text,
+                        sampling_params=SamplingParams(),
+                        max_tokens=max_tokens,
+                    )
+                )
+                first_step_time: float | None = None
+                for step in handle.steps():
+                    if first_step_time is None and step.text:
+                        first_step_time = time.perf_counter()
+                    if step.finish_reason is not None:
+                        break
+                if first_step_time is None:
+                    ttfts_ms.append(float("nan"))
+                else:
+                    ttfts_ms.append((first_step_time - t0) * 1000.0)
+        finally:
+            sched.stop()
+
+        # Concurrent aggregate throughput at each concurrency.
+        throughput_rows: list[dict[str, Any]] = []
+        for concurrency in concurrencies:
+            scheduler = ContinuousScheduler(runner, max_concurrent=concurrency, chunk_size=256)
+            scheduler.start()
+            try:
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                handles = [
+                    scheduler.submit(
+                        Request(
+                            prompt=p,
+                            sampling_params=SamplingParams(),
+                            max_tokens=max_tokens,
+                        )
+                    )
+                    for p in prompts
+                ]
+                results = [h.wait() for h in handles]
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start
+            finally:
+                scheduler.stop()
+            total_tokens = sum(len(r.tokens) for r in results)
+            throughput_rows.append(
+                {
+                    "concurrency": concurrency,
+                    "elapsed_s": round(elapsed, 3),
+                    "tokens": total_tokens,
+                    "tok_per_s": round(total_tokens / elapsed, 2),
+                }
+            )
+
+        per_mode[label] = {
+            "prompt_len": prompt_len,
+            "ttfts_ms": ttfts_ms,
+            "throughput": throughput_rows,
+        }
+        del runner
+        torch.cuda.empty_cache()
+
+    off = per_mode["cache_off"]
+    on = per_mode["cache_on"]
+
+    # Format report.
+    lines: list[str] = []
+    lines.append(
+        f"prompt_len={off['prompt_len']} tokens | "
+        f"max_tokens={max_tokens} | n_prompts={len(prompts)}"
+    )
+    lines.append("")
+    lines.append("Sequential TTFT (single-request, sequential submission):")
+    lines.append(
+        f"  cache_off: first={off['ttfts_ms'][0]:.0f}ms  "
+        f"rest_avg={statistics.fmean(off['ttfts_ms'][1:]):.0f}ms  "
+        f"all={[round(t, 1) for t in off['ttfts_ms']]}"
+    )
+    lines.append(
+        f"  cache_on : first={on['ttfts_ms'][0]:.0f}ms  "
+        f"rest_avg={statistics.fmean(on['ttfts_ms'][1:]):.0f}ms  "
+        f"all={[round(t, 1) for t in on['ttfts_ms']]}"
+    )
+    rest_off = statistics.fmean(off["ttfts_ms"][1:])
+    rest_on = statistics.fmean(on["ttfts_ms"][1:])
+    if rest_on > 0:
+        lines.append(f"  warm-TTFT speedup: {rest_off / rest_on:.1f}x")
+    lines.append("")
+    lines.append("Concurrent throughput (all prompts submitted at once):")
+    header = (
+        f"  {'C':>3}  {'cache_off (s, tok/s)':>26}  {'cache_on (s, tok/s)':>26}  {'speedup':>8}"
+    )
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for row_off, row_on in zip(off["throughput"], on["throughput"], strict=True):
+        speedup = row_on["tok_per_s"] / row_off["tok_per_s"] if row_off["tok_per_s"] else 0.0
+        off_cell = f"{row_off['elapsed_s']}s, {row_off['tok_per_s']} tok/s"
+        on_cell = f"{row_on['elapsed_s']}s, {row_on['tok_per_s']} tok/s"
+        lines.append(
+            f"  {row_off['concurrency']:>3}  {off_cell:>26}  {on_cell:>26}  {speedup:>7.2f}x"
+        )
+
+    return "\n".join(lines)
+
+
+@app.function(image=image, gpu=_BENCH_GPU, timeout=1800)
 def run_bench(
     config: str,
     model: str,
@@ -315,6 +494,7 @@ def run_bench(
     concurrencies: list[int],
     chunk_size: int,
     workload: str,
+    target_prompt_tokens: int,
 ) -> str:
     """Modal entry point. Single function; selects internal path by `config`."""
     import torch
@@ -324,11 +504,37 @@ def run_bench(
     assert torch.cuda.is_available()
     gpu_name = torch.cuda.get_device_name()
     fa_available = supports_packed_kernel(torch.device("cuda"))
-    runner = _make_runner(model, num_blocks=num_blocks, block_size=block_size)
 
     header = (
         f"GPU: {gpu_name} | flash_attn={fa_available} | block_size={block_size} | model={model}"
     )
+
+    if config == "prefix":
+        # Cache-OFF C=N has N concurrent requests each carrying their own full
+        # K/V; size the pool for that worst case. `_build_long_prompt`'s repeat
+        # count is heuristic (estimates ~80 tokens/paragraph; Qwen tokenizes
+        # closer to ~105), so the actual prompt is ~30% longer than asked. Add
+        # a 2x safety factor + decode_headroom + a fixed slack so the bench
+        # never OOMs under sloppy size estimation.
+        per_req_blocks = (target_prompt_tokens * 2 + max_tokens + block_size - 1) // block_size
+        required_blocks = max(concurrencies) * per_req_blocks + 256
+        effective_num_blocks = max(num_blocks, required_blocks)
+        if effective_num_blocks > num_blocks:
+            print(
+                f"prefix bench: bumping num_blocks {num_blocks} -> {effective_num_blocks} "
+                f"to fit C={max(concurrencies)} requests at ~{target_prompt_tokens} tokens"
+            )
+        body = _run_prefix_bench(
+            model=model,
+            num_blocks=effective_num_blocks,
+            block_size=block_size,
+            target_prompt_tokens=target_prompt_tokens,
+            max_tokens=max_tokens,
+            concurrencies=concurrencies,
+        )
+        return f"\n{header}\n\n=== Prefix cache OFF vs ON ===\n{body}\n"
+
+    runner = _make_runner(model, num_blocks=num_blocks, block_size=block_size)
 
     if config == "smoke":
         body = _run_smoke(runner, max_tokens=max_tokens)
@@ -373,13 +579,12 @@ def run_bench(
             f"=== Long throughput ===\n{long_out}\n"
         )
 
-    raise ValueError(f"unknown config={config!r}; expected smoke|throughput|holb|sweep")
+    raise ValueError(f"unknown config={config!r}; expected smoke|throughput|holb|sweep|prefix")
 
 
 @app.local_entrypoint()
 def main(
     config: str = "smoke",
-    gpu: str = "A10",
     model: str = DEFAULT_MODEL,
     block_size: int = 16,
     num_blocks: int = 1024,
@@ -388,9 +593,12 @@ def main(
     concurrencies: str = "1,4,8",
     chunk_size: int = 32,
     workload: str = "short",
+    target_prompt_tokens: int = 12000,
 ) -> None:
+    # GPU is set via the MINI_INFER_BENCH_GPU env var (see _BENCH_GPU above).
+    # Default A10. Modal 1.4 removed runtime gpu overrides on Function.
     print(
-        run_bench.with_options(gpu=gpu).remote(
+        run_bench.remote(
             config=config,
             model=model,
             block_size=block_size,
@@ -400,5 +608,6 @@ def main(
             concurrencies=_parse_int_list(concurrencies),
             chunk_size=chunk_size,
             workload=workload,
+            target_prompt_tokens=target_prompt_tokens,
         )
     )
