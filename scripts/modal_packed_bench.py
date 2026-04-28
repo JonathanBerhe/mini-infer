@@ -12,6 +12,8 @@ Configurations (selected via the `config` arg of the local entrypoint):
   Reports per-request TTFT (cold vs warm) and aggregate throughput at
   several concurrencies. The system prompt is intentionally large
   (`target_prompt_tokens`, default 12000) so the cache hit pays off visibly.
+- **quant**: weight-only INT8 (W8A16) vs fp16 baseline. Reports model-weight
+  HBM footprint and a small concurrent throughput sweep on a moderate prompt.
 
 CLI flags:
 
@@ -37,6 +39,7 @@ Examples:
     MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/modal_packed_bench.py --config sweep
     uv run modal run scripts/modal_packed_bench.py --config holb
     uv run modal run scripts/modal_packed_bench.py --config prefix
+    uv run modal run scripts/modal_packed_bench.py --config quant
 """
 
 import itertools
@@ -483,6 +486,131 @@ def _run_prefix_bench(
     return "\n".join(lines)
 
 
+def _run_quant_bench(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+    max_tokens: int,
+    concurrencies: list[int],
+) -> str:
+    """Weight-only INT8 (W8A16) vs fp16 baseline.
+
+    Loads the model in three configurations on the same Modal container:
+      - fp16
+      - int8 with `lm_head` skipped (default)
+      - int8 with `lm_head` quantized too
+
+    For each, reports the post-load CUDA memory footprint and a small
+    concurrent throughput sweep on a moderate-length prompt. The throughput
+    measurement is honest about W8A16's expected behaviour: dequant happens
+    on every forward, so throughput at small batch sizes can be neutral or
+    slightly negative versus the fp16 baseline.
+    """
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    prompt = (
+        "Summarize the following passage in one sentence. "
+        "The mini-infer engine is an open-source LLM inference server "
+        "demonstrating production techniques: continuous batching, paged "
+        "attention, chunked prefill, packed varlen forward, prefix caching, "
+        "and weight quantization. " * 8
+    )
+
+    configs: list[tuple[str, dict[str, Any]]] = [
+        ("fp16", {}),
+        ("int8 (skip lm_head)", {"quant": "int8"}),
+        ("int8 (quant lm_head)", {"quant": "int8", "quant_lm_head": True}),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for label, kwargs in configs:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        before_alloc = torch.cuda.memory_allocated()
+
+        runner = ModelRunner.from_pretrained(
+            model, num_blocks=num_blocks, block_size=block_size, **kwargs
+        )
+        torch.cuda.synchronize()
+        after_alloc = torch.cuda.memory_allocated()
+        weight_bytes_observed = after_alloc - before_alloc
+
+        # Throughput sweep at each concurrency.
+        throughput_at: dict[int, dict[str, Any]] = {}
+        for concurrency in concurrencies:
+            sched = ContinuousScheduler(runner, max_concurrent=concurrency, chunk_size=256)
+            sched.start()
+            try:
+                # Warmup so we're not timing the first matmul launch.
+                sched.run(
+                    Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+                )
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                handles = [
+                    sched.submit(
+                        Request(
+                            prompt=prompt,
+                            sampling_params=SamplingParams(),
+                            max_tokens=max_tokens,
+                        )
+                    )
+                    for _ in range(concurrency)
+                ]
+                results = [h.wait() for h in handles]
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start
+            finally:
+                sched.stop()
+            total_tokens = sum(len(r.tokens) for r in results)
+            throughput_at[concurrency] = {
+                "elapsed_s": round(elapsed, 3),
+                "tokens": total_tokens,
+                "tok_per_s": round(total_tokens / elapsed, 2),
+            }
+
+        rows.append(
+            {
+                "label": label,
+                "weight_mib": weight_bytes_observed / (1024 * 1024),
+                "throughput": throughput_at,
+            }
+        )
+        del runner
+        torch.cuda.empty_cache()
+
+    # Format the report.
+    lines: list[str] = [f"prompt_chars={len(prompt)} | max_tokens={max_tokens}", ""]
+    lines.append("Model-weight memory footprint (CUDA allocated by ModelRunner.from_pretrained):")
+    fp_mib = rows[0]["weight_mib"]
+    for row in rows:
+        savings = (fp_mib - row["weight_mib"]) / fp_mib if fp_mib else 0.0
+        lines.append(
+            f"  {row['label']:<24}  {row['weight_mib']:>8.1f} MiB"
+            + (f"   ({savings:+.1%} vs fp16)" if row["label"] != "fp16" else "")
+        )
+    lines.append("")
+    lines.append("Concurrent throughput (warmup + N requests at each concurrency):")
+    header = (
+        f"  {'C':>3}  {'fp16 (s, tok/s)':>22}  "
+        f"{'int8-skip-lm (s, tok/s)':>26}  {'int8-all (s, tok/s)':>22}"
+    )
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for c in concurrencies:
+        cells = []
+        for row in rows:
+            t = row["throughput"][c]
+            cells.append(f"{t['elapsed_s']}s, {t['tok_per_s']} tok/s")
+        lines.append(f"  {c:>3}  {cells[0]:>22}  {cells[1]:>26}  {cells[2]:>22}")
+
+    return "\n".join(lines)
+
+
 @app.function(image=image, gpu=_BENCH_GPU, timeout=1800)
 def run_bench(
     config: str,
@@ -508,6 +636,18 @@ def run_bench(
     header = (
         f"GPU: {gpu_name} | flash_attn={fa_available} | block_size={block_size} | model={model}"
     )
+
+    if config == "quant":
+        # `quant` builds its own runners (one per quant mode); skip the
+        # default _make_runner here.
+        body = _run_quant_bench(
+            model=model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            max_tokens=max_tokens,
+            concurrencies=concurrencies,
+        )
+        return f"\n{header}\n\n=== INT8 weight-only vs fp16 ===\n{body}\n"
 
     if config == "prefix":
         # Cache-OFF C=N has N concurrent requests each carrying their own full
@@ -579,7 +719,9 @@ def run_bench(
             f"=== Long throughput ===\n{long_out}\n"
         )
 
-    raise ValueError(f"unknown config={config!r}; expected smoke|throughput|holb|sweep|prefix")
+    raise ValueError(
+        f"unknown config={config!r}; expected smoke|throughput|holb|sweep|prefix|quant"
+    )
 
 
 @app.local_entrypoint()
