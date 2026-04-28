@@ -5,7 +5,9 @@ An open-source LLM inference engine built from scratch in Python and Triton, imp
 ## What's working today
 
 * **Continuous batching scheduler** (`ContinuousScheduler`) on a dedicated engine thread with FIFO admission, per-request handles, and backpressure. One forward pass per step over all in-flight decoding requests.
+* **Chunked prefill + packed-varlen forward**: long prompts advance one chunk per step alongside in-flight decoders, eliminating head-of-line blocking. Single `model.forward(...)` per step via FlashAttention's varlen API on CUDA, PyTorch reference elsewhere.
 * **PagedAttention** with a fixed-size block pool, batch-aware `PagedKVCache`, and per-architecture monkey-patch registry (`Qwen2` shipping; the engine itself is model-agnostic via the HF `Cache` interface).
+* **Prefix caching**: chained-hash, block-granular, refcounted LRU. Repeat or shared-prefix prompts skip prefill on the cached prefix; opt-in via `prefix_cache=True`. Verified token-for-token against the no-cache path.
 * **Triton decode kernel** (single-request and batched variants) with online-softmax accumulation, validated against a PyTorch reference within cosine similarity > 0.99.
 * **OpenAI-compatible HTTP API** (`/v1/completions`) with both non-streaming responses and SSE streaming.
 * **Sampler** with greedy, temperature, top-k, top-p; pure-logic unit tests.
@@ -82,6 +84,10 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 * [ADR-003](docs/decisions/ADR-003-paged-kv-cache.md): block-based KV cache layout
 * [ADR-004](docs/decisions/ADR-004-paged-attention-kernel.md): Triton paged attention kernel
 * [ADR-005](docs/decisions/ADR-005-continuous-batching-integration.md): batch-aware cache and the continuous-batching forward pass
+* [ADR-006](docs/decisions/ADR-006-chunked-prefill.md): chunked prefill (two-forward design)
+* [ADR-007](docs/decisions/ADR-007-packed-forward-integration.md): packed-varlen forward, one `model.forward` per step
+* [ADR-008](docs/decisions/ADR-008-paged-fa-varlen.md): paged FlashAttention varlen, kept as a tunable
+* [ADR-009](docs/decisions/ADR-009-prefix-caching.md): prefix caching (chained-hash, block-granular, refcounted LRU)
 
 ## Tests
 
