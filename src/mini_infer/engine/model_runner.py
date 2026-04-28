@@ -8,11 +8,17 @@ from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
 from mini_infer.engine.attention_patch import patch_model_attention
 from mini_infer.engine.tokenizer import Tokenizer
+from mini_infer.quant import quantize_model_to_int8
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_NUM_BLOCKS = 1024
 DEFAULT_BLOCK_SIZE = 16
+
+# Modules whose names match these (suffix-of-dotted-path) are NOT quantized by
+# default. `lm_head` is the embedding-tied output projection; quantization noise
+# there directly affects sampling, so industry practice is to leave it in float.
+_DEFAULT_QUANT_SKIP = frozenset({"lm_head"})
 
 
 def _resolve_device(device: str) -> str:
@@ -67,6 +73,8 @@ class ModelRunner:
         block_size: int = DEFAULT_BLOCK_SIZE,
         use_paged_kernel: bool = True,
         prefix_cache: bool = False,
+        quant: str | None = None,
+        quant_lm_head: bool = False,
     ) -> "ModelRunner":
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
@@ -74,6 +82,15 @@ class ModelRunner:
         tokenizer = Tokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=actual_dtype).to(resolved)
         model.eval()
+
+        if quant is not None:
+            if quant != "int8":
+                raise ValueError(f"unsupported quant={quant!r}; expected None or 'int8'")
+            skip = set() if quant_lm_head else set(_DEFAULT_QUANT_SKIP)
+            n_replaced = quantize_model_to_int8(model, skip_modules=skip)
+            logger.info(
+                "Quantized %d nn.Linear modules to int8 (skip=%s)", n_replaced, sorted(skip)
+            )
 
         cfg = model.config
         head_dim = cfg.hidden_size // cfg.num_attention_heads
