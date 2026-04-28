@@ -174,8 +174,14 @@ class ContinuousScheduler:
         """Move waiting requests into the running batch while the block pool has room.
 
         New admits get a slot in the shared `_batched_cache` immediately; their
-        first chunk lands in this step's forward.
+        first chunk lands in this step's forward. When a prefix cache is
+        configured, the slot's blocks are pre-populated with cached prefix
+        blocks (no new allocation needed for those positions), and evictable
+        cached blocks count toward the admission budget since the pool can
+        reclaim them on demand.
         """
+        block_pool = self._runner.block_pool
+        prefix_cache = block_pool.prefix_cache
         while len(self._running) < self._max_concurrent:
             try:
                 running = self._waiting.get_nowait()
@@ -183,12 +189,17 @@ class ContinuousScheduler:
                 return
 
             running.prompt_token_ids = self._runner.tokenizer.encode(running.request.prompt)
-            block_size = self._runner.block_pool.block_size
+            block_size = block_pool.block_size
             required_blocks = (
                 math.ceil(len(running.prompt_token_ids) / block_size) + self._decode_headroom
             )
 
-            if self._runner.block_pool.num_free_blocks < required_blocks:
+            available_blocks = block_pool.num_free_blocks
+            if prefix_cache is not None:
+                # Evictable cached blocks are reclaimable by the pool on
+                # demand; they count toward what we can give this request.
+                available_blocks += prefix_cache.num_evictable
+            if available_blocks < required_blocks:
                 # Pool is too full to safely admit this request. Re-enqueue and
                 # stop admitting this step. Note: the re-enqueue breaks strict
                 # FIFO if the queue contains smaller requests behind this one;
@@ -197,8 +208,14 @@ class ContinuousScheduler:
                 return
 
             if self._batched_cache is None:
-                self._batched_cache = PagedKVCache(self._runner.block_pool)
-            running.batch_idx = self._batched_cache.add_request_slot()
+                self._batched_cache = PagedKVCache(block_pool)
+            running.batch_idx = self._batched_cache.add_request_slot(
+                prompt_token_ids=running.prompt_token_ids
+            )
+            # If the prefix cache pre-populated this slot, tokens_prefilled
+            # starts non-zero. The PREFILLING -> CHUNKED_PREFILLING transition
+            # in `_packed_forward` picks up from there.
+            running.tokens_prefilled = self._batched_cache.seq_lens_list()[running.batch_idx]
             running.state = RequestState.PREFILLING
             self._running.append(running)
 

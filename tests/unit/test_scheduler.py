@@ -205,3 +205,69 @@ def test_chunked_prefill_matches_unchunked() -> None:
         f"chunked prefill diverged from unchunked: "
         f"chunked={out_small.tokens}, unchunked={out_big.tokens}"
     )
+
+
+@pytest.mark.requires_model
+def test_prefix_cache_matches_no_cache() -> None:
+    """Prefix-cached output must equal the no-cache reference token-for-token.
+
+    The point of prefix caching is to skip prefill on prompt prefixes that have
+    been computed before. This must be a numerical no-op: a request whose
+    prefix is in the cache produces the same K/V values, the same attention
+    outputs, and therefore the same sampled tokens as a request whose cache is
+    cold. Two prompts sharing a long prefix exercise both the lookup path
+    (second prompt hits) and the publish path (first prompt populates).
+    """
+    # Long shared prefix so the prefix cache has multiple full blocks to hit.
+    shared = (
+        "You are a helpful assistant. Answer the user's question directly and "
+        "without unnecessary preamble. Today's date is January 1st 2025. "
+    )
+    prompt_a = shared + "Question: What is the capital of France?"
+    prompt_b = shared + "Question: What is the capital of Germany?"
+    sampling = SamplingParams()
+    max_tokens = 8
+
+    runner_no_cache = ModelRunner.from_pretrained(MODEL_NAME, prefix_cache=False)
+    sched_no_cache = ContinuousScheduler(runner_no_cache)
+    sched_no_cache.start()
+    try:
+        ref_a = sched_no_cache.run(
+            Request(prompt=prompt_a, sampling_params=sampling, max_tokens=max_tokens)
+        )
+        ref_b = sched_no_cache.run(
+            Request(prompt=prompt_b, sampling_params=sampling, max_tokens=max_tokens)
+        )
+    finally:
+        sched_no_cache.stop()
+
+    runner_with_cache = ModelRunner.from_pretrained(MODEL_NAME, prefix_cache=True)
+    sched_with_cache = ContinuousScheduler(runner_with_cache)
+    sched_with_cache.start()
+    try:
+        cached_a = sched_with_cache.run(
+            Request(prompt=prompt_a, sampling_params=sampling, max_tokens=max_tokens)
+        )
+        # `prompt_b` shares the system prefix with `prompt_a`; the second run
+        # exercises the lookup-then-prepopulate path.
+        cached_b = sched_with_cache.run(
+            Request(prompt=prompt_b, sampling_params=sampling, max_tokens=max_tokens)
+        )
+    finally:
+        sched_with_cache.stop()
+
+    assert cached_a.tokens == ref_a.tokens, (
+        f"first cached run diverged: cached={cached_a.tokens}, ref={ref_a.tokens}"
+    )
+    assert cached_b.tokens == ref_b.tokens, (
+        f"second cached run (with prefix hit) diverged: "
+        f"cached={cached_b.tokens}, ref={ref_b.tokens}"
+    )
+
+    # Sanity: the second cached run actually hit something. Block pool's prefix
+    # cache should have entries from prompt_a; prompt_b's shared prefix was
+    # served from those entries. We can't easily inspect the engine thread's
+    # state here, but `num_cached > 0` after both runs is enough.
+    pf = runner_with_cache.block_pool.prefix_cache
+    assert pf is not None
+    assert pf.num_cached > 0, "expected the prefix cache to retain at least one block"

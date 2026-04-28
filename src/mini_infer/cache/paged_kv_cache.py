@@ -4,6 +4,7 @@ import torch
 from transformers import DynamicCache
 
 from mini_infer.cache.block_pool import BlockPool
+from mini_infer.cache.prefix_cache import PrefixCache
 
 
 class PagedKVCache(DynamicCache):  # type: ignore[misc]
@@ -22,23 +23,78 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
     it materializes per-request K/V padded to `max_seq_len` when B > 1 so
     HF's attention can mask via `attention_mask`. The hot decode path bypasses
     `update()` entirely and uses `append_kv()`.
+
+    Prefix caching: if the underlying `BlockPool` was constructed with a
+    `PrefixCache`, `add_request_slot(prompt_token_ids=...)` looks up cached
+    block-hash chains and pre-populates the slot's blocks (with refcounts
+    held in the prefix cache). On the last layer of each step's
+    `append_kv_packed`, blocks that just filled with prompt tokens are
+    published into the prefix cache so future requests can hit them.
     """
 
     def __init__(self, pool: BlockPool) -> None:
         super().__init__()
         self._pool = pool
+        self._prefix_cache = pool.prefix_cache
         self._block_ids: list[list[int]] = []
         self._num_tokens: list[int] = []
+        # Per-slot tracking for prefix-cache publish. Empty/0/None when prefix
+        # caching is disabled OR when the slot was created without a prompt
+        # (e.g., the legacy single-request prefill cache).
+        self._slot_prompt_tokens: list[list[int]] = []
+        self._slot_num_published: list[int] = []
+        self._slot_parent_hash: list[bytes | None] = []
 
     @property
     def batch_size(self) -> int:
         return len(self._num_tokens)
 
-    def add_request_slot(self) -> int:
-        """Append an empty request slot; returns its batch_idx."""
+    def add_request_slot(self, prompt_token_ids: list[int] | None = None) -> int:
+        """Append a request slot; returns its batch_idx.
+
+        If `prompt_token_ids` is provided AND the pool has a prefix cache, the
+        slot is pre-populated with cached blocks for any matching prompt prefix.
+        On return, `self._num_tokens[batch_idx]` reflects how many tokens are
+        already in the slot's K/V cache (zero if no hit, or no prefix cache).
+
+        The "last-token rule": if the entire prompt is cached, we drop the last
+        cached block so that at least one token of the prompt remains
+        unprocessed. The scheduler relies on running forward over at least one
+        token to obtain logits for the next sample; if everything is cached,
+        there is nothing to run.
+        """
         self._num_tokens.append(0)
         self._block_ids.append([])
-        return len(self._num_tokens) - 1
+        self._slot_prompt_tokens.append(list(prompt_token_ids) if prompt_token_ids else [])
+        self._slot_num_published.append(0)
+        self._slot_parent_hash.append(None)
+        batch_idx = self.batch_size - 1
+
+        if not prompt_token_ids or self._prefix_cache is None:
+            return batch_idx
+
+        chain = PrefixCache.compute_block_hashes(prompt_token_ids, self._pool.block_size)
+        if not chain:
+            return batch_idx
+
+        matched = self._prefix_cache.lookup(chain)
+        num_cached_blocks = len(matched)
+        if num_cached_blocks == 0:
+            return batch_idx
+        # Last-token rule: leave at least one token un-prefilled so the
+        # scheduler's first forward over this slot produces logits.
+        if num_cached_blocks * self._pool.block_size >= len(prompt_token_ids):
+            num_cached_blocks -= 1
+        if num_cached_blocks <= 0:
+            return batch_idx
+
+        for block_id in matched[:num_cached_blocks]:
+            self._prefix_cache.incref(block_id)
+        self._block_ids[batch_idx] = list(matched[:num_cached_blocks])
+        self._num_tokens[batch_idx] = num_cached_blocks * self._pool.block_size
+        self._slot_num_published[batch_idx] = num_cached_blocks
+        self._slot_parent_hash[batch_idx] = chain[num_cached_blocks - 1][0]
+        return batch_idx
 
     def remove_request(self, batch_idx: int) -> None:
         """Free this request's blocks and remove its slot. Shifts later indices down by 1."""
@@ -48,6 +104,9 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             self._pool.free(block_id)
         self._block_ids.pop(batch_idx)
         self._num_tokens.pop(batch_idx)
+        self._slot_prompt_tokens.pop(batch_idx)
+        self._slot_num_published.pop(batch_idx)
+        self._slot_parent_hash.pop(batch_idx)
 
     def merge_request(self, other: "PagedKVCache") -> int:
         """Absorb a single-request cache from prefill. Returns the new batch_idx in self.
@@ -61,8 +120,14 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             raise ValueError("cannot merge caches backed by different pools")
         self._block_ids.append(other._block_ids[0])
         self._num_tokens.append(other._num_tokens[0])
+        self._slot_prompt_tokens.append(other._slot_prompt_tokens[0])
+        self._slot_num_published.append(other._slot_num_published[0])
+        self._slot_parent_hash.append(other._slot_parent_hash[0])
         other._block_ids = []
         other._num_tokens = []
+        other._slot_prompt_tokens = []
+        other._slot_num_published = []
+        other._slot_parent_hash = []
         return len(self._num_tokens) - 1
 
     def block_ids_for_request(self, batch_idx: int) -> list[int]:
@@ -261,6 +326,12 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                     self._block_ids[batch_idx].append(self._pool.allocate())
                 self._num_tokens[batch_idx] = new_total
         self._write_packed_kv(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
+        # Publish prompt blocks that just filled, but only on the LAST layer:
+        # earlier layers' K/V isn't written yet, so the cached entry would be
+        # incomplete. By the last layer's append, every layer has been written.
+        if self._prefix_cache is not None and layer_idx == self._pool.num_layers - 1:
+            for batch_idx in range(self.batch_size):
+                self._publish_filled_blocks(batch_idx)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Returns max seq_len across the batch (HF assumes a single value).
@@ -297,6 +368,49 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 self._pool.free(block_id)
         self._block_ids.clear()
         self._num_tokens.clear()
+        self._slot_prompt_tokens.clear()
+        self._slot_num_published.clear()
+        self._slot_parent_hash.clear()
+
+    def _publish_filled_blocks(self, batch_idx: int) -> None:
+        """Publish any blocks of this slot's prompt that just became fully filled.
+
+        A block is publishable when (a) it lies entirely within the slot's
+        prompt and (b) its block_size'th token has been written. We track
+        which blocks are already published in `_slot_num_published`.
+
+        On a duplicate publish (another slot's prompt produced the identical
+        chained hash), the prefix cache returns its canonical block id; we
+        return our just-allocated block to the pool and rewrite the slot's
+        block list to point at the canonical block. The K/V values in the
+        canonical block are bit-equal to ours (same tokens, same model), so
+        attention reads after the swap are correct.
+        """
+        assert self._prefix_cache is not None
+        prompt = self._slot_prompt_tokens[batch_idx]
+        if not prompt:
+            return
+        block_size = self._pool.block_size
+        num_full_prompt_blocks = len(prompt) // block_size
+        target_count = min(self._num_tokens[batch_idx] // block_size, num_full_prompt_blocks)
+        already = self._slot_num_published[batch_idx]
+        if target_count <= already:
+            return
+
+        parent_hash = self._slot_parent_hash[batch_idx]
+        for block_idx_in_slot in range(already, target_count):
+            token_start = block_idx_in_slot * block_size
+            token_end = token_start + block_size
+            tokens = tuple(prompt[token_start:token_end])
+            block_hash = PrefixCache.hash_block(parent_hash, tokens)
+            block_id = self._block_ids[batch_idx][block_idx_in_slot]
+            canonical_id, was_dup = self._prefix_cache.publish(block_hash, tokens, block_id)
+            if was_dup:
+                self._pool.free(block_id)
+                self._block_ids[batch_idx][block_idx_in_slot] = canonical_id
+            parent_hash = block_hash
+        self._slot_num_published[batch_idx] = target_count
+        self._slot_parent_hash[batch_idx] = parent_hash
 
     def _write_packed_kv(
         self,

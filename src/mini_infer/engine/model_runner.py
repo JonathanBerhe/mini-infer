@@ -5,6 +5,7 @@ from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.cache.prefix_cache import PrefixCache
 from mini_infer.engine.attention_patch import patch_model_attention
 from mini_infer.engine.tokenizer import Tokenizer
 
@@ -65,6 +66,7 @@ class ModelRunner:
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
         use_paged_kernel: bool = True,
+        prefix_cache: bool = False,
     ) -> "ModelRunner":
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
@@ -75,6 +77,7 @@ class ModelRunner:
 
         cfg = model.config
         head_dim = cfg.hidden_size // cfg.num_attention_heads
+        prefix_cache_obj = PrefixCache(block_size=block_size) if prefix_cache else None
         block_pool = BlockPool(
             num_blocks=num_blocks,
             block_size=block_size,
@@ -83,6 +86,7 @@ class ModelRunner:
             head_dim=head_dim,
             dtype=actual_dtype,
             device=resolved,
+            prefix_cache=prefix_cache_obj,
         )
 
         # Apply the architecture-specific attention patch. The patched forward
