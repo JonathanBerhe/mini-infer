@@ -146,8 +146,10 @@ caching disabled.
 - **Eviction under pressure**: 20 unique long prompts on a 64-block pool
   complete without OOM, exercising the BlockPool fallback path
   (`tests/stress/test_prefix_cache_load.py::test_eviction_under_unique_prompts`).
-- **CUDA**: not yet benchmarked; Modal smoke + throughput sweep pending
-  approval.
+- **CUDA (A10, Qwen2.5-0.5B, bf16)**: 15.9k-token shared system prompt + 8
+  unique short user questions. **Warm-TTFT 158x speedup** (74ms vs 11.7s);
+  **concurrent throughput 13–32x** across C ∈ {1, 4, 8}. Numbers in
+  `docs/benchmarks/2026-04-28-prefix-caching.md`.
 
 ## Pointers
 
@@ -164,10 +166,10 @@ caching disabled.
 
 ## Follow-ups
 
-- **Modal smoke + benchmark**: TTFT and tokens/sec on a shared-system-prompt
-  workload with the cache on vs off. Numbers to land in
-  `docs/benchmarks/2026-04-XX-prefix-caching.md`. Awaiting per-run approval.
 - **Radix tree** (sub-block-granular sharing). Worth doing only if a real
   workload shows the cost of block-edge alignment matters.
 - **Cache-aware admission**: prioritize the request with the largest expected
   cache hit. Improves TTFT under contention.
+- **H100 sweep** for the prefix workload, to characterise how the speedup
+  scales with hardware. The bottleneck on cache-OFF is prefill compute, so
+  faster GPUs should narrow the speedup proportionally.

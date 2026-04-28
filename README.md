@@ -24,6 +24,16 @@ Throughput on Qwen2.5-0.5B-Instruct, NVIDIA A10, bf16:
 
 Full report: [docs/benchmarks/2026-04-27-continuous-batching.md](docs/benchmarks/2026-04-27-continuous-batching.md).
 
+Prefix caching on a 15.9k-token shared system prompt + 8 unique short user questions, A10, bf16:
+
+| Concurrency | cache OFF | cache ON | Throughput speedup |
+|---:|---:|---:|---:|
+| 1 | 2.57 tok/s | 34.1 tok/s | **13.27x** |
+| 4 | 2.87 tok/s | 74.3 tok/s | **25.88x** |
+| 8 | 2.91 tok/s | 94.4 tok/s | **32.45x** |
+
+Warm-cache TTFT: ~74ms vs ~11.7s (cold), a 158x reduction once the system prompt has been served once. Full report: [docs/benchmarks/2026-04-28-prefix-caching.md](docs/benchmarks/2026-04-28-prefix-caching.md).
+
 ## Quickstart
 
 ```bash
