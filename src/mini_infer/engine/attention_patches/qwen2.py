@@ -74,7 +74,14 @@ def _packed_attention_path(
     cu_seqlens_q: torch.Tensor,
     kwargs: dict[str, Any],
 ) -> tuple[torch.Tensor, None]:
-    """Compute Q/K/V, append new K/V to cache, run packed varlen attention."""
+    """Compute Q/K/V, append new K/V to cache, run packed varlen attention.
+
+    The dispatcher inside `packed_attention_forward` handles the K/V read:
+    paged-aware FlashAttention on CUDA reads directly from `BlockPool` storage
+    via `block_table` (no per-layer gather); the PyTorch reference path
+    materializes per-request K/V internally for the SDPA loop.
+    """
+    del kwargs  # No longer needed; dispatcher computes max_seqlen_q internally.
     # hidden_states is (1, total_q, hidden). The "batch" dim is always 1 here —
     # all per-request boundaries live in cu_seqlens_q.
     input_shape = hidden_states.shape[:-1]
@@ -98,25 +105,8 @@ def _packed_attention_path(
         new_keys_packed, new_values_packed, cu_seqlens_q, attn_module.layer_idx
     )
 
-    # Materialize the full per-request K/V history (now including the just-
-    # appended K/V) into packed form for varlen attention.
-    keys_full, values_full, cu_seqlens_k, max_seqlen_k = past_key_values.materialize_packed_kv(
-        attn_module.layer_idx
-    )
-
-    max_seqlen_q = int(kwargs.get("max_seqlen_q", 0))
-    if max_seqlen_q == 0:
-        # Compute on the fly if the caller didn't pass it.
-        max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
-
     attn_packed = packed_attention_forward(
-        queries_packed,
-        keys_full,
-        values_full,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
+        queries_packed, past_key_values, attn_module.layer_idx, cu_seqlens_q
     )
     # attn_packed: (total_q, num_q_heads, head_dim).
 

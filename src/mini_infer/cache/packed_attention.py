@@ -3,22 +3,24 @@
 Each engine step packs q-tokens from all in-flight requests into a single packed
 sequence (a prefilling request contributes `chunk_size` tokens; a decoding
 request contributes 1). Attention is varlen-aware: per-request boundaries are
-defined by `cu_seqlens_q` / `cu_seqlens_k`, and each request's queries can only
-attend to keys within its own request, with causal ordering inside the request.
+defined by `cu_seqlens_q` / per-request `seq_lens`, and each request's queries
+can only attend to keys within its own request, with causal ordering inside
+the request.
 
-Two backends:
-- `packed_attention_flash`: CUDA + FlashAttention's `flash_attn_varlen_func`. Fast.
-- `packed_attention_torch`: pure PyTorch reference looping per request through
-  a standard SDPA call. Slow but device-agnostic and the numerical oracle the
-  flash backend is validated against.
+Two backends, both selected via `packed_attention_forward(...)`:
 
-Use `packed_attention_forward(...)` as the entry point; it dispatches to the
-fastest available implementation for the device.
+- **CUDA (FlashAttention 2.8+)**: paged varlen call. The kernel reads K/V
+  directly from `BlockPool` storage via `block_table` — no per-layer gather.
+- **CPU / MPS (PyTorch reference)**: per-request SDPA loop after gathering
+  per-request K/V into a packed buffer. Slow but correct, and the numerical
+  oracle that the FA backend is validated against.
 """
 
 import math
 
 import torch
+
+from mini_infer.cache.paged_kv_cache import PagedKVCache
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -42,40 +44,63 @@ def supports_packed_kernel(device: torch.device | str) -> bool:
     return device.type == "cuda"
 
 
+# FlashAttention's paged varlen API (`flash_attn_varlen_func` + `block_table`)
+# requires the K/V cache block size to be a multiple of this value. Smaller
+# block sizes still work, but go through the materialized varlen path (no
+# direct paged read; one gather per layer per step).
+_FA_PAGED_BLOCK_SIZE_MULTIPLE = 256
+
+
 def packed_attention_forward(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    cache: PagedKVCache,
+    layer_idx: int,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
-    """Varlen attention over packed-q and packed-k/v with causal masking per request.
+    """Varlen attention over packed-q with K/V read from a `PagedKVCache`.
 
-    Shapes:
-        q             : (total_q, num_q_heads, head_dim)  — packed across requests
-        k             : (total_k, num_kv_heads, head_dim) — packed across requests
-        v             : (total_k, num_kv_heads, head_dim)
-        cu_seqlens_q  : (B+1,) int — cumulative q lengths
-        cu_seqlens_k  : (B+1,) int — cumulative k lengths (full per-request K/V history)
-        max_seqlen_q  : int — max query length in the batch
-        max_seqlen_k  : int — max key length in the batch
-        softmax_scale : float, defaults to 1/sqrt(head_dim)
+    The cache is expected to have already had this step's new K/V appended via
+    `cache.append_kv_packed(...)` before this call — i.e. for every request,
+    `cache.seq_lens_list()[batch_idx]` is the post-append K-length.
 
-    Returns: (total_q, num_q_heads, head_dim) attention output.
+    Three backends are picked automatically:
 
-    GQA is handled implicitly: when `num_q_heads != num_kv_heads`, the K/V are
-    broadcast to match the Q head count (group_size = num_q_heads / num_kv_heads).
+    - **CUDA + `block_size % 256 == 0`**: paged FA varlen via `block_table`.
+      No per-layer gather; reads K/V directly from `BlockPool` storage.
+    - **CUDA + other block_size**: materialized FA varlen. Per-layer gather
+      into a contiguous packed buffer, then `flash_attn_varlen_func` without
+      `block_table`. Compatible with any block size; this is the original
+      Slice B path.
+    - **CPU / MPS**: PyTorch reference (per-request SDPA loop after gather).
+
+    Args:
+        q: `(total_q, num_q_heads, head_dim)` packed across requests.
+        cache: shared `PagedKVCache` with `batch_size == B`.
+        layer_idx: which layer's K/V to attend over.
+        cu_seqlens_q: `(B+1,)` int cumulative q boundaries; `cu_seqlens_q[-1]`
+            equals `total_q`.
+        softmax_scale: defaults to `1/sqrt(head_dim)`.
+
+    Returns:
+        `(total_q, num_q_heads, head_dim)` attention output. GQA is handled by
+        broadcasting on the K head count when `num_q_heads != num_kv_heads`.
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if supports_packed_kernel(q.device):
-        return _packed_attention_flash(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale
+        block_size = cache._pool.block_size
+        if block_size % _FA_PAGED_BLOCK_SIZE_MULTIPLE == 0:
+            return _packed_attention_paged_flash(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
+        return _packed_attention_materialized_flash(
+            q, cache, layer_idx, cu_seqlens_q, softmax_scale
         )
-    return packed_attention_torch(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale)
+    # PyTorch reference path: gather K/V from blocks into a packed buffer, then
+    # use the per-request SDPA reference. Slower but device-agnostic.
+    keys_packed, values_packed, cu_seqlens_k, _ = cache.materialize_packed_kv(layer_idx)
+    return packed_attention_torch(
+        q, keys_packed, values_packed, cu_seqlens_q, cu_seqlens_k, softmax_scale
+    )
 
 
 def packed_attention_torch(
@@ -151,38 +176,89 @@ def packed_attention_torch(
     return out
 
 
-def _packed_attention_flash(
+def _packed_attention_materialized_flash(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    cache: PagedKVCache,
+    layer_idx: int,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """FlashAttention varlen call. CUDA only.
+    """Materialized FA varlen call: gather K/V from blocks into a packed buffer.
 
-    Inputs must be on a CUDA device with a half-precision dtype (fp16 / bf16 —
-    FA's varlen API doesn't accept fp32). cu_seqlens are int32; FlashAttention
-    requires this exact dtype.
+    Used when the cache's block_size doesn't satisfy FA's paged constraint
+    (must be divisible by 256). One gather per layer per step. Slower than the
+    paged path but works for any block size, and faster than the PyTorch
+    reference because the attention math itself is still done by FA.
     """
     if not _FLASH_ATTN_AVAILABLE:
         raise RuntimeError(
-            "flash-attn not installed; install via `uv add flash-attn` or use "
+            "flash-attn not installed; install via the [cuda] extra or use "
             "packed_attention_torch instead"
         )
     if q.device.type != "cuda":
         raise RuntimeError("flash_attn_varlen_func requires CUDA tensors")
+
+    keys_packed, values_packed, cu_seqlens_k, max_seqlen_k = cache.materialize_packed_kv(layer_idx)
+    max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+
     out: torch.Tensor = flash_attn_varlen_func(
         q,
-        k,
-        v,
+        keys_packed,
+        values_packed,
         cu_seqlens_q.to(torch.int32),
         cu_seqlens_k.to(torch.int32),
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=True,
+    )
+    return out
+
+
+def _packed_attention_paged_flash(
+    q: torch.Tensor,
+    cache: PagedKVCache,
+    layer_idx: int,
+    cu_seqlens_q: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Paged varlen FlashAttention call: reads K/V directly from `BlockPool`.
+
+    Requires flash-attn 2.8+ (`flash_attn_varlen_func` with `block_table`).
+    Inputs must be on a CUDA device with a half-precision dtype (fp16 / bf16);
+    FA's varlen API doesn't accept fp32.
+
+    The kernel walks `block_table[batch_idx]` to find each request's blocks,
+    reads `cache_seqlens[batch_idx]` valid positions out of each, and runs
+    causal varlen attention. No per-layer gather, no contiguous K/V buffer.
+    """
+    if not _FLASH_ATTN_AVAILABLE:
+        raise RuntimeError(
+            "flash-attn not installed; install via the [cuda] extra or use "
+            "packed_attention_torch instead"
+        )
+    if q.device.type != "cuda":
+        raise RuntimeError("flash_attn_varlen_func requires CUDA tensors")
+
+    device = q.device
+    keys_pool, values_pool = cache.pool_storage_for_layer(layer_idx)
+    block_table = cache.block_table_padded(device)
+    cache_seqlens = cache.seq_lens_tensor(device)
+    max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+    max_seqlen_k = int(cache_seqlens.max().item())
+    cu_seqlens_k = torch.zeros(cache_seqlens.shape[0] + 1, dtype=torch.int32, device=device)
+    cu_seqlens_k[1:] = torch.cumsum(cache_seqlens, dim=0)
+
+    out: torch.Tensor = flash_attn_varlen_func(
+        q,
+        keys_pool,
+        values_pool,
+        cu_seqlens_q.to(torch.int32),
+        cu_seqlens_k.to(torch.int32),
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+        block_table=block_table,
     )
     return out

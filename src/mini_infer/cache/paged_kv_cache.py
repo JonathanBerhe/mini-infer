@@ -78,6 +78,41 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
     def seq_lens_list(self) -> list[int]:
         return list(self._num_tokens)
 
+    def block_table_padded(
+        self, device: torch.device | str, dtype: torch.dtype = torch.int32
+    ) -> torch.Tensor:
+        """Padded `(B, max_blocks)` block-id tensor for FlashAttention's paged varlen API.
+
+        Each row is one request's block IDs, padded with zeros to `max_blocks`.
+        FA's varlen + `block_table` path uses `cache_seqlens` (from
+        `seq_lens_tensor`) to know how many of each row's slots are real, so
+        the zero padding is never read.
+        """
+        if not self._block_ids:
+            return torch.zeros((0, 0), device=device, dtype=dtype)
+        max_blocks = max(len(ids) for ids in self._block_ids)
+        if max_blocks == 0:
+            return torch.zeros((self.batch_size, 0), device=device, dtype=dtype)
+        table = torch.zeros((self.batch_size, max_blocks), device=device, dtype=dtype)
+        for batch_idx, ids in enumerate(self._block_ids):
+            if ids:
+                table[batch_idx, : len(ids)] = torch.tensor(ids, device=device, dtype=dtype)
+        return table
+
+    def seq_lens_tensor(
+        self, device: torch.device | str, dtype: torch.dtype = torch.int32
+    ) -> torch.Tensor:
+        """Per-request seq_lens as a `(B,)` tensor on `device`."""
+        return torch.tensor(self._num_tokens, device=device, dtype=dtype)
+
+    def pool_storage_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return `(K_pool, V_pool)` slices for one layer, shape
+        `(num_blocks, block_size, num_kv_heads, head_dim)` each.
+
+        Used by FA's paged varlen path to read K/V directly from blocks.
+        """
+        return self._pool.storage[layer_idx, 0], self._pool.storage[layer_idx, 1]
+
     def materialize_packed_kv(
         self, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
