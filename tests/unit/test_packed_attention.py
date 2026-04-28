@@ -187,31 +187,62 @@ def test_torch_packed_rejects_q_longer_than_k() -> None:
 
 
 @pytest.mark.requires_cuda
-def test_flash_matches_torch_reference() -> None:
-    """Flash varlen kernel must match the PyTorch reference within cosine sim > 0.99."""
-    from mini_infer.cache.packed_attention import _packed_attention_flash
+def test_paged_flash_matches_torch_reference() -> None:
+    """Paged FA varlen output must match the PyTorch reference within cosine sim > 0.99.
+
+    Builds a small `PagedKVCache`, appends K/V for two requests with different
+    seq_lens, then compares `packed_attention_forward` (paged FA on CUDA) to
+    `packed_attention_torch` (per-request SDPA reference).
+    """
+    from mini_infer.cache.block_pool import BlockPool
+    from mini_infer.cache.packed_attention import packed_attention_forward
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
 
     device = torch.device("cuda")
     if not supports_packed_kernel(device):
         pytest.skip("flash-attn not available on this device")
 
     seq_lens_q = [3, 1, 2]
-    seq_lens_k = [3, 8, 2]
+    seq_lens_k = [3, 8, 2]  # request 1 has 7 tokens of prior history
     num_q_heads, num_kv_heads, head_dim = 4, 2, 16
+    # FA's paged varlen requires block_size divisible by 256.
+    block_size = 256
+
     q_cpu, k_cpu, v_cpu, cu_q_cpu, cu_k_cpu = _build_packed_inputs(
         seq_lens_q, seq_lens_k, num_q_heads, num_kv_heads, head_dim, seed=11
     )
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    q = q_cpu.to(device).to(torch.float16)
-    k = k_cpu.to(device).to(torch.float16)
-    v = v_cpu.to(device).to(torch.float16)
-    cu_q = cu_q_cpu.to(device)
-    cu_k = cu_k_cpu.to(device)
-    max_q = max(seq_lens_q)
-    max_k = max(seq_lens_k)
+    # Set up the cache and append all per-request K/V (this simulates the cache
+    # state right before attention runs in the engine flow).
+    pool = BlockPool(
+        num_blocks=8,
+        block_size=block_size,
+        num_layers=1,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    cache = PagedKVCache(pool)
+    for _ in seq_lens_k:
+        cache.add_request_slot()
+    # Append all of each request's K/V at once (cu_seqlens_q matches seq_lens_k here).
+    cache.append_kv_packed(
+        k_cpu.to(device).to(torch.float16),
+        v_cpu.to(device).to(torch.float16),
+        cu_k_cpu.to(device),
+        layer_idx=0,
+    )
 
-    out_flash = _packed_attention_flash(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale)
+    # The "queries" for attention are the LAST seq_lens_q tokens of each request,
+    # consistent with how the engine builds them (chunked prefill or decode).
+    q_gpu = q_cpu.to(device).to(torch.float16)
+    cu_q_gpu = cu_q_cpu.to(device)
+    out_flash = packed_attention_forward(
+        q_gpu, cache, layer_idx=0, cu_seqlens_q=cu_q_gpu, softmax_scale=softmax_scale
+    )
+
     out_torch = packed_attention_torch(
         q_cpu.float(), k_cpu.float(), v_cpu.float(), cu_q_cpu, cu_k_cpu, softmax_scale
     )

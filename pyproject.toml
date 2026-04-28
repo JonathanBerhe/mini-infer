@@ -19,8 +19,11 @@ dependencies = [
 # CUDA-only extras. Installed in Modal images and on machines with CUDA;
 # omitted on M1 / CPU where flash-attn cannot build. Imports of `flash_attn`
 # in the codebase MUST be try/except guarded so non-CUDA installs still work.
+# 2.8+ is required for `flash_attn_varlen_func`'s `block_table` parameter
+# (paged-aware varlen attention; lets the kernel read K/V directly from our
+# `BlockPool` storage without per-layer materialization).
 cuda = [
-    "flash-attn>=2.6",
+    "flash-attn>=2.8",
 ]
 
 [tool.hatch.build.targets.wheel]

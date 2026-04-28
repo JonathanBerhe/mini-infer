@@ -37,7 +37,7 @@ Throughput scaling (chunked, vs C=1): C=4 → 2.4×, C=8 → 3.3×.
 
 ## What this validates
 
-- **The packed-forward path is correct on real CUDA.** Smoke (`modal_packed_smoke.py`) confirmed concurrent outputs match a serial reference within bf16 numerical drift (3/4 prompts exact, 1/4 with a single tail-token flip — same drift pattern vLLM and SGLang publish).
+- **The packed-forward path is correct on real CUDA.** Smoke (`modal_packed_bench.py --config smoke`) confirmed concurrent outputs match a serial reference within bf16 numerical drift (3/4 prompts exact, 1/4 with a single tail-token flip — same drift pattern vLLM and SGLang publish).
 - **FlashAttention varlen integration works.** `flash_attn=True` reported by the runner; the patched Qwen2 forward routes every layer through `flash_attn_varlen_func`.
 - **Throughput scales with concurrency**: 3.3× at C=8 means the engine's batching mechanics are doing real work, not serializing internally.
 
@@ -49,7 +49,7 @@ Throughput scaling (chunked, vs C=1): C=4 → 2.4×, C=8 → 3.3×.
 
 ## Long-context sweep
 
-Re-ran with realistic long prompts to surface the long-context behavior. Workload: 3938-token prompts (RAG / long-chat scale), `max_tokens=64`, sweep at C ∈ {1, 2, 4}, same chunked-vs-unchunked split. Reproducer: `scripts/modal_packed_bench_long.py`.
+Re-ran with realistic long prompts to surface the long-context behavior. Workload: 3938-token prompts (RAG / long-chat scale), `max_tokens=64`, sweep at C ∈ {1, 2, 4}, same chunked-vs-unchunked split. Reproducer: `scripts/modal_packed_bench.py --config throughput --workload long`.
 
 | Config | C | Elapsed (s) | Output tokens | Throughput (tok/s) |
 |---|---:|---:|---:|---:|
@@ -70,7 +70,7 @@ This last point is worth dwelling on: **on this synthetic-batch workload the chu
 
 ## Head-of-line blocking microbench
 
-To check whether chunked prefill actually delivers its claimed benefit (decoders keep flowing while a long prompt is being prefilled), I ran a focused microbench. Setup: start a short decoder, let it emit 4 tokens at steady-state ITL (~55-58ms). Then submit a 3065-token long prompt. Measure: the time from long-submit to the short decoder's next token. Reproducer: `scripts/modal_packed_bench_hol.py`.
+To check whether chunked prefill actually delivers its claimed benefit (decoders keep flowing while a long prompt is being prefilled), I ran a focused microbench. Setup: start a short decoder, let it emit 4 tokens at steady-state ITL (~55-58ms). Then submit a 3065-token long prompt. Measure: the time from long-submit to the short decoder's next token. Reproducer: `scripts/modal_packed_bench.py --config holb`.
 
 | Config | Baseline ITL (ms) | First short token after long-submit (ms) | Long total (ms) |
 |---|---:|---:|---:|
@@ -87,15 +87,58 @@ The interesting metric is `long_total_ms`: **chunked is 44% slower than un-chunk
 
 **What this changes about the chunked-prefill story**: chunking still has a real reason to exist — bounded per-step memory pressure (the un-chunked 3k-token prefill materializes all 3k positions at once at every layer; chunked materializes one chunk at a time). At 4k or 16k+ contexts on the same model, the un-chunked path would OOM before the chunked path. But the throughput-vs-latency story we'd been telling ("chunking is the HOL fix") was specific to two-forward designs. For Slice B's packed design, **the architecture is the HOL fix**, and chunking is a memory tool.
 
+## Paged vs materialized FA: cross-platform sweep
+
+Subsequent work (ADR-008) added a paged FA varlen path (`flash_attn_varlen_func` with `block_table`) as an alternative to materializing K/V per layer per step. Hypothesis was that paged would close the gap to ADR-005's numbers, especially on Hopper-class hardware. The hypothesis didn't pan out — measurements on both A10 and H100, with `block_size=16` (materialized) vs `block_size=256` (paged) and the same packed-varlen scheduler.
+
+### A10 (Ampere)
+
+| Workload | Materialized | Paged | Δ |
+|---|---:|---:|---:|
+| Short, C=1 | 36.6 tok/s | 17.5 tok/s | -52% |
+| Short, C=4 | 88.0 tok/s | 49.9 tok/s | -43% |
+| Short, C=8 | 122.2 tok/s | 122.7 tok/s | ≈0 |
+| Long (~3.9k), C=1 | 14.5 tok/s | 12.0 tok/s | -17% |
+| Long, C=4 | 19.7 tok/s | 16.9 tok/s | -14% |
+
+### H100 (Hopper)
+
+| Workload | Materialized | Paged | Δ |
+|---|---:|---:|---:|
+| Short, C=1 | 57.2 tok/s | 43.9 tok/s | -23% |
+| Short, C=4 | 144.9 tok/s | 132.3 tok/s | -9% |
+| Short, C=8 | 203.0 tok/s | 209.8 tok/s | +3% |
+| Long, C=1 | 21.4 tok/s | 16.8 tok/s | -22% |
+| Long, C=4 | 28.4 tok/s | 24.3 tok/s | -14% |
+
+**Materialized wins on both GPUs at almost every config.** The only place paged is competitive is C=8 short on H100, and the +3% there is within run-to-run noise. The block-table indirection cost and the `block_size=256` wasted-bandwidth-on-short-prompts cost don't go away on newer silicon for our model scale (0.5B). This doesn't disprove the production paged FA story for 70B+ models with 32k+ contexts where the gather scales into gigabytes — it just means the win isn't there at our scale.
+
+ADR-008 documents the design and the decision to keep both paths available but default to materialized.
+
+### H100 vs A10 (materialized FA, the default)
+
+Side-by-side, holding everything else constant:
+
+| Workload | A10 | H100 | Speedup |
+|---|---:|---:|---:|
+| Short, C=1 | 36.6 tok/s | 57.2 tok/s | 1.6× |
+| Short, C=4 | 88.0 tok/s | 144.9 tok/s | 1.6× |
+| Short, C=8 | 122.2 tok/s | 203.0 tok/s | 1.7× |
+| Long, C=1 | 14.5 tok/s | 21.4 tok/s | 1.5× |
+| Long, C=4 | 19.7 tok/s | 28.4 tok/s | 1.4× |
+
+Roughly **1.4-1.7× speedup** moving from A10 to H100 on the same code path, holding workload constant. The architecture is GPU-portable; FlashAttention's regular varlen is well-tuned across Ampere and Hopper.
+
 ## Bottom line
 
-Three findings, all measured:
+Four findings, all measured:
 
-1. **Throughput scales with concurrency on short workloads** (3.3× at C=8) but degrades at long context (1.4× at C=4 on 4k prompts). Long-context throughput is bottlenecked by attention compute that scales with `kv_len`, not by our scheduling.
-2. **Slice B is ~30% slower than ADR-005's decode-only kernel** at short workloads (122 vs 187 tok/s at C=8). The cost is per-layer K/V materialization for `flash_attn_varlen_func`. We did not benchmark ADR-005 at long context, so we can't say whether the gap closes there.
-3. **Slice B's packed-forward design eliminates HOL blocking by construction**. Chunked vs un-chunked makes ~no difference to decoder ITL when a long prompt arrives; un-chunked is actually faster for the prefill itself (no chunk overhead). Chunking remains useful for memory pressure at very long contexts but is no longer the HOL solution it was in the two-forward design.
+1. **Throughput scales with concurrency on short workloads** (3.3× at C=8 on A10) but degrades at long context (1.4× at C=4 on 4k prompts). Long-context throughput is bottlenecked by attention compute that scales with `kv_len`, not by our scheduling.
+2. **Slice B (packed varlen + materialized FA) is ~30% slower than ADR-005's decode-only kernel** at short workloads (122 vs 187 tok/s at C=8 on A10). The cost is the per-layer K/V materialization for `flash_attn_varlen_func`. ADR-005 was decode-only with a custom Triton kernel that read K/V directly from blocks; the architecture switch to packed varlen pays a real but bounded perf cost.
+3. **Slice B's packed-forward design eliminates HOL blocking by construction**. Chunked vs un-chunked makes ~no difference to decoder ITL when a long prompt arrives; un-chunked is actually faster for the prefill itself (no chunk overhead).
+4. **Paged FA isn't a win on either A10 or H100 at our model scale.** ADR-008 has the full numbers and decision rationale. Materialized FA is the default; paged is an opt-in via `block_size=256`.
 
 Two follow-ups, in priority order:
 
-1. **Close the materialization gap** via `flash_attn_with_kvcache` (FA 2.7+ paged-aware varlen) or a custom Triton kernel. The interface in `cache/packed_attention.py::packed_attention_forward` is the abstraction boundary. This is the path back to (or past) ADR-005 numbers.
-2. **Re-bench at very long contexts** (16k+) to find where the chunked path's memory advantage starts to matter. The current 3k workload is too small to surface that.
+1. **Re-bench on a 70B+ model** when hardware is available — that's the regime where paged FA's gather-avoidance was supposed to matter, and where our 0.5B measurements can't validate or refute the production claim.
+2. **Custom Triton varlen-paged kernel** with `block_size=16`. Would avoid both costs (FA paged's indirection + the FA materialized's gather). Phase 3b stretch.
