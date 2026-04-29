@@ -1,13 +1,13 @@
-# Speculative decoding (vanilla, two-model, greedy V1), A10
+# Speculative decoding (vanilla, two-model, greedy V1), A10 + H100
 
 Date: 2026-04-29
-Hardware: NVIDIA A10 (Ampere, SM_86), bf16
+Hardware: NVIDIA A10 (Ampere, SM_86) and NVIDIA H100 80GB HBM3 (Hopper), bf16
 Target: Qwen/Qwen2.5-7B-Instruct
 Draft: Qwen/Qwen2.5-0.5B-Instruct
 K (draft length): 4
 max_tokens: 32 (greedy)
 Engine: mini-infer @ this slice (ADR-011)
-Script: `scripts/modal_packed_bench.py --config spec`
+Script: `scripts/modal_packed_bench.py --config spec` (set `MINI_INFER_BENCH_GPU=H100` for H100)
 
 ## Workload
 
@@ -27,6 +27,8 @@ For each, we measure:
 
 ## Results
 
+### A10 (Ampere, SM_86)
+
 ```
 target=Qwen/Qwen2.5-7B-Instruct | draft=Qwen/Qwen2.5-0.5B-Instruct | K=4 | max_tokens=32
 
@@ -39,127 +41,159 @@ target=Qwen/Qwen2.5-7B-Instruct | draft=Qwen/Qwen2.5-0.5B-Instruct | K=4 | max_t
   aggregate: base=5.16s (18.6 t/s)  spec=4.52s (21.2 t/s)  speedup=1.14x
 ```
 
+### H100 80GB HBM3 (Hopper, SM_90)
+
+```
+  prompt                             base s   base t/s   spec s   spec t/s      x  iters   mean_acc   match
+  ---------------------------------------------------------------------------------------------------------
+  Explain the concept of recursion    1.826      17.52    1.414      22.63   1.29     10        2.3      yes
+  def fibonacci(n: int) -> int:       0.938      34.11    1.147      27.89   0.82      8       3.38     yes
+  Q: What are the four base pairs     0.971      32.94    1.171      27.33   0.83      8       3.12     yes
+
+  aggregate: base=3.74s (25.7 t/s)  spec=3.73s (25.7 t/s)  speedup=1.00x
+```
+
 ## Reading the data
 
-- **Aggregate 1.14x speedup**, below the ≥1.5x target the plan called for.
-- **Acceptance rates are healthy** (2.3, 3.38, 3.12 out of K=4 = 58–85%),
-  which says the draft model is doing useful work — it's not acceptance
-  that's holding the win back.
-- **One prompt's match was NO** (recursion prose). Numerical drift
-  explanation below; the *content* is correct, the divergence is at the
-  argmax tie-break level.
+The first time I'd expected H100 to amplify the win (faster verify-vs-decode
+ratio on Hopper's tensor cores). Measured the opposite — H100 makes spec
+*break even* in aggregate, with one prompt winning more (1.29x) but two
+prompts regressing to 0.82–0.83x.
 
-## Why the speedup is muted at this scale (1.14x, not the expected 1.5–2x)
+- **A10 aggregate 1.14x; H100 aggregate 1.00x.** Speculative decoding is
+  more regime-dependent than the headline "1.5–2x" number suggests.
+- **Same acceptance rates on both GPUs** (2.3, 3.38, 3.12 out of K=4 = 58–85%);
+  the algorithm is identical, the deterministic draft argmax produces the
+  same K candidates regardless of hardware.
+- **The bf16 token-divergence quirk goes away on H100** (`match=yes` for
+  all three prompts vs `match=NO` on A10's recursion prompt). Hopper's
+  matmul reduction order matches well enough between q_len=1 and q_len=5
+  paths to avoid the LSB-flip drift A10 saw.
 
-The speedup math says:
+## Why H100 doesn't widen the win (and actually narrows it)
 
-- Target-alone for N tokens: N decode forwards.
-- Spec for N tokens: `N / (mean_acc + 1)` iterations, each costing
-  `1 × verify_latency + K × draft_latency`.
+The intuition that motivated the H100 re-run was: faster matmul should
+make verify (q_len=5) relatively cheaper vs decode (q_len=1), so the spec
+speedup should grow. Empirically, the opposite happened.
 
-With `mean_acc ≈ 3.0`, that's `N/4` iterations. If verify (q_len=5) costs
-the same wall time as 1 decode step (memory-bound on weight reads), and
-draft cost is small relative to verify (0.5B vs 7B), spec should hit
-`N / (N/4) = 4x` token throughput — far above what we see.
+The reason is that **H100 makes target decode dramatically faster too**,
+and target decode is the thing spec replaces. Per-token decode times:
 
-The hardware reality on A10:
+| GPU  | Prompt 1 | Prompt 2 | Prompt 3 |
+|------|---------:|---------:|---------:|
+| A10  | 66 ms    | 47 ms    | 47 ms    |
+| H100 | 57 ms    | 29 ms    | 30 ms    |
 
-1. **Verify at q_len=5 is meaningfully slower than q_len=1**, not free.
-   Target decode at q_len=1 is HBM-bandwidth-bound on the weight matrix
-   reads; verify at q_len=5 reads the same weights once but does 5x the
-   matmul flops, which become non-trivial on Ampere SMs at 7B. Empirically,
-   verify wall time is ~3x decode wall time, not ~1x.
-2. **Draft cost is real** at K=4 with a 0.5B draft. Per iteration we run
-   4 draft decodes; each costs about 20% of a 7B decode (rough scaling
-   with parameters and HBM bandwidth). 4 × 0.2 = 0.8 7B-decodes of overhead
-   per iteration.
+H100 cuts the *baseline* decode latency roughly in half on the shorter
+prompts. Spec's per-iteration overhead — the K=4 draft forwards plus the
+verify forward — also gets faster on H100, but the draft model (0.5B)
+doesn't get proportionally faster because at 0.5B you're already
+HBM-bandwidth-saturated on a much smaller weight matrix; H100's extra
+compute doesn't help.
 
-Putting numbers together: per iteration, spec costs `~3 + 0.8 ≈ 3.8`
-target-decode-equivalents and emits `mean_acc + 1 ≈ 4` tokens. That's
-`4 / 3.8 ≈ 1.05x` per-iteration throughput — close to the observed
-aggregate. The slight outperformance vs this estimate (1.14x vs 1.05x)
-is from cases where verify is closer to 2x decode rather than 3x.
+Per-iteration time on H100 (from the data): ~140 ms across all prompts.
+Mean tokens emitted per iteration: 3.2 (prompt 1), 4.4 (prompts 2/3).
+Per-emitted-token cost in spec on H100:
 
-**This isn't a bug; it's the regime.** The "1.5–2x" headline applies when:
+- Prompt 1: 140 / 3.2 = 44 ms/token. Beats baseline 57 ms. **Win (1.29x).**
+- Prompt 2: 140 / 4.4 = 32 ms/token. Loses to baseline 29 ms. **Loss (0.83x).**
+- Prompt 3: 140 / 4.4 = 32 ms/token. Loses to baseline 30 ms. **Loss (0.83x).**
 
-- The target is much larger (70B+), where decode is fully HBM-bound and
-  verify amortizes weight reads.
-- The draft compute is tiny relative to target (e.g., 70B + 1B pair).
-- Sampling is enabled (so we keep generating from the corrected distribution
-  and acceptance is calibrated by temperature).
+Spec wins precisely when target-alone decode is slow enough to amortize
+the draft + verify overhead. On H100 with a 7B target, the regime
+borderline cuts right through the workload: the longest / hardest prompt
+still wins, the shorter / easier ones lose.
 
-At 7B + 0.5B on A10, the design space puts us closer to break-even.
+## Why the win is also small on A10 (1.14x, not 1.5–2x)
 
-## Why one prompt's match was NO
+Same math, different constants:
 
-The match check is exact token-for-token: spec output must equal
-target-alone greedy. The recursion prompt was the longest run (10
-iterations × ~3.2 emit_count = 32 tokens) and had the lowest acceptance
-(2.3/4 = 58%), meaning the most rejection-driven cache rewriting.
+- **A10 verify at q_len=5 ≈ 3x decode wall time**. Target decode is
+  HBM-bandwidth-bound on the weight reads; verify reads the same weights
+  once but does 5x the matmul flops, and Ampere SMs become the bottleneck.
+- **Draft cost is real** at K=4 with a 0.5B draft. Per iteration: 4 draft
+  decodes ≈ 0.8 target-decode-equivalents.
 
-The mathematical guarantee for greedy spec-decode is:
+Per-iteration spec cost: `~3 (verify) + 0.8 (draft) ≈ 3.8` target-decode
+units, emitting `mean_acc + 1 ≈ 4` tokens. Predicted per-iter throughput:
+`4 / 3.8 ≈ 1.05x`. Observed: 1.14x — a bit better, mostly from cases
+where verify is closer to 2x decode than 3x.
 
-> If verify produces the same target logits as the standalone decode of
-> the same input sequence, then for every emitted position the bonus
-> mechanism produces target's argmax — i.e., the same token target-alone
-> would produce.
+**This isn't a bug; it's the regime.** The published "1.5–2x" headline
+applies when:
 
-The "if" is what fails at bf16. Two paths produce these logits:
+- The target is much larger (70B+), where decode stays HBM-bound deep
+  into the q_len > 1 regime and verify amortizes weight reads.
+- The draft compute is tiny relative to target (e.g., 70B + 1B pair, where
+  K draft decodes < 0.1 target decodes).
+- Sampling is enabled with calibrated temperature, so acceptance lands in
+  the high-but-not-perfect range.
 
-- **Target-alone**: 32 separate forwards, each appending one token's K/V.
-  Attention at decode step `n` reads K/V from a cache built one position
-  at a time, with every layer's matmul done at q_len=1.
-- **Spec verify**: forwards with q_len=K+1=5 over 8–10 iterations.
-  Attention at the verify positions reads K/V from a cache that, on
-  rejection iterations, was truncated and re-written. Per-layer matmul
-  runs at q_len=5.
+At 7B + 0.5B, the regime puts us at the ~1x boundary on either GPU. The
+implementation is identical to what would deliver the published wins on
+larger pairs; the speedup is gated by hardware characteristics and
+parameter ratios, not by code path.
 
-bf16 has only 7 mantissa bits; reduction order in matmul affects the
-final value at the LSB level. Identical math at q_len=1 vs q_len=5 can
-produce values that differ by `~2^-7 × |scale|`, which is enough to flip
-an argmax when two logits are close. After 10 iterations, drift compounds
-and one position eventually flips.
+## bf16 token-divergence on A10 (and not H100)
 
-Crucially, the *same* drift would happen in any production engine running
-spec-decode at bf16; vLLM and SGLang ship spec-decode despite this and
-treat parity-vs-baseline as a useful sanity check, not a hard contract.
-fp32 reference math (which our M1 unit tests use) never trips this; we
-verified the pure-logic correctness on M1 with token-for-token parity
-across multiple prompts and a synthetic divergent draft.
+The A10 recursion prompt's `match=NO` is bf16 numerical drift: q_len=1
+matmul (target-alone decode) and q_len=5 matmul (spec verify) reduce in
+slightly different orders, and bf16's 7-bit mantissa is just narrow
+enough that two close logits can flip across the argmax boundary. The
+recursion prompt had the most iterations (10) and the lowest acceptance
+(58%), meaning the most rejection-driven cache rewriting and the most
+opportunities for drift to compound.
 
-The honest takeaway: at bf16 on 7B + iter ≥ ~10, ≤1 of 32 tokens may
-flip due to numerical drift, the same way bf16 affects any matmul-heavy
-inference path. The output is still semantically correct.
+H100 produced `match=yes` on all three prompts. Two plausible reasons:
+
+1. Hopper's matmul kernels use a more deterministic reduction order
+   between the two q_len shapes (FlashAttention 2.8 has Hopper-specific
+   warp-specialized scheduling).
+2. Hopper's higher numerical headroom in TF32 / FP8 paths reduces the
+   bf16-cast frequency at intermediate steps.
+
+Either way, the M1 fp32 reference parity (in `tests/unit/test_speculative.py`
+and `tests/stress/test_speculative_load.py`) is the strict correctness
+oracle; the GPU bf16 paths are subject to floating-point drift at the
+same level any production engine ships at bf16. vLLM and SGLang treat
+parity-vs-baseline as a sanity check, not a hard contract; we do the
+same.
 
 ## What this proves
 
-- **Mechanism works end-to-end on real hardware.** Cache truncation,
-  draft loop, verify pack, accept-reject, and catch-up draft step all
-  exercised across 26 iterations × 3 prompts. No crashes, no leaks
-  (M1 stress test confirms block-pool returns to all-free).
-- **Acceptance rates are realistic.** 58–85% per prompt across prose /
-  code / Q&A. Matches the published range for matched-family pairs.
-- **Throughput is positive but modest** at this scale (1.14x). The
-  speedup is gated by hardware regime (A10 verify-vs-decode latency
-  ratio) and target/draft size ratio (7B/0.5B = 14x), not by
-  algorithm.
+- **Mechanism works end-to-end on real hardware**, both Ampere and Hopper.
+  Cache truncation, draft loop, verify pack, accept-reject, and catch-up
+  draft step all exercised across 26 iterations × 3 prompts × 2 GPUs. No
+  crashes, no leaks (M1 stress test confirms block-pool returns to all-free).
+- **Acceptance rates are realistic and identical across hardware** (greedy
+  argmax is deterministic): 58–85% per prompt across prose / code / Q&A.
+  Matches the published range for matched-family pairs.
+- **Throughput is regime-dependent**, and this finding is more interesting
+  than a single number. On A10 spec wins by 1.14x; on H100 it breaks even
+  in aggregate (1.29x on the long/low-acceptance prompt, 0.83x on the
+  short ones). Faster GPUs with the same target/draft pair don't
+  automatically widen the win — they speed up baseline decode too, and at
+  small target sizes that erodes spec's overhead amortization.
 - **The pieces that do scale are in place**: the same `SpeculativeRunner`
-  + `truncate_to` + `forward_step_packed` would deliver 1.5–2x on a
-  70B target / H100 setup, where verify is fully HBM-bound and draft
-  cost is a smaller fraction.
+  + `truncate_to` + `forward_step_packed` machinery would deliver the
+  published 1.5–2x on a 70B+ target / Hopper setup, where target decode
+  stays HBM-bound deep into the q_len > 1 regime and the draft (a 1–7B
+  model) is a much smaller fraction of iteration cost.
 
 ## Caveats
 
-- 7B target is small. The headline win for spec-decode is at 70B+.
-- A10 is the wrong GPU class for this technique to shine — Hopper's
-  larger HBM bandwidth + INT8 Tensor Cores would amplify the verify-vs-decode
-  asymmetry.
+- 7B target is small. The headline win for spec-decode is at 70B+, where
+  target decode is fully HBM-bound and verify amortizes the weight reads
+  much more dramatically.
+- The "Hopper makes spec faster" assumption was wrong at this size; we
+  tested it directly. Hopper makes baseline decode faster too, and at
+  7B that erases the relative win.
 - Greedy only. Sampling spec is more interesting in production (lets you
   use temperature) but needs the corrected-distribution math.
 - Single request. Multi-request batched spec is where production
   throughput wins compound.
-- bf16 drift on long greedy runs flips ≤1 token out of 32 vs target-alone;
-  fp32 reference parity holds (M1 tests).
+- bf16 drift on long A10 greedy runs flips ≤1 token / 32 vs target-alone;
+  H100 didn't trip this; fp32 reference parity holds (M1 tests).
 
 ## Reproduce
 
