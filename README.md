@@ -8,7 +8,7 @@ An open-source LLM inference engine built from scratch in Python and Triton, imp
 * **Chunked prefill + packed-varlen forward**: long prompts advance one chunk per step alongside in-flight decoders, eliminating head-of-line blocking. Single `model.forward(...)` per step via FlashAttention's varlen API on CUDA, PyTorch reference elsewhere.
 * **PagedAttention** with a fixed-size block pool, batch-aware `PagedKVCache`, and per-architecture monkey-patch registry (`Qwen2` shipping; the engine itself is model-agnostic via the HF `Cache` interface).
 * **Prefix caching**: chained-hash, block-granular, refcounted LRU. Repeat or shared-prefix prompts skip prefill on the cached prefix; opt-in via `prefix_cache=True`. Verified token-for-token against the no-cache path.
-* **Weight-only INT8 quantization (W8A16)**: symmetric per-output-channel scales applied at load time; opt-in via `quant="int8"`. Drops model-weight HBM by ~30% on Qwen2.5-0.5B with cosine-sim > 0.99 on logits and first-token greedy parity preserved.
+* **Weight-only INT8 quantization (W8A16)**: symmetric per-output-channel scales applied at load time; opt-in via `quant="int8"`. Drops model-weight HBM by ~30% on Qwen2.5-0.5B with cosine-sim > 0.99 on logits and first-token greedy parity preserved. Forward dispatches to a fused Triton W8A16 GEMM kernel on CUDA — keeps weights in INT8 in HBM and dequants tile-by-tile in registers, skipping the bf16-weight HBM round-trip the naive path pays.
 * **Speculative decoding** (vanilla two-model, greedy V1): small draft model proposes K tokens, large target verifies them in one forward, accept-reject emits target's argmax sequence. `PagedKVCache.truncate_to` rolls back on rejections. 1.14x decode throughput on Qwen2.5-7B target + 0.5B draft on A10 at bf16; the regime is constrained by the modest target/draft size ratio (the same implementation scales to the published 1.5–2x range at 70B+ on Hopper).
 * **Triton decode kernel** (single-request and batched variants) with online-softmax accumulation, validated against a PyTorch reference within cosine similarity > 0.99.
 * **OpenAI-compatible HTTP API** (`/v1/completions`) with both non-streaming responses and SSE streaming.
@@ -37,6 +37,8 @@ Prefix caching on a 15.9k-token shared system prompt + 8 unique short user quest
 Warm-cache TTFT: ~74ms vs ~11.7s (cold), a 158x reduction once the system prompt has been served once. Full report: [docs/benchmarks/2026-04-28-prefix-caching.md](docs/benchmarks/2026-04-28-prefix-caching.md).
 
 Weight-only INT8 (W8A16) on Qwen2.5-0.5B, A10: model-weight HBM drops from 1142 MiB (fp16) to 794 MiB (**−30.5%**) with cosine similarity > 0.99 on logits and first-token greedy parity preserved. Throughput is ~neutral (no FLOP savings; a fused dequant kernel is the path to compute speedup). Full report: [docs/benchmarks/2026-04-28-int8-weight-quant.md](docs/benchmarks/2026-04-28-int8-weight-quant.md).
+
+Fused W8A16 Triton kernel on Qwen2.5-7B, A10, bf16: same kernel that loses 0.74–0.99x to cuBLAS at 0.5B wins **2.74x at decode (C=1)** and 1.47–1.65x at higher concurrency on 7B. The regime flip is exactly where the math predicts: at 7B the bf16-weight HBM round-trip in the naive int8 path becomes the dominant cost per forward, and that's what the fused kernel skips. Full report: [docs/benchmarks/2026-04-29-fused-int8-kernel.md](docs/benchmarks/2026-04-29-fused-int8-kernel.md).
 
 Speculative decoding on Qwen2.5-7B target + Qwen2.5-0.5B draft, bf16, K=4: aggregate **1.14x on A10**, **1.00x on H100** vs target-alone greedy on a 3-prompt workload. Mean acceptance 2.3–3.4 / K=4 (58–85%). Below the published 1.5–2x range; the H100 result is the more interesting finding — faster baseline decode on Hopper *narrows* the win at this target size rather than widening it (1.29x on the longest prompt, 0.83x on the shorter ones). Full report: [docs/benchmarks/2026-04-29-speculative-decoding.md](docs/benchmarks/2026-04-29-speculative-decoding.md).
 
@@ -106,6 +108,7 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 * [ADR-009](docs/decisions/ADR-009-prefix-caching.md): prefix caching (chained-hash, block-granular, refcounted LRU)
 * [ADR-010](docs/decisions/ADR-010-int8-weight-quant.md): weight-only INT8 quantization (W8A16)
 * [ADR-011](docs/decisions/ADR-011-speculative-decoding.md): speculative decoding (vanilla two-model, greedy, single-request)
+* [ADR-012](docs/decisions/ADR-012-fused-int8-kernel.md): fused W8A16 Triton kernel for `Int8Linear`
 
 ## Tests
 

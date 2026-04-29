@@ -140,11 +140,21 @@ class Int8Linear(nn.Module):
         return q
 
     def forward(self, x: Tensor) -> Tensor:
-        # Dequant happens in `x.dtype` so downstream matmul stays in that dtype.
-        # Multiplying int8 by a float dtype upcasts; the broadcast of (out, in)
-        # by (out, 1) yields the dequantized weight matrix in `x.dtype`. The
-        # bias may have been stored in a different float dtype than `x` (e.g.
-        # an fp32 model called with bf16 input via autocast), so cast it too.
+        # CUDA + Triton fast path: keep weights in INT8 in HBM and dequant
+        # tile-by-tile in registers inside the matmul kernel. Avoids the
+        # bf16-weight HBM round-trip the naive path pays on every call.
+        if x.is_cuda:
+            from mini_infer.quant.int8_kernel import (
+                fused_w8a16_linear,
+                supports_fused_kernel,
+            )
+
+            if supports_fused_kernel(x.device):
+                return fused_w8a16_linear(x, self.weight, self.scales, self.bias)
+
+        # CPU / MPS fallback: dequant the whole weight matrix to x.dtype, then
+        # call the standard matmul. Same numerical contract, no HBM
+        # bandwidth optimization.
         w_dq = self.weight.to(x.dtype) * self.scales.to(x.dtype).unsqueeze(1)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return torch.nn.functional.linear(x, w_dq, bias)

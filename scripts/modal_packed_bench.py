@@ -17,6 +17,10 @@ Configurations (selected via the `config` arg of the local entrypoint):
 - **spec**: greedy speculative decoding (Qwen2.5-7B target + Qwen2.5-0.5B
   draft). Reports target-alone vs spec-decode tokens/sec, mean acceptance
   per iteration, target forwards saved.
+- **quant_kernel**: fp16 vs int8-naive vs int8-fused (Triton W8A16) on the
+  same model. Throughput sweep at C=1 and C=4 on a moderate prompt; the
+  fused path is the ADR-012 follow-up to ADR-010's neutral throughput
+  result.
 
 CLI flags:
 
@@ -44,6 +48,7 @@ Examples:
     uv run modal run scripts/modal_packed_bench.py --config prefix
     uv run modal run scripts/modal_packed_bench.py --config quant
     uv run modal run scripts/modal_packed_bench.py --config spec
+    uv run modal run scripts/modal_packed_bench.py --config quant_kernel
 """
 
 import itertools
@@ -615,6 +620,147 @@ def _run_quant_bench(
     return "\n".join(lines)
 
 
+def _run_quant_kernel_bench(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+    max_tokens: int,
+    concurrencies: list[int],
+    skip_fp16: bool = False,
+) -> str:
+    """fp16 vs int8-naive vs int8-fused (Triton) throughput, same model.
+
+    Loads ONE int8 ModelRunner and toggles `int8_kernel._FUSED_DISABLED_FOR_BENCH`
+    to flip between naive and fused dispatch on the same weights — keeps the
+    A/B clean (same INT8 quantization, only the matmul path differs).
+    """
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.quant import int8_kernel
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    prompt = (
+        "Summarize the following passage in one sentence. "
+        "The mini-infer engine is an open-source LLM inference server "
+        "demonstrating production techniques: continuous batching, paged "
+        "attention, chunked prefill, packed varlen forward, prefix caching, "
+        "and weight quantization. " * 8
+    )
+
+    def _sweep(label: str, runner: Any) -> dict[int, dict[str, Any]]:
+        per_c: dict[int, dict[str, Any]] = {}
+        for concurrency in concurrencies:
+            sched = ContinuousScheduler(runner, max_concurrent=concurrency, chunk_size=256)
+            sched.start()
+            try:
+                # Warmup so we're not timing the first matmul launch (Triton
+                # JIT compile latency on the int8-fused config).
+                sched.run(
+                    Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+                )
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                handles = [
+                    sched.submit(
+                        Request(
+                            prompt=prompt,
+                            sampling_params=SamplingParams(),
+                            max_tokens=max_tokens,
+                        )
+                    )
+                    for _ in range(concurrency)
+                ]
+                results = [h.wait() for h in handles]
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start
+            finally:
+                sched.stop()
+            total_tokens = sum(len(r.tokens) for r in results)
+            per_c[concurrency] = {
+                "elapsed_s": round(elapsed, 3),
+                "tokens": total_tokens,
+                "tok_per_s": round(total_tokens / elapsed, 2),
+            }
+            print(f"  [{label} C={concurrency}] {per_c[concurrency]}")
+        return per_c
+
+    import gc
+
+    # 1) fp16 baseline (optional — at 7B+ on A10 it OOMs because the next
+    # int8 load can't coexist; skip via `skip_fp16=True`).
+    if skip_fp16:
+        fp_results: dict[int, dict[str, Any]] = {}
+    else:
+        fp_runner = ModelRunner.from_pretrained(model, num_blocks=num_blocks, block_size=block_size)
+        fp_results = _sweep("fp16", fp_runner)
+        del fp_runner
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # 2) int8 with naive (HBM-round-trip) dispatch
+    int8_runner = ModelRunner.from_pretrained(
+        model, num_blocks=num_blocks, block_size=block_size, quant="int8"
+    )
+    int8_kernel._FUSED_DISABLED_FOR_BENCH = True
+    naive_results = _sweep("int8-naive", int8_runner)
+
+    # 3) Same int8 model, fused dispatch enabled
+    int8_kernel._FUSED_DISABLED_FOR_BENCH = False
+    fused_results = _sweep("int8-fused", int8_runner)
+
+    del int8_runner
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Format report.
+    lines: list[str] = [
+        f"model={model} | prompt_chars={len(prompt)} | max_tokens={max_tokens}",
+        "",
+        "Throughput (warmup + N concurrent requests):",
+    ]
+    if skip_fp16:
+        header = (
+            f"  {'C':>3}  {'int8-naive (s, t/s)':>26}  "
+            f"{'int8-fused (s, t/s)':>26}  {'fused/naive':>11}"
+        )
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for c in concurrencies:
+            nv = naive_results[c]
+            fu = fused_results[c]
+            speedup = fu["tok_per_s"] / nv["tok_per_s"] if nv["tok_per_s"] else 0.0
+            lines.append(
+                f"  {c:>3}  "
+                + f"{nv['elapsed_s']}s, {nv['tok_per_s']} t/s".rjust(26)
+                + "  "
+                + f"{fu['elapsed_s']}s, {fu['tok_per_s']} t/s".rjust(26)
+                + f"  {speedup:>10.2f}x"
+            )
+    else:
+        header = (
+            f"  {'C':>3}  {'fp16 (s, t/s)':>22}  {'int8-naive (s, t/s)':>26}  "
+            f"{'int8-fused (s, t/s)':>26}  {'fused/naive':>11}"
+        )
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for c in concurrencies:
+            fp = fp_results[c]
+            nv = naive_results[c]
+            fu = fused_results[c]
+            speedup = fu["tok_per_s"] / nv["tok_per_s"] if nv["tok_per_s"] else 0.0
+            lines.append(
+                f"  {c:>3}  {fp['elapsed_s']}s, {fp['tok_per_s']} t/s".rjust(22)
+                + "  "
+                + f"{nv['elapsed_s']}s, {nv['tok_per_s']} t/s".rjust(26)
+                + "  "
+                + f"{fu['elapsed_s']}s, {fu['tok_per_s']} t/s".rjust(26)
+                + f"  {speedup:>10.2f}x"
+            )
+    return "\n".join(lines)
+
+
 def _run_spec_bench(
     target_model: str,
     draft_model: str,
@@ -738,6 +884,7 @@ def run_bench(
     spec_target_model: str,
     spec_draft_model: str,
     spec_K: int,  # noqa: N803 (canonical name in the spec-decode literature)
+    skip_fp16: bool,
 ) -> str:
     """Modal entry point. Single function; selects internal path by `config`."""
     import torch
@@ -751,6 +898,18 @@ def run_bench(
     header = (
         f"GPU: {gpu_name} | flash_attn={fa_available} | block_size={block_size} | model={model}"
     )
+
+    if config == "quant_kernel":
+        body = _run_quant_kernel_bench(
+            model=model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            max_tokens=max_tokens,
+            concurrencies=concurrencies,
+            skip_fp16=skip_fp16,
+        )
+        title = "int8-naive / int8-fused" if skip_fp16 else "fp16 / int8-naive / int8-fused"
+        return f"\n{header}\n\n=== {title} ===\n{body}\n"
 
     if config == "spec":
         spec_prompts = [
@@ -853,7 +1012,8 @@ def run_bench(
         )
 
     raise ValueError(
-        f"unknown config={config!r}; expected smoke|throughput|holb|sweep|prefix|quant|spec"
+        f"unknown config={config!r}; "
+        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel"
     )
 
 
@@ -872,6 +1032,7 @@ def main(
     spec_target_model: str = "Qwen/Qwen2.5-7B-Instruct",
     spec_draft_model: str = "Qwen/Qwen2.5-0.5B-Instruct",
     spec_k: int = 4,
+    skip_fp16: bool = False,
 ) -> None:
     # GPU is set via the MINI_INFER_BENCH_GPU env var (see _BENCH_GPU above).
     # Default A10. Modal 1.4 removed runtime gpu overrides on Function.
@@ -890,5 +1051,6 @@ def main(
             spec_target_model=spec_target_model,
             spec_draft_model=spec_draft_model,
             spec_K=spec_k,
+            skip_fp16=skip_fp16,
         )
     )
