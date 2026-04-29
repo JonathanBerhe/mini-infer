@@ -21,6 +21,9 @@ Configurations (selected via the `config` arg of the local entrypoint):
   same model. Throughput sweep at C=1 and C=4 on a moderate prompt; the
   fused path is the ADR-012 follow-up to ADR-010's neutral throughput
   result.
+- **turbo**: TurboQuant V1 KV cache compression (rotation + 4-bit) vs
+  bf16 baseline. Reports KV-cache storage memory, first-token parity, and
+  throughput on a moderate prompt. ADR-013.
 
 CLI flags:
 
@@ -49,6 +52,7 @@ Examples:
     uv run modal run scripts/modal_packed_bench.py --config quant
     uv run modal run scripts/modal_packed_bench.py --config spec
     uv run modal run scripts/modal_packed_bench.py --config quant_kernel
+    uv run modal run scripts/modal_packed_bench.py --config turbo
 """
 
 import itertools
@@ -620,6 +624,154 @@ def _run_quant_bench(
     return "\n".join(lines)
 
 
+def _run_turbo_bench(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+    max_tokens: int,
+    concurrencies: list[int],
+) -> str:
+    """TurboQuant V1 (rotation + 4-bit KV) vs bf16 baseline.
+
+    Reports KV-cache storage memory, first-token parity, and throughput.
+    Throughput will likely regress vs bf16 (V1 dequantizes to bf16 on every
+    materialize call); the headline win is persistent storage memory.
+    """
+    import gc
+
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    prompt = (
+        "Summarize the following passage in one sentence. "
+        "The mini-infer engine is an open-source LLM inference server "
+        "demonstrating production techniques: continuous batching, paged "
+        "attention, chunked prefill, packed varlen forward, prefix caching, "
+        "weight quantization, speculative decoding, and TurboQuant. " * 8
+    )
+
+    def _measure_storage_bytes(runner: Any) -> int:
+        pool = runner.block_pool
+        if pool.kv_quant is None:
+            storage: torch.Tensor = pool._storage
+            return int(storage.numel() * storage.element_size())
+        compressed: torch.Tensor = pool._compressed_storage
+        scales: torch.Tensor = pool._scales_storage
+        rotation: torch.Tensor = pool._rotation
+        return int(
+            compressed.numel() * compressed.element_size()
+            + scales.numel() * scales.element_size()
+            + rotation.numel() * rotation.element_size()
+        )
+
+    def _sweep(label: str, runner: Any) -> dict[int, dict[str, Any]]:
+        per_c: dict[int, dict[str, Any]] = {}
+        for concurrency in concurrencies:
+            sched = ContinuousScheduler(runner, max_concurrent=concurrency, chunk_size=256)
+            sched.start()
+            try:
+                # Warmup so we're not timing the first matmul launch.
+                sched.run(
+                    Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+                )
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                handles = [
+                    sched.submit(
+                        Request(
+                            prompt=prompt,
+                            sampling_params=SamplingParams(),
+                            max_tokens=max_tokens,
+                        )
+                    )
+                    for _ in range(concurrency)
+                ]
+                results = [h.wait() for h in handles]
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start
+            finally:
+                sched.stop()
+            total_tokens = sum(len(r.tokens) for r in results)
+            per_c[concurrency] = {
+                "elapsed_s": round(elapsed, 3),
+                "tokens": total_tokens,
+                "tok_per_s": round(total_tokens / elapsed, 2),
+            }
+            print(f"  [{label} C={concurrency}] {per_c[concurrency]}")
+        return per_c
+
+    def _parity_tokens(label: str, runner: Any) -> list[int]:
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            r = sched.run(
+                Request(
+                    prompt="The capital of France is",
+                    sampling_params=SamplingParams(),
+                    max_tokens=8,
+                )
+            )
+        finally:
+            sched.stop()
+        print(f"  [parity {label}] tokens={r.tokens} text={r.text!r}")
+        return list(r.tokens)
+
+    # 1) bf16 baseline
+    bf16_runner = ModelRunner.from_pretrained(model, num_blocks=num_blocks, block_size=block_size)
+    bf16_storage = _measure_storage_bytes(bf16_runner)
+    bf16_tokens = _parity_tokens("bf16", bf16_runner)
+    bf16_results = _sweep("bf16", bf16_runner)
+    del bf16_runner
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # 2) turbo4
+    turbo_runner = ModelRunner.from_pretrained(
+        model, num_blocks=num_blocks, block_size=block_size, kv_quant="turbo4"
+    )
+    turbo_storage = _measure_storage_bytes(turbo_runner)
+    turbo_tokens = _parity_tokens("turbo4", turbo_runner)
+    turbo_results = _sweep("turbo4", turbo_runner)
+    del turbo_runner
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    first_token_match = bf16_tokens and turbo_tokens and bf16_tokens[0] == turbo_tokens[0]
+    full_match = bf16_tokens == turbo_tokens
+
+    # Format report.
+    lines: list[str] = [
+        f"model={model} | prompt_chars={len(prompt)} | max_tokens={max_tokens}",
+        "",
+        "KV-cache pool storage:",
+        f"  bf16:   {bf16_storage / (1024**2):.1f} MiB",
+        f"  turbo4: {turbo_storage / (1024**2):.1f} MiB "
+        f"({turbo_storage / bf16_storage:.1%} of bf16, "
+        f"savings={1 - turbo_storage / bf16_storage:.1%})",
+        "",
+        "Greedy parity (prompt='The capital of France is', max_tokens=8):",
+        f"  bf16:   {bf16_tokens}",
+        f"  turbo4: {turbo_tokens}",
+        f"  first_token_match={first_token_match}, full_match={full_match}",
+        "",
+        "Throughput:",
+    ]
+    header = f"  {'C':>3}  {'bf16 (s, t/s)':>22}  {'turbo4 (s, t/s)':>22}  {'turbo/bf16':>10}"
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for c in concurrencies:
+        bf = bf16_results[c]
+        tu = turbo_results[c]
+        ratio = tu["tok_per_s"] / bf["tok_per_s"] if bf["tok_per_s"] else 0.0
+        bf_cell = f"{bf['elapsed_s']}s, {bf['tok_per_s']} t/s"
+        tu_cell = f"{tu['elapsed_s']}s, {tu['tok_per_s']} t/s"
+        lines.append(f"  {c:>3}  {bf_cell:>22}  {tu_cell:>22}  {ratio:>9.2f}x")
+    return "\n".join(lines)
+
+
 def _run_quant_kernel_bench(
     model: str,
     num_blocks: int,
@@ -936,6 +1088,16 @@ def run_bench(
         f"GPU: {gpu_name} | flash_attn={fa_available} | block_size={block_size} | model={model}"
     )
 
+    if config == "turbo":
+        body = _run_turbo_bench(
+            model=model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            max_tokens=max_tokens,
+            concurrencies=concurrencies,
+        )
+        return f"\n{header}\n\n=== TurboQuant V1 (rotation + 4-bit KV) vs bf16 ===\n{body}\n"
+
     if config == "quant_kernel":
         body = _run_quant_kernel_bench(
             model=model,
@@ -1050,7 +1212,7 @@ def run_bench(
 
     raise ValueError(
         f"unknown config={config!r}; "
-        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel"
+        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo"
     )
 
 

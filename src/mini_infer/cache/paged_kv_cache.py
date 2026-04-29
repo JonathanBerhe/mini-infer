@@ -222,7 +222,16 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         `(num_blocks, block_size, num_kv_heads, head_dim)` each.
 
         Used by FA's paged varlen path to read K/V directly from blocks.
+        Compressed-mode pools don't expose direct bf16 storage; the FA
+        paged path is unsupported there and the dispatcher should fall
+        back to the materialized path.
         """
+        if self._pool.kv_quant is not None:
+            raise RuntimeError(
+                "pool_storage_for_layer is uncompressed-only; "
+                f"got kv_quant={self._pool.kv_quant!r}. The FA paged path "
+                "doesn't support compressed K/V; use the materialized path."
+            )
         return self._pool.storage[layer_idx, 0], self._pool.storage[layer_idx, 1]
 
     def materialize_packed_kv(
@@ -240,12 +249,20 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         This is the packed counterpart of `_materialize`, which pads to a 4D
         rectangular tensor for HF's stock attention. The packed form is what
         `flash_attn_varlen_func` and our PyTorch reference both consume.
+
+        Compressed pool (`kv_quant="turbo4"`): per-block read goes through
+        `pool.read_compressed_block`, which decompresses + inverse-rotates
+        each block back to bf16 before slicing the relevant prefix.
         """
-        device = self._pool.storage.device
-        dtype = self._pool.storage.dtype
         num_kv_heads = self._pool.num_kv_heads
         head_dim = self._pool.head_dim
         block_size = self._pool.block_size
+        dtype = self._pool.dtype
+        if self._pool.kv_quant is None:
+            device = self._pool.storage.device
+        else:
+            assert self._pool._compressed_storage is not None
+            device = self._pool._compressed_storage.device
 
         seq_lens = self._num_tokens
         if not seq_lens or all(seq_len == 0 for seq_len in seq_lens):
@@ -264,21 +281,47 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         key_packed = torch.empty((total_k, num_kv_heads, head_dim), dtype=dtype, device=device)
         value_packed = torch.empty_like(key_packed)
 
-        for batch_idx in range(self.batch_size):
-            seq_len = seq_lens[batch_idx]
-            if seq_len == 0:
-                continue
-            offset = cu_seqlens_k_list[batch_idx]
-            positions = torch.arange(seq_len, device=device)
-            block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
-            block_ids_per_pos = block_ids_lookup[positions // block_size]
-            slots_per_pos = positions % block_size
-            key_packed[offset : offset + seq_len] = self._pool.storage[
-                layer_idx, 0, block_ids_per_pos, slots_per_pos
-            ]
-            value_packed[offset : offset + seq_len] = self._pool.storage[
-                layer_idx, 1, block_ids_per_pos, slots_per_pos
-            ]
+        if self._pool.kv_quant is None:
+            # Uncompressed fast path: gather directly from pool storage.
+            for batch_idx in range(self.batch_size):
+                seq_len = seq_lens[batch_idx]
+                if seq_len == 0:
+                    continue
+                offset = cu_seqlens_k_list[batch_idx]
+                positions = torch.arange(seq_len, device=device)
+                block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
+                block_ids_per_pos = block_ids_lookup[positions // block_size]
+                slots_per_pos = positions % block_size
+                key_packed[offset : offset + seq_len] = self._pool.storage[
+                    layer_idx, 0, block_ids_per_pos, slots_per_pos
+                ]
+                value_packed[offset : offset + seq_len] = self._pool.storage[
+                    layer_idx, 1, block_ids_per_pos, slots_per_pos
+                ]
+        else:
+            # Compressed path: read each block (dequant + inverse-rotate),
+            # then slice the seq_len-bounded prefix into the packed output.
+            for batch_idx in range(self.batch_size):
+                seq_len = seq_lens[batch_idx]
+                if seq_len == 0:
+                    continue
+                offset = cu_seqlens_k_list[batch_idx]
+                pos_in_packed = 0
+                num_blocks_used = (seq_len + block_size - 1) // block_size
+                for block_idx_in_slot in range(num_blocks_used):
+                    block_id = self._block_ids[batch_idx][block_idx_in_slot]
+                    full_block_k = self._pool.read_compressed_block(layer_idx, 0, block_id)
+                    full_block_v = self._pool.read_compressed_block(layer_idx, 1, block_id)
+                    # How many slots of this block contain valid data.
+                    block_start = block_idx_in_slot * block_size
+                    valid_in_block = min(block_size, seq_len - block_start)
+                    key_packed[offset + pos_in_packed : offset + pos_in_packed + valid_in_block] = (
+                        full_block_k[:valid_in_block]
+                    )
+                    value_packed[
+                        offset + pos_in_packed : offset + pos_in_packed + valid_in_block
+                    ] = full_block_v[:valid_in_block]
+                    pos_in_packed += valid_in_block
 
         return key_packed, value_packed, cu_seqlens_k, max(seq_lens)
 
@@ -466,6 +509,18 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         packed_v: torch.Tensor,
         cu_seqlens_q_new: torch.Tensor,
     ) -> None:
+        if self._pool.kv_quant is None:
+            self._write_packed_kv_uncompressed(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
+        else:
+            self._write_packed_kv_compressed(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
+
+    def _write_packed_kv_uncompressed(
+        self,
+        layer_idx: int,
+        packed_k: torch.Tensor,
+        packed_v: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
+    ) -> None:
         block_size = self._pool.block_size
         for batch_idx in range(self.batch_size):
             packed_start = int(cu_seqlens_q_new[batch_idx])
@@ -487,8 +542,73 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                     packed_start + token_offset
                 ]
 
+    def _write_packed_kv_compressed(
+        self,
+        layer_idx: int,
+        packed_k: torch.Tensor,
+        packed_v: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
+    ) -> None:
+        """Compressed-mode write: per-block dequant -> patch new tokens -> requantize.
+
+        Quantization is per-block (block_size tokens share scales), so we
+        can't write a single token without re-quantizing the affected
+        block. V1 ships this slow-but-correct path; a Triton kernel that
+        fuses partial-block updates is a follow-up.
+
+        For each affected block we:
+          1. Dequantize + inverse-rotate the existing block to bf16. Slots
+             past the slot's seq_len are zeros (block was zero-initialized
+             at allocation), which keeps the per-channel range tight.
+          2. Patch in the new K/V tokens at their slot positions.
+          3. Re-rotate + re-quantize + write back.
+        """
+        block_size = self._pool.block_size
+        for batch_idx in range(self.batch_size):
+            packed_start = int(cu_seqlens_q_new[batch_idx])
+            packed_end = int(cu_seqlens_q_new[batch_idx + 1])
+            new_tokens = packed_end - packed_start
+            if new_tokens == 0:
+                continue
+            start_token = self._num_tokens[batch_idx] - new_tokens
+            end_token = start_token + new_tokens
+
+            first_block_idx = start_token // block_size
+            last_block_idx = (end_token - 1) // block_size
+
+            for block_idx_in_slot in range(first_block_idx, last_block_idx + 1):
+                block_id = self._block_ids[batch_idx][block_idx_in_slot]
+                block_token_start = block_idx_in_slot * block_size
+                block_token_end = block_token_start + block_size
+
+                full_block_k = self._pool.read_compressed_block(layer_idx, 0, block_id)
+                full_block_v = self._pool.read_compressed_block(layer_idx, 1, block_id)
+
+                write_token_start = max(start_token, block_token_start)
+                write_token_end = min(end_token, block_token_end)
+                for pos in range(write_token_start, write_token_end):
+                    slot = pos - block_token_start
+                    packed_idx = packed_start + (pos - start_token)
+                    full_block_k[slot] = packed_k[packed_idx]
+                    full_block_v[slot] = packed_v[packed_idx]
+
+                self._pool.write_compressed_block(layer_idx, 0, block_id, full_block_k)
+                self._pool.write_compressed_block(layer_idx, 1, block_id, full_block_v)
+
     def _materialize(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (B, num_kv_heads, max_seq_len, head_dim), zero-padded for shorter requests."""
+        """Return (B, num_kv_heads, max_seq_len, head_dim), zero-padded for shorter requests.
+
+        HF `Cache.update()` compatibility path, used only by the legacy
+        single-request prefill flow. Compressed-mode pools must reach
+        attention via the packed-varlen path (`materialize_packed_kv`);
+        this method raises rather than allocate the bf16 fallback.
+        """
+        if self._pool.kv_quant is not None:
+            raise RuntimeError(
+                "_materialize (HF Cache.update path) is uncompressed-only; "
+                f"got kv_quant={self._pool.kv_quant!r}. Compressed pools should "
+                "reach attention via the packed-varlen forward path."
+            )
         if self.batch_size == 0:
             shape = (0, self._pool.num_kv_heads, 0, self._pool.head_dim)
             empty = torch.empty(

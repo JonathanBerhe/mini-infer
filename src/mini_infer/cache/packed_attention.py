@@ -90,7 +90,10 @@ def packed_attention_forward(
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if supports_packed_kernel(q.device):
         block_size = cache._pool.block_size
-        if block_size % _FA_PAGED_BLOCK_SIZE_MULTIPLE == 0:
+        # Paged FA varlen reads K/V directly from bf16 pool storage; not
+        # compatible with compressed (TurboQuant) storage. Compressed always
+        # routes through the materialized path which knows how to dequant.
+        if cache._pool.kv_quant is None and block_size % _FA_PAGED_BLOCK_SIZE_MULTIPLE == 0:
             return _packed_attention_paged_flash(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
         return _packed_attention_materialized_flash(
             q, cache, layer_idx, cu_seqlens_q, softmax_scale

@@ -10,6 +10,7 @@ An open-source LLM inference engine built from scratch in Python and Triton, imp
 * **Prefix caching**: chained-hash, block-granular, refcounted LRU. Repeat or shared-prefix prompts skip prefill on the cached prefix; opt-in via `prefix_cache=True`. Verified token-for-token against the no-cache path.
 * **Weight-only INT8 quantization (W8A16)**: symmetric per-output-channel scales applied at load time; opt-in via `quant="int8"`. Drops model-weight HBM by ~30% on Qwen2.5-0.5B with cosine-sim > 0.99 on logits and first-token greedy parity preserved. Forward dispatches to a fused Triton W8A16 GEMM kernel on CUDA — keeps weights in INT8 in HBM and dequants tile-by-tile in registers, skipping the bf16-weight HBM round-trip the naive path pays.
 * **Speculative decoding** (vanilla two-model, greedy V1): small draft model proposes K tokens, large target verifies them in one forward, accept-reject emits target's argmax sequence. `PagedKVCache.truncate_to` rolls back on rejections. 1.14x decode throughput on Qwen2.5-7B target + 0.5B draft on A10 at bf16; the regime is constrained by the modest target/draft size ratio (the same implementation scales to the published 1.5–2x range at 70B+ on Hopper).
+* **TurboQuant KV cache** (V1, rotation + 4-bit, materialize-on-read): per-layer random orthogonal rotation + per-block asymmetric 4-bit quant of K/V before storage. Opt-in via `kv_quant="turbo4"`. ~62% persistent KV memory savings on Qwen2.5-0.5B and 7B; full token-for-token parity on 0.5B (V1 cuts surface as 7B accuracy degradation, addressed by V3). Throughput regresses heavily until V2's fused dequant-attention kernel lands.
 * **Triton decode kernel** (single-request and batched variants) with online-softmax accumulation, validated against a PyTorch reference within cosine similarity > 0.99.
 * **OpenAI-compatible HTTP API** (`/v1/completions`) with both non-streaming responses and SSE streaming.
 * **Sampler** with greedy, temperature, top-k, top-p; pure-logic unit tests.
@@ -109,6 +110,7 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 * [ADR-010](docs/decisions/ADR-010-int8-weight-quant.md): weight-only INT8 quantization (W8A16)
 * [ADR-011](docs/decisions/ADR-011-speculative-decoding.md): speculative decoding (vanilla two-model, greedy, single-request)
 * [ADR-012](docs/decisions/ADR-012-fused-int8-kernel.md): fused W8A16 Triton kernel for `Int8Linear`
+* [ADR-013](docs/decisions/ADR-013-turboquant-kv.md): TurboQuant KV cache (V1 — rotation + 4-bit)
 
 ## Tests
 

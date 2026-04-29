@@ -75,6 +75,7 @@ class ModelRunner:
         prefix_cache: bool = False,
         quant: str | None = None,
         quant_lm_head: bool = False,
+        kv_quant: str | None = None,
     ) -> "ModelRunner":
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
@@ -104,6 +105,7 @@ class ModelRunner:
             dtype=actual_dtype,
             device=resolved,
             prefix_cache=prefix_cache_obj,
+            kv_quant=kv_quant,
         )
 
         # Apply the architecture-specific attention patch. The patched forward
