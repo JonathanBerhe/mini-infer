@@ -131,7 +131,29 @@ class ModelRunner:
         cu_seqlens_q: list[int],
         position_offsets: list[int],
     ) -> list[torch.Tensor]:
-        """Run ONE packed-varlen forward over `cache.batch_size` requests.
+        """Run ONE packed-varlen forward; return last-position logits per request.
+
+        See `forward_step_packed` for the underlying packed-logits path. This
+        helper slices the last position per request and is the standard entry
+        point for the scheduler.
+        """
+        packed_logits = self.forward_step_packed(
+            cache, packed_input_ids, cu_seqlens_q, position_offsets
+        )
+        per_request_logits: list[torch.Tensor] = []
+        for batch_idx in range(cache.batch_size):
+            last_pos = cu_seqlens_q[batch_idx + 1] - 1
+            per_request_logits.append(packed_logits[0, last_pos, :])
+        return per_request_logits
+
+    def forward_step_packed(
+        self,
+        cache: PagedKVCache,
+        packed_input_ids: list[int],
+        cu_seqlens_q: list[int],
+        position_offsets: list[int],
+    ) -> torch.Tensor:
+        """Run ONE packed-varlen forward; return the raw packed logits.
 
         Args:
             cache: shared `PagedKVCache` whose `batch_size` matches the number
@@ -146,8 +168,9 @@ class ModelRunner:
                 BEFORE this step's append.
 
         Returns:
-            A list of `(vocab_size,)` tensors, one per request, holding the
-            last-position logits.
+            A `(1, total_q, vocab_size)` tensor with logits at every q
+            position. Spec-decode's verify phase needs all K+1 positions, not
+            just the last; the standard `forward_step` slices the last one.
         """
         batch_size = cache.batch_size
         if len(position_offsets) != batch_size:
@@ -200,13 +223,8 @@ class ModelRunner:
                 cu_seqlens_q=cu_seqlens_q_t,
                 max_seqlen_q=max_seqlen_q,
             )
-
-        # out.logits is (1, total_q, vocab_size). Pull each request's last-position slice.
-        per_request_logits: list[torch.Tensor] = []
-        for batch_idx in range(batch_size):
-            last_pos = cu_seqlens_q[batch_idx + 1] - 1
-            per_request_logits.append(out.logits[0, last_pos, :])
-        return per_request_logits
+        logits: torch.Tensor = out.logits
+        return logits
 
     def prefill(self, prompt_tokens: list[int]) -> tuple[PagedKVCache, torch.Tensor]:
         """Process the full prompt in one forward; return single-request cache + last logits.

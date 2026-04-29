@@ -9,6 +9,7 @@ An open-source LLM inference engine built from scratch in Python and Triton, imp
 * **PagedAttention** with a fixed-size block pool, batch-aware `PagedKVCache`, and per-architecture monkey-patch registry (`Qwen2` shipping; the engine itself is model-agnostic via the HF `Cache` interface).
 * **Prefix caching**: chained-hash, block-granular, refcounted LRU. Repeat or shared-prefix prompts skip prefill on the cached prefix; opt-in via `prefix_cache=True`. Verified token-for-token against the no-cache path.
 * **Weight-only INT8 quantization (W8A16)**: symmetric per-output-channel scales applied at load time; opt-in via `quant="int8"`. Drops model-weight HBM by ~30% on Qwen2.5-0.5B with cosine-sim > 0.99 on logits and first-token greedy parity preserved.
+* **Speculative decoding** (vanilla two-model, greedy V1): small draft model proposes K tokens, large target verifies them in one forward, accept-reject emits target's argmax sequence. `PagedKVCache.truncate_to` rolls back on rejections. 1.14x decode throughput on Qwen2.5-7B target + 0.5B draft on A10 at bf16; the regime is constrained by the modest target/draft size ratio (the same implementation scales to the published 1.5–2x range at 70B+ on Hopper).
 * **Triton decode kernel** (single-request and batched variants) with online-softmax accumulation, validated against a PyTorch reference within cosine similarity > 0.99.
 * **OpenAI-compatible HTTP API** (`/v1/completions`) with both non-streaming responses and SSE streaming.
 * **Sampler** with greedy, temperature, top-k, top-p; pure-logic unit tests.
@@ -36,6 +37,8 @@ Prefix caching on a 15.9k-token shared system prompt + 8 unique short user quest
 Warm-cache TTFT: ~74ms vs ~11.7s (cold), a 158x reduction once the system prompt has been served once. Full report: [docs/benchmarks/2026-04-28-prefix-caching.md](docs/benchmarks/2026-04-28-prefix-caching.md).
 
 Weight-only INT8 (W8A16) on Qwen2.5-0.5B, A10: model-weight HBM drops from 1142 MiB (fp16) to 794 MiB (**−30.5%**) with cosine similarity > 0.99 on logits and first-token greedy parity preserved. Throughput is ~neutral (no FLOP savings; a fused dequant kernel is the path to compute speedup). Full report: [docs/benchmarks/2026-04-28-int8-weight-quant.md](docs/benchmarks/2026-04-28-int8-weight-quant.md).
+
+Speculative decoding on Qwen2.5-7B target + Qwen2.5-0.5B draft, A10, bf16, K=4: aggregate **1.14x** decode throughput on a 3-prompt workload, mean acceptance 2.3–3.4 / K=4 (58–85%). Below the published 1.5–2x range — that regime needs a larger target (decode HBM-bound) and bigger target/draft ratio. Full report: [docs/benchmarks/2026-04-29-speculative-decoding.md](docs/benchmarks/2026-04-29-speculative-decoding.md).
 
 ## Quickstart
 
@@ -102,6 +105,7 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 * [ADR-008](docs/decisions/ADR-008-paged-fa-varlen.md): paged FlashAttention varlen, kept as a tunable
 * [ADR-009](docs/decisions/ADR-009-prefix-caching.md): prefix caching (chained-hash, block-granular, refcounted LRU)
 * [ADR-010](docs/decisions/ADR-010-int8-weight-quant.md): weight-only INT8 quantization (W8A16)
+* [ADR-011](docs/decisions/ADR-011-speculative-decoding.md): speculative decoding (vanilla two-model, greedy, single-request)
 
 ## Tests
 

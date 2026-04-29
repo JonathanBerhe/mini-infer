@@ -390,3 +390,163 @@ def test_materialize_batched_pads_to_max_seq() -> None:
     assert torch.allclose(out_key[0, :, :3, :], torch.full_like(out_key[0, :, :3, :], 1.0))
     assert torch.allclose(out_key[0, :, 3:, :], torch.zeros_like(out_key[0, :, 3:, :]))
     assert torch.allclose(out_key[1], torch.full_like(out_key[1], 2.0))
+
+
+# ----- truncate_to tests -----
+
+
+def test_truncate_to_no_op_at_current_len() -> None:
+    """Truncating to the current length is a no-op; nothing is freed."""
+    pool = make_pool(block_size=4)
+    cache = make_single_request_cache(pool)
+    key, value = make_kv(7)
+    cache.update(key, value, layer_idx=0)
+    free_before = pool.num_free_blocks
+    blocks_before = list(cache.block_ids_for_request(0))
+    cache.truncate_to(0, 7)
+    assert pool.num_free_blocks == free_before
+    assert cache.get_seq_length() == 7
+    assert cache.block_ids_for_request(0) == blocks_before
+
+
+def test_truncate_to_zero_clears_slot_and_returns_blocks() -> None:
+    """Truncate to 0: every block returned to the free pool; slot is empty but slot still exists."""
+    pool = make_pool(block_size=4, num_blocks=8)
+    cache = make_single_request_cache(pool)
+    key, value = make_kv(9)
+    cache.update(key, value, layer_idx=0)
+    assert pool.num_free_blocks == 8 - 3  # 9 tokens / 4 = 3 blocks
+    cache.truncate_to(0, 0)
+    assert pool.num_free_blocks == 8
+    assert cache.get_seq_length() == 0
+    assert cache.block_ids_for_request(0) == []
+    # The slot still exists; batch_size unchanged.
+    assert cache.batch_size == 1
+
+
+def test_truncate_to_below_block_boundary_keeps_partial_block() -> None:
+    """Truncating mid-block keeps the surviving block; only fully-out-of-range blocks are freed."""
+    pool = make_pool(block_size=4, num_blocks=8)
+    cache = make_single_request_cache(pool)
+    key, value = make_kv(10)
+    cache.update(key, value, layer_idx=0)
+    # 10 tokens => 3 blocks (block 2 is partial with 2 tokens).
+    assert len(cache.block_ids_for_request(0)) == 3
+
+    # Truncate to 5: keeps 2 blocks (block 0 full, block 1 holds position 4 only).
+    cache.truncate_to(0, 5)
+    assert cache.get_seq_length() == 5
+    assert len(cache.block_ids_for_request(0)) == 2
+    # The third block was returned to the pool.
+    assert pool.num_free_blocks == 8 - 2
+
+
+def test_truncate_to_preserves_kv_below_new_len() -> None:
+    """K/V values at positions below new_seq_len are bit-equal after truncation."""
+    pool = make_pool(block_size=4, num_blocks=8)
+    cache = make_single_request_cache(pool)
+    key, value = make_kv(8)
+    cache.update(key, value, layer_idx=0)
+
+    surviving_keys, _ = cache._materialize(layer_idx=0)
+    surviving_keys_before_trunc = surviving_keys[0, :, :5, :].clone()
+
+    cache.truncate_to(0, 5)
+
+    after_keys, _ = cache._materialize(layer_idx=0)
+    assert torch.equal(after_keys[0], surviving_keys_before_trunc)
+
+
+def test_truncate_to_rejects_growing() -> None:
+    """truncate_to must shrink; growing is a programming error."""
+    pool = make_pool(block_size=4)
+    cache = make_single_request_cache(pool)
+    key, value = make_kv(3)
+    cache.update(key, value, layer_idx=0)
+    with pytest.raises(ValueError, match="truncation only shrinks"):
+        cache.truncate_to(0, 10)
+
+
+def test_truncate_to_rejects_negative_length() -> None:
+    pool = make_pool(block_size=4)
+    cache = make_single_request_cache(pool)
+    with pytest.raises(ValueError, match="must be non-negative"):
+        cache.truncate_to(0, -1)
+
+
+def test_truncate_to_rejects_bad_batch_idx() -> None:
+    pool = make_pool(block_size=4)
+    cache = make_single_request_cache(pool)
+    with pytest.raises(IndexError, match="out of range"):
+        cache.truncate_to(5, 0)
+
+
+def test_truncate_to_with_prefix_cache_decrefs_published_blocks() -> None:
+    """Freed blocks that lived in the prefix cache go through decref, not direct free."""
+    from mini_infer.cache.prefix_cache import PrefixCache
+
+    block_size = 4
+    prefix_cache = PrefixCache(block_size=block_size)
+    pool = BlockPool(
+        num_blocks=8,
+        block_size=block_size,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device="cpu",
+        prefix_cache=prefix_cache,
+    )
+    # Slot with a 2-block prompt; both blocks get published as we fill them.
+    cache = PagedKVCache(pool)
+    prompt = list(range(8))  # exactly 2 full blocks worth
+    cache.add_request_slot(prompt_token_ids=prompt)
+    key, value = make_kv(8)
+    cache.update(key, value, layer_idx=0)
+    cache._publish_filled_blocks(0)
+    assert prefix_cache.num_cached == 2
+    assert prefix_cache.num_evictable == 0  # both held by the slot
+
+    # Append one decode-time token (position 8) to allocate a 3rd, NOT-published block.
+    extra_k, extra_v = make_kv(1)
+    cache.update(extra_k, extra_v, layer_idx=0)
+    assert len(cache.block_ids_for_request(0)) == 3
+
+    # Truncate to 8 (exactly the published-prefix length): the 3rd block (un-published)
+    # goes back to the pool's free list directly.
+    free_before = pool.num_free_blocks
+    cache.truncate_to(0, 8)
+    assert pool.num_free_blocks == free_before + 1  # the un-published block returned
+    # Published blocks remain in the cache; refcounts unchanged.
+    assert prefix_cache.num_cached == 2
+    assert prefix_cache.num_evictable == 0
+
+
+def test_truncate_to_refuses_inside_published_block() -> None:
+    """Truncating into a published block would corrupt cached K/V on next append."""
+    from mini_infer.cache.prefix_cache import PrefixCache
+
+    block_size = 4
+    prefix_cache = PrefixCache(block_size=block_size)
+    pool = BlockPool(
+        num_blocks=8,
+        block_size=block_size,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device="cpu",
+        prefix_cache=prefix_cache,
+    )
+    cache = PagedKVCache(pool)
+    prompt = list(range(8))
+    cache.add_request_slot(prompt_token_ids=prompt)
+    key, value = make_kv(8)
+    cache.update(key, value, layer_idx=0)
+    cache._publish_filled_blocks(0)
+    # Two full prompt blocks now published. Truncating below 8 lands inside
+    # one of them; refuse.
+    with pytest.raises(ValueError, match="published prompt block"):
+        cache.truncate_to(0, 5)
+    # State unchanged.
+    assert cache.get_seq_length() == 8
