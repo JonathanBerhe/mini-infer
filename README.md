@@ -38,7 +38,7 @@ Warm-cache TTFT: ~74ms vs ~11.7s (cold), a 158x reduction once the system prompt
 
 Weight-only INT8 (W8A16) on Qwen2.5-0.5B, A10: model-weight HBM drops from 1142 MiB (fp16) to 794 MiB (**−30.5%**) with cosine similarity > 0.99 on logits and first-token greedy parity preserved. Throughput is ~neutral (no FLOP savings; a fused dequant kernel is the path to compute speedup). Full report: [docs/benchmarks/2026-04-28-int8-weight-quant.md](docs/benchmarks/2026-04-28-int8-weight-quant.md).
 
-Speculative decoding on Qwen2.5-7B target + Qwen2.5-0.5B draft, A10, bf16, K=4: aggregate **1.14x** decode throughput on a 3-prompt workload, mean acceptance 2.3–3.4 / K=4 (58–85%). Below the published 1.5–2x range — that regime needs a larger target (decode HBM-bound) and bigger target/draft ratio. Full report: [docs/benchmarks/2026-04-29-speculative-decoding.md](docs/benchmarks/2026-04-29-speculative-decoding.md).
+Speculative decoding on Qwen2.5-7B target + Qwen2.5-0.5B draft, bf16, K=4: aggregate **1.14x on A10**, **1.00x on H100** vs target-alone greedy on a 3-prompt workload. Mean acceptance 2.3–3.4 / K=4 (58–85%). Below the published 1.5–2x range; the H100 result is the more interesting finding — faster baseline decode on Hopper *narrows* the win at this target size rather than widening it (1.29x on the longest prompt, 0.83x on the shorter ones). Full report: [docs/benchmarks/2026-04-29-speculative-decoding.md](docs/benchmarks/2026-04-29-speculative-decoding.md).
 
 ## Quickstart
 

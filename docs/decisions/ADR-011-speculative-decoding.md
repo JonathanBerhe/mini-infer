@@ -164,21 +164,23 @@ it was accepted.)
   produces 100% acceptance and parity vs target-alone greedy across 3
   prompts. Synthetic-divergent-draft test produces 0% acceptance and same
   parity (bonus mechanism corrects each step).
-- **CUDA (A10, Qwen2.5-7B target + Qwen2.5-0.5B draft, bf16, K=4)**:
-  aggregate throughput **1.14x** vs target-alone greedy on a 3-prompt
-  workload, mean acceptance 2.3–3.4 / K=4 (58–85%). One of three prompts
-  showed bf16-drift token divergence vs target-alone exact baseline (≤1
-  flipped token / 32 emitted) — expected at bf16 with q_len=5 verify
-  matmul vs q_len=1 decode matmul; fp32 M1 reference holds parity
-  exactly. Numbers in `docs/benchmarks/2026-04-29-speculative-decoding.md`.
+- **CUDA (A10 + H100, Qwen2.5-7B target + Qwen2.5-0.5B draft, bf16, K=4)**:
+  aggregate throughput **1.14x on A10**, **1.00x on H100** vs target-alone
+  greedy. Mean acceptance 2.3–3.4 / K=4 (58–85%), identical across GPUs
+  (greedy argmax is deterministic). On A10, one of three prompts had
+  bf16-drift token divergence vs target-alone exact baseline (≤1 flipped
+  token / 32); H100 matched all three exactly. Numbers in
+  `docs/benchmarks/2026-04-29-speculative-decoding.md`.
 
-The 1.14x is below the 1.5x plan target — hardware regime and model-size
-ratio, not an algorithm bug. At 7B target on A10, verify-at-q_len=5 is
-~3x decode wall time (Ampere becomes compute-bound at q_len > 1) and
-draft cost (0.5B at K=4) is a non-trivial fraction of the iteration
-budget. The same mechanism on a 70B target + smaller-relative draft on
-Hopper would close the gap to the published 1.5–2x range; the
-implementation here is the same one that scales there.
+Below the 1.5x plan target on both GPUs. **Hopper does not amplify the
+win at this target size — it narrows it.** Faster baseline decode on
+H100 erodes the per-iteration overhead amortization: spec wins 1.29x on
+the longest / lowest-acceptance prompt but loses 0.83x on the shorter
+ones, netting ~1.00x. This is regime-dependent behavior, not an algorithm
+bug; the same `SpeculativeRunner` + `truncate_to` + `forward_step_packed`
+would deliver the published 1.5–2x at 70B+ target size, where decode
+stays HBM-bound at q_len > 1 and the draft is a much smaller fraction of
+iteration cost.
 
 ## Pointers
 
