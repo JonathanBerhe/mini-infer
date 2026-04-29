@@ -14,6 +14,9 @@ Configurations (selected via the `config` arg of the local entrypoint):
   (`target_prompt_tokens`, default 12000) so the cache hit pays off visibly.
 - **quant**: weight-only INT8 (W8A16) vs fp16 baseline. Reports model-weight
   HBM footprint and a small concurrent throughput sweep on a moderate prompt.
+- **spec**: greedy speculative decoding (Qwen2.5-7B target + Qwen2.5-0.5B
+  draft). Reports target-alone vs spec-decode tokens/sec, mean acceptance
+  per iteration, target forwards saved.
 
 CLI flags:
 
@@ -40,6 +43,7 @@ Examples:
     uv run modal run scripts/modal_packed_bench.py --config holb
     uv run modal run scripts/modal_packed_bench.py --config prefix
     uv run modal run scripts/modal_packed_bench.py --config quant
+    uv run modal run scripts/modal_packed_bench.py --config spec
 """
 
 import itertools
@@ -611,7 +615,115 @@ def _run_quant_bench(
     return "\n".join(lines)
 
 
-@app.function(image=image, gpu=_BENCH_GPU, timeout=1800)
+def _run_spec_bench(
+    target_model: str,
+    draft_model: str,
+    prompts: list[str],
+    max_tokens: int,
+    K: int,  # noqa: N803 (canonical name in the spec-decode literature)
+) -> str:
+    """Greedy speculative decoding (target + draft) vs target-alone greedy.
+
+    Loads both models on the same container, runs each prompt through:
+      - target-alone greedy (timed)
+      - spec-decode greedy (timed, with `SpecStats`)
+
+    Outputs a per-prompt table plus aggregate summary: tokens/sec, mean
+    acceptance per iteration, ratio of target forwards saved.
+    """
+    import torch
+
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.speculative import SpeculativeRunner
+
+    target = ModelRunner.from_pretrained(target_model)
+    draft = ModelRunner.from_pretrained(draft_model)
+    spec = SpeculativeRunner(target, draft, K=K)
+
+    def _target_alone_greedy(prompt: str) -> tuple[list[int], float]:
+        cache = PagedKVCache(target.block_pool)
+        batch_idx = cache.add_request_slot()
+        eos = target.tokenizer.eos_token_id
+        try:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            prompt_ids = target.tokenizer.encode(prompt)
+            packed = target.forward_step_packed(cache, prompt_ids, [0, len(prompt_ids)], [0])
+            next_tok = int(packed[0, -1, :].argmax().item())
+            out = [next_tok]
+            seq_len = len(prompt_ids)
+            while len(out) < max_tokens and next_tok != eos:
+                logits_list = target.forward_step(cache, [next_tok], [0, 1], [seq_len])
+                next_tok = int(logits_list[0].argmax().item())
+                out.append(next_tok)
+                seq_len += 1
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+            return out[:max_tokens], elapsed
+        finally:
+            cache.remove_request(batch_idx)
+
+    rows: list[dict[str, Any]] = []
+    for prompt in prompts:
+        baseline_tokens, baseline_s = _target_alone_greedy(prompt)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        spec_tokens, spec_stats = spec.run_greedy(prompt, max_tokens=max_tokens)
+        torch.cuda.synchronize()
+        spec_s = time.perf_counter() - t0
+
+        match = spec_tokens == baseline_tokens
+        rows.append(
+            {
+                "prompt": prompt[:32],
+                "n_tok_base": len(baseline_tokens),
+                "base_s": round(baseline_s, 3),
+                "base_tok_s": round(len(baseline_tokens) / baseline_s, 2),
+                "n_tok_spec": len(spec_tokens),
+                "spec_s": round(spec_s, 3),
+                "spec_tok_s": round(len(spec_tokens) / spec_s, 2),
+                "speedup": round(baseline_s / spec_s, 2),
+                "iters": spec_stats.n_iterations,
+                "mean_acc": round(spec_stats.mean_acceptance_per_iter, 2),
+                "tgt_fwds": spec_stats.n_target_forwards,
+                "match": "yes" if match else "NO",
+            }
+        )
+
+    # Aggregate.
+    total_base_s = sum(r["base_s"] for r in rows)
+    total_spec_s = sum(r["spec_s"] for r in rows)
+    total_base_tok = sum(r["n_tok_base"] for r in rows)
+    total_spec_tok = sum(r["n_tok_spec"] for r in rows)
+
+    lines: list[str] = [
+        f"target={target_model} | draft={draft_model} | K={K} | max_tokens={max_tokens}",
+        "",
+    ]
+    header = (
+        f"  {'prompt':<32}  {'base s':>7}  {'base t/s':>9}  "
+        f"{'spec s':>7}  {'spec t/s':>9}  {'x':>5}  {'iters':>5}  "
+        f"{'mean_acc':>9}  {'match':>6}"
+    )
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for r in rows:
+        lines.append(
+            f"  {r['prompt']:<32}  {r['base_s']:>7}  {r['base_tok_s']:>9}  "
+            f"{r['spec_s']:>7}  {r['spec_tok_s']:>9}  {r['speedup']:>5}  "
+            f"{r['iters']:>5}  {r['mean_acc']:>9}  {r['match']:>6}"
+        )
+    lines.append("")
+    lines.append(
+        f"  aggregate: base={total_base_s:.2f}s ({total_base_tok / total_base_s:.1f} t/s)  "
+        f"spec={total_spec_s:.2f}s ({total_spec_tok / total_spec_s:.1f} t/s)  "
+        f"speedup={total_base_s / total_spec_s:.2f}x"
+    )
+    return "\n".join(lines)
+
+
+@app.function(image=image, gpu=_BENCH_GPU, timeout=3600)
 def run_bench(
     config: str,
     model: str,
@@ -623,6 +735,9 @@ def run_bench(
     chunk_size: int,
     workload: str,
     target_prompt_tokens: int,
+    spec_target_model: str,
+    spec_draft_model: str,
+    spec_K: int,  # noqa: N803 (canonical name in the spec-decode literature)
 ) -> str:
     """Modal entry point. Single function; selects internal path by `config`."""
     import torch
@@ -636,6 +751,24 @@ def run_bench(
     header = (
         f"GPU: {gpu_name} | flash_attn={fa_available} | block_size={block_size} | model={model}"
     )
+
+    if config == "spec":
+        spec_prompts = [
+            (
+                "Explain the concept of recursion in programming, "
+                "with a short example. Use plain prose, no code blocks."
+            ),
+            ('def fibonacci(n: int) -> int:\n    """Return the n-th Fibonacci number."""\n'),
+            ("Q: What are the four base pairs of DNA, and how do they pair?\nA:"),
+        ]
+        body = _run_spec_bench(
+            target_model=spec_target_model,
+            draft_model=spec_draft_model,
+            prompts=spec_prompts,
+            max_tokens=max_tokens,
+            K=spec_K,
+        )
+        return f"\n{header}\n\n=== Speculative decoding ===\n{body}\n"
 
     if config == "quant":
         # `quant` builds its own runners (one per quant mode); skip the
@@ -720,7 +853,7 @@ def run_bench(
         )
 
     raise ValueError(
-        f"unknown config={config!r}; expected smoke|throughput|holb|sweep|prefix|quant"
+        f"unknown config={config!r}; expected smoke|throughput|holb|sweep|prefix|quant|spec"
     )
 
 
@@ -736,6 +869,9 @@ def main(
     chunk_size: int = 32,
     workload: str = "short",
     target_prompt_tokens: int = 12000,
+    spec_target_model: str = "Qwen/Qwen2.5-7B-Instruct",
+    spec_draft_model: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    spec_k: int = 4,
 ) -> None:
     # GPU is set via the MINI_INFER_BENCH_GPU env var (see _BENCH_GPU above).
     # Default A10. Modal 1.4 removed runtime gpu overrides on Function.
@@ -751,5 +887,8 @@ def main(
             chunk_size=chunk_size,
             workload=workload,
             target_prompt_tokens=target_prompt_tokens,
+            spec_target_model=spec_target_model,
+            spec_draft_model=spec_draft_model,
+            spec_K=spec_k,
         )
     )

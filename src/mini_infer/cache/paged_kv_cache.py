@@ -108,6 +108,53 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._slot_num_published.pop(batch_idx)
         self._slot_parent_hash.pop(batch_idx)
 
+    def truncate_to(self, batch_idx: int, new_seq_len: int) -> None:
+        """Roll back this slot to `new_seq_len`; free blocks beyond the new boundary.
+
+        Frees blocks whose entire token range lies past `new_seq_len`. The
+        block that contains `new_seq_len` is kept (its tail K/V values become
+        stale and will be overwritten by the next append).
+
+        Idempotent at the current length. Raises `ValueError` if asked to
+        grow, or if the truncation would land inside a published prompt block
+        (the block's K/V is shared with other slots via the prefix cache; we
+        can't rewrite part of it on a later append without corrupting the
+        cached entry).
+
+        Common use: speculative decoding rolls back after rejected draft
+        candidates. Spec-decode only truncates within decode-time blocks
+        (never published), so the published-block guard never trips in that
+        flow; it's a safety net for general use.
+        """
+        if not 0 <= batch_idx < self.batch_size:
+            raise IndexError(f"batch_idx={batch_idx} out of range for batch_size={self.batch_size}")
+        current = self._num_tokens[batch_idx]
+        if new_seq_len < 0:
+            raise ValueError(f"new_seq_len={new_seq_len} must be non-negative")
+        if new_seq_len > current:
+            raise ValueError(
+                f"truncate_to(new_seq_len={new_seq_len}) > current {current}; "
+                "truncation only shrinks"
+            )
+        if new_seq_len == current:
+            return
+
+        block_size = self._pool.block_size
+        published_threshold = self._slot_num_published[batch_idx] * block_size
+        if new_seq_len < published_threshold:
+            raise ValueError(
+                f"truncate_to(new_seq_len={new_seq_len}) lands inside a published "
+                f"prompt block (published_threshold={published_threshold}); refusing "
+                "to avoid corrupting the cache entry's K/V"
+            )
+
+        required_blocks = (new_seq_len + block_size - 1) // block_size
+        blocks_to_free = self._block_ids[batch_idx][required_blocks:]
+        self._block_ids[batch_idx] = self._block_ids[batch_idx][:required_blocks]
+        for block_id in blocks_to_free:
+            self._pool.free(block_id)
+        self._num_tokens[batch_idx] = new_seq_len
+
     def merge_request(self, other: "PagedKVCache") -> int:
         """Absorb a single-request cache from prefill. Returns the new batch_idx in self.
 

@@ -25,3 +25,7 @@ class Tokenizer:
         if eos is None:
             raise ValueError("Tokenizer has no EOS token")
         return int(eos)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self._tokenizer.vocab_size)
