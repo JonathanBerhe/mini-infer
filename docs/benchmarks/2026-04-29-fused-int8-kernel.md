@@ -123,21 +123,32 @@ exactly where the math predicts.
 
 ## Caveats
 
-- Modal-side end-to-end token-level correctness (bf16 model decoding a
-  known prompt with int8-fused matches int8-naive) was NOT verified in
-  this run — the bench measures throughput only. The kernel ran without
-  NaN crashes and produced sensible decode counts; M1 fp32 reference
-  parity holds in unit tests. A small token-for-token Modal verification
-  is a follow-up.
-- Block-size profile is hand-picked, not autotuned. Triton autotune
-  could find better tile sizes per (M, N, K) shape, especially for the
-  0.5B regime where cuBLAS still wins.
+- Block-size profile is hand-picked, not autotuned. A `@triton.autotune`
+  attempt with `key=['M', 'N', 'K']` regressed badly because continuous
+  batching produces many distinct M values (M=1, 80, 320, 4, ...) and
+  each fired a fresh 8-config sweep that dominated the timed window
+  (0.5B C=4 dropped to 0.19x of naive, 7B C=4 to 0.46x). The proper
+  fix is a per-bucket autotune (separate decode/prefill kernels with
+  narrow `key=['N', 'K']` autotune); tracked as an ADR-012 follow-up.
 - 7B fp16 baseline not measured at A10 (memory: 14 GB fp16 + ~7 GB int8
   during the load can't coexist on a 24 GB GPU). A100-80 or H100 would
   fit both.
 - C=1 at 7B is naive's worst regime by design — single-token decode
   is fully HBM-bandwidth-bound on the weight read. The ratio at higher
   concurrency or larger sequences will be lower.
+
+## Token-level parity (verified on Modal)
+
+The `quant_kernel` bench includes a greedy parity check before the
+throughput sweeps. Confirmed exact match (same token IDs) on:
+
+- 0.5B / A10 / bf16: prompt `"The capital of France is"` →
+  ` Paris. It is the largest city in` for both naive and fused.
+- 7B / A10 / bf16: same prompt → ` Paris. Which of the following statements is`
+  for both naive and fused.
+
+Closes the original "correctness verified only on M1 fp32 reference"
+caveat.
 
 ## Reproduce
 

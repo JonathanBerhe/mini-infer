@@ -13,18 +13,22 @@ contract as cuBLAS bf16 GEMM).
 
 Two block-size profiles are selected at launch time:
 
-- **Decode profile** (M ≤ 16): `BLOCK_M=16, BLOCK_N=64, BLOCK_K=64`.
-  Triton's ``tl.dot`` requires BLOCK_M ≥ 16, so a true M=1 decode pads M
-  with masking. `num_warps=2` keeps occupancy reasonable on the small tile.
-- **Prefill profile** (M > 16): `BLOCK_M=64, BLOCK_N=64, BLOCK_K=32`.
-  Deliberately moderate so the (BLOCK_M, BLOCK_N) fp32 accumulator stays
-  well within the per-warp register budget on Ampere SMs (16 KB total at
-  4 warps); the larger 128x128 tile that's typical in cuBLAS-style
-  matmuls trips a Triton MLIR lowering assertion when combined with the
-  int8→bf16 cast inside the loop.
+- **Decode profile** (M ≤ 16): `BLOCK_M=16, BLOCK_N=64, BLOCK_K=64`,
+  `num_warps=2`. Triton's ``tl.dot`` requires BLOCK_M ≥ 16, so a true
+  M=1 decode pads M with masking.
+- **Prefill profile** (M > 16): `BLOCK_M=64, BLOCK_N=64, BLOCK_K=32`,
+  `num_warps=4`. Moderate tile that keeps the (BLOCK_M, BLOCK_N) fp32
+  accumulator within the per-warp register budget on Ampere SMs.
+
+(An attempt to add `@triton.autotune` over a wider config space
+regressed badly because the autotune key included `M`, and continuous
+batching produces many distinct M values per run, each firing a fresh
+8-config sweep. The proper fix is splitting decode and prefill into
+separate narrowly-autotuned kernels; tracked as an ADR-012 follow-up.)
 
 The kernel assumes K is divisible by `BLOCK_K`. Qwen2.5-0.5B's linear
-layers have K ∈ {896, 4864}, both multiples of 32 and 64, so this holds.
+layers have K ∈ {896, 4864}, and Qwen2.5-7B has K ∈ {896, 3584, 18944},
+all multiples of 32 and 64, so this holds for the models we benchmark.
 For models with K not BLOCK_K-aligned, pad K externally or reintroduce
 K masking.
 
@@ -207,7 +211,12 @@ def fused_w8a16_linear(
 
     # Block-size profile + warp count selected per regime. Sized to keep the
     # fp32 accumulator (BLOCK_M * BLOCK_N elements) inside the per-warp
-    # register budget on Ampere SMs.
+    # register budget on Ampere SMs. (An earlier iteration tried
+    # `@triton.autotune` keyed on `(M, N, K)`; it regressed badly because
+    # M varies per call in continuous batching, and every new M value
+    # triggered a fresh 8-config sweep that dominated runtime. See ADR-012
+    # follow-ups: the fix is to split decode and prefill into two narrowly-
+    # autotuned kernels, but hand-picked tiles ship until that lands.)
     if m_dim <= 16:
         # Decode (M ≤ 16): tiny M tile, 2 warps. Accumulator 16*64 = 4 KB total.
         block_m, block_n, block_k = 16, 64, 64

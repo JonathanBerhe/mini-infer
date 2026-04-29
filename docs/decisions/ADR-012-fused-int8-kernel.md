@@ -167,12 +167,14 @@ delivers when the workload moves into its target regime.
     workload isn't HBM-bound at 0.5B).
   - Qwen2.5-7B: fused **2.74/1.65/1.47x** naive at C=1/4/8.
   - Numbers in `docs/benchmarks/2026-04-29-fused-int8-kernel.md`.
-- **Modal-side token-level correctness** (bf16 decode produces the
-  same tokens as the naive path): not verified end-to-end in this
-  slice. The kernel runs without crash and produces sensible decode
-  counts; M1 fp32 reference parity in `tests/unit/test_int8_kernel.py`
-  is the strict correctness oracle. Adding a parity assert to the
-  bench is a small follow-up.
+- **Modal-side token-level correctness verified**. The
+  `quant_kernel` bench now runs a greedy parity check (same prompt,
+  naive vs fused dispatch on the same int8 model) before the
+  throughput sweeps. Confirmed match on:
+  - Qwen2.5-0.5B / A10 / bf16: `[12095, 13, 1084, 374, 279, 7772, 3283, 304]`
+    = " Paris. It is the largest city in" — naive == fused, exact.
+  - Qwen2.5-7B / A10 / bf16: `[12095, 13, 15920, 315, 279, 2701, 12239, 374]`
+    = " Paris. Which of the following statements is" — naive == fused, exact.
 
 ## Pointers
 
@@ -186,11 +188,22 @@ delivers when the workload moves into its target regime.
 
 ## Follow-ups
 
-- **Modal-side token parity check** in the bench (compare first-emitted
-  token between naive and fused on a fixed prompt; assert match within
-  bf16 noise). Cheap; closes the correctness gap.
-- **Triton autotune** across `BLOCK_M / BLOCK_N / BLOCK_K / num_warps`.
-  Likely closes the 0.5B gap and may add another 10–20% at 7B.
+- **Triton autotune attempted, reverted (regression)**. Wrapping the
+  kernel in `@triton.autotune` over an 8-config space keyed on
+  `(M, N, K)` regressed throughput badly at C=4/C=8 on both 0.5B
+  (0.19x/0.29x of naive) and 7B (0.46x/0.51x of naive). Diagnosis:
+  continuous batching produces many distinct M values per run (M=1
+  decode, M=80 single-prefill, M=320 4-way packed prefill, M=4 packed
+  decode, ...), each firing a fresh 8-config sweep, and the sweep cost
+  dominated the timed window. Hand-picked profiles ship instead, with
+  a clearer fix as a real follow-up below.
+- **M-bucketed autotune**: split into two `@triton.jit` kernels —
+  `_w8a16_decode_kernel` (autotune over small-M configs only,
+  `key=['N', 'K']`) and `_w8a16_prefill_kernel` (autotune over large-M
+  configs only, `key=['N', 'K']`). Wrapper dispatches by M. Each
+  kernel's autotune sweep fires once per (N, K), regardless of M
+  variation within the bucket. Should close the 0.5B regression and
+  give ~10% at 7B.
 - **W4A16** (4-bit weights, GPTQ/AWQ dequant). Same kernel skeleton
   with a 4-bit unpacking step in the K-loop body; biggest memory win.
 - **W8A8** (full INT8). Real Tensor-Core INT8 GEMM throughput on
