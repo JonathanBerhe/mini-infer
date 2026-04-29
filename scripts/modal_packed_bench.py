@@ -703,6 +703,39 @@ def _run_quant_kernel_bench(
     int8_runner = ModelRunner.from_pretrained(
         model, num_blocks=num_blocks, block_size=block_size, quant="int8"
     )
+
+    # Token-level parity check: greedy-decode the same prompt under naive and
+    # fused dispatch on the same int8 model; compare token IDs. Closes the
+    # ADR-012 "Modal-side correctness not verified" gap. Runs BEFORE the
+    # throughput sweeps so we surface mismatches early.
+    parity_prompt = "The capital of France is"
+    parity_max_tokens = 8
+
+    def _greedy_tokens(label: str, runner: Any) -> list[int]:
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            r = sched.run(
+                Request(
+                    prompt=parity_prompt,
+                    sampling_params=SamplingParams(),
+                    max_tokens=parity_max_tokens,
+                )
+            )
+        finally:
+            sched.stop()
+        print(f"  [parity {label}] tokens={r.tokens} text={r.text!r}")
+        return list(r.tokens)
+
+    int8_kernel._FUSED_DISABLED_FOR_BENCH = True
+    naive_tokens = _greedy_tokens("int8-naive", int8_runner)
+    int8_kernel._FUSED_DISABLED_FOR_BENCH = False
+    fused_tokens = _greedy_tokens("int8-fused", int8_runner)
+    parity_match = naive_tokens == fused_tokens
+    parity_line = (
+        f"naive_tokens={naive_tokens}\n  fused_tokens={fused_tokens}\n  match={parity_match}"
+    )
+
     int8_kernel._FUSED_DISABLED_FOR_BENCH = True
     naive_results = _sweep("int8-naive", int8_runner)
 
@@ -717,6 +750,10 @@ def _run_quant_kernel_bench(
     # Format report.
     lines: list[str] = [
         f"model={model} | prompt_chars={len(prompt)} | max_tokens={max_tokens}",
+        "",
+        "Token-level parity (int8-naive vs int8-fused, same model, greedy):",
+        f"  prompt={parity_prompt!r}",
+        f"  {parity_line}",
         "",
         "Throughput (warmup + N concurrent requests):",
     ]
