@@ -186,6 +186,27 @@ def test_quantize_model_to_int8_custom_skip_set() -> None:
     assert isinstance(model.v_proj, Int8Linear)
 
 
+def test_int8_linear_cpu_does_not_attempt_fused_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On CPU, forward must NOT call the fused kernel (which would crash)."""
+    import mini_infer.quant.int8_kernel as kernel_mod
+
+    calls: list[int] = []
+
+    def _spy(*args: object, **kwargs: object) -> None:
+        calls.append(1)
+        raise AssertionError("fused kernel must not be called from a CPU forward")
+
+    monkeypatch.setattr(kernel_mod, "fused_w8a16_linear", _spy)
+
+    fp_linear = nn.Linear(8, 16, bias=True).float()
+    int8_linear = Int8Linear.from_float(fp_linear)
+    x = torch.randn(2, 8)  # CPU
+    out = int8_linear(x)
+
+    assert out.shape == (2, 16)
+    assert calls == []
+
+
 def test_quantize_model_to_int8_handles_nested_modules() -> None:
     """Linears inside child modules are reachable via `get_submodule`."""
 
