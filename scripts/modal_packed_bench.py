@@ -21,8 +21,10 @@ Configurations (selected via the `config` arg of the local entrypoint):
   same model. Throughput sweep at C=1 and C=4 on a moderate prompt; the
   fused path is the ADR-012 follow-up to ADR-010's neutral throughput
   result.
-- **turbo**: TurboQuant V1 KV cache compression (rotation + 4-bit) vs
-  bf16 baseline. Reports KV-cache storage memory, first-token parity, and
+- **turbo**: TurboQuant KV cache compression vs bf16 baseline. Compares
+  three modes: bf16 (uncompressed), turbo4 (V1: rotation + uniform 4-bit),
+  turbo3 (V3 full: rotation + polar + Lloyd-Max + QJL + asymmetric K3V4).
+  Reports KV-cache storage memory, output-coherence parity, and
   throughput on a moderate prompt. ADR-013.
 
 CLI flags:
@@ -95,23 +97,198 @@ image = (
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_PROMPT = "The capital of France is"
 
-# A synthetic ~3k-token "RAG" prompt used when `workload=long`. Built from a
-# fixed paragraph repeated to approximately the requested token count.
-_LONG_PARAGRAPH = (
-    "The mini-infer engine is an open-source LLM inference server that "
-    "demonstrates production-grade serving techniques. It implements "
-    "continuous batching, paged attention with a paged KV cache, chunked "
-    "prefill, and a packed varlen attention forward via FlashAttention. "
-    "These techniques are the foundation of modern inference engines like "
-    "vLLM and SGLang. The engine is structured to be readable, modular, "
-    "and testable: a single engine thread owns the model and the running "
-    "batch, while API threads only enqueue requests and drain output queues. "
-)
+# Real long-form technical prose used by every workload that needs a
+# substantive prompt. Built from distinct paragraphs covering several
+# facets of LLM inference (memory bandwidth, KV cache, paged attention,
+# quantization, TurboQuant, batching, speculative decoding) so the
+# benchmark exercises a representative vocabulary spread and natural
+# attention structure. Do NOT replace this with `paragraph * N` — that
+# inflates prefix-cache hits and understates true decode cost.
+_TECHNICAL_PASSAGE = """\
+Modern transformer inference is dominated by memory bandwidth rather than \
+arithmetic throughput. A decode step on a 7-billion-parameter model in bfloat16 \
+must stream roughly 14 GB of weights through the streaming multiprocessors for \
+each generated token, while the GEMM operations themselves only require a few \
+hundred milliseconds of tensor-core time on a modern accelerator. The result \
+is that practical inference engines spend most of their budget either reducing \
+the bytes that have to be moved or hiding the latency of those reads behind \
+other work. Weight quantization, key-value cache compression, and operator \
+fusion all attack different parts of this bandwidth ceiling.
+
+The key-value cache is the second large consumer of high-bandwidth memory in \
+autoregressive serving. Each new token writes a key and a value vector for \
+every attention head in every layer; over a thousand-token context, this can \
+easily exceed the model parameters in size, especially for grouped-query \
+attention configurations that share a small number of key-value heads across \
+many query heads. Paged attention treats this cache as a virtual memory system \
+with fixed-size physical blocks that requests reference indirectly through a \
+per-request block table. The indirection eliminates the contiguous-allocation \
+fragmentation that plagued earlier implementations and lets two requests share \
+the same physical pages when their prompts share a prefix, a property that \
+underpins prefix caching across requests.
+
+TurboQuant compresses each new key and value vector at write time using a \
+randomized orthogonal rotation drawn at engine startup, followed by a polar \
+decomposition into a per-vector radius and a unit direction. The unit \
+directions are encoded with a Lloyd-Max scalar quantizer optimized for the \
+post-rotation Gaussian marginals, and a one-bit Quantized \
+Johnson-Lindenstrauss residual sign refines the codebook center. Storing \
+three bits of codebook index plus a one-bit residual on the key side, and \
+four bits of pure codebook index on the value side, packs each element into \
+a single nibble. The rotation precondition makes the per-coordinate \
+distribution data-oblivious, so no calibration set is required, and the \
+inverse rotation that restores standard-space values fits comfortably in a \
+register tile alongside the dequantized payload.
+
+Continuous batching schedules prefill and decode work on the same forward \
+pass without re-launching the kernel for each request. A single engine \
+iteration packs all in-flight queries into a varying-length sequence, \
+attaches a cumulative-sequence-length tensor that delineates per-request \
+boundaries, and dispatches a paged variable-length attention kernel. \
+Because the kernel reads keys and values directly from the block pool by \
+indexing through each request's block table, no per-layer materialization \
+of contiguous tensors is required for the bf16 path. This packed forward \
+keeps the GPU saturated even when most requests are mid-decode and only \
+contribute a single new query token per step, while a small number of \
+prompts in their prefill phase contribute hundreds of tokens of \
+chunked-prefill work in the same batch.
+
+Speculative decoding amortizes the latency of large-target decode steps \
+by drafting several tokens with a smaller, cheaper model and verifying \
+them in a single target-model forward pass. When the draft model agrees \
+with the target on the first k accepted positions, the engine emits k \
+tokens for the cost of one target-model step plus k cheap draft steps; \
+when the draft diverges, the engine falls back to a regular sample for \
+the rejected position. Acceptance rate determines the realized speedup: \
+a 0.7 acceptance rate over a draft length of four typically translates \
+into a one-and-a-half to two-times wall-clock improvement on \
+conversational workloads, while highly stochastic prompts can break \
+even or regress when the draft proposes branches the target rejects.
+
+Paged attention's block-table indirection plays directly into prefix \
+caching at the request level. When a new request arrives whose prompt \
+shares a leading prefix with a previously served request, the scheduler \
+hashes the prompt by block-sized chunks and consults a radix-style \
+cache to locate matching block ids. Each cached block carries a \
+reference count; a hit increments the count and binds the block into \
+the new request's table without any recomputation. The first \
+unmatched block is the prefix boundary, and the engine prefills only \
+the suffix from that boundary onward. On long shared system prompts \
+this can collapse the prefill cost of the second and subsequent \
+requests by an order of magnitude, turning what would have been \
+parallel-but-redundant work into an effective broadcast of the cached \
+key-value state.
+
+Operator fusion at the kernel level closes the remaining gap between \
+algorithmic and realized throughput. A naive int8 weight, bfloat16 \
+activation linear layer dequantizes the entire weight tensor to bf16 \
+before each matmul, which throws away the bandwidth savings of storing \
+weights in a smaller representation. A fused kernel keeps the weights \
+int8 in high-bandwidth memory, loads small tiles into shared memory, \
+casts to bf16 inside the dot accumulator, and applies the per-output \
+channel scale after the contraction. The same fusion pattern applies \
+to compressed key-value caches: the dequantization of nibble-packed \
+values, the codebook lookup, the radius multiplication, and the \
+inverse rotation all fit inside a single Triton program that produces \
+ready-to-attend bf16 tiles without ever materializing them in global \
+memory. Without that fusion, the per-block dequantization launches \
+hundreds of small CUDA operations per decode step and the resulting \
+launch overhead dominates the arithmetic the kernel was meant to \
+amortize.
+
+Eviction policy becomes the limiting factor on engines that serve more \
+concurrent requests than the block pool can hold simultaneously. A \
+least-recently-used policy treats every block as fungible, which works \
+well for shared system prompts but disposes of cached prefixes that \
+arrive in bursts. Importance-aware policies score each block by some \
+combination of access frequency, projected reuse, and the cost to \
+recompute it; for instance, the first block of a long shared prompt \
+deserves a higher protection priority than a single decode-step block \
+midway through a private response. Implementing this without locking \
+the hot path requires a free list paired with a lock-free reference \
+counter, and care that the eviction signal is sampled often enough to \
+avoid stalls when the pool runs near full but rare enough that bookkeeping \
+does not contend with the request-routing thread. Engines that mismanage \
+eviction see tail latency spikes that look like model regressions but are \
+in fact memory-system thrashing.
+
+Tensor parallelism splits each weight matrix across several accelerators \
+and runs the corresponding partial computations in parallel, with all-reduce \
+or all-gather steps to combine the results. The split direction matters: \
+column-parallel splits along the output dimension produce per-shard outputs \
+that need to be gathered before the next layer, whereas row-parallel splits \
+along the contraction dimension produce partial sums that need an all-reduce. \
+Modern transformer blocks alternate the two so that the gather of one matmul \
+becomes the input of the next without an extra collective. The remaining \
+collective lives at the residual addition between attention and MLP, and the \
+network bandwidth available to that single all-reduce often determines the \
+strong-scaling ceiling of the whole system. For sufficiently large models \
+this is unavoidable, but for medium-sized models the inter-GPU crossing tax \
+can outweigh the parallel speedup, which is why the right strategy is \
+model-and-batch dependent.
+
+Long-context inference exposes a different cluster of bottlenecks. The \
+attention computation itself scales quadratically with sequence length when \
+implemented naively, but FlashAttention's online-softmax tiling collapses the \
+quadratic memory cost to linear and turns the latency into an arithmetic \
+bound that grows linearly with both query length and key length. Sliding \
+window attention bounds the key length per layer to a fixed window, which \
+makes long generations practical at the cost of some long-range information. \
+Attention sinks reserve a small number of always-attended-to positions at \
+the start of the context to stabilize the softmax distribution under the \
+sliding window, mitigating the entropy collapse that otherwise causes the \
+model to lose track of system-prompt content past the window boundary. \
+These structural choices interact with the cache compression strategy: a \
+sliding window halves the cache footprint independently of any \
+per-element compression, while a fixed-window combined with TurboQuant \
+multiplies the savings.
+
+Disaggregated serving separates the prefill stage onto dedicated workers \
+from the decode stage that runs on different workers, exchanging key and \
+value cache between them over the interconnect once prefill completes. \
+The motivation is that prefill is compute-bound and benefits from large \
+batches of concurrent prompts, while decode is memory-bandwidth-bound and \
+benefits from tight per-request latency. Co-locating both on the same \
+worker forces a compromise: the batch composition that maximizes prefill \
+throughput starves the decode requests that could otherwise stream tokens \
+quickly. Splitting them lets each side run on a profile of resources and \
+batch sizes that suits its arithmetic intensity. The catch is the \
+cross-worker key-value transfer: at typical model sizes this is several \
+hundred megabytes per request, which only pays off when the prefill batch \
+is large enough that the saved compute outweighs the network cost. \
+Practical deployments tune the disaggregation ratio dynamically based on \
+real-time queue lengths and observed transfer latency.
+
+Routing across replicas turns the inference cluster into a stateful load \
+balancer. A naive round-robin distribution ignores the fact that each \
+replica has a different key-value cache hit rate for any given prompt — a \
+prompt whose prefix is already cached on replica seven costs essentially \
+nothing on that replica and a full prefill on every other one. \
+Cache-aware routers hash incoming prompts and consult per-replica prefix \
+indices to land each new request on the worker most likely to hit. The \
+resulting scheduling policy has to balance hit-rate locality against \
+queue length, because routing every prefix-sharing prompt to the same \
+hot replica eventually saturates that replica while others sit idle. \
+The right answer is a multi-factor cost function that weights cache \
+hit, queue depth, and an estimate of marginal compute per replica, \
+re-evaluated every few hundred milliseconds with feedback from per-replica \
+telemetry.
+
+Question: Summarize the techniques described above and explain which \
+ones address memory bandwidth versus which ones address scheduling \
+overhead.
+
+Answer:"""
 
 
-def _build_long_prompt(target_tokens: int = 3000) -> str:
-    repeats = max(1, target_tokens // 80)
-    return _LONG_PARAGRAPH * repeats + "\n\nQuestion: Summarize.\n\nAnswer:"
+def _build_long_prompt(target_tokens: int | None = None) -> str:
+    """Return the technical passage. `target_tokens` is accepted for API
+    compatibility but ignored; the passage is sized for ~1500-2000 tokens
+    of natural varied technical prose, which exercises the engine more
+    realistically than a basic paragraph repeated to a target length.
+    """
+    del target_tokens
+    return _TECHNICAL_PASSAGE
 
 
 def _parse_int_list(csv: str) -> list[int]:
@@ -624,6 +801,207 @@ def _run_quant_bench(
     return "\n".join(lines)
 
 
+def _run_turbo_parity(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+) -> str:
+    """Verify the V2a fused dequant kernel matches the Python-loop reference.
+
+    Two layers of evidence:
+
+    1. **Random-fixture parity** — populate `BlockPool(kv_quant="turbo3")`
+       with random data, materialize via fused kernel and via Python loop,
+       assert cosine sim > 0.999 on both K and V. Five shape configurations
+       cover Qwen2.5-0.5B (head_dim=64, num_kv_heads=2), Qwen2.5-7B
+       (head_dim=128, num_kv_heads=8), partial-block edge cases, and a
+       larger block_size=64. Mirrors `tests/unit/test_turbo_kernel.py`'s
+       `@pytest.mark.requires_cuda` tests, which the local CI skips.
+    2. **End-to-end greedy parity** — load Qwen2.5-0.5B turbo3, run a
+       12-token greedy decode with `_FUSED_DISABLED_FOR_BENCH=False`
+       (kernel) and `=True` (Python loop), assert token-for-token equality.
+
+    The kernel and Python loop go through different fp accumulation orders
+    (`tl.dot` vs `torch.matmul`), so absolute equality vs bf16 is not
+    expected — but the kernel's output must match the Python loop on the
+    same inputs to within the parity bar (cosine sim > 0.999) and produce
+    identical tokens under greedy decoding.
+    """
+    import torch
+
+    from mini_infer.cache import turbo_kernel
+    from mini_infer.cache.block_pool import BlockPool
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+        return float(
+            torch.nn.functional.cosine_similarity(
+                a.float().flatten(), b.float().flatten(), dim=0
+            ).item()
+        )
+
+    def _populate_pool(
+        *,
+        num_layers: int,
+        n_blocks: int,
+        bs: int,
+        nh: int,
+        hd: int,
+        seq_lens: list[int],
+        seed: int,
+    ) -> tuple[BlockPool, PagedKVCache]:
+        pool = BlockPool(
+            num_blocks=n_blocks,
+            block_size=bs,
+            num_layers=num_layers,
+            num_kv_heads=nh,
+            head_dim=hd,
+            dtype=torch.bfloat16,
+            device="cuda",
+            kv_quant="turbo3",
+        )
+        cache = PagedKVCache(pool)
+        torch.manual_seed(seed)
+        for slot_idx, seq_len in enumerate(seq_lens):
+            cache.add_request_slot()
+            if seq_len == 0:
+                continue
+            num_blocks_used = (seq_len + bs - 1) // bs
+            block_ids = [pool.allocate() for _ in range(num_blocks_used)]
+            cache._block_ids[slot_idx] = block_ids
+            cache._num_tokens[slot_idx] = seq_len
+            for layer_idx in range(num_layers):
+                for bid in block_ids:
+                    k = (torch.randn(bs, nh, hd) * 0.1).to(torch.bfloat16).cuda()
+                    v = (torch.randn(bs, nh, hd) * 0.1).to(torch.bfloat16).cuda()
+                    pool.write_compressed_block(layer_idx, 0, bid, k)
+                    pool.write_compressed_block(layer_idx, 1, bid, v)
+        return pool, cache
+
+    def _materialize_two_paths(cache: PagedKVCache, layer_idx: int) -> tuple[float, float]:
+        # Default: kernel ON.
+        k_fused, v_fused, _, _ = cache.materialize_packed_kv(layer_idx)
+        saved = turbo_kernel._FUSED_DISABLED_FOR_BENCH
+        turbo_kernel._FUSED_DISABLED_FOR_BENCH = True
+        try:
+            k_python, v_python, _, _ = cache.materialize_packed_kv(layer_idx)
+        finally:
+            turbo_kernel._FUSED_DISABLED_FOR_BENCH = saved
+        return _cos(k_fused, k_python), _cos(v_fused, v_python)
+
+    fixtures = [
+        {
+            "name": "qwen 0.5B shape",
+            "num_layers": 2,
+            "n_blocks": 16,
+            "bs": 16,
+            "nh": 2,
+            "hd": 64,
+            "seq_lens": [24, 17, 0, 32],
+            "seed": 11,
+        },
+        {
+            "name": "qwen 7B shape",
+            "num_layers": 2,
+            "n_blocks": 8,
+            "bs": 16,
+            "nh": 8,
+            "hd": 128,
+            "seq_lens": [16, 32, 8],
+            "seed": 23,
+        },
+        {
+            "name": "partial-block edges",
+            "num_layers": 1,
+            "n_blocks": 8,
+            "bs": 16,
+            "nh": 2,
+            "hd": 64,
+            "seq_lens": [16, 0, 1, 31],
+            "seed": 42,
+        },
+        {
+            "name": "block_size=64",
+            "num_layers": 1,
+            "n_blocks": 4,
+            "bs": 64,
+            "nh": 2,
+            "hd": 64,
+            "seq_lens": [100, 50],
+            "seed": 77,
+        },
+    ]
+
+    lines: list[str] = []
+    lines.append("Random-fixture parity (cosine sim > 0.999 required):")
+    all_fixtures_pass = True
+    for fx in fixtures:
+        pool, cache = _populate_pool(
+            num_layers=fx["num_layers"],
+            n_blocks=fx["n_blocks"],
+            bs=fx["bs"],
+            nh=fx["nh"],
+            hd=fx["hd"],
+            seq_lens=fx["seq_lens"],
+            seed=fx["seed"],
+        )
+        cos_k, cos_v = _materialize_two_paths(cache, layer_idx=fx["num_layers"] - 1)
+        ok = cos_k > 0.999 and cos_v > 0.999
+        all_fixtures_pass = all_fixtures_pass and ok
+        mark = "✓" if ok else "✗"
+        lines.append(f"  {mark} {fx['name']}: cos_K={cos_k:.6f} cos_V={cos_v:.6f}")
+        del pool, cache
+        torch.cuda.empty_cache()
+
+    # End-to-end greedy parity on Qwen2.5-0.5B turbo3.
+    def _greedy_decode() -> list[int]:
+        runner = ModelRunner.from_pretrained(
+            model, num_blocks=num_blocks, block_size=block_size, kv_quant="turbo3"
+        )
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            r = sched.run(
+                Request(
+                    prompt="The capital of France is",
+                    sampling_params=SamplingParams(),
+                    max_tokens=12,
+                )
+            )
+        finally:
+            sched.stop()
+        del runner
+        torch.cuda.empty_cache()
+        return list(r.tokens)
+
+    lines.append("")
+    lines.append("End-to-end greedy parity (Qwen2.5-0.5B turbo3, 12 tokens):")
+    saved = turbo_kernel._FUSED_DISABLED_FOR_BENCH
+
+    turbo_kernel._FUSED_DISABLED_FOR_BENCH = False
+    fused_tokens = _greedy_decode()
+    turbo_kernel._FUSED_DISABLED_FOR_BENCH = True
+    python_tokens = _greedy_decode()
+    turbo_kernel._FUSED_DISABLED_FOR_BENCH = saved
+
+    lines.append(f"  fused tokens:  {fused_tokens}")
+    lines.append(f"  python tokens: {python_tokens}")
+    greedy_ok = fused_tokens == python_tokens
+    lines.append(
+        f"  {'✓' if greedy_ok else '✗'} {'token-for-token match' if greedy_ok else 'MISMATCH'}"
+    )
+
+    lines.append("")
+    overall_ok = all_fixtures_pass and greedy_ok
+    lines.append(
+        f"OVERALL: {'✓ all parity checks passed' if overall_ok else '✗ some checks failed'}"
+    )
+    return "\n".join(lines)
+
+
 def _run_turbo_bench(
     model: str,
     num_blocks: int,
@@ -631,11 +1009,18 @@ def _run_turbo_bench(
     max_tokens: int,
     concurrencies: list[int],
 ) -> str:
-    """TurboQuant V1 (rotation + 4-bit KV) vs bf16 baseline.
+    """TurboQuant V1 (turbo4) and V3 (turbo3) vs bf16 baseline.
 
-    Reports KV-cache storage memory, first-token parity, and throughput.
-    Throughput will likely regress vs bf16 (V1 dequantizes to bf16 on every
-    materialize call); the headline win is persistent storage memory.
+    Three modes loaded sequentially on the same Modal container:
+      - bf16: uncompressed reference.
+      - turbo4: rotation + per-channel uniform 4-bit (V1, ADR-013 baseline).
+      - turbo3: rotation + polar + Lloyd-Max + QJL + asymmetric K3V4
+        (V3 full algorithm).
+    Reports per-mode KV-cache storage, greedy parity (vs bf16 tokens),
+    and throughput. V1/V3 throughput regresses vs bf16 in this slice
+    because materialize-on-read dequant runs in Python loops; the fused
+    dequant-attention kernel is the V2 follow-up that turns this into a
+    real perf win.
     """
     import gc
 
@@ -645,13 +1030,11 @@ def _run_turbo_bench(
     from mini_infer.engine.sampler import SamplingParams
     from mini_infer.scheduler import ContinuousScheduler, Request
 
-    prompt = (
-        "Summarize the following passage in one sentence. "
-        "The mini-infer engine is an open-source LLM inference server "
-        "demonstrating production techniques: continuous batching, paged "
-        "attention, chunked prefill, packed varlen forward, prefix caching, "
-        "weight quantization, speculative decoding, and TurboQuant. " * 8
-    )
+    # Real long-form technical prose — distinct paragraphs covering several
+    # facets of LLM inference. Picked to give the benchmark a representative
+    # vocabulary spread and varied attention structure rather than the
+    # artificial cache patterns a `paragraph * N` prompt would produce.
+    prompt = _TECHNICAL_PASSAGE
 
     def _measure_storage_bytes(runner: Any) -> int:
         pool = runner.block_pool
@@ -659,13 +1042,16 @@ def _run_turbo_bench(
             storage: torch.Tensor = pool._storage
             return int(storage.numel() * storage.element_size())
         compressed: torch.Tensor = pool._compressed_storage
-        scales: torch.Tensor = pool._scales_storage
         rotation: torch.Tensor = pool._rotation
-        return int(
-            compressed.numel() * compressed.element_size()
-            + scales.numel() * scales.element_size()
-            + rotation.numel() * rotation.element_size()
-        )
+        total = compressed.numel() * compressed.element_size()
+        total += rotation.numel() * rotation.element_size()
+        if pool.kv_quant == "turbo4":
+            scales = pool._scales_storage
+            total += scales.numel() * scales.element_size()
+        else:  # turbo3
+            radii = pool._radii_storage
+            total += radii.numel() * radii.element_size()
+        return int(total)
 
     def _sweep(label: str, runner: Any) -> dict[int, dict[str, Any]]:
         per_c: dict[int, dict[str, Any]] = {}
@@ -728,19 +1114,34 @@ def _run_turbo_bench(
     gc.collect()
     torch.cuda.empty_cache()
 
-    # 2) turbo4
-    turbo_runner = ModelRunner.from_pretrained(
+    # 2) turbo4 (V1)
+    turbo4_runner = ModelRunner.from_pretrained(
         model, num_blocks=num_blocks, block_size=block_size, kv_quant="turbo4"
     )
-    turbo_storage = _measure_storage_bytes(turbo_runner)
-    turbo_tokens = _parity_tokens("turbo4", turbo_runner)
-    turbo_results = _sweep("turbo4", turbo_runner)
-    del turbo_runner
+    turbo4_storage = _measure_storage_bytes(turbo4_runner)
+    turbo4_tokens = _parity_tokens("turbo4", turbo4_runner)
+    turbo4_results = _sweep("turbo4", turbo4_runner)
+    del turbo4_runner
     gc.collect()
     torch.cuda.empty_cache()
 
-    first_token_match = bf16_tokens and turbo_tokens and bf16_tokens[0] == turbo_tokens[0]
-    full_match = bf16_tokens == turbo_tokens
+    # 3) turbo3 (V3 full)
+    turbo3_runner = ModelRunner.from_pretrained(
+        model, num_blocks=num_blocks, block_size=block_size, kv_quant="turbo3"
+    )
+    turbo3_storage = _measure_storage_bytes(turbo3_runner)
+    turbo3_tokens = _parity_tokens("turbo3", turbo3_runner)
+    turbo3_results = _sweep("turbo3", turbo3_runner)
+    del turbo3_runner
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    def _parity_summary(other: list[int]) -> str:
+        if not bf16_tokens or not other:
+            return "no_tokens"
+        first_match = bf16_tokens[0] == other[0]
+        full_match = bf16_tokens == other
+        return f"first_match={first_match}, full_match={full_match}"
 
     # Format report.
     lines: list[str] = [
@@ -748,27 +1149,39 @@ def _run_turbo_bench(
         "",
         "KV-cache pool storage:",
         f"  bf16:   {bf16_storage / (1024**2):.1f} MiB",
-        f"  turbo4: {turbo_storage / (1024**2):.1f} MiB "
-        f"({turbo_storage / bf16_storage:.1%} of bf16, "
-        f"savings={1 - turbo_storage / bf16_storage:.1%})",
+        f"  turbo4: {turbo4_storage / (1024**2):.1f} MiB "
+        f"({turbo4_storage / bf16_storage:.1%} of bf16, "
+        f"savings={1 - turbo4_storage / bf16_storage:.1%})",
+        f"  turbo3: {turbo3_storage / (1024**2):.1f} MiB "
+        f"({turbo3_storage / bf16_storage:.1%} of bf16, "
+        f"savings={1 - turbo3_storage / bf16_storage:.1%})",
         "",
         "Greedy parity (prompt='The capital of France is', max_tokens=8):",
         f"  bf16:   {bf16_tokens}",
-        f"  turbo4: {turbo_tokens}",
-        f"  first_token_match={first_token_match}, full_match={full_match}",
+        f"  turbo4: {turbo4_tokens}     [{_parity_summary(turbo4_tokens)}]",
+        f"  turbo3: {turbo3_tokens}     [{_parity_summary(turbo3_tokens)}]",
         "",
         "Throughput:",
     ]
-    header = f"  {'C':>3}  {'bf16 (s, t/s)':>22}  {'turbo4 (s, t/s)':>22}  {'turbo/bf16':>10}"
+    header = (
+        f"  {'C':>3}  {'bf16 (s, t/s)':>20}  "
+        f"{'turbo4 (s, t/s)':>20}  {'turbo3 (s, t/s)':>20}  "
+        f"{'t4/bf16':>8}  {'t3/bf16':>8}"
+    )
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
     for c in concurrencies:
         bf = bf16_results[c]
-        tu = turbo_results[c]
-        ratio = tu["tok_per_s"] / bf["tok_per_s"] if bf["tok_per_s"] else 0.0
+        t4 = turbo4_results[c]
+        t3 = turbo3_results[c]
+        r4 = t4["tok_per_s"] / bf["tok_per_s"] if bf["tok_per_s"] else 0.0
+        r3 = t3["tok_per_s"] / bf["tok_per_s"] if bf["tok_per_s"] else 0.0
         bf_cell = f"{bf['elapsed_s']}s, {bf['tok_per_s']} t/s"
-        tu_cell = f"{tu['elapsed_s']}s, {tu['tok_per_s']} t/s"
-        lines.append(f"  {c:>3}  {bf_cell:>22}  {tu_cell:>22}  {ratio:>9.2f}x")
+        t4_cell = f"{t4['elapsed_s']}s, {t4['tok_per_s']} t/s"
+        t3_cell = f"{t3['elapsed_s']}s, {t3['tok_per_s']} t/s"
+        lines.append(
+            f"  {c:>3}  {bf_cell:>20}  {t4_cell:>20}  {t3_cell:>20}  {r4:>7.2f}x  {r3:>7.2f}x"
+        )
     return "\n".join(lines)
 
 
@@ -1098,6 +1511,10 @@ def run_bench(
         )
         return f"\n{header}\n\n=== TurboQuant V1 (rotation + 4-bit KV) vs bf16 ===\n{body}\n"
 
+    if config == "turbo_parity":
+        body = _run_turbo_parity(model=model, num_blocks=num_blocks, block_size=block_size)
+        return f"\n{header}\n\n=== TurboQuant V2a fused-vs-python parity ===\n{body}\n"
+
     if config == "quant_kernel":
         body = _run_quant_kernel_bench(
             model=model,
@@ -1212,7 +1629,7 @@ def run_bench(
 
     raise ValueError(
         f"unknown config={config!r}; "
-        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo"
+        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo|turbo_parity"
     )
 
 

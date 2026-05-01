@@ -22,6 +22,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
+from mini_infer.device import is_cuda_device
+
 
 def quantize_per_channel(weight: Tensor) -> tuple[Tensor, Tensor]:
     """Symmetric per-output-channel INT8 quantization.
@@ -143,7 +145,7 @@ class Int8Linear(nn.Module):
         # CUDA + Triton fast path: keep weights in INT8 in HBM and dequant
         # tile-by-tile in registers inside the matmul kernel. Avoids the
         # bf16-weight HBM round-trip the naive path pays on every call.
-        if x.is_cuda:
+        if is_cuda_device(x.device):
             from mini_infer.quant.int8_kernel import (
                 fused_w8a16_linear,
                 supports_fused_kernel,

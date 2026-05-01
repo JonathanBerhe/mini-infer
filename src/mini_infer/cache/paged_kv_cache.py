@@ -5,6 +5,10 @@ from transformers import DynamicCache
 
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.prefix_cache import PrefixCache
+from mini_infer.cache.turbo_kernel import (
+    fused_materialize_packed_kv,
+    supports_fused_kernel,
+)
 
 
 class PagedKVCache(DynamicCache):  # type: ignore[misc]
@@ -298,9 +302,45 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 value_packed[offset : offset + seq_len] = self._pool.storage[
                     layer_idx, 1, block_ids_per_pos, slots_per_pos
                 ]
+        elif self._pool.kv_quant == "turbo3" and supports_fused_kernel(device):
+            # Fused fast path: a single Triton kernel per K/V replaces the
+            # per-block Python loop below. Same numerical contract within
+            # bf16 round-trip noise; falls through to the Python loop on
+            # non-CUDA or with `_FUSED_DISABLED_FOR_BENCH`.
+            task_block_ids: list[int] = []
+            task_offsets: list[int] = []
+            task_valid: list[int] = []
+            for batch_idx in range(self.batch_size):
+                seq_len = seq_lens[batch_idx]
+                if seq_len == 0:
+                    continue
+                offset = cu_seqlens_k_list[batch_idx]
+                pos_in_packed = 0
+                num_blocks_used = (seq_len + block_size - 1) // block_size
+                for block_idx_in_slot in range(num_blocks_used):
+                    valid_in_block = min(block_size, seq_len - block_idx_in_slot * block_size)
+                    task_block_ids.append(self._block_ids[batch_idx][block_idx_in_slot])
+                    task_offsets.append(offset + pos_in_packed)
+                    task_valid.append(valid_in_block)
+                    pos_in_packed += valid_in_block
+
+            task_block_ids_t = torch.tensor(task_block_ids, dtype=torch.int32, device=device)
+            task_offsets_t = torch.tensor(task_offsets, dtype=torch.int32, device=device)
+            task_valid_t = torch.tensor(task_valid, dtype=torch.int32, device=device)
+
+            fused_materialize_packed_kv(
+                self._pool,
+                layer_idx,
+                task_block_ids=task_block_ids_t,
+                task_offsets=task_offsets_t,
+                task_valid=task_valid_t,
+                key_out=key_packed,
+                value_out=value_packed,
+            )
         else:
-            # Compressed path: read each block (dequant + inverse-rotate),
+            # Compressed slow path: read each block (dequant + inverse-rotate),
             # then slice the seq_len-bounded prefix into the packed output.
+            # Hit on non-CUDA, missing Triton, or kv_quant=="turbo4".
             for batch_idx in range(self.batch_size):
                 seq_len = seq_lens[batch_idx]
                 if seq_len == 0:

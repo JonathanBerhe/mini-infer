@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import torch
 
+from mini_infer.device import is_cuda_device, require_cuda_device
+
 try:
     import triton
     import triton.language as tl
@@ -69,9 +71,7 @@ def supports_fused_kernel(device: torch.device | str) -> bool:
         return False
     if not _TRITON_AVAILABLE:
         return False
-    if isinstance(device, str):
-        return device == "cuda"
-    return device.type == "cuda"
+    return is_cuda_device(device)
 
 
 if _TRITON_AVAILABLE:
@@ -180,8 +180,7 @@ def fused_w8a16_linear(
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton not available; cannot run fused W8A16 kernel")
-    if not x.is_cuda:
-        raise RuntimeError(f"fused_w8a16_linear requires CUDA tensors; got x.device={x.device}")
+    require_cuda_device(x.device, "fused_w8a16_linear")
     if weight.dtype != torch.int8:
         raise ValueError(f"weight must be int8, got {weight.dtype}")
     if x.shape[-1] != weight.shape[1]:
