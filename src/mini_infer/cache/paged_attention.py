@@ -14,6 +14,8 @@ import math
 
 import torch
 
+from mini_infer.device import is_cuda_device, require_cuda_device
+
 try:
     import triton
     import triton.language as tl
@@ -34,9 +36,7 @@ def supports_paged_kernel(device: torch.device | str) -> bool:
     """
     if not _TRITON_AVAILABLE:
         return False
-    if isinstance(device, str):
-        return device == "cuda"
-    return device.type == "cuda"
+    return is_cuda_device(device)
 
 
 def paged_attention_decode_torch(
@@ -341,8 +341,7 @@ def paged_attention_decode_triton(
     """CUDA-only Triton kernel launcher. Same contract as the torch reference."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("triton not available; use paged_attention_decode_torch instead")
-    if q.device.type != "cuda":
-        raise RuntimeError("Triton paged attention requires a CUDA tensor for q")
+    require_cuda_device(q.device, "Triton paged attention")
 
     batch, num_q_heads, head_dim = q.shape
     _, block_size, num_kv_heads, _ = k_pool_layer.shape
@@ -438,8 +437,7 @@ def _paged_attention_decode_batched_triton(
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("triton not available; use paged_attention_decode_torch_batched instead")
-    if q.device.type != "cuda":
-        raise RuntimeError("Triton paged attention requires a CUDA tensor for q")
+    require_cuda_device(q.device, "Triton paged attention")
 
     batch, num_q_heads, head_dim = q.shape
     if len(block_tables) != batch or len(seq_lens) != batch:

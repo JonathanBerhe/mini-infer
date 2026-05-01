@@ -1,7 +1,21 @@
-# ADR-013: TurboQuant KV cache (V1 — rotation + 4-bit, materialize-on-read)
+# ADR-013: TurboQuant KV cache (V1 + V3 full algorithm + V2a fused dequant kernel)
 
-Date: 2026-04-29
-Status: Accepted (with explicit V2/V3 follow-ups based on the empirical limits surfaced)
+Date: 2026-04-29 (V1), 2026-04-30 (V3 update), 2026-05-02 (V2a update)
+Status: Accepted
+
+V1 (`kv_quant="turbo4"`): rotation + per-channel uniform 4-bit. Shipped
+2026-04-29. ~62% storage savings; parity holds on 0.5B, breaks at 7B.
+
+V3 (`kv_quant="turbo3"`): full TurboQuant — rotation + polar transform +
+Lloyd-Max codebook + QJL residual + asymmetric K (3-bit + QJL = 4 bits
+stored) / V (4-bit Lloyd-Max). Shipped 2026-04-30. ~74% storage savings;
+0.5B coherent-but-different argmax; 7B less degenerate than V1.
+
+V2a (fused dequant Triton kernel for `turbo3`): one launch per K/V side
+per layer replaces the per-block Python loop in `materialize_packed_kv`.
+Shipped 2026-05-02. **6-7x throughput over the Python-loop turbo4 path**
+on Qwen2.5-0.5B + A10; turbo3 throughput recovers from 0.04-0.18x of
+bf16 (V3 baseline) to 0.31-0.41x of bf16. Storage layout unchanged.
 
 ## Context
 
@@ -225,30 +239,106 @@ materialize. This is exactly the V2 fused-kernel territory.
 - Paper: https://arxiv.org/abs/2504.19874
 - Reference repos: `0xSero/turboquant`, `tonbistudio/turboquant-pytorch`.
 
+## V3 update (2026-04-30) — full algorithm shipped
+
+The follow-ups V3a-d listed at the bottom of this ADR were all
+implemented and shipped under `kv_quant="turbo3"`:
+
+- **V3a (PolarQuant)**: Cartesian K/V → polar (radius + unit vector).
+  Per-vector L2 norm replaces the per-channel `(low, scale)` pair. The
+  unit vectors are bounded and ~Gaussian after rotation.
+- **V3c (Lloyd-Max codebook)**: precomputed optimal-for-N(0,1) scalar
+  quantizer with 8 levels (3-bit) and 16 levels (4-bit), hardcoded as
+  module constants. Replaces uniform quant on the unit-vector coords.
+- **V3b (QJL residual sign bit)**: 1-bit sign telling whether the
+  pre-quant value was above or below the chosen Lloyd-Max center, used
+  to nudge the dequantized value by a quarter-step.
+- **V3d (asymmetric K/V bits)**: K side uses 3-bit Lloyd-Max codebook
+  + 1-bit QJL = 4 bits stored. V side uses 4-bit Lloyd-Max codebook
+  directly. Same packed layout as V1 (4 bits/element, two per byte).
+
+Full bench in `docs/benchmarks/2026-04-30-turboquant-v3.md`. Headline
+findings:
+
+- **Storage**: V3 saves ~74% (vs V1's 62%) on both 0.5B and 7B. The
+  per-vector radii layout removes most of V1's per-channel scale
+  overhead. ~3.7x compression vs V1's 2.7x.
+- **Accuracy at depth**: V3 wins at 7B. V1 produces degenerate
+  `of of France of` repetition; V3 produces `capital capital the` —
+  also imperfect but more coherent. The Lloyd-Max + QJL machinery
+  recovers ~1 bit of effective precision that V1 loses.
+- **Accuracy at small depth**: V1 wins on 0.5B. V1's full-sequence
+  parity vs V3's argmax flip. V3's 3-bit K is more aggressive than
+  V1's 4-bit and tips the argmax at shallow depth even though logit
+  cosine sim still > 0.99.
+- **Throughput**: V3 is ~1.6x slower than V1 (Lloyd-Max table lookup
+  + QJL bit fiddle on the Python-loop dequant). Both unusable until
+  V2 (fused kernel).
+
+Both `kv_quant="turbo4"` and `kv_quant="turbo3"` ship; `turbo4` is
+preserved for the V1-vs-V3 comparison and as the simpler choice on
+small models. The shipped V3 demonstrates the full algorithm; the
+remaining gap to the paper's claims is on more aggressive QJL step
+tuning, per-head rotations, and calibration of the codebook to the
+specific model's K/V distributions — outside the V3 scope.
+
+## V2a update (2026-05-02) — fused dequant kernel shipped
+
+V2 is split into two stages; V2a (this update) ships the fused dequant
+half. A single Triton kernel per K/V side per layer replaces the
+per-block Python loop in `materialize_packed_kv` that called
+`pool.read_compressed_block(...)` twice per block per layer per step.
+The kernel reads packed nibbles + per-vector radii + per-layer rotation,
+applies the V3 codec (3-bit Lloyd-Max + 1-bit QJL on K, 4-bit Lloyd-Max
+on V), inverse-rotates via `tl.dot` against the rotation transpose, and
+writes directly into the packed `(total_k, num_kv_heads, head_dim)`
+buffer. The existing `flash_attn_varlen_func` consumes that buffer
+unchanged.
+
+Headline numbers on Qwen2.5-0.5B + A10, real ~2000-token prompt
+(`docs/benchmarks/2026-05-02-turboquant-v2a.md`):
+
+- **6-7x throughput** over the same Python-loop dequant at C ∈ {1, 4, 8}
+  (5.34 / 6.10 / 6.31 t/s vs turbo4's 0.86 / 0.90 / 0.92 t/s).
+- **0.31-0.41x of bf16** (vs the V3 baseline's 0.04-0.18x). Different
+  prompt length than the V3 doc so not a clean apples-to-apples, but the
+  *same-class* turbo3-vs-turbo4 comparison above is the clean evidence.
+- Storage savings unchanged (73.3% on 0.5B) — V2a doesn't touch the
+  layout. Codebooks + rotation matrices are the same tensors.
+- turbo3's coherent-but-different-argmax property carries through; the
+  unit-test [`test_qwen_05b_turbo3_greedy_matches_python_path`](../../tests/unit/test_turbo_kernel.py)
+  is the relevant correctness check (kernel vs Python loop, not vs bf16).
+
+This confirms the V2 hypothesis: launch overhead, not arithmetic, was
+the bottleneck in V3. One kernel per layer replaces hundreds of small
+launches and the savings track perfectly with the number of blocks
+walked per step.
+
+V2b (fuse FA online softmax into the same kernel so K/V tiles are
+dequanted in registers and never materialized) remains as the secondary
+follow-up — captures the peak-memory reduction needed for "fit longer
+contexts on the same GPU" but, on the throughput axis specifically, the
+big win is already in.
+
 ## Follow-ups (in order of value/effort)
 
-- **V2 — Fused dequant-attention Triton kernel**. Reads compressed
-  K/V tiles, dequants in shared mem, runs the attention math without
-  materializing to bf16. The single highest-value follow-up: turns
-  the unusable 0.06–0.18x throughput into something workable, AND
-  unlocks "fit longer contexts on the same GPU" (peak attention
-  memory drops because we don't materialize). ~1-2 Modal iterations
-  of kernel debugging.
-- **V3a — PolarQuant**. Replaces the per-channel `(low, scale)` pair
-  with a single per-channel magnitude (polar coordinates are
-  zero-centered), reclaiming ~50% of the scale overhead. Pushes
-  realized compression from 2.7x toward the paper's 5x. Implementation:
-  Cartesian → polar transform on write, polar → Cartesian on read.
-- **V3b — QJL residual sign bit**. ~1 extra bit per dimension of
-  error correction. Reduces per-block quantization error and is what
-  closes the 7B accuracy gap.
-- **V3c — Lloyd-Max codebook**. Optimal scalar quantizer for the
-  post-rotation distribution (which is roughly Gaussian by the
-  Johnson-Lindenstrauss argument). Replaces uniform quant.
-- **V3d — Asymmetric 3-bit K + 2-bit (or 4-bit) V**. Reference repo
-  reports values are the bottleneck and 4-bit V suffices; 2-bit V
-  is the most aggressive option. Reaches the paper's 3-bit headline.
+- **V2b — Fuse attention into the dequant kernel.** Adds Q +
+  cu_seqlens_q/k + softmax_scale to the kernel signature; the K/V tiles
+  produced by the V2a codec body feed an in-kernel FA-2 online softmax,
+  so the materialized bf16 buffer goes away. Throughput at parity with
+  V2a or slightly better; peak attention memory drops by
+  `total_k × num_kv_heads × head_dim × 4` bytes. Reuses the V2a kernel
+  structure (rotation matrix in SMEM, Lloyd-Max + QJL codec) so dequant
+  correctness is already validated by the time we reach this stage.
+- **V2a-for-turbo4.** Same kernel pattern, different codec body
+  (per-channel `(low, scale)` instead of polar + Lloyd-Max + QJL). Wire
+  if 7B turbo4 ever becomes a target; turbo3 is the recommended V3 mode
+  so this is low priority.
 - **Per-head rotation** (instead of per-layer). Slightly better
-  decorrelation at the cost of more rotation storage.
-- **Calibration-based scales** for cases where training-free isn't
-  required.
+  decorrelation. ~1% accuracy at modest extra storage.
+- **Calibration-based codebook tuning** for K/V distributions
+  specific to a model. Loses the "training-free" property but should
+  close the 7B parity gap.
+- **More aggressive QJL** (multi-bit residual, fp4 or fp8 storage of
+  residual offsets). Narrows the K-side accuracy at the cost of
+  storage budget.

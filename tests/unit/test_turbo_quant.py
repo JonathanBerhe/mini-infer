@@ -173,3 +173,185 @@ def test_full_pipeline_rotation_plus_quant_within_cosine() -> None:
 
     cos = _cosine_sim(block, recovered)
     assert cos > 0.99, f"end-to-end cos sim {cos:.4f} < 0.99"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# V3 (TurboQuant full): polar + Lloyd-Max + QJL primitives
+# ──────────────────────────────────────────────────────────────────────
+
+
+from mini_infer.cache.turbo_quant import (  # noqa: E402
+    lloyd_max_codebook,
+    polar_dequantize_block,
+    polar_quantize_block,
+)
+
+
+def test_lloyd_max_codebook_4bit_shape_and_symmetry() -> None:
+    cb = lloyd_max_codebook(4, dtype=torch.float32, device="cpu")
+    assert cb.shape == (16,)
+    # Symmetric around 0.
+    assert torch.allclose(cb + cb.flip(0), torch.zeros_like(cb), atol=1e-5)
+    # Sorted ascending.
+    assert torch.all(cb[:-1] < cb[1:])
+
+
+def test_lloyd_max_codebook_3bit_shape_and_symmetry() -> None:
+    cb = lloyd_max_codebook(3, dtype=torch.float32, device="cpu")
+    assert cb.shape == (8,)
+    assert torch.allclose(cb + cb.flip(0), torch.zeros_like(cb), atol=1e-5)
+    assert torch.all(cb[:-1] < cb[1:])
+
+
+def test_lloyd_max_codebook_rejects_unsupported_bits() -> None:
+    with pytest.raises(ValueError, match="3- or 4-bit"):
+        lloyd_max_codebook(2, dtype=torch.float32, device="cpu")
+
+
+def test_polar_quantize_dequantize_uniform_4bit_baseline() -> None:
+    """V3a alone (uniform 4-bit on [-1, 1]) is the strawman.
+
+    Unit-vector coords on the rotated sphere have std ~1/sqrt(head_dim), so
+    uniform [-1, 1] wastes most of its range — exactly the inefficiency
+    V3c (Lloyd-Max codebook) is designed to fix. We only require the
+    roundtrip to be sane (> 0.9) here; the > 0.99 threshold is the
+    Lloyd-Max test below.
+    """
+    torch.manual_seed(0)
+    block = torch.randn(16, 2, 64, dtype=torch.float32) * 0.5
+
+    packed, radii = polar_quantize_block(block, bits=4, use_lloyd_max=False, use_qjl=False)
+    recovered = polar_dequantize_block(
+        packed,
+        radii,
+        16,
+        2,
+        64,
+        dtype=torch.float32,
+        bits=4,
+        use_lloyd_max=False,
+        use_qjl=False,
+    )
+
+    cos = _cosine_sim(block, recovered)
+    assert cos > 0.9, f"polar + uniform 4-bit cos sim {cos:.4f} < 0.9"
+
+
+def test_polar_quantize_dequantize_lloyd_max_4bit_high_cosine() -> None:
+    """V3a + V3c: polar + Lloyd-Max 4-bit beats uniform on cosine sim."""
+    torch.manual_seed(0)
+    block = torch.randn(16, 2, 64, dtype=torch.float32) * 0.5
+
+    # Uniform reference.
+    packed_u, radii_u = polar_quantize_block(block, bits=4, use_lloyd_max=False, use_qjl=False)
+    rec_u = polar_dequantize_block(
+        packed_u,
+        radii_u,
+        16,
+        2,
+        64,
+        dtype=torch.float32,
+        bits=4,
+        use_lloyd_max=False,
+        use_qjl=False,
+    )
+    cos_u = _cosine_sim(block, rec_u)
+
+    # Lloyd-Max.
+    packed_lm, radii_lm = polar_quantize_block(block, bits=4, use_lloyd_max=True, use_qjl=False)
+    rec_lm = polar_dequantize_block(
+        packed_lm,
+        radii_lm,
+        16,
+        2,
+        64,
+        dtype=torch.float32,
+        bits=4,
+        use_lloyd_max=True,
+        use_qjl=False,
+    )
+    cos_lm = _cosine_sim(block, rec_lm)
+
+    assert cos_lm > cos_u, f"Lloyd-Max should beat uniform; got LM={cos_lm:.4f} <= U={cos_u:.4f}"
+    assert cos_lm > 0.99, f"Lloyd-Max 4-bit cos sim {cos_lm:.4f} < 0.99"
+
+
+def test_polar_quantize_dequantize_lloyd_max_3bit_with_qjl() -> None:
+    """V3b + V3d: 3-bit Lloyd-Max + QJL residual sign approaches 4-bit fidelity."""
+    torch.manual_seed(0)
+    block = torch.randn(16, 2, 64, dtype=torch.float32) * 0.5
+
+    # 3-bit alone (8 levels).
+    packed_3, radii_3 = polar_quantize_block(block, bits=3, use_lloyd_max=True, use_qjl=False)
+    rec_3 = polar_dequantize_block(
+        packed_3,
+        radii_3,
+        16,
+        2,
+        64,
+        dtype=torch.float32,
+        bits=3,
+        use_lloyd_max=True,
+        use_qjl=False,
+    )
+    cos_3 = _cosine_sim(block, rec_3)
+
+    # 3-bit + QJL (= 4 bits stored, 8 levels with sign-bit refinement).
+    packed_3q, radii_3q = polar_quantize_block(block, bits=3, use_lloyd_max=True, use_qjl=True)
+    rec_3q = polar_dequantize_block(
+        packed_3q,
+        radii_3q,
+        16,
+        2,
+        64,
+        dtype=torch.float32,
+        bits=3,
+        use_lloyd_max=True,
+        use_qjl=True,
+    )
+    cos_3q = _cosine_sim(block, rec_3q)
+
+    assert cos_3q > cos_3, (
+        f"QJL should improve 3-bit accuracy; got with-QJL={cos_3q:.4f} <= without={cos_3:.4f}"
+    )
+
+
+def test_polar_qjl_only_with_3bit() -> None:
+    with pytest.raises(ValueError, match="bits=3"):
+        polar_quantize_block(torch.randn(2, 1, 4), bits=4, use_lloyd_max=True, use_qjl=True)
+
+
+def test_polar_quantize_returns_correct_shapes() -> None:
+    block = torch.randn(8, 4, 16, dtype=torch.bfloat16)
+    packed, radii = polar_quantize_block(block, bits=4, use_lloyd_max=True)
+    assert packed.shape == (8 * 4 * 16 // 2,)
+    assert packed.dtype == torch.int8
+    assert radii.shape == (8, 4)
+    assert radii.dtype == torch.bfloat16
+
+
+def test_polar_full_pipeline_with_rotation_within_cosine() -> None:
+    """End-to-end rotation + polar (Lloyd-Max + QJL): cosine > 0.99."""
+    torch.manual_seed(2)
+    rotation = generate_rotation_matrices(num_layers=1, head_dim=64, dtype=torch.float32)[0]
+    block = torch.randn(16, 2, 64, dtype=torch.float32) * 0.4
+
+    rotated = rotate(block, rotation)
+    packed, radii = polar_quantize_block(rotated, bits=3, use_lloyd_max=True, use_qjl=True)
+    recovered_rot = polar_dequantize_block(
+        packed,
+        radii,
+        16,
+        2,
+        64,
+        dtype=torch.float32,
+        bits=3,
+        use_lloyd_max=True,
+        use_qjl=True,
+    )
+    recovered = inverse_rotate(recovered_rot, rotation)
+
+    cos = _cosine_sim(block, recovered)
+    # 3-bit with QJL is the most aggressive V3 config; cosine should still
+    # comfortably exceed 0.99 because the rotation Gaussianizes the input.
+    assert cos > 0.99, f"3-bit+QJL end-to-end cos sim {cos:.4f} < 0.99"

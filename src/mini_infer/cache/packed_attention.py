@@ -21,6 +21,7 @@ import math
 import torch
 
 from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.device import is_cuda_device, require_cuda_device
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -39,9 +40,7 @@ def supports_packed_kernel(device: torch.device | str) -> bool:
     """
     if not _FLASH_ATTN_AVAILABLE:
         return False
-    if isinstance(device, str):
-        return device == "cuda"
-    return device.type == "cuda"
+    return is_cuda_device(device)
 
 
 # FlashAttention's paged varlen API (`flash_attn_varlen_func` + `block_table`)
@@ -198,8 +197,7 @@ def _packed_attention_materialized_flash(
             "flash-attn not installed; install via the [cuda] extra or use "
             "packed_attention_torch instead"
         )
-    if q.device.type != "cuda":
-        raise RuntimeError("flash_attn_varlen_func requires CUDA tensors")
+    require_cuda_device(q.device, "flash_attn_varlen_func")
 
     keys_packed, values_packed, cu_seqlens_k, max_seqlen_k = cache.materialize_packed_kv(layer_idx)
     max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
@@ -240,8 +238,7 @@ def _packed_attention_paged_flash(
             "flash-attn not installed; install via the [cuda] extra or use "
             "packed_attention_torch instead"
         )
-    if q.device.type != "cuda":
-        raise RuntimeError("flash_attn_varlen_func requires CUDA tensors")
+    require_cuda_device(q.device, "flash_attn_varlen_func")
 
     device = q.device
     keys_pool, values_pool = cache.pool_storage_for_layer(layer_idx)

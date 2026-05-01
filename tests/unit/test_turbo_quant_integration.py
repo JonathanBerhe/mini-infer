@@ -58,6 +58,76 @@ def test_turbo4_decodes_paris_smoke() -> None:
 
 
 @pytest.mark.requires_model
+def test_turbo3_logits_close_to_bf16_reference() -> None:
+    """Last-position logits with kv_quant='turbo3' have cosine sim > 0.99 vs baseline.
+
+    turbo3 = full V3 (rotation + polar + Lloyd-Max + QJL + asymmetric K3V4).
+    The richer recipe should match (or beat) turbo4's > 0.99 cosine sim
+    despite K only having 3 bits of codebook precision (the QJL residual
+    sign bit closes the gap to ~4-bit fidelity).
+    """
+    prompt = "The capital of France is"
+
+    baseline = ModelRunner.from_pretrained(MODEL_NAME, kv_quant=None)
+    turbo3 = ModelRunner.from_pretrained(MODEL_NAME, kv_quant="turbo3")
+
+    input_ids = baseline.tokenizer.encode(prompt)
+    input_tensor = torch.tensor([input_ids], device=baseline.device, dtype=torch.long)
+    with torch.inference_mode():
+        baseline_logits = baseline._model(input_tensor, use_cache=False).logits[0, -1, :]
+        turbo3_logits = turbo3._model(input_tensor, use_cache=False).logits[0, -1, :]
+
+    cos = torch.nn.functional.cosine_similarity(
+        baseline_logits.float().flatten(), turbo3_logits.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.99, f"turbo3 vs baseline cosine sim {cos:.4f} below 0.99"
+
+
+@pytest.mark.requires_model
+def test_turbo3_produces_coherent_output() -> None:
+    """A turbo3-cache run produces grammatically coherent output (non-degenerate).
+
+    Unlike turbo4 (which preserves argmax exactly on 0.5B), turbo3's
+    aggressive 3-bit K compression can flip argmax even when logit
+    cosine sim is > 0.99. The contract is "high-fidelity logits, but
+    not argmax parity"; this test asserts the model still produces a
+    non-empty, coherent completion (no NaN, no empty output, no infinite
+    repeat).
+    """
+    runner = ModelRunner.from_pretrained(MODEL_NAME, kv_quant="turbo3")
+    sched = ContinuousScheduler(runner)
+    sched.start()
+    try:
+        result = sched.run(
+            Request(
+                prompt="The capital of France is",
+                sampling_params=SamplingParams(),
+                max_tokens=12,
+            )
+        )
+    finally:
+        sched.stop()
+    # Coherence checks: the model emitted some tokens, decoded text isn't
+    # empty, and doesn't degenerate into single-token repetition.
+    assert result.tokens, "turbo3 produced no tokens"
+    assert result.text.strip(), f"turbo3 output is empty: {result.text!r}"
+    # Reject obvious degenerate output (same token > 6 times in a row).
+    counts: dict[int, int] = {}
+    max_run = 1
+    current_run = 1
+    last_tok = result.tokens[0]
+    for tok in result.tokens[1:]:
+        counts[tok] = counts.get(tok, 0) + 1
+        current_run = current_run + 1 if tok == last_tok else 1
+        max_run = max(max_run, current_run)
+        last_tok = tok
+    assert max_run < 6, (
+        f"turbo3 output has degenerate {max_run}-token repeat: "
+        f"tokens={result.tokens}, text={result.text!r}"
+    )
+
+
+@pytest.mark.requires_model
 def test_turbo4_first_token_matches_bf16_baseline() -> None:
     """First decoded token of turbo4 must match the bf16 baseline.
 
