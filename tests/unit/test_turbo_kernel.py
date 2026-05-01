@@ -414,3 +414,109 @@ def test_qwen_05b_turbo3_first_token_logits_match_python_path() -> None:
 
     cos = _cosine_sim(fused_logits, python_logits)
     assert cos > 0.999, f"fused vs python first-token logit cosine sim {cos:.6f} below 0.999"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# V2b: fully-fused attention kernel parity vs V2a materialized path
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_supports_fused_attn_kernel_returns_false_on_cpu() -> None:
+    """V2b predicate must report not-supported on CPU (and respect both toggles)."""
+    from mini_infer.cache.turbo_kernel import supports_fused_attn_kernel
+
+    assert supports_fused_attn_kernel("cpu") is False
+    assert supports_fused_attn_kernel(torch.device("cpu")) is False
+
+
+def _attention_two_paths(
+    pool: BlockPool,
+    cache: PagedKVCache,
+    *,
+    layer_idx: int,
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute attention via V2b (fused-attn ON) and via V2a materialized (V2b OFF).
+
+    Returns `(out_v2b, out_v2a)` of shape `(total_q, num_q_heads, head_dim)`.
+    """
+    from mini_infer.cache import turbo_kernel
+    from mini_infer.cache.packed_attention import packed_attention_forward
+
+    # Default: V2b on (and V2a as fallback for prefill, but we're decode-only).
+    out_v2b = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
+
+    saved = turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH
+    turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = True
+    try:
+        out_v2a = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
+    finally:
+        turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = saved
+    return out_v2b, out_v2a
+
+
+@pytest.mark.requires_cuda
+def test_fused_attn_decode_matches_materialized_qwen_05b_shape() -> None:
+    """V2b decode-only attention output matches V2a materialized at cos sim > 0.999.
+
+    Qwen2.5-0.5B shape (head_dim=64, num_kv_heads=2, num_q_heads=14).
+    Each request has q_len=1 — the decode-only contract V2b enforces.
+    """
+    pool, cache = _build_populated_turbo3(
+        num_layers=2,
+        num_blocks=16,
+        block_size=16,
+        num_kv_heads=2,
+        head_dim=64,
+        seq_lens=[24, 17, 32, 8],
+        seed=101,
+        device="cuda",
+    )
+    batch_size = cache.batch_size
+    num_q_heads = 14
+    head_dim = 64
+
+    torch.manual_seed(202)
+    q = torch.randn(batch_size, num_q_heads, head_dim, dtype=torch.bfloat16, device="cuda") * 0.1
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
+
+    out_v2b, out_v2a = _attention_two_paths(
+        pool, cache, layer_idx=1, q=q, cu_seqlens_q=cu_seqlens_q
+    )
+    assert out_v2b.shape == out_v2a.shape == (batch_size, num_q_heads, head_dim)
+    cos = _cosine_sim(out_v2b, out_v2a)
+    assert cos > 0.999, f"V2b vs V2a attention output cosine sim {cos:.6f} below 0.999"
+
+
+@pytest.mark.requires_cuda
+def test_fused_attn_decode_matches_materialized_qwen_7b_shape() -> None:
+    """Qwen2.5-7B shape (head_dim=128, num_kv_heads=4, num_q_heads=28, group_size=7).
+
+    Validates the kernel at the larger head_dim where the rotation
+    matrix tile in SMEM is 32 KB on A10.
+    """
+    pool, cache = _build_populated_turbo3(
+        num_layers=2,
+        num_blocks=8,
+        block_size=16,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_lens=[16, 32, 8],
+        seed=303,
+        device="cuda",
+    )
+    batch_size = cache.batch_size
+    num_q_heads = 28
+    head_dim = 128
+
+    torch.manual_seed(404)
+    q = torch.randn(batch_size, num_q_heads, head_dim, dtype=torch.bfloat16, device="cuda") * 0.1
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
+
+    out_v2b, out_v2a = _attention_two_paths(
+        pool, cache, layer_idx=0, q=q, cu_seqlens_q=cu_seqlens_q
+    )
+    assert out_v2b.shape == out_v2a.shape == (batch_size, num_q_heads, head_dim)
+    cos = _cosine_sim(out_v2b, out_v2a)
+    assert cos > 0.999, f"7B-shape V2b vs V2a cosine sim {cos:.6f} below 0.999"
