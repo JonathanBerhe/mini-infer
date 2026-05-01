@@ -88,7 +88,32 @@ def packed_attention_forward(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if supports_packed_kernel(q.device):
+        from mini_infer.cache.turbo_kernel import (
+            fused_turbo_attention_decode,
+            supports_fused_attn_kernel,
+        )
+
         block_size = cache._pool.block_size
+        # Fully-fused TurboQuant attention path: only fires for turbo3
+        # decode-only batches (one Q token per request). Reads compressed
+        # K/V directly, dequants in registers, runs online softmax — never
+        # materializes bf16 K/V in HBM. Multi-token Q (chunked prefill)
+        # falls through to the V2a materialized path below.
+        if (
+            cache._pool.kv_quant == "turbo3"
+            and supports_fused_attn_kernel(q.device)
+            and q.shape[0] == cu_seqlens_q.shape[0] - 1
+        ):
+            seq_lens = cache.seq_lens_tensor(q.device)
+            block_tables = cache.block_table_padded(q.device)
+            return fused_turbo_attention_decode(
+                cache._pool,
+                layer_idx,
+                q=q,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
+                softmax_scale=softmax_scale,
+            )
         # Paged FA varlen reads K/V directly from bf16 pool storage; not
         # compatible with compressed (TurboQuant) storage. Compressed always
         # routes through the materialized path which knows how to dequant.
