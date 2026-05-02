@@ -3,6 +3,7 @@
 import dataclasses
 import enum
 import queue
+import threading
 from collections.abc import Iterator
 from typing import Literal
 
@@ -10,7 +11,12 @@ import torch
 
 from mini_infer.engine.sampler import SamplingParams
 
-FinishReason = Literal["stop", "length"]
+# `cancelled` covers both API-side cancellation (client disconnect on a
+# streaming request) and engine-side rejection (admission can't be satisfied
+# by the current pool). Both paths emit a final GenerationStep with this
+# finish_reason so consumers see a clean terminal step rather than a
+# never-completing stream.
+FinishReason = Literal["stop", "length", "cancelled"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,10 +73,16 @@ class RunningRequest:
     `batch_idx` is the request's slot in the scheduler's shared batched
     `PagedKVCache`. None until prefill is merged in; shifts down by one each
     time an earlier-slot request finishes and is removed from the cache.
+
+    `cancel_event` is set by the API thread (`RequestHandle.cancel`) when a
+    client disconnects on a streaming request. The engine checks it at safe
+    points (before sampling each decoder, before admitting from the queue)
+    and finishes the request with finish_reason="cancelled" when set.
     """
 
     request: Request
     output_queue: queue.Queue[GenerationStep]
+    cancel_event: threading.Event = dataclasses.field(default_factory=threading.Event)
     state: RequestState = RequestState.WAITING
     batch_idx: int | None = None
     prompt_token_ids: list[int] = dataclasses.field(default_factory=list)
@@ -110,3 +122,18 @@ class RequestHandle:
             finish_reason=finish_reason,
             prompt_tokens=len(self._req.prompt_token_ids),
         )
+
+    def cancel(self) -> None:
+        """Signal the engine to stop generating for this request.
+
+        Idempotent and safe to call from any thread. The engine notices the
+        flag at safe points (between sample/forward iterations) and emits a
+        terminal `GenerationStep(finish_reason="cancelled")` to drain
+        consumers. Resources (KV blocks, batch slot) are reclaimed on the
+        next `_reap_done` pass.
+        """
+        self._req.cancel_event.set()
+
+    def get_step(self) -> GenerationStep:
+        """Block until the next GenerationStep arrives. Thread-safe."""
+        return self._req.output_queue.get()

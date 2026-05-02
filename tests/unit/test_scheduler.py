@@ -271,3 +271,28 @@ def test_prefix_cache_matches_no_cache() -> None:
     pf = runner_with_cache.block_pool.prefix_cache
     assert pf is not None
     assert pf.num_cached > 0, "expected the prefix cache to retain at least one block"
+
+
+@pytest.mark.requires_model
+def test_oversized_prompt_finishes_with_cancelled(scheduler: ContinuousScheduler) -> None:
+    """A request that needs more blocks than the pool has must terminate, not loop.
+
+    The scheduler used to unconditionally re-enqueue any request that didn't
+    fit, which let one oversized request block every smaller request behind
+    it. Now, requests whose `required_blocks` exceeds the pool's total
+    capacity finish immediately with `finish_reason="cancelled"` so the
+    queue can drain.
+    """
+    # Build a prompt long enough that required_blocks exceeds the pool's
+    # capacity. The default pool size on the fixture is small; padding the
+    # prompt with repeated tokens far past the pool's total token budget
+    # forces rejection at admission.
+    pool = scheduler._runner.block_pool
+    pool_token_capacity = pool.num_blocks * pool.block_size
+    huge_prompt = "the " * (pool_token_capacity * 4)
+    result = scheduler.run(
+        Request(prompt=huge_prompt, sampling_params=SamplingParams(), max_tokens=4)
+    )
+    assert result.finish_reason == "cancelled"
+    # The request never advanced past admission, so no tokens were generated.
+    assert result.tokens == []

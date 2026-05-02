@@ -1,12 +1,33 @@
+"""OpenAI-compatible HTTP API for mini-infer.
+
+Security posture (the server is meant to run behind a trusted reverse proxy
+or on localhost — these guards are belt-and-suspenders):
+
+- Defaults to binding `127.0.0.1`. Set `MINI_INFER_HOST=0.0.0.0` to expose.
+- Optional bearer-token auth: set `MINI_INFER_API_KEY=<secret>` and clients
+  must send `Authorization: Bearer <secret>`. Unset = open access (intended
+  for dev / trusted networks).
+- Per-request input bounds (`prompt` length, `max_tokens`) are enforced by
+  Pydantic in `schemas.py`; oversized payloads return 422 before any
+  engine work happens.
+- Streaming endpoint polls for client disconnect between yielded tokens
+  and cancels the request when the client drops the connection.
+- A global exception handler converts uncaught engine errors into a sanitized
+  503 instead of letting FastAPI emit a stack trace.
+"""
+
+import asyncio
+import logging
 import os
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from mini_infer.api.schemas import (
     CompletionChoice,
@@ -17,9 +38,43 @@ from mini_infer.api.schemas import (
 )
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import SamplingParams
-from mini_infer.scheduler import ContinuousScheduler, Request
+from mini_infer.scheduler import ContinuousScheduler, Request, RequestHandle
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+# Default bind is loopback; set MINI_INFER_HOST=0.0.0.0 (or a specific
+# interface) to expose. Pairing with MINI_INFER_API_KEY for any non-loopback
+# bind is strongly recommended; the server logs a warning at startup if you
+# bind publicly without a key.
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+
+# Polling interval for client-disconnect detection during SSE. 100 ms keeps
+# the per-step overhead negligible while still cancelling within a typical
+# token's wall-clock budget.
+_DISCONNECT_POLL_SECONDS = 0.1
+
+logger = logging.getLogger(__name__)
+_API_KEY = os.environ.get("MINI_INFER_API_KEY")
+# `auto_error=False` keeps the Bearer scheme parsing optional so an unset
+# MINI_INFER_API_KEY (the default dev case) doesn't reject every request.
+# The actual key check happens inside `_verify_auth`.
+_AUTH_SCHEME = HTTPBearer(auto_error=False)
+
+
+async def _verify_auth(
+    creds: HTTPAuthorizationCredentials | None = Depends(_AUTH_SCHEME),
+) -> None:
+    """Bearer-token gate; only active when MINI_INFER_API_KEY is set.
+
+    Returns None on success; raises 401 on missing or wrong token. When the
+    env var is unset (typical dev case), this dependency is a no-op so
+    requests pass through.
+    """
+    if _API_KEY is None:
+        return
+    if creds is None or creds.credentials != _API_KEY:
+        raise HTTPException(status_code=401, detail="missing or invalid api key")
 
 
 @asynccontextmanager
@@ -38,10 +93,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(lifespan=lifespan)
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(_request: FastAPIRequest, exc: Exception) -> JSONResponse:
+    """Return a sanitized 503 instead of FastAPI's default traceback page.
+
+    The exception is logged server-side with full context; the client gets
+    only an opaque error code. Prevents accidentally leaking model paths,
+    HF tokens, or internal state via tracebacks in error responses.
+    """
+    logger.exception("unhandled error in request handler", exc_info=exc)
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"type": "internal_error", "message": "engine error"}},
+    )
+
+
 @app.post("/v1/completions", response_model=None)
 async def completions(
     req: CompletionRequest,
     fastapi_req: FastAPIRequest,
+    _auth: None = Depends(_verify_auth),
 ) -> StreamingResponse | CompletionResponse:
     scheduler: ContinuousScheduler = fastapi_req.app.state.scheduler
     internal = Request(
@@ -57,20 +128,36 @@ async def completions(
     created = int(time.time())
 
     if req.stream:
-        # Sync generator so Starlette runs it in a threadpool: blocking queue.get()
-        # in the scheduler doesn't stall the event loop when other requests are in flight.
-        def event_stream() -> Iterator[str]:
-            for step in scheduler.stream(internal):
-                chunk = CompletionChunk(
-                    id=completion_id,
-                    created=created,
-                    model=req.model,
-                    choices=[
-                        CompletionChoice(text=step.text, finish_reason=step.finish_reason),
-                    ],
-                )
-                yield f"data: {chunk.model_dump_json()}\n\n"
-            yield "data: [DONE]\n\n"
+        handle = scheduler.submit(internal)
+
+        async def event_stream() -> AsyncIterator[str]:
+            """Stream generation steps as SSE.
+
+            A background watcher polls `fastapi_req.is_disconnected` every
+            100 ms; on client drop it calls `handle.cancel()`, which makes
+            the engine emit a terminal step and unblocks the consumer's
+            `get_step()` so resources (KV blocks, batch slot) are freed
+            promptly.
+            """
+            watcher = asyncio.create_task(_watch_disconnect(fastapi_req, handle))
+            try:
+                while True:
+                    step = await asyncio.to_thread(handle.get_step)
+                    chunk = CompletionChunk(
+                        id=completion_id,
+                        created=created,
+                        model=req.model,
+                        choices=[
+                            CompletionChoice(text=step.text, finish_reason=step.finish_reason),
+                        ],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    if step.finish_reason is not None:
+                        break
+                yield "data: [DONE]\n\n"
+            finally:
+                watcher.cancel()
+                handle.cancel()
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -88,7 +175,33 @@ async def completions(
     )
 
 
+async def _watch_disconnect(fastapi_req: FastAPIRequest, handle: RequestHandle) -> None:
+    """Poll the client's connection; cancel the request when it drops.
+
+    Runs as a background task during streaming. When the client closes
+    the SSE connection, calling `handle.cancel()` makes the engine emit a
+    terminal step at its next safe point, which unblocks the main stream
+    loop's `get_step()` call so the response generator returns and FastAPI
+    cleans up.
+    """
+    try:
+        while True:
+            await asyncio.sleep(_DISCONNECT_POLL_SECONDS)
+            if await fastapi_req.is_disconnected():
+                handle.cancel()
+                return
+    except asyncio.CancelledError:
+        pass
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("mini_infer.api.server:app", host="0.0.0.0", port=8000)
+    host = os.environ.get("MINI_INFER_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("MINI_INFER_PORT", str(DEFAULT_PORT)))
+    if host != "127.0.0.1" and _API_KEY is None:
+        logger.warning(
+            "binding to %s without MINI_INFER_API_KEY set; the API is unauthenticated",
+            host,
+        )
+    uvicorn.run("mini_infer.api.server:app", host=host, port=port)

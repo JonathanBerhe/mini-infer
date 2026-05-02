@@ -30,6 +30,42 @@ def test_completion_request_accepts_stream_flag() -> None:
     assert req.stream is True
 
 
+def test_completion_request_rejects_empty_prompt() -> None:
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="")
+
+
+def test_completion_request_rejects_oversized_prompt() -> None:
+    """Prompt length is bounded by `MINI_INFER_MAX_PROMPT_CHARS` (default 131072)."""
+    from mini_infer.api.schemas import MAX_PROMPT_CHARS
+
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="x" * (MAX_PROMPT_CHARS + 1))
+
+
+def test_completion_request_rejects_invalid_max_tokens() -> None:
+    """`max_tokens` must be in [1, MAX_OUTPUT_TOKENS]."""
+    from mini_infer.api.schemas import MAX_OUTPUT_TOKENS
+
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", max_tokens=0)
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", max_tokens=-1)
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", max_tokens=MAX_OUTPUT_TOKENS + 1)
+
+
+def test_completion_request_rejects_invalid_sampling_params() -> None:
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", temperature=-0.1)
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", top_p=0.0)
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", top_p=1.1)
+    with pytest.raises(ValidationError):
+        CompletionRequest(model="m", prompt="p", top_k=-1)
+
+
 def test_completion_response_round_trips_through_json() -> None:
     resp = CompletionResponse(
         id="cmpl-abc",
