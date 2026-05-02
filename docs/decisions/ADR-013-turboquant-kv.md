@@ -1,6 +1,6 @@
-# ADR-013: TurboQuant KV cache (V1 + V3 full algorithm + V2a fused dequant kernel)
+# ADR-013: TurboQuant KV cache (V1 + V3 + V2a fused dequant; V2b deselected)
 
-Date: 2026-04-29 (V1), 2026-04-30 (V3 update), 2026-05-02 (V2a update)
+Date: 2026-04-29 (V1), 2026-04-30 (V3 update), 2026-05-02 (V2a + V2b updates)
 Status: Accepted
 
 V1 (`kv_quant="turbo4"`): rotation + per-channel uniform 4-bit. Shipped
@@ -16,6 +16,15 @@ per layer replaces the per-block Python loop in `materialize_packed_kv`.
 Shipped 2026-05-02. **6-7x throughput over the Python-loop turbo4 path**
 on Qwen2.5-0.5B + A10; turbo3 throughput recovers from 0.04-0.18x of
 bf16 (V3 baseline) to 0.31-0.41x of bf16. Storage layout unchanged.
+
+V2b (fully-fused dequant + online softmax for decode): a second Triton
+kernel that walks compressed K/V tiles in registers and avoids
+materializing bf16 K/V in HBM. Shipped 2026-05-02 but **deselected as
+the default attention path the same day**: at Qwen2.5-7B + A10, V2b is
+12% slower than V2a (FA varlen on materialized K/V) and the avoided
+transient buffer is too small to register on the peak-memory meter.
+Kept opt-in via `_FUSED_ATTN_DISABLED_FOR_BENCH = False` (default True)
+for memory-constrained edge cases.
 
 ## Context
 
@@ -320,16 +329,83 @@ follow-up — captures the peak-memory reduction needed for "fit longer
 contexts on the same GPU" but, on the throughput axis specifically, the
 big win is already in.
 
+## V2b update (2026-05-02) — shipped, then deselected
+
+V2b shipped a second Triton kernel
+(`_turbo_fused_attn_decode_kernel`) that walks compressed K/V tiles for
+each (request, q_head), dequants them in registers using the V2a codec
+body, and runs FA-2 online softmax in-kernel — never materializing
+bf16 K/V in HBM. Decode-only contract (q_len=1 per request); chunked
+prefill falls through to the V2a path. Cosine sim parity vs V2a's
+attention output: 0.999996 on Qwen2.5-7B GQA (28 q_heads, 4 kv_heads,
+head_dim=128).
+
+Bench (`docs/benchmarks/2026-05-02-turboquant-v2b.md`) tested the
+"fit longer contexts" thesis directly. **The result deselected V2b as
+the default**:
+
+- Qwen2.5-0.5B + A10: V2b 1.03x throughput vs V2a, peak HBM identical.
+- Qwen2.5-7B + A10: V2b **0.88x throughput** (12% slower) vs V2a, peak
+  HBM identical.
+
+Two reasons:
+
+1. **V2a uses FlashAttention; V2b reimplements it.** V2a calls
+   `flash_attn_varlen_func` on the materialized bf16 K/V — a kernel
+   tuned over years on tensor cores. V2b's hand-rolled Triton online
+   softmax keeps up at small head_dim (64) but loses to FA at 128.
+   Beating FA in our own kernel is a separate, large project.
+2. **The avoided buffer is too small to register.** V2a's per-call
+   materialized K/V is `total_k × num_kv_heads × head_dim × 4 bytes` —
+   1-4 MB at our scales (0.5-7B at ~2k tokens). PyTorch's caching
+   allocator reuses the same physical bytes across layers, so historical
+   peak doesn't change. Even on Llama-405B at 32k tokens the buffer is
+   ~250 MB — < 0.03% of the 820 GB working set.
+
+V2b therefore stays in the codebase but is **off by default**:
+`_FUSED_ATTN_DISABLED_FOR_BENCH = True`. Opt-in via the toggle for
+A/B benchmarks or memory-pressured workloads. V2a is the recommended
+attention path for compressed pools.
+
+### Production-grade alternatives we'd reach for instead
+
+The V2b deselection raises a fair question: is there a library that
+does fused dequant + attention well enough to be worth integrating
+instead of writing our own? Today's landscape:
+
+| Library | Status | What it gives | What it lacks (for our case) |
+|---|---|---|---|
+| **FlashAttention-3** ([github](https://github.com/Dao-AILab/flash-attention)) | Production | State-of-the-art tensor-core attention; FP8 KV on H100 | No TurboQuant codec hook; bf16/fp16/fp8 only |
+| **FlashInfer** ([github](https://github.com/flashinfer-ai/flashinfer)) | Production | Page-aware attention kernels powering vLLM/SGLang; FP8 KV | Same — no rotation+Lloyd-Max+QJL primitive |
+| **vLLM FP8 KV** ([code](https://github.com/vllm-project/vllm/blob/main/vllm/attention/backends/flash_attn.py)) | Production | Per-channel FP8 KV cache, integrated with FA | FP8 not 4-bit; lossier than turbo3 in spirit but uses native HW FP8 path |
+| **TensorRT-LLM** | Production (NVIDIA) | INT8/FP8 KV with custom kernels | NVIDIA-only, closed-ish; no turbo3-style rotation |
+| **CUTLASS attention** ([github](https://github.com/NVIDIA/cutlass)) | Building blocks | Templates for writing FA-class kernels with custom epilogues | Not a finished library; you still write the kernel |
+| **`0xSero/turboquant`** | Research | The reference TurboQuant kernels (3 separate); paper-aligned | Research repo, not packaged, A100-targeted |
+
+**Practical answer**: there's no off-the-shelf library that does
+"compressed-KV fused attention" the way V2b tried to. The realistic
+production path for KV-quantized inference looks like:
+
+1. Use **FP8 KV** (vLLM / FlashInfer / TRT-LLM) on H100+ — uses the
+   hardware's native FP8 tensor-core path, no custom kernels, ~50%
+   memory savings vs bf16 with minimal accuracy loss. Less compression
+   than turbo3 but production-quality.
+2. For 4-bit KV: there's no "just use the library" option. Custom
+   kernels via FlashInfer's primitives or a CUTLASS-based dequant
+   epilogue are the realistic build path. That's the V2b shape but
+   with engineering quality our slice didn't aim for.
+
+For mini-infer's purposes, **V2a + FA varlen on materialized K/V** is
+the right architectural answer. V2b stays as the kernel-engineering
+exploration it was — useful as a study, kept out of the default path.
+
 ## Follow-ups (in order of value/effort)
 
-- **V2b — Fuse attention into the dequant kernel.** Adds Q +
-  cu_seqlens_q/k + softmax_scale to the kernel signature; the K/V tiles
-  produced by the V2a codec body feed an in-kernel FA-2 online softmax,
-  so the materialized bf16 buffer goes away. Throughput at parity with
-  V2a or slightly better; peak attention memory drops by
-  `total_k × num_kv_heads × head_dim × 4` bytes. Reuses the V2a kernel
-  structure (rotation matrix in SMEM, Lloyd-Max + QJL codec) so dequant
-  correctness is already validated by the time we reach this stage.
+- **~~V2b — Fuse attention into the dequant kernel.~~ Shipped and
+  deselected (above).** No further V2b work planned.
+- **FP8 KV cache** (alternative to turbo3 on H100+). Native hardware
+  support; integrate via FlashInfer or vLLM-style custom kernels. Less
+  algorithmic novelty than turbo3 but production-grade.
 - **V2a-for-turbo4.** Same kernel pattern, different codec body
   (per-channel `(low, scale)` instead of polar + Lloyd-Max + QJL). Wire
   if 7B turbo4 ever becomes a target; turbo3 is the recommended V3 mode

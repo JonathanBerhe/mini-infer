@@ -59,12 +59,16 @@ except ImportError:  # macOS / no-CUDA installs typically lack triton
 #   per-block Python loop and `packed_attention_forward` through the
 #   bf16 materialized path. This is the "what would V3 look like with
 #   no Triton" comparison.
-# - `_FUSED_ATTN_DISABLED_FOR_BENCH = True`: disables only the V2b
-#   attention path. Materialize stays fused (V2a). Useful for measuring
-#   the incremental win of the attention-fusion stage on top of the
-#   dequant-fusion stage.
+# - `_FUSED_ATTN_DISABLED_FOR_BENCH = True` (DEFAULT): disables only the
+#   V2b attention path. Materialize stays fused (V2a) and FA varlen
+#   handles the attention math. V2b is off by default because at 7B+
+#   our custom Triton softmax loses to FlashAttention's hand-tuned
+#   kernel by ~12% throughput (validated 2026-05-02 on A10 + Qwen2.5-7B
+#   in `docs/benchmarks/2026-05-02-turboquant-v2b.md`); the kernel is
+#   kept opt-in for memory-constrained scenarios where the avoided
+#   transient buffer matters more than throughput.
 _FUSED_DISABLED_FOR_BENCH = False
-_FUSED_ATTN_DISABLED_FOR_BENCH = False
+_FUSED_ATTN_DISABLED_FOR_BENCH = True
 
 
 def supports_fused_kernel(device: torch.device | str) -> bool:
@@ -85,8 +89,10 @@ def supports_fused_attn_kernel(device: torch.device | str) -> bool:
     """Whether the fully-fused TurboQuant attention kernel (V2b) can run.
 
     Stricter than `supports_fused_kernel`: V2b additionally requires
-    `_FUSED_ATTN_DISABLED_FOR_BENCH` to be False so the bench can A/B
-    V2b against the V2a materialized path on the same model load.
+    `_FUSED_ATTN_DISABLED_FOR_BENCH` to be False. **The default is True**
+    (V2b off) because V2a is faster on 7B+ — see the toggle's docstring
+    above. Set the flag to False to opt into V2b for memory-constrained
+    workloads or A/B comparisons.
     """
     if _FUSED_ATTN_DISABLED_FOR_BENCH:
         return False

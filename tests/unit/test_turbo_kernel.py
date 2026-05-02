@@ -440,14 +440,23 @@ def _attention_two_paths(
     """Compute attention via V2b (fused-attn ON) and via V2a materialized (V2b OFF).
 
     Returns `(out_v2b, out_v2a)` of shape `(total_q, num_q_heads, head_dim)`.
+
+    V2b is now off by default (V2a is faster at 7B+); the test explicitly
+    flips the toggle to compare the two paths.
     """
     from mini_infer.cache import turbo_kernel
     from mini_infer.cache.packed_attention import packed_attention_forward
 
-    # Default: V2b on (and V2a as fallback for prefill, but we're decode-only).
-    out_v2b = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
-
     saved = turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH
+
+    # Force V2b on for the first call.
+    turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = False
+    try:
+        out_v2b = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
+    finally:
+        turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = saved
+
+    # Force V2b off (V2a path) for the second call.
     turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = True
     try:
         out_v2a = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
