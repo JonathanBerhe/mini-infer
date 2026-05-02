@@ -23,10 +23,12 @@ the same forward pass. The matmul cost amortizes across all in-flight q-tokens.
 """
 
 import contextlib
+import json
 import logging
 import math
 import queue
 import threading
+import time
 from collections.abc import Iterator
 
 from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -94,6 +96,7 @@ class ContinuousScheduler:
         max_concurrent: int = 16,
         decode_headroom_blocks: int = DEFAULT_DECODE_HEADROOM_BLOCKS,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        trace_out: str | None = None,
     ) -> None:
         self._runner = runner
         self._max_concurrent = max_concurrent
@@ -104,6 +107,13 @@ class ContinuousScheduler:
         self._batched_cache: PagedKVCache | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Chrome Trace Event recording. When `trace_out` is set, each engine
+        # step that runs a forward appends a duration event to `_trace_events`;
+        # `stop()` writes them out as JSON. `_trace_t0` anchors `ts` at zero
+        # for the first recorded step so the timeline starts at the origin.
+        self._trace_out = trace_out
+        self._trace_events: list[dict[str, object]] | None = [] if trace_out is not None else None
+        self._trace_t0: float | None = None
 
     def start(self) -> None:
         """Spawn the engine thread. Idempotent if the thread is already running."""
@@ -121,6 +131,9 @@ class ContinuousScheduler:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        if self._trace_events is not None and self._trace_out is not None:
+            with open(self._trace_out, "w") as f:
+                json.dump({"traceEvents": self._trace_events}, f)
 
     def submit(self, request: Request) -> RequestHandle:
         """Enqueue a request and return a handle the caller drains for output."""
@@ -155,6 +168,8 @@ class ContinuousScheduler:
 
     def _step(self) -> None:
         """One scheduler iteration: admit, sample decoders, reap, packed forward."""
+        step_start = time.perf_counter() if self._trace_events is not None else 0.0
+
         self._cancel_pending()
         self._admit_waiting()
         sampled_decode_tokens = self._sample_decoders()
@@ -169,8 +184,41 @@ class ContinuousScheduler:
                 RequestState.DECODING,
             )
         ]
+
+        # Snapshot the phase BEFORE `_packed_forward` mutates request states
+        # (e.g. PREFILLING -> DECODING when the last chunk lands).
+        trace_phase: str | None = None
+        if alive and self._trace_events is not None:
+            trace_phase = self._classify_phase(alive)
+
         if alive:
             self._packed_forward(alive, sampled_decode_tokens)
+
+        if alive and self._trace_events is not None:
+            if self._trace_t0 is None:
+                self._trace_t0 = step_start
+            assert trace_phase is not None
+            self._trace_events.append(
+                {
+                    "name": "step",
+                    "ph": "X",
+                    "ts": (step_start - self._trace_t0) * 1e6,
+                    "dur": (time.perf_counter() - step_start) * 1e6,
+                    "pid": 0,
+                    "tid": 0,
+                    "args": {"B": len(alive), "phase": trace_phase},
+                }
+            )
+
+    @staticmethod
+    def _classify_phase(alive: list[RunningRequest]) -> str:
+        """Label the step as prefill / decode / mixed for the trace timeline."""
+        states = {r.state for r in alive}
+        if states <= {RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING}:
+            return "prefill"
+        if states == {RequestState.DECODING}:
+            return "decode"
+        return "mixed"
 
     def _cancel_pending(self) -> None:
         """Mark any cancellation-flagged in-flight requests as DONE.
