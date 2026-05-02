@@ -264,6 +264,9 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         dtype = self._pool.dtype
         if self._pool.kv_quant is None:
             device = self._pool.storage.device
+        elif self._pool.kv_quant == "fp8":
+            assert self._pool._fp8_storage is not None
+            device = self._pool._fp8_storage.device
         else:
             assert self._pool._compressed_storage is not None
             device = self._pool._compressed_storage.device
@@ -302,6 +305,32 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 value_packed[offset : offset + seq_len] = self._pool.storage[
                     layer_idx, 1, block_ids_per_pos, slots_per_pos
                 ]
+        elif self._pool.kv_quant == "fp8":
+            # FP8 path used by the CPU/MPS reference fallback (the CUDA
+            # FlashInfer path skips materialize entirely). Dequant per
+            # request: gather fp8 K/V, cast to fp32, multiply by per-head
+            # scale, cast to the pool's bf16/fp16 dtype.
+            assert self._pool._fp8_storage is not None
+            assert self._pool._fp8_scales is not None
+            for batch_idx in range(self.batch_size):
+                seq_len = seq_lens[batch_idx]
+                if seq_len == 0:
+                    continue
+                offset = cu_seqlens_k_list[batch_idx]
+                positions = torch.arange(seq_len, device=device)
+                block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
+                block_ids_per_pos = block_ids_lookup[positions // block_size]
+                slots_per_pos = positions % block_size
+                k_fp8 = self._pool._fp8_storage[layer_idx, 0, block_ids_per_pos, slots_per_pos]
+                v_fp8 = self._pool._fp8_storage[layer_idx, 1, block_ids_per_pos, slots_per_pos]
+                k_scale = self._pool._fp8_scales[layer_idx, 0]  # (num_kv_heads,)
+                v_scale = self._pool._fp8_scales[layer_idx, 1]
+                key_packed[offset : offset + seq_len] = (
+                    k_fp8.to(torch.float32) * k_scale.view(1, -1, 1)
+                ).to(dtype)
+                value_packed[offset : offset + seq_len] = (
+                    v_fp8.to(torch.float32) * v_scale.view(1, -1, 1)
+                ).to(dtype)
         elif self._pool.kv_quant == "turbo3" and supports_fused_kernel(device):
             # Fused fast path: a single Triton kernel per K/V replaces the
             # per-block Python loop below. Same numerical contract within
@@ -551,6 +580,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
     ) -> None:
         if self._pool.kv_quant is None:
             self._write_packed_kv_uncompressed(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
+        elif self._pool.kv_quant == "fp8":
+            self._write_packed_kv_fp8(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
         else:
             self._write_packed_kv_compressed(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
 
@@ -581,6 +612,63 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 self._pool.storage[layer_idx, 1, block_id, slot_in_block] = packed_v[
                     packed_start + token_offset
                 ]
+
+    def _write_packed_kv_fp8(
+        self,
+        layer_idx: int,
+        packed_k: torch.Tensor,
+        packed_v: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
+    ) -> None:
+        """FP8 e4m3fn write path: per-tensor scale set on first append,
+        then used to quantize new K/V tokens before storing in the paged
+        cache.
+
+        FlashInfer's `run()` takes `k_scale` / `v_scale` as Python
+        floats (per-tensor), not per-head tensors, so the quant side
+        also has to use a single scalar per layer per side — otherwise
+        the dequant during attention won't round-trip. We compute the
+        scalar from the abs-max of the first batch's K (or V) and fill
+        every head slot with it (the per-head storage layout is kept
+        for forward compatibility with a future per-head FlashInfer
+        path).
+        """
+        pool = self._pool
+        assert pool._fp8_storage is not None
+        assert pool._fp8_scales is not None
+        assert pool._fp8_scales_initialized is not None
+
+        block_size = pool.block_size
+        fp8_max = 448.0  # max representable value for float8_e4m3fn
+
+        for kv_idx, packed in ((0, packed_k), (1, packed_v)):
+            if not bool(pool._fp8_scales_initialized[layer_idx, kv_idx]):
+                abs_max = float(packed.abs().max().to(torch.float32).item())
+                scalar = max(abs_max, 1e-6) / fp8_max
+                pool._fp8_scales[layer_idx, kv_idx].fill_(scalar)
+                pool._fp8_scales_initialized[layer_idx, kv_idx] = True
+
+            scale = float(pool._fp8_scales[layer_idx, kv_idx, 0].item())
+            quantized = (
+                (packed.to(torch.float32) / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            )
+
+            # Same per-token write as the uncompressed path; the only
+            # difference is the dtype of the storage tensor.
+            for batch_idx in range(self.batch_size):
+                packed_start = int(cu_seqlens_q_new[batch_idx])
+                packed_end = int(cu_seqlens_q_new[batch_idx + 1])
+                new_tokens = packed_end - packed_start
+                if new_tokens == 0:
+                    continue
+                start_token = self._num_tokens[batch_idx] - new_tokens
+                for token_offset in range(new_tokens):
+                    position = start_token + token_offset
+                    block_id = self._block_ids[batch_idx][position // block_size]
+                    slot_in_block = position % block_size
+                    pool._fp8_storage[layer_idx, kv_idx, block_id, slot_in_block] = quantized[
+                        packed_start + token_offset
+                    ]
 
     def _write_packed_kv_compressed(
         self,

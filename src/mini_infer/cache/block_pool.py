@@ -23,13 +23,17 @@ from mini_infer.exceptions import OutOfMemoryError
 #              turbo4 (4 bits per element) but better fidelity at deeper
 #              models, plus per-vector radii instead of per-channel
 #              (low, scale).
-_SUPPORTED_KV_QUANT = (None, "turbo4", "turbo3")
+#   "fp8"    = FP8 e4m3fn KV cache. Per-(layer, side, kv_head) scale set
+#              from the first append's abs-max; ~50% memory savings vs
+#              bf16. Requires attention_backend="flashinfer" — FlashInfer
+#              fuses fp8 dequant into its paged-attention kernel.
+_SUPPORTED_KV_QUANT = (None, "turbo4", "turbo3", "fp8")
 
 # Supported attention backends. The dispatcher in `packed_attention.py`
 # reads `BlockPool.attention_backend` to pick which implementation runs:
 #   "flash_attn" = `flash_attn_varlen_func` (default)
-#   "flashinfer" = FlashInfer's paged-attention wrappers; requires
-#                  `kv_quant is None` (uncompressed bf16 pool layout)
+#   "flashinfer" = FlashInfer's paged-attention wrappers; valid with
+#                  `kv_quant in {None, "fp8"}`
 _SUPPORTED_ATTENTION_BACKENDS = ("flash_attn", "flashinfer")
 
 
@@ -92,11 +96,15 @@ class BlockPool:
                 f"unsupported attention_backend={attention_backend!r}; "
                 f"expected one of {_SUPPORTED_ATTENTION_BACKENDS}"
             )
-        if attention_backend == "flashinfer" and kv_quant is not None:
+        if attention_backend == "flashinfer" and kv_quant not in (None, "fp8"):
             raise ValueError(
-                f"attention_backend='flashinfer' requires kv_quant=None; "
-                f"got kv_quant={kv_quant!r}. Compressed pools route through "
-                "the materialized path."
+                f"attention_backend='flashinfer' is valid only with "
+                f"kv_quant in (None, 'fp8'); got kv_quant={kv_quant!r}."
+            )
+        if kv_quant == "fp8" and attention_backend != "flashinfer":
+            raise ValueError(
+                "kv_quant='fp8' requires attention_backend='flashinfer'; "
+                f"got {attention_backend!r}."
             )
 
         self.num_blocks = num_blocks
@@ -125,6 +133,39 @@ class BlockPool:
             self._rotation: torch.Tensor | None = None
             self._k_codebook: torch.Tensor | None = None
             self._v_codebook: torch.Tensor | None = None
+            self._fp8_storage: torch.Tensor | None = None
+            self._fp8_scales: torch.Tensor | None = None
+            self._fp8_scales_initialized: torch.Tensor | None = None
+        elif kv_quant == "fp8":
+            # FP8 e4m3fn paged storage with the same NHD layout the bf16
+            # path uses, plus a per-(layer, side, kv_head) scale tensor.
+            # The first append per (layer, side) sets the scale from the
+            # batch's abs-max divided by 448 (the fp8 max representable
+            # value). Subsequent appends quantize against the cached
+            # scale and clamp on overflow.
+            self._fp8_storage = torch.zeros(
+                num_layers,
+                2,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            self._fp8_scales = torch.ones(
+                num_layers, 2, num_kv_heads, dtype=torch.float32, device=device
+            )
+            self._fp8_scales_initialized = torch.zeros(
+                num_layers, 2, dtype=torch.bool, device=device
+            )
+            self._compressed_storage = None
+            self._scales_storage = None
+            self._radii_storage = None
+            self._rotation = None
+            self._k_codebook = None
+            self._v_codebook = None
+            self._storage = torch.empty(0, dtype=dtype, device=device)
         else:
             # Both turbo4 and turbo3 pack 4 bits per element, so the
             # compressed storage has the same shape. The "scales" tensor
@@ -180,6 +221,9 @@ class BlockPool:
             # tensors are tiny (~96 bytes total) so we always allocate.
             self._k_codebook = lloyd_max_codebook(3, dtype=torch.float32, device=device)
             self._v_codebook = lloyd_max_codebook(4, dtype=torch.float32, device=device)
+            self._fp8_storage = None
+            self._fp8_scales = None
+            self._fp8_scales_initialized = None
             # No bf16 _storage in compressed mode; using `.storage` raises.
             self._storage = torch.empty(0, dtype=dtype, device=device)
 
