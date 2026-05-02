@@ -62,6 +62,7 @@ import os
 import statistics
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import modal
@@ -91,6 +92,10 @@ image = (
         "triton>=3.0",
     )
     .pip_install(FLASH_ATTN_WHEEL)
+    .add_local_file(
+        str(Path(__file__).parent / "data" / "technical_passage.md"),
+        "/root/scripts/data/technical_passage.md",
+    )
     .add_local_python_source("mini_infer")
 )
 
@@ -98,187 +103,31 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_PROMPT = "The capital of France is"
 
 # Real long-form technical prose used by every workload that needs a
-# substantive prompt. Built from distinct paragraphs covering several
-# facets of LLM inference (memory bandwidth, KV cache, paged attention,
-# quantization, TurboQuant, batching, speculative decoding) so the
-# benchmark exercises a representative vocabulary spread and natural
-# attention structure. Do NOT replace this with `paragraph * N` — that
-# inflates prefix-cache hits and understates true decode cost.
-_TECHNICAL_PASSAGE = """\
-Modern transformer inference is dominated by memory bandwidth rather than \
-arithmetic throughput. A decode step on a 7-billion-parameter model in bfloat16 \
-must stream roughly 14 GB of weights through the streaming multiprocessors for \
-each generated token, while the GEMM operations themselves only require a few \
-hundred milliseconds of tensor-core time on a modern accelerator. The result \
-is that practical inference engines spend most of their budget either reducing \
-the bytes that have to be moved or hiding the latency of those reads behind \
-other work. Weight quantization, key-value cache compression, and operator \
-fusion all attack different parts of this bandwidth ceiling.
+# substantive prompt. Lives in a dedicated file so it doesn't bloat the
+# bench script. Distinct paragraphs covering several facets of LLM
+# inference; do NOT replace with `paragraph * N` — that inflates
+# prefix-cache hits and understates true decode cost.
+_PASSAGE_LOCAL_PATH = Path(__file__).parent / "data" / "technical_passage.md"
+_PASSAGE_REMOTE_PATH = "/root/scripts/data/technical_passage.md"
 
-The key-value cache is the second large consumer of high-bandwidth memory in \
-autoregressive serving. Each new token writes a key and a value vector for \
-every attention head in every layer; over a thousand-token context, this can \
-easily exceed the model parameters in size, especially for grouped-query \
-attention configurations that share a small number of key-value heads across \
-many query heads. Paged attention treats this cache as a virtual memory system \
-with fixed-size physical blocks that requests reference indirectly through a \
-per-request block table. The indirection eliminates the contiguous-allocation \
-fragmentation that plagued earlier implementations and lets two requests share \
-the same physical pages when their prompts share a prefix, a property that \
-underpins prefix caching across requests.
 
-TurboQuant compresses each new key and value vector at write time using a \
-randomized orthogonal rotation drawn at engine startup, followed by a polar \
-decomposition into a per-vector radius and a unit direction. The unit \
-directions are encoded with a Lloyd-Max scalar quantizer optimized for the \
-post-rotation Gaussian marginals, and a one-bit Quantized \
-Johnson-Lindenstrauss residual sign refines the codebook center. Storing \
-three bits of codebook index plus a one-bit residual on the key side, and \
-four bits of pure codebook index on the value side, packs each element into \
-a single nibble. The rotation precondition makes the per-coordinate \
-distribution data-oblivious, so no calibration set is required, and the \
-inverse rotation that restores standard-space values fits comfortably in a \
-register tile alongside the dequantized payload.
+def _load_technical_passage() -> str:
+    """Read the bench passage from disk.
 
-Continuous batching schedules prefill and decode work on the same forward \
-pass without re-launching the kernel for each request. A single engine \
-iteration packs all in-flight queries into a varying-length sequence, \
-attaches a cumulative-sequence-length tensor that delineates per-request \
-boundaries, and dispatches a paged variable-length attention kernel. \
-Because the kernel reads keys and values directly from the block pool by \
-indexing through each request's block table, no per-layer materialization \
-of contiguous tensors is required for the bf16 path. This packed forward \
-keeps the GPU saturated even when most requests are mid-decode and only \
-contribute a single new query token per step, while a small number of \
-prompts in their prefill phase contribute hundreds of tokens of \
-chunked-prefill work in the same batch.
+    Tries the Modal-mounted remote path first (where the file lives in
+    the container image), then falls back to the local repo path so the
+    same constant is available outside Modal. Either path may be missing
+    on a fresh setup; raise a helpful error in that case.
+    """
+    for path in (Path(_PASSAGE_REMOTE_PATH), _PASSAGE_LOCAL_PATH):
+        if path.exists():
+            return path.read_text()
+    raise FileNotFoundError(
+        f"technical_passage.md not found at {_PASSAGE_REMOTE_PATH} or {_PASSAGE_LOCAL_PATH}"
+    )
 
-Speculative decoding amortizes the latency of large-target decode steps \
-by drafting several tokens with a smaller, cheaper model and verifying \
-them in a single target-model forward pass. When the draft model agrees \
-with the target on the first k accepted positions, the engine emits k \
-tokens for the cost of one target-model step plus k cheap draft steps; \
-when the draft diverges, the engine falls back to a regular sample for \
-the rejected position. Acceptance rate determines the realized speedup: \
-a 0.7 acceptance rate over a draft length of four typically translates \
-into a one-and-a-half to two-times wall-clock improvement on \
-conversational workloads, while highly stochastic prompts can break \
-even or regress when the draft proposes branches the target rejects.
 
-Paged attention's block-table indirection plays directly into prefix \
-caching at the request level. When a new request arrives whose prompt \
-shares a leading prefix with a previously served request, the scheduler \
-hashes the prompt by block-sized chunks and consults a radix-style \
-cache to locate matching block ids. Each cached block carries a \
-reference count; a hit increments the count and binds the block into \
-the new request's table without any recomputation. The first \
-unmatched block is the prefix boundary, and the engine prefills only \
-the suffix from that boundary onward. On long shared system prompts \
-this can collapse the prefill cost of the second and subsequent \
-requests by an order of magnitude, turning what would have been \
-parallel-but-redundant work into an effective broadcast of the cached \
-key-value state.
-
-Operator fusion at the kernel level closes the remaining gap between \
-algorithmic and realized throughput. A naive int8 weight, bfloat16 \
-activation linear layer dequantizes the entire weight tensor to bf16 \
-before each matmul, which throws away the bandwidth savings of storing \
-weights in a smaller representation. A fused kernel keeps the weights \
-int8 in high-bandwidth memory, loads small tiles into shared memory, \
-casts to bf16 inside the dot accumulator, and applies the per-output \
-channel scale after the contraction. The same fusion pattern applies \
-to compressed key-value caches: the dequantization of nibble-packed \
-values, the codebook lookup, the radius multiplication, and the \
-inverse rotation all fit inside a single Triton program that produces \
-ready-to-attend bf16 tiles without ever materializing them in global \
-memory. Without that fusion, the per-block dequantization launches \
-hundreds of small CUDA operations per decode step and the resulting \
-launch overhead dominates the arithmetic the kernel was meant to \
-amortize.
-
-Eviction policy becomes the limiting factor on engines that serve more \
-concurrent requests than the block pool can hold simultaneously. A \
-least-recently-used policy treats every block as fungible, which works \
-well for shared system prompts but disposes of cached prefixes that \
-arrive in bursts. Importance-aware policies score each block by some \
-combination of access frequency, projected reuse, and the cost to \
-recompute it; for instance, the first block of a long shared prompt \
-deserves a higher protection priority than a single decode-step block \
-midway through a private response. Implementing this without locking \
-the hot path requires a free list paired with a lock-free reference \
-counter, and care that the eviction signal is sampled often enough to \
-avoid stalls when the pool runs near full but rare enough that bookkeeping \
-does not contend with the request-routing thread. Engines that mismanage \
-eviction see tail latency spikes that look like model regressions but are \
-in fact memory-system thrashing.
-
-Tensor parallelism splits each weight matrix across several accelerators \
-and runs the corresponding partial computations in parallel, with all-reduce \
-or all-gather steps to combine the results. The split direction matters: \
-column-parallel splits along the output dimension produce per-shard outputs \
-that need to be gathered before the next layer, whereas row-parallel splits \
-along the contraction dimension produce partial sums that need an all-reduce. \
-Modern transformer blocks alternate the two so that the gather of one matmul \
-becomes the input of the next without an extra collective. The remaining \
-collective lives at the residual addition between attention and MLP, and the \
-network bandwidth available to that single all-reduce often determines the \
-strong-scaling ceiling of the whole system. For sufficiently large models \
-this is unavoidable, but for medium-sized models the inter-GPU crossing tax \
-can outweigh the parallel speedup, which is why the right strategy is \
-model-and-batch dependent.
-
-Long-context inference exposes a different cluster of bottlenecks. The \
-attention computation itself scales quadratically with sequence length when \
-implemented naively, but FlashAttention's online-softmax tiling collapses the \
-quadratic memory cost to linear and turns the latency into an arithmetic \
-bound that grows linearly with both query length and key length. Sliding \
-window attention bounds the key length per layer to a fixed window, which \
-makes long generations practical at the cost of some long-range information. \
-Attention sinks reserve a small number of always-attended-to positions at \
-the start of the context to stabilize the softmax distribution under the \
-sliding window, mitigating the entropy collapse that otherwise causes the \
-model to lose track of system-prompt content past the window boundary. \
-These structural choices interact with the cache compression strategy: a \
-sliding window halves the cache footprint independently of any \
-per-element compression, while a fixed-window combined with TurboQuant \
-multiplies the savings.
-
-Disaggregated serving separates the prefill stage onto dedicated workers \
-from the decode stage that runs on different workers, exchanging key and \
-value cache between them over the interconnect once prefill completes. \
-The motivation is that prefill is compute-bound and benefits from large \
-batches of concurrent prompts, while decode is memory-bandwidth-bound and \
-benefits from tight per-request latency. Co-locating both on the same \
-worker forces a compromise: the batch composition that maximizes prefill \
-throughput starves the decode requests that could otherwise stream tokens \
-quickly. Splitting them lets each side run on a profile of resources and \
-batch sizes that suits its arithmetic intensity. The catch is the \
-cross-worker key-value transfer: at typical model sizes this is several \
-hundred megabytes per request, which only pays off when the prefill batch \
-is large enough that the saved compute outweighs the network cost. \
-Practical deployments tune the disaggregation ratio dynamically based on \
-real-time queue lengths and observed transfer latency.
-
-Routing across replicas turns the inference cluster into a stateful load \
-balancer. A naive round-robin distribution ignores the fact that each \
-replica has a different key-value cache hit rate for any given prompt — a \
-prompt whose prefix is already cached on replica seven costs essentially \
-nothing on that replica and a full prefill on every other one. \
-Cache-aware routers hash incoming prompts and consult per-replica prefix \
-indices to land each new request on the worker most likely to hit. The \
-resulting scheduling policy has to balance hit-rate locality against \
-queue length, because routing every prefix-sharing prompt to the same \
-hot replica eventually saturates that replica while others sit idle. \
-The right answer is a multi-factor cost function that weights cache \
-hit, queue depth, and an estimate of marginal compute per replica, \
-re-evaluated every few hundred milliseconds with feedback from per-replica \
-telemetry.
-
-Question: Summarize the techniques described above and explain which \
-ones address memory bandwidth versus which ones address scheduling \
-overhead.
-
-Answer:"""
+_TECHNICAL_PASSAGE = _load_technical_passage()
 
 
 def _build_long_prompt(target_tokens: int | None = None) -> str:
@@ -1078,6 +927,106 @@ def _run_turbo_parity(
     return "\n".join(lines)
 
 
+def _run_flashinfer_compare(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+) -> str:
+    """flash-attn vs FlashInfer on the same uncompressed bf16 model.
+
+    Loads the model twice (once per backend) and runs the same long-prompt
+    decode workload. Reports per-backend throughput, peak HBM, and the
+    cosine sim of greedy first-token logits to confirm numerical parity.
+    """
+    import gc
+
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    prompt = _TECHNICAL_PASSAGE
+    max_tokens = 128
+
+    def _measure(backend: str) -> dict[str, Any]:
+        runner = ModelRunner.from_pretrained(
+            model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            attention_backend=backend,
+        )
+        # Warmup so first-launch JIT (FlashInfer) isn't counted.
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            sched.run(Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=8))
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        start = time.perf_counter()
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            result = sched.run(
+                Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+            )
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        peak_bytes = torch.cuda.max_memory_allocated()
+
+        # First-token logits for parity comparison.
+        input_ids = runner.tokenizer.encode(prompt)
+        x = torch.tensor([input_ids], device=runner.device, dtype=torch.long)
+        with torch.inference_mode():
+            logits = runner._model(x, use_cache=False).logits[0, -1, :].float().cpu()
+
+        del runner
+        gc.collect()
+        torch.cuda.empty_cache()
+        return {
+            "backend": backend,
+            "elapsed_s": round(elapsed, 3),
+            "decoded_tokens": len(result.tokens),
+            "tok_per_s": round(len(result.tokens) / elapsed, 2),
+            "peak_mib": round(peak_bytes / (1024**2), 1),
+            "first_tokens": list(result.tokens[:8]),
+            "first_token_logits": logits,
+        }
+
+    fa_result = _measure("flash_attn")
+    fi_result = _measure("flashinfer")
+
+    cos = float(
+        torch.nn.functional.cosine_similarity(
+            fa_result["first_token_logits"].flatten(),
+            fi_result["first_token_logits"].flatten(),
+            dim=0,
+        ).item()
+    )
+
+    speedup = fi_result["tok_per_s"] / fa_result["tok_per_s"]
+    delta_mib = fa_result["peak_mib"] - fi_result["peak_mib"]
+    lines = [
+        f"Workload: prompt={len(prompt)} chars, max_tokens={max_tokens}, C=1",
+        "",
+        f"  flash_attn   t/s={fa_result['tok_per_s']:>6.2f}  "
+        f"peak HBM={fa_result['peak_mib']:>8.1f} MiB  first8={fa_result['first_tokens']}",
+        f"  flashinfer   t/s={fi_result['tok_per_s']:>6.2f}  "
+        f"peak HBM={fi_result['peak_mib']:>8.1f} MiB  first8={fi_result['first_tokens']}",
+        "",
+        f"  Logit cos sim (first decode position): {cos:.6f} (>0.999 required)",
+        f"  flashinfer vs flash_attn: throughput {speedup:.2f}x, peak HBM {delta_mib:+.1f} MiB",
+    ]
+    return "\n".join(lines)
+
+
 def _run_turbo_v2b_compare(
     model: str,
     num_blocks: int,
@@ -1694,6 +1643,10 @@ def run_bench(
         body = _run_turbo_v2b_compare(model=model, num_blocks=num_blocks, block_size=block_size)
         return f"\n{header}\n\n=== TurboQuant V2b vs V2a (memory + throughput) ===\n{body}\n"
 
+    if config == "flashinfer":
+        body = _run_flashinfer_compare(model=model, num_blocks=num_blocks, block_size=block_size)
+        return f"\n{header}\n\n=== flash-attn vs FlashInfer (bf16 backend A/B) ===\n{body}\n"
+
     if config == "quant_kernel":
         body = _run_quant_kernel_bench(
             model=model,
@@ -1809,7 +1762,7 @@ def run_bench(
     raise ValueError(
         f"unknown config={config!r}; "
         "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo|"
-        "turbo_parity|turbo_v2b"
+        "turbo_parity|turbo_v2b|flashinfer"
     )
 
 

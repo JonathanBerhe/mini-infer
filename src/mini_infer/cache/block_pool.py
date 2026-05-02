@@ -25,6 +25,13 @@ from mini_infer.exceptions import OutOfMemoryError
 #              (low, scale).
 _SUPPORTED_KV_QUANT = (None, "turbo4", "turbo3")
 
+# Supported attention backends. The dispatcher in `packed_attention.py`
+# reads `BlockPool.attention_backend` to pick which implementation runs:
+#   "flash_attn" = `flash_attn_varlen_func` (default)
+#   "flashinfer" = FlashInfer's paged-attention wrappers; requires
+#                  `kv_quant is None` (uncompressed bf16 pool layout)
+_SUPPORTED_ATTENTION_BACKENDS = ("flash_attn", "flashinfer")
+
 
 class BlockPool:
     """Pre-allocated pool of fixed-size K/V blocks shared across requests.
@@ -60,6 +67,7 @@ class BlockPool:
         device: str,
         prefix_cache: PrefixCache | None = None,
         kv_quant: str | None = None,
+        attention_backend: str = "flash_attn",
     ) -> None:
         if num_blocks <= 0:
             raise ValueError(f"num_blocks must be positive, got {num_blocks}")
@@ -79,6 +87,17 @@ class BlockPool:
                 f"{kv_quant!r} packs two 4-bit values per byte; "
                 "block_size * num_kv_heads * head_dim must be even"
             )
+        if attention_backend not in _SUPPORTED_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"unsupported attention_backend={attention_backend!r}; "
+                f"expected one of {_SUPPORTED_ATTENTION_BACKENDS}"
+            )
+        if attention_backend == "flashinfer" and kv_quant is not None:
+            raise ValueError(
+                f"attention_backend='flashinfer' requires kv_quant=None; "
+                f"got kv_quant={kv_quant!r}. Compressed pools route through "
+                "the materialized path."
+            )
 
         self.num_blocks = num_blocks
         self.block_size = block_size
@@ -87,6 +106,7 @@ class BlockPool:
         self.head_dim = head_dim
         self.dtype = dtype
         self._kv_quant = kv_quant
+        self._attention_backend = attention_backend
 
         if kv_quant is None:
             self._storage = torch.zeros(
@@ -182,6 +202,10 @@ class BlockPool:
     @property
     def kv_quant(self) -> str | None:
         return self._kv_quant
+
+    @property
+    def attention_backend(self) -> str:
+        return self._attention_backend
 
     @property
     def rotation(self) -> torch.Tensor | None:
