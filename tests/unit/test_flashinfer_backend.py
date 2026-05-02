@@ -79,7 +79,7 @@ def test_block_pool_rejects_unknown_attention_backend() -> None:
 def test_block_pool_rejects_flashinfer_with_turboquant_pool() -> None:
     """FlashInfer's bf16/fp8 paged storage layouts don't match the
     TurboQuant nibble-packed layout, so the combo is rejected."""
-    with pytest.raises(ValueError, match="kv_quant in \\(None, 'fp8'\\)"):
+    with pytest.raises(ValueError, match="kv_quant in \\(None, 'fp8', 'nvfp4'\\)"):
         BlockPool(
             num_blocks=4,
             block_size=8,

@@ -1,6 +1,6 @@
-# ADR-013: TurboQuant KV cache (V1 + V3 + V2a fused dequant; V2b deselected)
+# ADR-013: TurboQuant KV cache (V1 + V3 + V2a fused dequant; V2b deselected); FlashInfer FP8 + NVFP4
 
-Date: 2026-04-29 (V1), 2026-04-30 (V3 update), 2026-05-02 (V2a + V2b updates)
+Date: 2026-04-29 (V1), 2026-04-30 (V3), 2026-05-02 (V2a/V2b, FlashInfer bf16/FP8/NVFP4)
 Status: Accepted
 
 V1 (`kv_quant="turbo4"`): rotation + per-channel uniform 4-bit. Shipped
@@ -25,6 +25,28 @@ the default attention path the same day**: at Qwen2.5-7B + A10, V2b is
 transient buffer is too small to register on the peak-memory meter.
 Kept opt-in via `_FUSED_ATTN_DISABLED_FOR_BENCH = False` (default True)
 for memory-constrained edge cases.
+
+FlashInfer FP8 KV (`kv_quant="fp8"`): FP8 e4m3fn paged storage routed
+through FlashInfer's tensor-core paged-attention wrapper, which fuses
+dequant into the kernel. Shipped 2026-05-02 on H100. **50% KV memory
+savings**, logit cos sim 0.999985 vs bf16, 0.93x throughput at
+Qwen2.5-0.5B. The production-grade 8-bit KV path on Hopper.
+
+FlashInfer NVFP4 KV (`kv_quant="nvfp4"`): FP4-packed paged storage with
+per-16-element FP8 block scales + per-(layer, side) FP32 global scale,
+routed through the same FlashInfer wrapper via `kv_cache_sf`. Shipped
+2026-05-02 on B200. **71.9% KV memory savings**, 0.91x throughput at
+Qwen2.5-7B. **Token-level accuracy is degraded under greedy decode**:
+the textbook per-(layer, side) global scale leaves bulk K/V values
+quantized toward FP4-zero in the presence of outliers, and the
+per-layer ~5% direction error (cos sim 0.948 on a parity probe)
+compounds across 28+ layers into incoherent token output. Production
+NVFP4 KV deployments need outlier-aware preprocessing (per-channel
+scales, SmoothQuant-style transforms, calibration) we haven't
+implemented. Integration infrastructure is correct (memory savings
+real, kernel path validated within FlashInfer's own 1e-1 tolerance);
+treat this as a working FP4 plumbing layer that needs a calibration
+slice on top before token-quality-sensitive use.
 
 ## Context
 

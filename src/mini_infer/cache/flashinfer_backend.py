@@ -123,9 +123,10 @@ def flashinfer_attention_forward(
         )
     require_cuda_device(q.device, "FlashInfer paged attention")
 
-    if cache._pool.kv_quant not in (None, "fp8"):
+    if cache._pool.kv_quant not in (None, "fp8", "nvfp4"):
         raise RuntimeError(
-            f"FlashInfer backend supports kv_quant in (None, 'fp8'); got {cache._pool.kv_quant!r}."
+            f"FlashInfer backend supports kv_quant in (None, 'fp8', 'nvfp4'); "
+            f"got {cache._pool.kv_quant!r}."
         )
 
     device = q.device
@@ -167,7 +168,10 @@ def flashinfer_attention_forward(
 
     # Layer slice. For uncompressed pools the storage is bf16; for fp8
     # pools we read from `_fp8_storage` and pass per-head scales to
-    # FlashInfer's run() so the kernel dequants on-the-fly.
+    # FlashInfer's run() so the kernel dequants on-the-fly. For nvfp4
+    # pools we additionally pass per-block FP8 scales via `kv_cache_sf`
+    # (the V side has TRT-LLM's 4-token swizzle baked in by the writer).
+    kv_cache_sf: tuple[torch.Tensor, torch.Tensor] | None = None
     if cache._pool.kv_quant == "fp8":
         assert cache._pool._fp8_storage is not None
         assert cache._pool._fp8_scales is not None
@@ -180,6 +184,31 @@ def flashinfer_attention_forward(
         # heads is slightly worse than a true per-head path would give.
         k_scale: float | None = float(cache._pool._fp8_scales[layer_idx, 0].max().item())
         v_scale: float | None = float(cache._pool._fp8_scales[layer_idx, 1].max().item())
+    elif cache._pool.kv_quant == "nvfp4":
+        assert cache._pool._nvfp4_storage is not None
+        assert cache._pool._nvfp4_block_scales is not None
+        assert cache._pool._nvfp4_global_sf is not None
+        assert cache._pool._nvfp4_initialized is not None
+        k_cache = cache._pool._nvfp4_storage[layer_idx, 0]
+        v_cache = cache._pool._nvfp4_storage[layer_idx, 1]
+        kv_cache_sf = (
+            cache._pool._nvfp4_block_scales[layer_idx, 0],
+            cache._pool._nvfp4_block_scales[layer_idx, 1],
+        )
+        # FlashInfer's plan() reads the packed-FP4 storage as uint8.
+        kv_data_type = torch.uint8
+        # k_scale / v_scale carry the per-(layer, side) global scale as
+        # Python floats. Convention from `nvfp4_quantize_paged_kv_cache`:
+        # k_scale = 1 / k_global_sf so the kernel multiplies on dequant.
+        if not bool(cache._pool._nvfp4_initialized[layer_idx, 0]) or not bool(
+            cache._pool._nvfp4_initialized[layer_idx, 1]
+        ):
+            raise RuntimeError(
+                f"NVFP4 attention before any K/V written for layer {layer_idx}; "
+                "the writer initializes per-(layer, side) global scales on first append."
+            )
+        k_scale = 1.0 / float(cache._pool._nvfp4_global_sf[layer_idx, 0].item())
+        v_scale = 1.0 / float(cache._pool._nvfp4_global_sf[layer_idx, 1].item())
     else:
         k_cache = cache._pool.storage[layer_idx, 0]
         v_cache = cache._pool.storage[layer_idx, 1]
@@ -210,8 +239,12 @@ def flashinfer_attention_forward(
         q_data_type=q.dtype,
         kv_data_type=kv_data_type,
     )
-    if k_scale is not None:
-        out: torch.Tensor = prefill_wrapper.run(q, kv_cache, k_scale=k_scale, v_scale=v_scale)
+    if kv_cache_sf is not None:
+        out: torch.Tensor = prefill_wrapper.run(
+            q, kv_cache, k_scale=k_scale, v_scale=v_scale, kv_cache_sf=kv_cache_sf
+        )
+    elif k_scale is not None:
+        out = prefill_wrapper.run(q, kv_cache, k_scale=k_scale, v_scale=v_scale)
     else:
         out = prefill_wrapper.run(q, kv_cache)
     return out

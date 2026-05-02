@@ -81,28 +81,54 @@ FLASH_ATTN_WHEEL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/"
     "v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 )
-image = (
-    # CUDA dev image (has nvcc) so FlashInfer's JIT-compiled prefill
-    # kernels can build at first call. CUDA 12.8 satisfies FlashInfer
-    # 0.6.10's `>=12.6` minimum and is forward-compatible with the
-    # CUDA 12.4 runtime libs bundled in the torch 2.5.1+cu124 wheel.
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")
-    .pip_install(
-        "transformers>=4.40",
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.27",
-        "pydantic>=2.5",
-        "triton>=3.0",
+_IS_BLACKWELL = _BENCH_GPU.upper().startswith("B200")
+
+if _IS_BLACKWELL:
+    # Blackwell (SM_100) needs the cu128 torch wheel; the cu124 wheel ships
+    # kernels through SM_90 only and fails with "no kernel image is available
+    # for execution on the device" on the first tensor op. flash-attn isn't
+    # used here: B200 runs always go through FlashInfer's paged kernels, and
+    # the prebuilt flash-attn 2.8.3 wheel is pinned to torch 2.5 anyway.
+    image = (
+        modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
+        .pip_install("torch>=2.6", extra_index_url="https://download.pytorch.org/whl/cu128")
+        .pip_install(
+            "transformers>=4.40",
+            "fastapi>=0.110",
+            "uvicorn[standard]>=0.27",
+            "pydantic>=2.5",
+            "triton>=3.0",
+        )
+        .pip_install("flashinfer-python>=0.6.10rc1")
+        .add_local_file(
+            str(Path(__file__).parent / "data" / "technical_passage.md"),
+            "/root/scripts/data/technical_passage.md",
+        )
+        .add_local_python_source("mini_infer")
     )
-    .pip_install(FLASH_ATTN_WHEEL)
-    .pip_install("flashinfer-python>=0.6.10rc1")
-    .add_local_file(
-        str(Path(__file__).parent / "data" / "technical_passage.md"),
-        "/root/scripts/data/technical_passage.md",
+else:
+    image = (
+        # CUDA dev image (has nvcc) so FlashInfer's JIT-compiled prefill
+        # kernels can build at first call. CUDA 12.8 satisfies FlashInfer
+        # 0.6.10's `>=12.6` minimum and is forward-compatible with the
+        # CUDA 12.4 runtime libs bundled in the torch 2.5.1+cu124 wheel.
+        modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
+        .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")
+        .pip_install(
+            "transformers>=4.40",
+            "fastapi>=0.110",
+            "uvicorn[standard]>=0.27",
+            "pydantic>=2.5",
+            "triton>=3.0",
+        )
+        .pip_install(FLASH_ATTN_WHEEL)
+        .pip_install("flashinfer-python>=0.6.10rc1")
+        .add_local_file(
+            str(Path(__file__).parent / "data" / "technical_passage.md"),
+            "/root/scripts/data/technical_passage.md",
+        )
+        .add_local_python_source("mini_infer")
     )
-    .add_local_python_source("mini_infer")
-)
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 DEFAULT_PROMPT = "The capital of France is"
@@ -1044,6 +1070,130 @@ def _run_flashinfer_fp8_compare(
     return "\n".join(lines)
 
 
+def _run_flashinfer_nvfp4_compare(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+) -> str:
+    """bf16 baseline vs NVFP4 KV cache via FlashInfer (Blackwell only).
+
+    Loads the model twice on the same Modal container and runs the same
+    long-prompt decode workload. Reports per-mode KV pool memory,
+    throughput, peak HBM, and first-token logit cosine sim. NVFP4 is
+    lossier than FP8 (4 bits per value vs 8) but each FP8 scale block
+    covers only 16 elements, so accuracy on real model tensors is
+    typically within a few percent.
+    """
+    import gc
+
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        return (
+            f"NVFP4 KV requires Blackwell (SM_100+); current GPU compute capability "
+            f"{torch.cuda.get_device_capability()}. Skipping."
+        )
+
+    prompt = _TECHNICAL_PASSAGE
+    max_tokens = 128
+
+    def _measure(label: str, **runner_kwargs: object) -> dict[str, Any]:
+        runner = ModelRunner.from_pretrained(
+            model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            **runner_kwargs,  # type: ignore[arg-type]
+        )
+        pool = runner.block_pool
+        if pool.kv_quant == "nvfp4":
+            assert pool._nvfp4_storage is not None
+            assert pool._nvfp4_block_scales is not None
+            kv_bytes = int(pool._nvfp4_storage.numel() * pool._nvfp4_storage.element_size())
+            kv_bytes += int(
+                pool._nvfp4_block_scales.numel() * pool._nvfp4_block_scales.element_size()
+            )
+        else:
+            storage: torch.Tensor = pool._storage
+            kv_bytes = int(storage.numel() * storage.element_size())
+        kv_mib = kv_bytes / (1024**2)
+
+        # Warmup so first-launch JIT isn't counted.
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            sched.run(Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=8))
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        start = time.perf_counter()
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            result = sched.run(
+                Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+            )
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        peak_bytes = torch.cuda.max_memory_allocated()
+
+        input_ids = runner.tokenizer.encode(prompt)
+        x = torch.tensor([input_ids], device=runner.device, dtype=torch.long)
+        with torch.inference_mode():
+            logits = runner._model(x, use_cache=False).logits[0, -1, :].float().cpu()
+
+        del runner
+        gc.collect()
+        torch.cuda.empty_cache()
+        return {
+            "label": label,
+            "kv_pool_mib": round(kv_mib, 1),
+            "elapsed_s": round(elapsed, 3),
+            "tok_per_s": round(len(result.tokens) / elapsed, 2),
+            "peak_mib": round(peak_bytes / (1024**2), 1),
+            "first_tokens": list(result.tokens[:8]),
+            "first_token_logits": logits,
+        }
+
+    bf16 = _measure("bf16 / flash_attn")
+    nvfp4 = _measure("nvfp4 / flashinfer", kv_quant="nvfp4", attention_backend="flashinfer")
+
+    cos = float(
+        torch.nn.functional.cosine_similarity(
+            bf16["first_token_logits"].flatten(),
+            nvfp4["first_token_logits"].flatten(),
+            dim=0,
+        ).item()
+    )
+    speedup = nvfp4["tok_per_s"] / bf16["tok_per_s"]
+    kv_savings_pct = (1.0 - nvfp4["kv_pool_mib"] / bf16["kv_pool_mib"]) * 100
+    lines = [
+        f"Workload: prompt={len(prompt)} chars, max_tokens={max_tokens}, C=1",
+        "",
+        f"  {bf16['label']:25s} t/s={bf16['tok_per_s']:>6.2f}  "
+        f"peak HBM={bf16['peak_mib']:>8.1f} MiB  KV pool={bf16['kv_pool_mib']:>8.1f} MiB",
+        f"  {nvfp4['label']:25s} t/s={nvfp4['tok_per_s']:>6.2f}  "
+        f"peak HBM={nvfp4['peak_mib']:>8.1f} MiB  KV pool={nvfp4['kv_pool_mib']:>8.1f} MiB",
+        "",
+        f"  KV memory savings: {kv_savings_pct:+.1f}% (nvfp4 vs bf16)",
+        f"  Logit cos sim (first decode position): {cos:.6f} (>0.97 expected)",
+        f"  Throughput nvfp4 / bf16: {speedup:.2f}x",
+        "",
+        f"  bf16  first 8 tokens: {bf16['first_tokens']}",
+        f"  nvfp4 first 8 tokens: {nvfp4['first_tokens']}",
+    ]
+    return "\n".join(lines)
+
+
 def _run_flashinfer_compare(
     model: str,
     num_blocks: int,
@@ -1712,7 +1862,15 @@ def _run_spec_bench(
     return "\n".join(lines)
 
 
-@app.function(image=image, gpu=_BENCH_GPU, timeout=3600)
+_HF_TOKEN = os.environ.get("HF_TOKEN")
+_SECRETS = (
+    [modal.Secret.from_dict({"HF_TOKEN": _HF_TOKEN, "HUGGING_FACE_HUB_TOKEN": _HF_TOKEN})]
+    if _HF_TOKEN
+    else []
+)
+
+
+@app.function(image=image, gpu=_BENCH_GPU, timeout=3600, secrets=_SECRETS)
 def run_bench(
     config: str,
     model: str,
@@ -1769,6 +1927,12 @@ def run_bench(
             model=model, num_blocks=num_blocks, block_size=block_size
         )
         return f"\n{header}\n\n=== bf16 vs FP8 KV (FlashInfer attention) ===\n{body}\n"
+
+    if config == "flashinfer_nvfp4":
+        body = _run_flashinfer_nvfp4_compare(
+            model=model, num_blocks=num_blocks, block_size=block_size
+        )
+        return f"\n{header}\n\n=== bf16 vs NVFP4 KV (FlashInfer attention, B200) ===\n{body}\n"
 
     if config == "quant_kernel":
         body = _run_quant_kernel_bench(
@@ -1885,7 +2049,7 @@ def run_bench(
     raise ValueError(
         f"unknown config={config!r}; "
         "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo|"
-        "turbo_parity|turbo_v2b|flashinfer|flashinfer_fp8"
+        "turbo_parity|turbo_v2b|flashinfer|flashinfer_fp8|flashinfer_nvfp4"
     )
 
 
