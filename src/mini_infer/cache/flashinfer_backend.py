@@ -177,26 +177,13 @@ def flashinfer_attention_forward(
     v_cache = cache._pool.storage[layer_idx, 1]
     kv_cache: tuple[torch.Tensor, torch.Tensor] | torch.Tensor = (k_cache, v_cache)
 
-    # Decode-only fast path: q_len == 1 per request → use the decode
-    # wrapper, which has a tighter scheduling plan. Multi-token Q (chunked
-    # prefill or mixed batches) goes through the prefill wrapper, which
-    # handles varlen Q via `qo_indptr` and applies a causal mask.
-    if q.shape[0] == cu_seqlens_q.shape[0] - 1:
-        decode_wrapper.plan(
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            pos_encoding_mode="NONE",
-            q_data_type=q.dtype,
-            kv_data_type=q.dtype,
-        )
-        out: torch.Tensor = decode_wrapper.run(q, kv_cache, sm_scale=softmax_scale)
-        return out
-
+    # Always go through the prefill wrapper. FlashInfer's decode wrapper
+    # is faster but only supports power-of-2 GQA group sizes (1, 2, 4,
+    # 8, 16); models like Qwen2.5 use group_size=7 which the decode
+    # kernel rejects. The prefill wrapper handles arbitrary group_size
+    # via `qo_indptr` (q_len=1 per request collapses to the decode case
+    # internally).
+    _ = decode_wrapper  # kept for future re-enable on power-of-2 GQA models
     prefill_wrapper.plan(
         qo_indptr,
         paged_kv_indptr,
@@ -208,8 +195,9 @@ def flashinfer_attention_forward(
         page_size,
         causal=True,
         pos_encoding_mode="NONE",
+        sm_scale=softmax_scale,
         q_data_type=q.dtype,
         kv_data_type=q.dtype,
     )
-    out = prefill_wrapper.run(q, kv_cache, sm_scale=softmax_scale)
+    out: torch.Tensor = prefill_wrapper.run(q, kv_cache)
     return out
