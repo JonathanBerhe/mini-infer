@@ -82,7 +82,11 @@ FLASH_ATTN_WHEEL = (
     "v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 )
 image = (
-    modal.Image.debian_slim(python_version="3.11")
+    # CUDA dev image (has nvcc) so FlashInfer's JIT-compiled prefill
+    # kernels can build at first call. CUDA 12.8 satisfies FlashInfer
+    # 0.6.10's `>=12.6` minimum and is forward-compatible with the
+    # CUDA 12.4 runtime libs bundled in the torch 2.5.1+cu124 wheel.
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
     .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")
     .pip_install(
         "transformers>=4.40",
@@ -92,6 +96,7 @@ image = (
         "triton>=3.0",
     )
     .pip_install(FLASH_ATTN_WHEEL)
+    .pip_install("flashinfer-python>=0.6.10rc1")
     .add_local_file(
         str(Path(__file__).parent / "data" / "technical_passage.md"),
         "/root/scripts/data/technical_passage.md",
