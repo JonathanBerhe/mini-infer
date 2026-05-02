@@ -87,27 +87,31 @@ def packed_attention_forward(
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+
+    # FlashInfer paged-attention backend (opt-in via the pool's
+    # `attention_backend="flashinfer"`). Handles bf16, fp8 e4m3fn, and
+    # nvfp4 paged storage (FlashInfer fuses dequant into the tensor-core
+    # kernel for the quantized modes). Hoisted ahead of the flash-attn
+    # gate because FlashInfer is independent of flash-attn — Blackwell
+    # builds ship without flash-attn (no torch-2.6 wheel) but FlashInfer
+    # still works.
+    from mini_infer.cache.flashinfer_backend import (
+        flashinfer_attention_forward,
+        supports_flashinfer_backend,
+    )
+
+    if (
+        cache._pool.attention_backend == "flashinfer"
+        and supports_flashinfer_backend(q.device)
+        and cache._pool.kv_quant in (None, "fp8", "nvfp4")
+    ):
+        return flashinfer_attention_forward(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
+
     if supports_packed_kernel(q.device):
-        from mini_infer.cache.flashinfer_backend import (
-            flashinfer_attention_forward,
-            supports_flashinfer_backend,
-        )
         from mini_infer.cache.turbo_kernel import (
             fused_turbo_attention_decode,
             supports_fused_attn_kernel,
         )
-
-        # FlashInfer paged-attention backend (opt-in via the pool's
-        # `attention_backend="flashinfer"`). Handles bf16 paged storage
-        # and fp8 paged storage (FlashInfer fuses fp8 dequant into the
-        # tensor-core kernel). Other compressed pools (TurboQuant) fall
-        # through to the materialized path below.
-        if (
-            cache._pool.attention_backend == "flashinfer"
-            and supports_flashinfer_backend(q.device)
-            and cache._pool.kv_quant in (None, "fp8")
-        ):
-            return flashinfer_attention_forward(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
 
         block_size = cache._pool.block_size
         # Fully-fused TurboQuant attention path: only fires for turbo3

@@ -48,6 +48,13 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._slot_prompt_tokens: list[list[int]] = []
         self._slot_num_published: list[int] = []
         self._slot_parent_hash: list[bytes | None] = []
+        # NVFP4 mode keeps a per-slot bf16 shadow of the slot's currently-
+        # active (last) block across all (layer, side). The shadow is the
+        # only place we hold bf16 K/V long enough to re-quantize the page
+        # whenever a new token lands in it. Allocated lazily on first
+        # write per slot; reset when the slot's active block changes.
+        self._nvfp4_shadow: list[torch.Tensor | None] = []
+        self._nvfp4_shadow_block_id: list[int | None] = []
 
     @property
     def batch_size(self) -> int:
@@ -72,6 +79,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._slot_prompt_tokens.append(list(prompt_token_ids) if prompt_token_ids else [])
         self._slot_num_published.append(0)
         self._slot_parent_hash.append(None)
+        self._nvfp4_shadow.append(None)
+        self._nvfp4_shadow_block_id.append(None)
         batch_idx = self.batch_size - 1
 
         if not prompt_token_ids or self._prefix_cache is None:
@@ -111,6 +120,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._slot_prompt_tokens.pop(batch_idx)
         self._slot_num_published.pop(batch_idx)
         self._slot_parent_hash.pop(batch_idx)
+        self._nvfp4_shadow.pop(batch_idx)
+        self._nvfp4_shadow_block_id.pop(batch_idx)
 
     def truncate_to(self, batch_idx: int, new_seq_len: int) -> None:
         """Roll back this slot to `new_seq_len`; free blocks beyond the new boundary.
@@ -174,11 +185,15 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._slot_prompt_tokens.append(other._slot_prompt_tokens[0])
         self._slot_num_published.append(other._slot_num_published[0])
         self._slot_parent_hash.append(other._slot_parent_hash[0])
+        self._nvfp4_shadow.append(other._nvfp4_shadow[0])
+        self._nvfp4_shadow_block_id.append(other._nvfp4_shadow_block_id[0])
         other._block_ids = []
         other._num_tokens = []
         other._slot_prompt_tokens = []
         other._slot_num_published = []
         other._slot_parent_hash = []
+        other._nvfp4_shadow = []
+        other._nvfp4_shadow_block_id = []
         return len(self._num_tokens) - 1
 
     def block_ids_for_request(self, batch_idx: int) -> list[int]:
@@ -267,6 +282,9 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         elif self._pool.kv_quant == "fp8":
             assert self._pool._fp8_storage is not None
             device = self._pool._fp8_storage.device
+        elif self._pool.kv_quant == "nvfp4":
+            assert self._pool._nvfp4_storage is not None
+            device = self._pool._nvfp4_storage.device
         else:
             assert self._pool._compressed_storage is not None
             device = self._pool._compressed_storage.device
@@ -331,6 +349,18 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 value_packed[offset : offset + seq_len] = (
                     v_fp8.to(torch.float32) * v_scale.view(1, -1, 1)
                 ).to(dtype)
+        elif self._pool.kv_quant == "nvfp4":
+            # NVFP4 path: paged storage is read directly by FlashInfer's
+            # attention kernel; the bf16 materialize path is only used by
+            # CPU/MPS reference fallbacks that the FlashInfer-required
+            # nvfp4 mode never reaches. We raise here rather than silently
+            # return zeros so a misrouted call surfaces fast.
+            raise NotImplementedError(
+                "materialize_packed_kv is not supported for kv_quant='nvfp4': "
+                "FlashInfer reads paged FP4 storage directly via the attention "
+                "kernel, and FlashInfer does not currently expose a working "
+                "paged-FP4 dequant helper for the bf16 fallback path."
+            )
         elif self._pool.kv_quant == "turbo3" and supports_fused_kernel(device):
             # Fused fast path: a single Triton kernel per K/V replaces the
             # per-block Python loop below. Same numerical contract within
@@ -582,6 +612,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             self._write_packed_kv_uncompressed(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
         elif self._pool.kv_quant == "fp8":
             self._write_packed_kv_fp8(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
+        elif self._pool.kv_quant == "nvfp4":
+            self._write_packed_kv_nvfp4(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
         else:
             self._write_packed_kv_compressed(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
 
@@ -669,6 +701,154 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                     pool._fp8_storage[layer_idx, kv_idx, block_id, slot_in_block] = quantized[
                         packed_start + token_offset
                     ]
+
+    def _write_packed_kv_nvfp4(
+        self,
+        layer_idx: int,
+        packed_k: torch.Tensor,
+        packed_v: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
+    ) -> None:
+        """NVFP4 write path via FlashInfer's paged quantizer.
+
+        Mirrors the FP8 path's structure but with a per-slot bf16
+        "shadow" of the active tail page. FlashInfer's
+        `nvfp4_quantize_paged_kv_cache` quantizes a whole
+        `(num_pages, block_size, num_kv_heads, head_dim)` bf16 input
+        and produces FP4-packed `uint8` + per-page FP8 scales the
+        wrapper consumes via `kv_cache_sf`. Because the API only
+        operates on whole pages, we re-quantize each affected page
+        on every step; the shadow holds the bf16 K/V of the
+        currently-being-filled page so prior tokens of an in-flight
+        page are available alongside this step's new tokens.
+
+        First call per (layer, side) auto-computes the global scale
+        from the batch's amax; we cache it on the pool and reuse on
+        every subsequent call so re-quantizing a partially-filled
+        page over multiple decode steps stays self-consistent.
+        """
+        from flashinfer.fp4_quantization import (  # type: ignore[import-not-found]
+            nvfp4_quantize_paged_kv_cache,
+        )
+
+        pool = self._pool
+        assert pool._nvfp4_storage is not None
+        assert pool._nvfp4_block_scales is not None
+        assert pool._nvfp4_global_sf is not None
+        assert pool._nvfp4_initialized is not None
+
+        block_size = pool.block_size
+        num_kv_heads = pool.num_kv_heads
+        head_dim = pool.head_dim
+        device = pool._nvfp4_storage.device
+        bf16_dtype = pool.dtype
+
+        # Group writes by (batch_idx, block_id) so each affected page
+        # is touched exactly once.
+        writes: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for batch_idx in range(self.batch_size):
+            packed_start = int(cu_seqlens_q_new[batch_idx])
+            packed_end = int(cu_seqlens_q_new[batch_idx + 1])
+            new_tokens = packed_end - packed_start
+            if new_tokens == 0:
+                continue
+            start_token = self._num_tokens[batch_idx] - new_tokens
+            for token_offset in range(new_tokens):
+                position = start_token + token_offset
+                block_id = self._block_ids[batch_idx][position // block_size]
+                slot_in_block = position % block_size
+                packed_idx = packed_start + token_offset
+                writes.setdefault((batch_idx, block_id), []).append((slot_in_block, packed_idx))
+
+        if not writes:
+            return
+
+        # Lazy-allocate the bf16 shadow for each slot that has writes.
+        for batch_idx in {b for (b, _) in writes}:
+            if self._nvfp4_shadow[batch_idx] is None:
+                self._nvfp4_shadow[batch_idx] = torch.zeros(
+                    pool.num_layers,
+                    2,
+                    block_size,
+                    num_kv_heads,
+                    head_dim,
+                    dtype=bf16_dtype,
+                    device=device,
+                )
+
+        affected = list(writes.keys())
+        n_pages = len(affected)
+        k_pages = torch.zeros(
+            n_pages, block_size, num_kv_heads, head_dim, dtype=bf16_dtype, device=device
+        )
+        v_pages = torch.zeros_like(k_pages)
+        for i, (batch_idx, block_id) in enumerate(affected):
+            shadow = self._nvfp4_shadow[batch_idx]
+            assert shadow is not None
+            if self._nvfp4_shadow_block_id[batch_idx] == block_id:
+                k_pages[i] = shadow[layer_idx, 0]
+                v_pages[i] = shadow[layer_idx, 1]
+            for slot_in_block, packed_idx in writes[(batch_idx, block_id)]:
+                k_pages[i, slot_in_block] = packed_k[packed_idx]
+                v_pages[i, slot_in_block] = packed_v[packed_idx]
+
+        # Explicit global_sf: on first call per (layer, side), set from
+        # this batch's amax using the textbook NVFP4 formula
+        # `global_sf = (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax = (448 * 6) /
+        # amax`. This matches FlashInfer's reference helper
+        # (`ref_fp4_quant` in `tests/test_helpers/utils_fp4.py`) and gives
+        # full per-block-scale dynamic range (the largest block scale
+        # lands exactly at the FP8 e4m3 saturation point of 448). Reusing
+        # the same value on subsequent calls keeps decode-step
+        # quantization consistent with the prefill.
+        fp8_max_x_fp4_max = 448.0 * 6.0
+        if not bool(pool._nvfp4_initialized[layer_idx, 0]):
+            amax_k = max(float(k_pages.float().abs().max().item()), 1e-6)
+            pool._nvfp4_global_sf[layer_idx, 0] = fp8_max_x_fp4_max / amax_k
+            pool._nvfp4_initialized[layer_idx, 0] = True
+        if not bool(pool._nvfp4_initialized[layer_idx, 1]):
+            amax_v = max(float(v_pages.float().abs().max().item()), 1e-6)
+            pool._nvfp4_global_sf[layer_idx, 1] = fp8_max_x_fp4_max / amax_v
+            pool._nvfp4_initialized[layer_idx, 1] = True
+
+        k_global_sf_arg = pool._nvfp4_global_sf[layer_idx, 0:1]
+        v_global_sf_arg = pool._nvfp4_global_sf[layer_idx, 1:2]
+
+        (k_packed, v_packed), (k_sf, v_sf), _k_scale_f, _v_scale_f = nvfp4_quantize_paged_kv_cache(
+            k_pages,
+            v_pages,
+            kv_layout="NHD",
+            k_global_sf=k_global_sf_arg,
+            v_global_sf=v_global_sf_arg,
+        )
+
+        # Scatter per-page output into paged storage. FlashInfer
+        # returns block scales as uint8 bytes; reinterpret as the
+        # FP8 e4m3 storage dtype before assignment (byte width
+        # matches; the wrapper reads them as FP8 on the dequant path).
+        k_sf_e4m3 = k_sf.view(torch.float8_e4m3fn)
+        v_sf_e4m3 = v_sf.view(torch.float8_e4m3fn)
+        for i, (_, block_id) in enumerate(affected):
+            pool._nvfp4_storage[layer_idx, 0, block_id] = k_packed[i]
+            pool._nvfp4_storage[layer_idx, 1, block_id] = v_packed[i]
+            pool._nvfp4_block_scales[layer_idx, 0, block_id] = k_sf_e4m3[i]
+            pool._nvfp4_block_scales[layer_idx, 1, block_id] = v_sf_e4m3[i]
+
+        # Update the shadow so it tracks each slot's new active block.
+        for batch_idx in {b for (b, _) in writes}:
+            if not self._block_ids[batch_idx]:
+                continue
+            active_block_id = self._block_ids[batch_idx][-1]
+            shadow = self._nvfp4_shadow[batch_idx]
+            assert shadow is not None
+            if self._nvfp4_shadow_block_id[batch_idx] != active_block_id:
+                shadow.zero_()
+                self._nvfp4_shadow_block_id[batch_idx] = active_block_id
+            key = (batch_idx, active_block_id)
+            if key in writes:
+                for slot_in_block, packed_idx in writes[key]:
+                    shadow[layer_idx, 0, slot_in_block] = packed_k[packed_idx]
+                    shadow[layer_idx, 1, slot_in_block] = packed_v[packed_idx]
 
     def _write_packed_kv_compressed(
         self,

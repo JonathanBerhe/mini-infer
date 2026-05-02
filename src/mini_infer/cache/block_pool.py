@@ -27,7 +27,13 @@ from mini_infer.exceptions import OutOfMemoryError
 #              from the first append's abs-max; ~50% memory savings vs
 #              bf16. Requires attention_backend="flashinfer" — FlashInfer
 #              fuses fp8 dequant into its paged-attention kernel.
-_SUPPORTED_KV_QUANT = (None, "turbo4", "turbo3", "fp8")
+#   "nvfp4"  = NVFP4 (FP4 e2m1) KV cache via FlashInfer's paged quantizer.
+#              Per-block FP8 scales + per-layer-per-side global scale;
+#              ~72% memory savings vs bf16. Requires Blackwell (SM_100)
+#              and `attention_backend="flashinfer"`. The V scale tensor
+#              uses TRT-LLM's 4-token-interleaved swizzle, so block_size
+#              must be a multiple of 4 and head_dim a multiple of 64.
+_SUPPORTED_KV_QUANT = (None, "turbo4", "turbo3", "fp8", "nvfp4")
 
 # Supported attention backends. The dispatcher in `packed_attention.py`
 # reads `BlockPool.attention_backend` to pick which implementation runs:
@@ -96,16 +102,37 @@ class BlockPool:
                 f"unsupported attention_backend={attention_backend!r}; "
                 f"expected one of {_SUPPORTED_ATTENTION_BACKENDS}"
             )
-        if attention_backend == "flashinfer" and kv_quant not in (None, "fp8"):
+        if attention_backend == "flashinfer" and kv_quant not in (None, "fp8", "nvfp4"):
             raise ValueError(
                 f"attention_backend='flashinfer' is valid only with "
-                f"kv_quant in (None, 'fp8'); got kv_quant={kv_quant!r}."
+                f"kv_quant in (None, 'fp8', 'nvfp4'); got kv_quant={kv_quant!r}."
             )
         if kv_quant == "fp8" and attention_backend != "flashinfer":
             raise ValueError(
                 "kv_quant='fp8' requires attention_backend='flashinfer'; "
                 f"got {attention_backend!r}."
             )
+        if kv_quant == "nvfp4":
+            if attention_backend != "flashinfer":
+                raise ValueError(
+                    "kv_quant='nvfp4' requires attention_backend='flashinfer'; "
+                    f"got {attention_backend!r}."
+                )
+            if block_size % 4 != 0:
+                raise ValueError(
+                    f"kv_quant='nvfp4' requires block_size %% 4 == 0 (V-scale 4-token "
+                    f"swizzle); got block_size={block_size}"
+                )
+            if head_dim % 64 != 0:
+                raise ValueError(
+                    f"kv_quant='nvfp4' requires head_dim %% 64 == 0; got head_dim={head_dim}"
+                )
+            if prefix_cache is not None:
+                raise ValueError(
+                    "kv_quant='nvfp4' does not support prefix caching: cached blocks "
+                    "would need a working paged-FP4 dequant to re-quantize on append, "
+                    "which FlashInfer does not currently expose. Pass prefix_cache=None."
+                )
 
         self.num_blocks = num_blocks
         self.block_size = block_size
@@ -136,6 +163,10 @@ class BlockPool:
             self._fp8_storage: torch.Tensor | None = None
             self._fp8_scales: torch.Tensor | None = None
             self._fp8_scales_initialized: torch.Tensor | None = None
+            self._nvfp4_storage: torch.Tensor | None = None
+            self._nvfp4_block_scales: torch.Tensor | None = None
+            self._nvfp4_global_sf: torch.Tensor | None = None
+            self._nvfp4_initialized: torch.Tensor | None = None
         elif kv_quant == "fp8":
             # FP8 e4m3fn paged storage with the same NHD layout the bf16
             # path uses, plus a per-(layer, side, kv_head) scale tensor.
@@ -159,6 +190,55 @@ class BlockPool:
             self._fp8_scales_initialized = torch.zeros(
                 num_layers, 2, dtype=torch.bool, device=device
             )
+            self._compressed_storage = None
+            self._scales_storage = None
+            self._radii_storage = None
+            self._rotation = None
+            self._k_codebook = None
+            self._v_codebook = None
+            self._nvfp4_storage = None
+            self._nvfp4_block_scales = None
+            self._nvfp4_global_sf = None
+            self._nvfp4_initialized = None
+            self._storage = torch.empty(0, dtype=dtype, device=device)
+        elif kv_quant == "nvfp4":
+            # NVFP4 paged storage. Two side-by-side tensors per (layer,
+            # side, num_blocks) block:
+            #   _nvfp4_storage:      packed FP4 bytes (head_dim // 2 per token).
+            #   _nvfp4_block_scales: per-16-element FP8 e4m3 scale block
+            #                        (head_dim // 16 per token), with the V
+            #                        side carrying TRT-LLM's 4-token swizzle
+            #                        layout that FlashInfer's kernel reads.
+            # A single fp32 global scale per (layer, side) is set on the
+            # first append from the batch's amax and reused thereafter so
+            # re-quantization across steps stays self-consistent.
+            packed_last = head_dim // 2
+            scale_last = head_dim // 16
+            self._nvfp4_storage = torch.zeros(
+                num_layers,
+                2,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                packed_last,
+                dtype=torch.uint8,
+                device=device,
+            )
+            self._nvfp4_block_scales = torch.zeros(
+                num_layers,
+                2,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                scale_last,
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            self._nvfp4_global_sf = torch.ones(num_layers, 2, dtype=torch.float32, device=device)
+            self._nvfp4_initialized = torch.zeros(num_layers, 2, dtype=torch.bool, device=device)
+            self._fp8_storage = None
+            self._fp8_scales = None
+            self._fp8_scales_initialized = None
             self._compressed_storage = None
             self._scales_storage = None
             self._radii_storage = None
@@ -224,6 +304,10 @@ class BlockPool:
             self._fp8_storage = None
             self._fp8_scales = None
             self._fp8_scales_initialized = None
+            self._nvfp4_storage = None
+            self._nvfp4_block_scales = None
+            self._nvfp4_global_sf = None
+            self._nvfp4_initialized = None
             # No bf16 _storage in compressed mode; using `.storage` raises.
             self._storage = torch.empty(0, dtype=dtype, device=device)
 
