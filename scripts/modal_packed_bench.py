@@ -1025,10 +1025,15 @@ def _run_turbo_parity(
         cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
         layer_idx = fx["num_layers"] - 1
 
-        # V2b on (default).
-        out_v2b = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
-        # V2b off → V2a materialized path.
+        # V2b is off by default since V2a wins at 7B+; explicitly toggle.
         saved_attn = turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH
+
+        turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = False
+        try:
+            out_v2b = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
+        finally:
+            turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = saved_attn
+
         turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = True
         try:
             out_v2a = packed_attention_forward(q, cache, layer_idx, cu_seqlens_q)
@@ -1070,6 +1075,105 @@ def _run_turbo_parity(
     lines.append(
         f"OVERALL: {'✓ all parity checks passed' if overall_ok else '✗ some checks failed'}"
     )
+    return "\n".join(lines)
+
+
+def _run_turbo_v2b_compare(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+) -> str:
+    """V2a (materialized) vs V2b (fully-fused) on a long-context decode.
+
+    Same model load, same workload, only the attention path differs:
+    - V2a: dequant fused (V2a kernel) into a materialized bf16 K/V
+      buffer per layer per step, then `flash_attn_varlen_func`.
+    - V2b: dequant + online softmax fused into one Triton kernel; no
+      materialized K/V buffer — K/V tiles live in registers.
+
+    The expected V2b win is **peak attention memory**: V2a allocates a
+    `(total_k, num_kv_heads, head_dim) * 2 bytes * 2 sides` transient
+    buffer per layer per step; V2b doesn't. Throughput should be
+    comparable since both already collapsed the per-block Python loop.
+    """
+    import gc
+
+    import torch
+
+    from mini_infer.cache import turbo_kernel
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    # Long real prompt + many decode steps so the materialized buffer is
+    # actually large and the cost of materializing is exposed.
+    prompt = _TECHNICAL_PASSAGE
+    max_tokens = 128
+
+    model_runner = ModelRunner.from_pretrained(
+        model, num_blocks=num_blocks, block_size=block_size, kv_quant="turbo3"
+    )
+
+    def _measure_path(runner: Any, label: str) -> dict[str, float]:
+        # Warmup so we're not counting first-launch JIT.
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            sched.run(Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=8))
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        start = time.perf_counter()
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            result = sched.run(
+                Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+            )
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        peak_bytes = torch.cuda.max_memory_allocated()
+        return {
+            "label": label,
+            "elapsed_s": round(elapsed, 3),
+            "decoded_tokens": len(result.tokens),
+            "tok_per_s": round(len(result.tokens) / elapsed, 2),
+            "peak_mib": round(peak_bytes / (1024**2), 1),
+        }
+
+    # V2b on (default).
+    saved = turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH
+    turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = False
+    v2b_result = _measure_path(model_runner, "V2b (fused attention)")
+
+    # V2a fallback (materialized).
+    turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = True
+    v2a_result = _measure_path(model_runner, "V2a (materialized + FA varlen)")
+    turbo_kernel._FUSED_ATTN_DISABLED_FOR_BENCH = saved
+
+    del model_runner
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    delta_mib = v2a_result["peak_mib"] - v2b_result["peak_mib"]
+    speedup = v2b_result["tok_per_s"] / v2a_result["tok_per_s"]
+    lines = [
+        f"Workload: prompt={len(prompt)} chars, max_tokens={max_tokens}, C=1",
+        "",
+        f"  {v2a_result['label']:35s} t/s={v2a_result['tok_per_s']:>6.2f}  "
+        f"peak HBM={v2a_result['peak_mib']:>8.1f} MiB",
+        f"  {v2b_result['label']:35s} t/s={v2b_result['tok_per_s']:>6.2f}  "
+        f"peak HBM={v2b_result['peak_mib']:>8.1f} MiB",
+        "",
+        f"  V2b vs V2a: throughput {speedup:.2f}x, peak HBM {delta_mib:+.1f} MiB "
+        f"({-delta_mib / v2a_result['peak_mib'] * 100:+.2f}% of V2a peak)",
+    ]
     return "\n".join(lines)
 
 
@@ -1586,6 +1690,10 @@ def run_bench(
         body = _run_turbo_parity(model=model, num_blocks=num_blocks, block_size=block_size)
         return f"\n{header}\n\n=== TurboQuant V2a fused-vs-python parity ===\n{body}\n"
 
+    if config == "turbo_v2b":
+        body = _run_turbo_v2b_compare(model=model, num_blocks=num_blocks, block_size=block_size)
+        return f"\n{header}\n\n=== TurboQuant V2b vs V2a (memory + throughput) ===\n{body}\n"
+
     if config == "quant_kernel":
         body = _run_quant_kernel_bench(
             model=model,
@@ -1700,7 +1808,8 @@ def run_bench(
 
     raise ValueError(
         f"unknown config={config!r}; "
-        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo|turbo_parity"
+        "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo|"
+        "turbo_parity|turbo_v2b"
     )
 
 
