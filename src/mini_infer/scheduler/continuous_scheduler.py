@@ -22,6 +22,7 @@ Throughput-wise this is "Approach 2": prefill chunks and decode tokens share
 the same forward pass. The matmul cost amortizes across all in-flight q-tokens.
 """
 
+import contextlib
 import logging
 import math
 import queue
@@ -154,6 +155,7 @@ class ContinuousScheduler:
 
     def _step(self) -> None:
         """One scheduler iteration: admit, sample decoders, reap, packed forward."""
+        self._cancel_pending()
         self._admit_waiting()
         sampled_decode_tokens = self._sample_decoders()
         self._reap_done()
@@ -169,6 +171,18 @@ class ContinuousScheduler:
         ]
         if alive:
             self._packed_forward(alive, sampled_decode_tokens)
+
+    def _cancel_pending(self) -> None:
+        """Mark any cancellation-flagged in-flight requests as DONE.
+
+        Cancellation is set on the request handle from the API thread (e.g.
+        the SSE generator detecting client disconnect). Picking it up here,
+        before sampling and the forward pass, lets the next `_reap_done`
+        free the slot's blocks at the same boundary as a natural finish.
+        """
+        for req in self._running:
+            if req.cancel_event.is_set() and req.state != RequestState.DONE:
+                self._finish(req, "cancelled")
 
     def _admit_waiting(self) -> None:
         """Move waiting requests into the running batch while the block pool has room.
@@ -188,11 +202,32 @@ class ContinuousScheduler:
             except queue.Empty:
                 return
 
+            # API-side cancel before admission: drop without tokenizing.
+            if running.cancel_event.is_set():
+                self._finish(running, "cancelled")
+                self._running.append(running)
+                continue
+
             running.prompt_token_ids = self._runner.tokenizer.encode(running.request.prompt)
             block_size = block_pool.block_size
             required_blocks = (
                 math.ceil(len(running.prompt_token_ids) / block_size) + self._decode_headroom
             )
+
+            # Permanent rejection: if the request needs more blocks than the
+            # pool can EVER provide, no amount of waiting helps. Reject with
+            # finish_reason="cancelled" instead of unconditionally re-enqueuing
+            # (which would otherwise let one oversized request block every
+            # smaller request behind it forever).
+            if required_blocks > block_pool.num_blocks:
+                logger.warning(
+                    "rejecting request: required_blocks=%d exceeds pool capacity=%d",
+                    required_blocks,
+                    block_pool.num_blocks,
+                )
+                self._finish(running, "cancelled")
+                self._running.append(running)
+                continue
 
             available_blocks = block_pool.num_free_blocks
             if prefix_cache is not None:
@@ -200,10 +235,11 @@ class ContinuousScheduler:
                 # demand; they count toward what we can give this request.
                 available_blocks += prefix_cache.num_evictable
             if available_blocks < required_blocks:
-                # Pool is too full to safely admit this request. Re-enqueue and
-                # stop admitting this step. Note: the re-enqueue breaks strict
-                # FIFO if the queue contains smaller requests behind this one;
-                # acceptable trade for now, can be revisited if it matters.
+                # Pool is full RIGHT NOW but the request fits in principle.
+                # Re-enqueue and try next step once running requests free
+                # blocks. Note: the re-enqueue breaks strict FIFO if the
+                # queue contains smaller requests behind this one; acceptable
+                # trade for now, can be revisited if it matters.
                 self._waiting.put(running)
                 return
 
@@ -242,7 +278,7 @@ class ContinuousScheduler:
             current_text = tokenizer.decode(req.tokens_generated)
             delta = current_text[len(req.last_text) :]
             req.last_text = current_text
-            req.output_queue.put(GenerationStep(text=delta))
+            self._emit(req, GenerationStep(text=delta))
             if len(req.tokens_generated) >= req.request.max_tokens:
                 self._finish(req, "length")
                 continue
@@ -324,7 +360,46 @@ class ContinuousScheduler:
             self._batched_cache = None
 
     def _finish(self, req: RunningRequest, reason: FinishReason) -> None:
-        """Mark a request DONE and emit the terminal step with its finish_reason."""
+        """Mark a request DONE and emit the terminal step with its finish_reason.
+
+        The terminal step is the consumer's signal that the stream is over,
+        so this MUST go through; if the queue is full we drop the most
+        recent intermediate step to make room rather than block the engine
+        thread.
+        """
         req.finish_reason = reason
         req.state = RequestState.DONE
-        req.output_queue.put(GenerationStep(text="", finish_reason=reason))
+        terminal = GenerationStep(text="", finish_reason=reason)
+        try:
+            req.output_queue.put_nowait(terminal)
+        except queue.Full:
+            # Make room by dropping one buffered intermediate step. The
+            # consumer sees at most a one-step gap; the terminal step still
+            # arrives so the stream terminates.
+            with contextlib.suppress(queue.Empty):
+                req.output_queue.get_nowait()
+            try:
+                req.output_queue.put_nowait(terminal)
+            except queue.Full:
+                logger.error(
+                    "output_queue stuck full even after drop; consumer is gone, "
+                    "terminal step will be missed (request leaked)"
+                )
+
+    def _emit(self, req: RunningRequest, step: GenerationStep) -> None:
+        """Non-blocking emit of an intermediate step.
+
+        Engine-thread safety: we never block on `output_queue.put`. A stuck
+        consumer (e.g. a streaming HTTP client that disconnected without
+        the engine noticing yet) must not be able to wedge the engine. If
+        the queue is full we drop the oldest buffered step and put the new
+        one; the consumer will see a small gap, which is strictly better
+        than a hung engine.
+        """
+        try:
+            req.output_queue.put_nowait(step)
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                req.output_queue.get_nowait()
+            with contextlib.suppress(queue.Full):
+                req.output_queue.put_nowait(step)

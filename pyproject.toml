@@ -53,6 +53,9 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 "src/mini_infer/cache/paged_attention.py" = ["N803"]
 "src/mini_infer/cache/turbo_kernel.py" = ["N803"]
 "src/mini_infer/quant/int8_kernel.py" = ["N803"]
+# `Depends(...)` in default args is the canonical FastAPI dependency-injection
+# idiom; B008 flags it as a "function call in default", which is the point.
+"src/mini_infer/api/server.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.11"

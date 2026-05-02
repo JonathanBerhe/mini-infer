@@ -67,3 +67,51 @@ def test_completions_stream_yields_chunks_and_done(client: TestClient) -> None:
 
 def test_unknown_endpoint_returns_404(client: TestClient) -> None:
     assert client.get("/v1/nope").status_code == 404
+
+
+def test_oversized_prompt_returns_422(client: TestClient) -> None:
+    """Pydantic rejects oversized prompts before any engine work happens."""
+    from mini_infer.api.schemas import MAX_PROMPT_CHARS
+
+    response = client.post(
+        "/v1/completions",
+        json={
+            "model": "m",
+            "prompt": "x" * (MAX_PROMPT_CHARS + 1),
+            "max_tokens": 1,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_negative_max_tokens_returns_422(client: TestClient) -> None:
+    response = client.post(
+        "/v1/completions",
+        json={"model": "m", "prompt": "p", "max_tokens": -1},
+    )
+    assert response.status_code == 422
+
+
+def test_request_handle_cancel_marks_event() -> None:
+    """`RequestHandle.cancel` is the API-thread side of the cancel contract.
+
+    Verifies the public surface without spinning up the scheduler: the
+    engine-side check (`req.cancel_event.is_set()`) is the same flag this
+    sets, so a thread-safe `cancel()` call is enough to wire the path.
+    """
+    import queue
+
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import Request, RequestHandle
+    from mini_infer.scheduler.request_state import RunningRequest
+
+    req = RunningRequest(
+        request=Request(prompt="p", sampling_params=SamplingParams(), max_tokens=1),
+        output_queue=queue.Queue(maxsize=4),
+    )
+    handle = RequestHandle(req)
+    assert not req.cancel_event.is_set()
+    handle.cancel()
+    assert req.cancel_event.is_set()
+    handle.cancel()  # idempotent
+    assert req.cancel_event.is_set()
