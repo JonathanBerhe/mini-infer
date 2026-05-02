@@ -76,6 +76,7 @@ class ModelRunner:
         quant: str | None = None,
         quant_lm_head: bool = False,
         kv_quant: str | None = None,
+        attention_backend: str = "flash_attn",
     ) -> "ModelRunner":
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
@@ -106,6 +107,7 @@ class ModelRunner:
             device=resolved,
             prefix_cache=prefix_cache_obj,
             kv_quant=kv_quant,
+            attention_backend=attention_backend,
         )
 
         # Apply the architecture-specific attention patch. The patched forward

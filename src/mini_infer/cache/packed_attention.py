@@ -88,10 +88,25 @@ def packed_attention_forward(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     if supports_packed_kernel(q.device):
+        from mini_infer.cache.flashinfer_backend import (
+            flashinfer_attention_forward,
+            supports_flashinfer_backend,
+        )
         from mini_infer.cache.turbo_kernel import (
             fused_turbo_attention_decode,
             supports_fused_attn_kernel,
         )
+
+        # FlashInfer paged-attention backend (opt-in via the pool's
+        # `attention_backend="flashinfer"`). Applies only to uncompressed
+        # bf16 pools today; compressed pools fall through to the
+        # TurboQuant-aware paths below.
+        if (
+            cache._pool.attention_backend == "flashinfer"
+            and supports_flashinfer_backend(q.device)
+            and cache._pool.kv_quant is None
+        ):
+            return flashinfer_attention_forward(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
 
         block_size = cache._pool.block_size
         # Fully-fused TurboQuant attention path: only fires for turbo3
