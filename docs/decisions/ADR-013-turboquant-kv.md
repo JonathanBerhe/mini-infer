@@ -373,39 +373,52 @@ The V2b deselection raises a fair question: is there a library that
 does fused dequant + attention well enough to be worth integrating
 instead of writing our own? Today's landscape:
 
-| Library | Status | What it gives | What it lacks (for our case) |
+| Library | Status | What it gives | Hardware required |
 |---|---|---|---|
-| **FlashAttention-3** ([github](https://github.com/Dao-AILab/flash-attention)) | Production | State-of-the-art tensor-core attention; FP8 KV on H100 | No TurboQuant codec hook; bf16/fp16/fp8 only |
-| **FlashInfer** ([github](https://github.com/flashinfer-ai/flashinfer)) | Production | Page-aware attention kernels powering vLLM/SGLang; FP8 KV | Same — no rotation+Lloyd-Max+QJL primitive |
-| **vLLM FP8 KV** ([code](https://github.com/vllm-project/vllm/blob/main/vllm/attention/backends/flash_attn.py)) | Production | Per-channel FP8 KV cache, integrated with FA | FP8 not 4-bit; lossier than turbo3 in spirit but uses native HW FP8 path |
-| **TensorRT-LLM** | Production (NVIDIA) | INT8/FP8 KV with custom kernels | NVIDIA-only, closed-ish; no turbo3-style rotation |
-| **CUTLASS attention** ([github](https://github.com/NVIDIA/cutlass)) | Building blocks | Templates for writing FA-class kernels with custom epilogues | Not a finished library; you still write the kernel |
-| **`0xSero/turboquant`** | Research | The reference TurboQuant kernels (3 separate); paper-aligned | Research repo, not packaged, A100-targeted |
+| **FlashAttention-3** ([github](https://github.com/Dao-AILab/flash-attention)) | Production | State-of-the-art tensor-core attention; FP8 KV | Hopper+ (H100/H200) for FP8 |
+| **FlashInfer FP8 KV** ([github](https://github.com/flashinfer-ai/flashinfer)) | Production | Page-aware FA + FP8 KV powering vLLM/SGLang | Hopper+ |
+| **FlashInfer NVFP4 KV** ([v0.6.10rc1](https://github.com/flashinfer-ai/flashinfer/releases), [NVIDIA blog](https://developer.nvidia.com/blog/optimizing-inference-for-long-context-and-large-batch-sizes-with-nvfp4-kv-cache/)) | **Production (2026-04)** | **4-bit** KV with native NVFP4 tensor-core dequant fused into attention | **Blackwell only** (B200/B300/RTX 50/DGX Spark) |
+| **vLLM** with FP8/NVFP4 KV ([code](https://github.com/vllm-project/vllm)) | Production | Wraps FlashInfer's quantized-KV kernels end-to-end | Same as kernels |
+| **TensorRT-LLM** | Production (NVIDIA) | INT8/FP8 KV with custom kernels | Hopper+ |
+| **CUTLASS attention** ([github](https://github.com/NVIDIA/cutlass)) | Building blocks | Templates for FA-class kernels with custom epilogues | n/a (you write the kernel) |
+| **`0xSero/turboquant`** | Research | Reference TurboQuant kernels (3 separate); paper-aligned | A100-targeted |
 
-**Practical answer**: there's no off-the-shelf library that does
-"compressed-KV fused attention" the way V2b tried to. The realistic
-production path for KV-quantized inference looks like:
+**The realistic production path for KV-quantized inference depends on
+target hardware**:
 
-1. Use **FP8 KV** (vLLM / FlashInfer / TRT-LLM) on H100+ — uses the
-   hardware's native FP8 tensor-core path, no custom kernels, ~50%
-   memory savings vs bf16 with minimal accuracy loss. Less compression
-   than turbo3 but production-quality.
-2. For 4-bit KV: there's no "just use the library" option. Custom
-   kernels via FlashInfer's primitives or a CUTLASS-based dequant
-   epilogue are the realistic build path. That's the V2b shape but
-   with engineering quality our slice didn't aim for.
+| Target GPU | Native KV format | Library | Notes |
+|---|---|---|---|
+| Ampere (A10, A100) | bf16 only natively | n/a — custom kernels | What we run today; turbo3 + V2a is reasonable |
+| Hopper (H100, H200) | **FP8** | FlashInfer FP8 KV / vLLM | ~50% memory vs bf16; production-grade |
+| Blackwell (B200, B300, RTX 50) | **FP4 (NVFP4)** | **FlashInfer NVFP4 KV / vLLM** | ~75% memory vs bf16; **same 4-bit compression as turbo3 but native HW path** |
 
-For mini-infer's purposes, **V2a + FA varlen on materialized K/V** is
-the right architectural answer. V2b stays as the kernel-engineering
-exploration it was — useful as a study, kept out of the default path.
+The 2026-04-30 FlashInfer NVFP4 release is the **right answer for
+4-bit KV in production** as soon as you're on Blackwell: the kernel
+team gets the dequant fused into attention via tensor-core FP4
+support, which is exactly the architectural shape V2b reached for —
+delivered with HW-vendor engineering quality.
+
+**For mini-infer's purposes**, V2a + FA varlen on materialized K/V is
+the right answer for the Ampere hardware our budget covers. V2b stays
+as a kernel-engineering study — useful for showing the design space
+of the problem, kept out of the default path because the production
+answer is "use FlashInfer NVFP4 on Blackwell" rather than "write a
+better Triton kernel on Ampere."
 
 ## Follow-ups (in order of value/effort)
 
 - **~~V2b — Fuse attention into the dequant kernel.~~ Shipped and
   deselected (above).** No further V2b work planned.
-- **FP8 KV cache** (alternative to turbo3 on H100+). Native hardware
-  support; integrate via FlashInfer or vLLM-style custom kernels. Less
-  algorithmic novelty than turbo3 but production-grade.
+- **FP8 / NVFP4 KV cache** (the production answer for KV-quant on
+  modern hardware). Use FlashInfer FP8 KV on Hopper (H100/H200) or
+  FlashInfer NVFP4 KV on Blackwell (B200+). Both are production-ready
+  in vLLM as of mid-2026. NVFP4 specifically matches turbo3's 4-bit
+  compression ratio with native tensor-core support — the
+  architectural shape V2b tried to build, delivered by the kernel
+  team. mini-infer would integrate by replacing the
+  TurboQuant-specific code paths with a FlashInfer attention call
+  against an FP8/FP4-quantized pool. Out of current scope (we're on
+  A10), but the right next step for any production target.
 - **V2a-for-turbo4.** Same kernel pattern, different codec body
   (per-channel `(low, scale)` instead of polar + Lloyd-Max + QJL). Wire
   if 7B turbo4 ever becomes a target; turbo3 is the recommended V3 mode
