@@ -76,10 +76,10 @@ def test_block_pool_rejects_unknown_attention_backend() -> None:
         )
 
 
-def test_block_pool_rejects_flashinfer_with_compressed_pool() -> None:
-    """FlashInfer reads bf16 paged storage directly; combining with
-    `kv_quant` (compressed pool) is invalid until FP8/NVFP4 modes ship."""
-    with pytest.raises(ValueError, match="requires kv_quant=None"):
+def test_block_pool_rejects_flashinfer_with_turboquant_pool() -> None:
+    """FlashInfer's bf16/fp8 paged storage layouts don't match the
+    TurboQuant nibble-packed layout, so the combo is rejected."""
+    with pytest.raises(ValueError, match="kv_quant in \\(None, 'fp8'\\)"):
         BlockPool(
             num_blocks=4,
             block_size=8,

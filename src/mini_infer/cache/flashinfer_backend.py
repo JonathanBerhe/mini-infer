@@ -123,11 +123,9 @@ def flashinfer_attention_forward(
         )
     require_cuda_device(q.device, "FlashInfer paged attention")
 
-    if cache._pool.kv_quant is not None:
+    if cache._pool.kv_quant not in (None, "fp8"):
         raise RuntimeError(
-            "FlashInfer backend (Stage 1) only supports the uncompressed "
-            f"bf16 pool layout; got kv_quant={cache._pool.kv_quant!r}. "
-            "Use the materialized path until FP8/NVFP4 modes ship."
+            f"FlashInfer backend supports kv_quant in (None, 'fp8'); got {cache._pool.kv_quant!r}."
         )
 
     device = q.device
@@ -167,14 +165,27 @@ def flashinfer_attention_forward(
     paged_kv_last_page_len = torch.tensor(last_page_lens, dtype=torch.int32, device=device)
     qo_indptr = cu_seqlens_q.to(dtype=torch.int32, device=device)
 
-    # Layer slice from the bf16 pool. For uncompressed turbo=None pools,
-    # storage shape is `(num_layers, 2, num_blocks, block_size,
-    # num_kv_heads, head_dim)`. The per-layer slice is `(2, num_blocks,
-    # ...)`; FlashInfer's wrapper accepts K and V as a `(k, v)` tuple
-    # (each `(num_blocks, page_size, num_kv_heads, head_dim)` NHD), so
-    # we slice without copying.
-    k_cache = cache._pool.storage[layer_idx, 0]
-    v_cache = cache._pool.storage[layer_idx, 1]
+    # Layer slice. For uncompressed pools the storage is bf16; for fp8
+    # pools we read from `_fp8_storage` and pass per-head scales to
+    # FlashInfer's run() so the kernel dequants on-the-fly.
+    if cache._pool.kv_quant == "fp8":
+        assert cache._pool._fp8_storage is not None
+        assert cache._pool._fp8_scales is not None
+        k_cache = cache._pool._fp8_storage[layer_idx, 0]
+        v_cache = cache._pool._fp8_storage[layer_idx, 1]
+        kv_data_type: torch.dtype = torch.float8_e4m3fn
+        # FlashInfer's `run()` takes k_scale and v_scale as Python floats
+        # (per-tensor scale). Collapse our per-head scales to the head-wise
+        # max so no head saturates on dequant; precision for low-magnitude
+        # heads is slightly worse than a true per-head path would give.
+        k_scale: float | None = float(cache._pool._fp8_scales[layer_idx, 0].max().item())
+        v_scale: float | None = float(cache._pool._fp8_scales[layer_idx, 1].max().item())
+    else:
+        k_cache = cache._pool.storage[layer_idx, 0]
+        v_cache = cache._pool.storage[layer_idx, 1]
+        kv_data_type = q.dtype
+        k_scale = None
+        v_scale = None
     kv_cache: tuple[torch.Tensor, torch.Tensor] | torch.Tensor = (k_cache, v_cache)
 
     # Always go through the prefill wrapper. FlashInfer's decode wrapper
@@ -197,7 +208,10 @@ def flashinfer_attention_forward(
         pos_encoding_mode="NONE",
         sm_scale=softmax_scale,
         q_data_type=q.dtype,
-        kv_data_type=q.dtype,
+        kv_data_type=kv_data_type,
     )
-    out: torch.Tensor = prefill_wrapper.run(q, kv_cache)
+    if k_scale is not None:
+        out: torch.Tensor = prefill_wrapper.run(q, kv_cache, k_scale=k_scale, v_scale=v_scale)
+    else:
+        out = prefill_wrapper.run(q, kv_cache)
     return out

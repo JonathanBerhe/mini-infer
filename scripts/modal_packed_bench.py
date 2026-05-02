@@ -932,6 +932,118 @@ def _run_turbo_parity(
     return "\n".join(lines)
 
 
+def _run_flashinfer_fp8_compare(
+    model: str,
+    num_blocks: int,
+    block_size: int,
+) -> str:
+    """bf16 baseline vs FP8 KV cache via FlashInfer.
+
+    Loads the model twice and runs the same long-prompt decode workload.
+    Reports per-mode KV pool memory, throughput, peak HBM, and first-token
+    logit cosine sim to surface FP8's expected ~1-2% drift.
+    """
+    import gc
+
+    import torch
+
+    from mini_infer.engine.model_runner import ModelRunner
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.scheduler import ContinuousScheduler, Request
+
+    prompt = _TECHNICAL_PASSAGE
+    max_tokens = 128
+
+    def _measure(label: str, **runner_kwargs: object) -> dict[str, Any]:
+        runner = ModelRunner.from_pretrained(
+            model,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            **runner_kwargs,  # type: ignore[arg-type]
+        )
+        # KV pool storage: bf16 vs fp8.
+        pool = runner.block_pool
+        if pool.kv_quant == "fp8":
+            assert pool._fp8_storage is not None
+            kv_bytes = int(pool._fp8_storage.numel() * pool._fp8_storage.element_size())
+        else:
+            storage: torch.Tensor = pool._storage
+            kv_bytes = int(storage.numel() * storage.element_size())
+        kv_mib = kv_bytes / (1024**2)
+
+        # Warmup so first-launch JIT isn't counted.
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            sched.run(Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=8))
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        start = time.perf_counter()
+        sched = ContinuousScheduler(runner)
+        sched.start()
+        try:
+            result = sched.run(
+                Request(prompt=prompt, sampling_params=SamplingParams(), max_tokens=max_tokens)
+            )
+        finally:
+            sched.stop()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        peak_bytes = torch.cuda.max_memory_allocated()
+
+        input_ids = runner.tokenizer.encode(prompt)
+        x = torch.tensor([input_ids], device=runner.device, dtype=torch.long)
+        with torch.inference_mode():
+            logits = runner._model(x, use_cache=False).logits[0, -1, :].float().cpu()
+
+        del runner
+        gc.collect()
+        torch.cuda.empty_cache()
+        return {
+            "label": label,
+            "kv_pool_mib": round(kv_mib, 1),
+            "elapsed_s": round(elapsed, 3),
+            "tok_per_s": round(len(result.tokens) / elapsed, 2),
+            "peak_mib": round(peak_bytes / (1024**2), 1),
+            "first_tokens": list(result.tokens[:8]),
+            "first_token_logits": logits,
+        }
+
+    bf16 = _measure("bf16 / flash_attn")
+    fp8 = _measure("fp8 / flashinfer", kv_quant="fp8", attention_backend="flashinfer")
+
+    cos = float(
+        torch.nn.functional.cosine_similarity(
+            bf16["first_token_logits"].flatten(),
+            fp8["first_token_logits"].flatten(),
+            dim=0,
+        ).item()
+    )
+    speedup = fp8["tok_per_s"] / bf16["tok_per_s"]
+    kv_savings_pct = (1.0 - fp8["kv_pool_mib"] / bf16["kv_pool_mib"]) * 100
+    lines = [
+        f"Workload: prompt={len(prompt)} chars, max_tokens={max_tokens}, C=1",
+        "",
+        f"  {bf16['label']:25s} t/s={bf16['tok_per_s']:>6.2f}  "
+        f"peak HBM={bf16['peak_mib']:>8.1f} MiB  KV pool={bf16['kv_pool_mib']:>8.1f} MiB",
+        f"  {fp8['label']:25s} t/s={fp8['tok_per_s']:>6.2f}  "
+        f"peak HBM={fp8['peak_mib']:>8.1f} MiB  KV pool={fp8['kv_pool_mib']:>8.1f} MiB",
+        "",
+        f"  KV memory savings: {kv_savings_pct:+.1f}% (fp8 vs bf16)",
+        f"  Logit cos sim (first decode position): {cos:.6f} (>0.99 required)",
+        f"  Throughput fp8 / bf16: {speedup:.2f}x",
+        "",
+        f"  bf16 first 8 tokens: {bf16['first_tokens']}",
+        f"  fp8 first 8 tokens:  {fp8['first_tokens']}",
+    ]
+    return "\n".join(lines)
+
+
 def _run_flashinfer_compare(
     model: str,
     num_blocks: int,
@@ -1652,6 +1764,12 @@ def run_bench(
         body = _run_flashinfer_compare(model=model, num_blocks=num_blocks, block_size=block_size)
         return f"\n{header}\n\n=== flash-attn vs FlashInfer (bf16 backend A/B) ===\n{body}\n"
 
+    if config == "flashinfer_fp8":
+        body = _run_flashinfer_fp8_compare(
+            model=model, num_blocks=num_blocks, block_size=block_size
+        )
+        return f"\n{header}\n\n=== bf16 vs FP8 KV (FlashInfer attention) ===\n{body}\n"
+
     if config == "quant_kernel":
         body = _run_quant_kernel_bench(
             model=model,
@@ -1767,7 +1885,7 @@ def run_bench(
     raise ValueError(
         f"unknown config={config!r}; "
         "expected smoke|throughput|holb|sweep|prefix|quant|spec|quant_kernel|turbo|"
-        "turbo_parity|turbo_v2b|flashinfer"
+        "turbo_parity|turbo_v2b|flashinfer|flashinfer_fp8"
     )
 
 

@@ -98,13 +98,14 @@ def packed_attention_forward(
         )
 
         # FlashInfer paged-attention backend (opt-in via the pool's
-        # `attention_backend="flashinfer"`). Applies only to uncompressed
-        # bf16 pools today; compressed pools fall through to the
-        # TurboQuant-aware paths below.
+        # `attention_backend="flashinfer"`). Handles bf16 paged storage
+        # and fp8 paged storage (FlashInfer fuses fp8 dequant into the
+        # tensor-core kernel). Other compressed pools (TurboQuant) fall
+        # through to the materialized path below.
         if (
             cache._pool.attention_backend == "flashinfer"
             and supports_flashinfer_backend(q.device)
-            and cache._pool.kv_quant is None
+            and cache._pool.kv_quant in (None, "fp8")
         ):
             return flashinfer_attention_forward(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
 
