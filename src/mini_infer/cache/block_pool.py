@@ -1,3 +1,5 @@
+from typing import Literal
+
 import torch
 
 from mini_infer.cache.prefix_cache import PrefixCache
@@ -12,6 +14,12 @@ from mini_infer.cache.turbo_quant import (
     rotate,
 )
 from mini_infer.exceptions import OutOfMemoryError
+
+# Per-layer attention pattern. Default models (Qwen2, Llama) are entirely
+# `"full"`. Sliding-window-aware models (Gemma 3+, Mistral SWA, Gemma 4)
+# specify `("sliding", window_size)` for their windowed layers; the
+# attention dispatcher honors the window when reading the cache.
+LayerAttentionSpec = Literal["full"] | tuple[Literal["sliding"], int]
 
 # Supported KV-cache compression modes:
 #   None     = legacy bf16/fp16 storage.
@@ -78,6 +86,7 @@ class BlockPool:
         prefix_cache: PrefixCache | None = None,
         kv_quant: str | None = None,
         attention_backend: str = "flash_attn",
+        layer_attention: list[LayerAttentionSpec] | None = None,
     ) -> None:
         if num_blocks <= 0:
             raise ValueError(f"num_blocks must be positive, got {num_blocks}")
@@ -134,6 +143,32 @@ class BlockPool:
                     "which FlashInfer does not currently expose. Pass prefix_cache=None."
                 )
 
+        # Per-layer attention spec defaults to all-`"full"` so existing models
+        # (Qwen2, Llama) get unchanged behavior. Sliding-window models pass an
+        # explicit list of length `num_layers`.
+        if layer_attention is None:
+            layer_attention = ["full"] * num_layers
+        if len(layer_attention) != num_layers:
+            raise ValueError(
+                f"layer_attention has {len(layer_attention)} entries; "
+                f"expected num_layers={num_layers}"
+            )
+        for layer_idx, spec in enumerate(layer_attention):
+            if spec == "full":
+                continue
+            if (
+                isinstance(spec, tuple)
+                and len(spec) == 2
+                and spec[0] == "sliding"
+                and isinstance(spec[1], int)
+                and spec[1] > 0
+            ):
+                continue
+            raise ValueError(
+                f"layer_attention[{layer_idx}]={spec!r} is not a valid spec; "
+                "use 'full' or ('sliding', positive_int)"
+            )
+
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.num_layers = num_layers
@@ -142,6 +177,7 @@ class BlockPool:
         self.dtype = dtype
         self._kv_quant = kv_quant
         self._attention_backend = attention_backend
+        self._layer_attention: list[LayerAttentionSpec] = list(layer_attention)
 
         if kv_quant is None:
             self._storage = torch.zeros(
@@ -334,6 +370,10 @@ class BlockPool:
     @property
     def attention_backend(self) -> str:
         return self._attention_backend
+
+    @property
+    def layer_attention(self) -> list[LayerAttentionSpec]:
+        return self._layer_attention
 
     @property
     def rotation(self) -> torch.Tensor | None:
