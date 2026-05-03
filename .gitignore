@@ -63,5 +63,8 @@ logs/
 *.nsys-rep
 profiling/
 
+# Reference papers kept locally for planning, not tracked
+docs/papers/*.pdf
+
 # Local Claude Code state
 .claude/
