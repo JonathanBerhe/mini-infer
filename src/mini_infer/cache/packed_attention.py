@@ -63,6 +63,11 @@ def packed_attention_forward(
     `cache.append_kv_packed(...)` before this call — i.e. for every request,
     `cache.seq_lens_list()[batch_idx]` is the post-append K-length.
 
+    Per-layer sliding-window attention is honored automatically via
+    `cache._pool.layer_attention[layer_idx]`: `"full"` runs unrestricted
+    causal attention; `("sliding", w)` clamps each query at position `q`
+    to attend only to keys at positions `[q - w + 1, q]`.
+
     Three backends are picked automatically:
 
     - **CUDA + `block_size % 256 == 0`**: paged FA varlen via `block_table`.
@@ -88,6 +93,13 @@ def packed_attention_forward(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
+    # Per-layer attention pattern. `None` window = full causal (every
+    # current model except Gemma family); positive int = sliding window
+    # of that size. The dispatcher passes it through to whichever backend
+    # runs, each of which has a native SWA arg.
+    layer_spec = cache._pool.layer_attention[layer_idx]
+    window: int | None = layer_spec[1] if isinstance(layer_spec, tuple) else None
+
     # FlashInfer paged-attention backend (opt-in via the pool's
     # `attention_backend="flashinfer"`). Handles bf16, fp8 e4m3fn, and
     # nvfp4 paged storage (FlashInfer fuses dequant into the tensor-core
@@ -105,7 +117,9 @@ def packed_attention_forward(
         and supports_flashinfer_backend(q.device)
         and cache._pool.kv_quant in (None, "fp8", "nvfp4")
     ):
-        return flashinfer_attention_forward(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
+        return flashinfer_attention_forward(
+            q, cache, layer_idx, cu_seqlens_q, softmax_scale, window=window
+        )
 
     if supports_packed_kernel(q.device):
         from mini_infer.cache.turbo_kernel import (
@@ -138,15 +152,17 @@ def packed_attention_forward(
         # compatible with compressed (TurboQuant) storage. Compressed always
         # routes through the materialized path which knows how to dequant.
         if cache._pool.kv_quant is None and block_size % _FA_PAGED_BLOCK_SIZE_MULTIPLE == 0:
-            return _packed_attention_paged_flash(q, cache, layer_idx, cu_seqlens_q, softmax_scale)
+            return _packed_attention_paged_flash(
+                q, cache, layer_idx, cu_seqlens_q, softmax_scale, window=window
+            )
         return _packed_attention_materialized_flash(
-            q, cache, layer_idx, cu_seqlens_q, softmax_scale
+            q, cache, layer_idx, cu_seqlens_q, softmax_scale, window=window
         )
     # PyTorch reference path: gather K/V from blocks into a packed buffer, then
     # use the per-request SDPA reference. Slower but device-agnostic.
     keys_packed, values_packed, cu_seqlens_k, _ = cache.materialize_packed_kv(layer_idx)
     return packed_attention_torch(
-        q, keys_packed, values_packed, cu_seqlens_q, cu_seqlens_k, softmax_scale
+        q, keys_packed, values_packed, cu_seqlens_q, cu_seqlens_k, softmax_scale, window=window
     )
 
 
@@ -157,6 +173,7 @@ def packed_attention_torch(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
+    window: int | None = None,
 ) -> torch.Tensor:
     """Pure PyTorch reference: per-request SDPA over the packed sequences.
 
@@ -169,6 +186,9 @@ def packed_attention_torch(
     occupy positions `[k_len - q_len, k_len)` within its full K/V history (the
     new tokens are the most recently appended). Each query at intra-request
     position `i` attends to keys `0..(k_len - q_len + i)`.
+
+    Sliding-window: when `window` is set, additionally clamp each query at
+    absolute position `q` to attend only to keys at `[q - window + 1, q]`.
     """
     out = torch.empty_like(q)
     num_q_heads = q.shape[1]
@@ -215,6 +235,10 @@ def packed_attention_torch(
         q_abs_positions = torch.arange(q_len, device=q.device) + q_offset
         k_positions = torch.arange(k_len, device=q.device)
         invalid = k_positions[None, :] > q_abs_positions[:, None]  # (q_len, k_len)
+        if window is not None:
+            # Sliding window: also forbid keys older than `q - window + 1`.
+            too_old = k_positions[None, :] < (q_abs_positions[:, None] - window + 1)
+            invalid = invalid | too_old
         scores = scores.masked_fill(invalid[:, None, :], -float("inf"))
 
         weights = torch.softmax(scores, dim=-1)
@@ -229,6 +253,7 @@ def _packed_attention_materialized_flash(
     layer_idx: int,
     cu_seqlens_q: torch.Tensor,
     softmax_scale: float,
+    window: int | None = None,
 ) -> torch.Tensor:
     """Materialized FA varlen call: gather K/V from blocks into a packed buffer.
 
@@ -236,6 +261,9 @@ def _packed_attention_materialized_flash(
     (must be divisible by 256). One gather per layer per step. Slower than the
     paged path but works for any block size, and faster than the PyTorch
     reference because the attention math itself is still done by FA.
+
+    `window` enables causal sliding-window via flash-attn's `window_size=(left, right)`
+    argument; for causal SWA `right=0` and `left=window-1`.
     """
     if not _FLASH_ATTN_AVAILABLE:
         raise RuntimeError(
@@ -246,6 +274,7 @@ def _packed_attention_materialized_flash(
 
     keys_packed, values_packed, cu_seqlens_k, max_seqlen_k = cache.materialize_packed_kv(layer_idx)
     max_seqlen_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+    window_size = (window - 1, 0) if window is not None else (-1, -1)
 
     out: torch.Tensor = flash_attn_varlen_func(
         q,
@@ -257,6 +286,7 @@ def _packed_attention_materialized_flash(
         max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=True,
+        window_size=window_size,
     )
     return out
 
@@ -267,6 +297,7 @@ def _packed_attention_paged_flash(
     layer_idx: int,
     cu_seqlens_q: torch.Tensor,
     softmax_scale: float,
+    window: int | None = None,
 ) -> torch.Tensor:
     """Paged varlen FlashAttention call: reads K/V directly from `BlockPool`.
 
@@ -277,6 +308,8 @@ def _packed_attention_paged_flash(
     The kernel walks `block_table[batch_idx]` to find each request's blocks,
     reads `cache_seqlens[batch_idx]` valid positions out of each, and runs
     causal varlen attention. No per-layer gather, no contiguous K/V buffer.
+
+    `window` enables causal sliding-window via flash-attn's `window_size=(left, right)`.
     """
     if not _FLASH_ATTN_AVAILABLE:
         raise RuntimeError(
@@ -293,6 +326,7 @@ def _packed_attention_paged_flash(
     max_seqlen_k = int(cache_seqlens.max().item())
     cu_seqlens_k = torch.zeros(cache_seqlens.shape[0] + 1, dtype=torch.int32, device=device)
     cu_seqlens_k[1:] = torch.cumsum(cache_seqlens, dim=0)
+    window_size = (window - 1, 0) if window is not None else (-1, -1)
 
     out: torch.Tensor = flash_attn_varlen_func(
         q,
@@ -305,5 +339,6 @@ def _packed_attention_paged_flash(
         softmax_scale=softmax_scale,
         causal=True,
         block_table=block_table,
+        window_size=window_size,
     )
     return out

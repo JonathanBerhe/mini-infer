@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import torch
 from torch import nn
 
+from mini_infer.cache.block_pool import LayerAttentionSpec
+
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
 
@@ -66,6 +68,15 @@ class BaseCausalLM(nn.Module):
     @property
     def kv_cache_dims(self) -> KVCacheDims:
         raise NotImplementedError
+
+    def per_layer_attention(self) -> list[LayerAttentionSpec]:
+        """Per-layer attention pattern for the block pool.
+
+        Default: every layer is full causal — matches Qwen2 / Llama. Models
+        with sliding-window layers (Gemma 3+, Mistral SWA, ...) override to
+        return a list of `"full"` and `("sliding", window_size)` entries.
+        """
+        return ["full"] * self.kv_cache_dims.num_layers
 
     def expected_missing_state_keys(self) -> set[str]:
         """Names present in the module hierarchy but expected to be absent

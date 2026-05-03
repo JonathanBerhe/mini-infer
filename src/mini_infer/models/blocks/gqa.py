@@ -34,6 +34,9 @@ class GroupedQueryAttention(nn.Module):
         head_dim: int,
         qkv_bias: bool,
         layer_idx: int,
+        query_scale: float | None = None,
+        q_norm: nn.Module | None = None,
+        k_norm: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -45,6 +48,17 @@ class GroupedQueryAttention(nn.Module):
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
         self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
         self.o_proj = nn.Linear(num_q_heads * head_dim, hidden_size, bias=False)
+        # Optional per-head norm on Q and K AFTER projection and BEFORE RoPE.
+        # Gemma 3+ uses GemmaRMSNorm(head_dim) here; the names `q_norm` and
+        # `k_norm` align with HF's parameter naming so weight loading is
+        # identity rename. None = pass-through (Qwen2, Llama).
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        # `query_scale` overrides the default `1/sqrt(head_dim)` softmax
+        # scale. Gemma uses `1/sqrt(query_pre_attn_scalar)` here, which is
+        # often (but not always) numerically identical to `1/sqrt(head_dim)`.
+        # `None` keeps the default (Qwen2, Llama).
+        self._query_scale = query_scale
 
     def forward(
         self,
@@ -63,6 +77,12 @@ class GroupedQueryAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        # Per-head Q/K norm (Gemma 3+). Acts on the last dim (head_dim).
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -77,7 +97,11 @@ class GroupedQueryAttention(nn.Module):
         )
 
         attn_packed = packed_attention_forward(
-            queries_packed, past_key_values, self.layer_idx, cu_seqlens_q
+            queries_packed,
+            past_key_values,
+            self.layer_idx,
+            cu_seqlens_q,
+            softmax_scale=self._query_scale,
         )
         # attn_packed: (total_q, num_q_heads, head_dim).
 

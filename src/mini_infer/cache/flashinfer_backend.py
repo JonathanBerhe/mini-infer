@@ -94,6 +94,7 @@ def flashinfer_attention_forward(
     layer_idx: int,
     cu_seqlens_q: torch.Tensor,
     softmax_scale: float,
+    window: int | None = None,
 ) -> torch.Tensor:
     """Paged attention via FlashInfer.
 
@@ -112,6 +113,10 @@ def flashinfer_attention_forward(
         layer_idx: which layer's K/V to attend over.
         cu_seqlens_q: `(B+1,)` int cumulative q boundaries.
         softmax_scale: typically `1/sqrt(head_dim)`.
+        window: when set, enables sliding-window attention via
+            FlashInfer's `window_left=window-1` plan arg (each query
+            attends to the most recent `window` keys). `None` =
+            full causal.
 
     Returns:
         `(total_q, num_q_heads, head_dim)` attention output.
@@ -238,6 +243,7 @@ def flashinfer_attention_forward(
         sm_scale=softmax_scale,
         q_data_type=q.dtype,
         kv_data_type=kv_data_type,
+        window_left=(window - 1) if window is not None else -1,
     )
     if kv_cache_sf is not None:
         out: torch.Tensor = prefill_wrapper.run(
