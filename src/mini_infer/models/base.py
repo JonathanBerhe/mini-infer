@@ -78,6 +78,15 @@ class BaseCausalLM(nn.Module):
         """
         return ["full"] * self.kv_cache_dims.num_layers
 
+    def per_layer_kv_shape(self) -> list[tuple[int, int]] | None:
+        """Per-layer (num_kv_heads, head_dim) for the block pool.
+
+        Default: None — homogeneous, the pool synthesizes the list from
+        `kv_cache_dims`. Models with per-layer-type heterogeneous attention
+        (Gemma 4 31B, MLA, V4) override to return an explicit list.
+        """
+        return None
+
     def expected_missing_state_keys(self) -> set[str]:
         """Names present in the module hierarchy but expected to be absent
         from the HF state_dict (e.g. aliases of tied weights).

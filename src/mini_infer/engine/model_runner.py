@@ -95,7 +95,9 @@ class ModelRunner:
         # Each owned model exposes its KV-cache dims; the pool is built from
         # them without re-loading HF's config. SWA-aware models also report
         # a per-layer attention pattern so the dispatcher can window the
-        # right layers.
+        # right layers. Heterogeneous-KV models (Gemma 4 31B, MLA, V4)
+        # additionally report per-layer (num_kv_heads, head_dim); the
+        # default `None` keeps the pool homogeneous via `kv_cache_dims`.
         dims = model.kv_cache_dims
         prefix_cache_obj = PrefixCache(block_size=block_size) if prefix_cache else None
         block_pool = BlockPool(
@@ -110,6 +112,7 @@ class ModelRunner:
             kv_quant=kv_quant,
             attention_backend=attention_backend,
             layer_attention=model.per_layer_attention(),
+            layer_kv_shape=model.per_layer_kv_shape(),
         )
 
         return cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)

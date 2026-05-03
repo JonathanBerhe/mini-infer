@@ -87,6 +87,7 @@ class BlockPool:
         kv_quant: str | None = None,
         attention_backend: str = "flash_attn",
         layer_attention: list[LayerAttentionSpec] | None = None,
+        layer_kv_shape: list[tuple[int, int]] | None = None,
     ) -> None:
         if num_blocks <= 0:
             raise ValueError(f"num_blocks must be positive, got {num_blocks}")
@@ -100,6 +101,21 @@ class BlockPool:
         if kv_quant not in _SUPPORTED_KV_QUANT:
             raise ValueError(
                 f"unsupported kv_quant={kv_quant!r}; expected one of {_SUPPORTED_KV_QUANT}"
+            )
+        # Reject heterogeneous-KV + any quant mode early, before the
+        # quant-specific prerequisite checks (flashinfer requirement etc).
+        # The "heterogeneous" decision is made just by looking at the user's
+        # `layer_kv_shape` argument; full validation of the list itself
+        # happens further down.
+        if (
+            kv_quant is not None
+            and layer_kv_shape is not None
+            and any(s != layer_kv_shape[0] for s in layer_kv_shape)
+        ):
+            raise ValueError(
+                f"heterogeneous layer_kv_shape requires kv_quant=None; "
+                f"got kv_quant={kv_quant!r}. Per-layer scales/codebooks for "
+                "FP8/NVFP4/TurboQuant aren't supported yet — that's a future stage."
             )
         if kv_quant in ("turbo4", "turbo3") and (block_size * num_kv_heads * head_dim) % 2 != 0:
             raise ValueError(
@@ -143,6 +159,35 @@ class BlockPool:
                     "which FlashInfer does not currently expose. Pass prefix_cache=None."
                 )
 
+        # Per-layer KV shape. Defaults to `[(num_kv_heads, head_dim)] *
+        # num_layers` (homogeneous — current behavior). Heterogeneous shapes
+        # (Gemma 4 31B-style: different head_dim/num_kv_heads per layer-type)
+        # require kv_quant=None for now; the quantized paths still assume
+        # homogeneous storage.
+        if layer_kv_shape is None:
+            layer_kv_shape = [(num_kv_heads, head_dim)] * num_layers
+        if len(layer_kv_shape) != num_layers:
+            raise ValueError(
+                f"layer_kv_shape has {len(layer_kv_shape)} entries; "
+                f"expected num_layers={num_layers}"
+            )
+        for layer_idx, shape in enumerate(layer_kv_shape):
+            if (
+                not isinstance(shape, tuple)
+                or len(shape) != 2
+                or not isinstance(shape[0], int)
+                or not isinstance(shape[1], int)
+                or shape[0] <= 0
+                or shape[1] <= 0
+            ):
+                raise ValueError(
+                    f"layer_kv_shape[{layer_idx}]={shape!r} must be "
+                    "(num_kv_heads_l, head_dim_l) with positive ints"
+                )
+        is_heterogeneous = any(s != layer_kv_shape[0] for s in layer_kv_shape)
+        # The early gate above already rejected heterogeneous + quant, so by
+        # the time we get here `is_heterogeneous` implies kv_quant is None.
+
         # Per-layer attention spec defaults to all-`"full"` so existing models
         # (Qwen2, Llama) get unchanged behavior. Sliding-window models pass an
         # explicit list of length `num_layers`.
@@ -172,24 +217,43 @@ class BlockPool:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.num_layers = num_layers
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
+        # `num_kv_heads` / `head_dim` retain their meaning for HOMOGENEOUS pools
+        # (the legacy property surface). Heterogeneous pools route through
+        # `num_kv_heads_for_layer` / `head_dim_for_layer`; the legacy
+        # properties raise on a heterogeneous pool.
+        self._homogeneous_num_kv_heads = num_kv_heads
+        self._homogeneous_head_dim = head_dim
+        self._layer_kv_shape: list[tuple[int, int]] = list(layer_kv_shape)
+        self._is_heterogeneous = is_heterogeneous
         self.dtype = dtype
         self._kv_quant = kv_quant
         self._attention_backend = attention_backend
         self._layer_attention: list[LayerAttentionSpec] = list(layer_attention)
 
         if kv_quant is None:
-            self._storage = torch.zeros(
-                num_layers,
-                2,
-                num_blocks,
-                block_size,
-                num_kv_heads,
-                head_dim,
-                dtype=dtype,
-                device=device,
-            )
+            # Per-layer storage list: each entry is `(2, num_blocks,
+            # block_size, num_kv_heads_l, head_dim_l)` where the per-layer
+            # KV shape comes from `_layer_kv_shape[layer_idx]`. Block IDs
+            # remain global — `block_id` is a logical chunk of `block_size`
+            # tokens that physically lives at slot `block_id` in EVERY
+            # layer's tensor. For homogeneous pools the list is just
+            # `num_layers` copies of the same shape.
+            self._layer_storage: list[torch.Tensor] = [
+                torch.zeros(2, num_blocks, block_size, kv_l, hd_l, dtype=dtype, device=device)
+                for (kv_l, hd_l) in self._layer_kv_shape
+            ]
+            # `_storage` retained as the rectangular view used by the
+            # legacy `pool.storage` property, only when the pool is
+            # homogeneous. Heterogeneous pools leave this as a tiny empty
+            # placeholder; `pool.storage` raises in that case.
+            if not self._is_heterogeneous:
+                self._storage = torch.stack(self._layer_storage, dim=0)
+                # Rebind per-layer entries so reads/writes through either
+                # `_storage[layer_idx]` or `_layer_storage[layer_idx]`
+                # touch the same memory.
+                self._layer_storage = [self._storage[layer_idx] for layer_idx in range(num_layers)]
+            else:
+                self._storage = torch.empty(0, dtype=dtype, device=device)
             self._compressed_storage: torch.Tensor | None = None
             self._scales_storage: torch.Tensor | None = None
             self._radii_storage: torch.Tensor | None = None
@@ -347,6 +411,12 @@ class BlockPool:
             # No bf16 _storage in compressed mode; using `.storage` raises.
             self._storage = torch.empty(0, dtype=dtype, device=device)
 
+        # `_layer_storage` always exists. Compressed pools leave it empty;
+        # `storage_for_layer` raises in that case (compressed pools route
+        # through `read_compressed_block`).
+        if not hasattr(self, "_layer_storage"):
+            self._layer_storage = []
+
         self._free_list: list[int] = list(range(num_blocks))
         self._prefix_cache = prefix_cache
 
@@ -361,7 +431,31 @@ class BlockPool:
                 f"`storage` only valid for uncompressed pool; got kv_quant={self._kv_quant!r}. "
                 "Use read_compressed_block / write_compressed_block instead."
             )
+        if self._is_heterogeneous:
+            raise RuntimeError(
+                "`storage` is the rectangular-tensor view; pool has heterogeneous "
+                "per-layer KV shape so there is no single rectangular tensor. "
+                "Use `storage_for_layer(layer_idx)` instead."
+            )
         return self._storage
+
+    @property
+    def num_kv_heads(self) -> int:
+        if self._is_heterogeneous:
+            raise RuntimeError(
+                "`num_kv_heads` is the homogeneous shortcut; pool has heterogeneous "
+                "per-layer KV shape. Use `num_kv_heads_for_layer(layer_idx)` instead."
+            )
+        return self._homogeneous_num_kv_heads
+
+    @property
+    def head_dim(self) -> int:
+        if self._is_heterogeneous:
+            raise RuntimeError(
+                "`head_dim` is the homogeneous shortcut; pool has heterogeneous "
+                "per-layer KV shape. Use `head_dim_for_layer(layer_idx)` instead."
+            )
+        return self._homogeneous_head_dim
 
     @property
     def kv_quant(self) -> str | None:
@@ -374,6 +468,30 @@ class BlockPool:
     @property
     def layer_attention(self) -> list[LayerAttentionSpec]:
         return self._layer_attention
+
+    def num_kv_heads_for_layer(self, layer_idx: int) -> int:
+        """Per-layer `num_kv_heads` from the pool's `layer_kv_shape`."""
+        return self._layer_kv_shape[layer_idx][0]
+
+    def head_dim_for_layer(self, layer_idx: int) -> int:
+        """Per-layer `head_dim` from the pool's `layer_kv_shape`."""
+        return self._layer_kv_shape[layer_idx][1]
+
+    def storage_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns `(K_pool, V_pool)` for `layer_idx`, each of shape
+        `(num_blocks, block_size, num_kv_heads_l, head_dim_l)`.
+
+        Uncompressed pools only. Compressed pools (`kv_quant != None`)
+        raise; the dispatcher in `packed_attention_forward` uses
+        `read_compressed_block` / the materialized fallback there.
+        """
+        if self._kv_quant is not None:
+            raise RuntimeError(
+                f"`storage_for_layer` only valid for uncompressed pool; got "
+                f"kv_quant={self._kv_quant!r}. Use read_compressed_block instead."
+            )
+        layer_storage = self._layer_storage[layer_idx]
+        return layer_storage[0], layer_storage[1]
 
     @property
     def rotation(self) -> torch.Tensor | None:

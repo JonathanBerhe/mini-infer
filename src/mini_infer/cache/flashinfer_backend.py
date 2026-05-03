@@ -137,7 +137,7 @@ def flashinfer_attention_forward(
     device = q.device
     num_q_heads = q.shape[1]
     head_dim = q.shape[2]
-    num_kv_heads = cache._pool.num_kv_heads
+    num_kv_heads = cache._pool.num_kv_heads_for_layer(layer_idx)
     page_size = cache._pool.block_size
 
     prefill_wrapper, decode_wrapper = _ensure_wrappers(device)
@@ -215,8 +215,7 @@ def flashinfer_attention_forward(
         k_scale = 1.0 / float(cache._pool._nvfp4_global_sf[layer_idx, 0].item())
         v_scale = 1.0 / float(cache._pool._nvfp4_global_sf[layer_idx, 1].item())
     else:
-        k_cache = cache._pool.storage[layer_idx, 0]
-        v_cache = cache._pool.storage[layer_idx, 1]
+        k_cache, v_cache = cache._pool.storage_for_layer(layer_idx)
         kv_data_type = q.dtype
         k_scale = None
         v_scale = None

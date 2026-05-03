@@ -238,7 +238,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
 
     def pool_storage_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return `(K_pool, V_pool)` slices for one layer, shape
-        `(num_blocks, block_size, num_kv_heads, head_dim)` each.
+        `(num_blocks, block_size, num_kv_heads_l, head_dim_l)` each.
 
         Used by FA's paged varlen path to read K/V directly from blocks.
         Compressed-mode pools don't expose direct bf16 storage; the FA
@@ -251,7 +251,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 f"got kv_quant={self._pool.kv_quant!r}. The FA paged path "
                 "doesn't support compressed K/V; use the materialized path."
             )
-        return self._pool.storage[layer_idx, 0], self._pool.storage[layer_idx, 1]
+        return self._pool.storage_for_layer(layer_idx)
 
     def materialize_packed_kv(
         self, layer_idx: int
@@ -273,12 +273,12 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         `pool.read_compressed_block`, which decompresses + inverse-rotates
         each block back to bf16 before slicing the relevant prefix.
         """
-        num_kv_heads = self._pool.num_kv_heads
-        head_dim = self._pool.head_dim
+        num_kv_heads = self._pool.num_kv_heads_for_layer(layer_idx)
+        head_dim = self._pool.head_dim_for_layer(layer_idx)
         block_size = self._pool.block_size
         dtype = self._pool.dtype
         if self._pool.kv_quant is None:
-            device = self._pool.storage.device
+            device = self._pool.storage_for_layer(layer_idx)[0].device
         elif self._pool.kv_quant == "fp8":
             assert self._pool._fp8_storage is not None
             device = self._pool._fp8_storage.device
@@ -308,6 +308,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
 
         if self._pool.kv_quant is None:
             # Uncompressed fast path: gather directly from pool storage.
+            k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
             for batch_idx in range(self.batch_size):
                 seq_len = seq_lens[batch_idx]
                 if seq_len == 0:
@@ -317,12 +318,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
                 block_ids_per_pos = block_ids_lookup[positions // block_size]
                 slots_per_pos = positions % block_size
-                key_packed[offset : offset + seq_len] = self._pool.storage[
-                    layer_idx, 0, block_ids_per_pos, slots_per_pos
-                ]
-                value_packed[offset : offset + seq_len] = self._pool.storage[
-                    layer_idx, 1, block_ids_per_pos, slots_per_pos
-                ]
+                key_packed[offset : offset + seq_len] = k_pool[block_ids_per_pos, slots_per_pos]
+                value_packed[offset : offset + seq_len] = v_pool[block_ids_per_pos, slots_per_pos]
         elif self._pool.kv_quant == "fp8":
             # FP8 path used by the CPU/MPS reference fallback (the CUDA
             # FlashInfer path skips materialize entirely). Dequant per
@@ -625,6 +622,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         cu_seqlens_q_new: torch.Tensor,
     ) -> None:
         block_size = self._pool.block_size
+        k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
         for batch_idx in range(self.batch_size):
             packed_start = int(cu_seqlens_q_new[batch_idx])
             packed_end = int(cu_seqlens_q_new[batch_idx + 1])
@@ -638,12 +636,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 position = start_token + token_offset
                 block_id = self._block_ids[batch_idx][position // block_size]
                 slot_in_block = position % block_size
-                self._pool.storage[layer_idx, 0, block_id, slot_in_block] = packed_k[
-                    packed_start + token_offset
-                ]
-                self._pool.storage[layer_idx, 1, block_id, slot_in_block] = packed_v[
-                    packed_start + token_offset
-                ]
+                k_pool[block_id, slot_in_block] = packed_k[packed_start + token_offset]
+                v_pool[block_id, slot_in_block] = packed_v[packed_start + token_offset]
 
     def _write_packed_kv_fp8(
         self,
@@ -917,26 +911,24 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 f"got kv_quant={self._pool.kv_quant!r}. Compressed pools should "
                 "reach attention via the packed-varlen forward path."
             )
+        k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
+        num_kv_heads = self._pool.num_kv_heads_for_layer(layer_idx)
+        head_dim = self._pool.head_dim_for_layer(layer_idx)
+        device = k_pool.device
+        dtype = k_pool.dtype
+
         if self.batch_size == 0:
-            shape = (0, self._pool.num_kv_heads, 0, self._pool.head_dim)
-            empty = torch.empty(
-                shape, dtype=self._pool.storage.dtype, device=self._pool.storage.device
-            )
+            shape = (0, num_kv_heads, 0, head_dim)
+            empty = torch.empty(shape, dtype=dtype, device=device)
             return empty, empty
 
         max_seq = max(self._num_tokens)
         if max_seq == 0:
-            shape = (self.batch_size, self._pool.num_kv_heads, 0, self._pool.head_dim)
-            empty = torch.empty(
-                shape, dtype=self._pool.storage.dtype, device=self._pool.storage.device
-            )
+            shape = (self.batch_size, num_kv_heads, 0, head_dim)
+            empty = torch.empty(shape, dtype=dtype, device=device)
             return empty, empty
 
         block_size = self._pool.block_size
-        device = self._pool.storage.device
-        num_kv_heads = self._pool.num_kv_heads
-        head_dim = self._pool.head_dim
-        dtype = self._pool.storage.dtype
 
         key_full = torch.zeros(
             (self.batch_size, num_kv_heads, max_seq, head_dim), dtype=dtype, device=device
@@ -953,8 +945,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
             block_ids_per_pos = block_ids_lookup[positions // block_size]
             slots_per_pos = positions % block_size
-            keys_gathered = self._pool.storage[layer_idx, 0, block_ids_per_pos, slots_per_pos]
-            values_gathered = self._pool.storage[layer_idx, 1, block_ids_per_pos, slots_per_pos]
+            keys_gathered = k_pool[block_ids_per_pos, slots_per_pos]
+            values_gathered = v_pool[block_ids_per_pos, slots_per_pos]
             # Reorder to HF's (num_kv_heads, seq_len, head_dim) and copy into the
             # padded (num_kv_heads, max_seq, head_dim) slot for this request.
             keys_in_hf_layout = keys_gathered.permute(1, 0, 2)
