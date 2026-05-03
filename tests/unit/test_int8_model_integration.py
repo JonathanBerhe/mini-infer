@@ -68,10 +68,8 @@ def test_quantized_logits_close_to_fp_reference() -> None:
     int8_runner = ModelRunner.from_pretrained(MODEL_NAME, quant="int8")
 
     input_ids = fp_runner.tokenizer.encode(prompt)
-    input_tensor = torch.tensor([input_ids], device=fp_runner.device, dtype=torch.long)
-    with torch.inference_mode():
-        fp_logits = fp_runner._model(input_tensor, use_cache=False).logits[0, -1, :]
-        int8_logits = int8_runner._model(input_tensor, use_cache=False).logits[0, -1, :]
+    _, fp_logits = fp_runner.prefill(input_ids)
+    _, int8_logits = int8_runner.prefill(input_ids)
 
     cos = torch.nn.functional.cosine_similarity(
         fp_logits.float().flatten(), int8_logits.float().flatten(), dim=0

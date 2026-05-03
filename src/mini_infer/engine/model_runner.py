@@ -1,13 +1,13 @@
 import logging
 
 import torch
-from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
-from mini_infer.engine.attention_patch import patch_model_attention
 from mini_infer.engine.tokenizer import Tokenizer
+from mini_infer.models import load_model
+from mini_infer.models.base import BaseCausalLM
 from mini_infer.quant import quantize_model_to_int8
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class ModelRunner:
 
     def __init__(
         self,
-        model: PreTrainedModel,
+        model: BaseCausalLM,
         tokenizer: Tokenizer,
         device: str,
         block_pool: BlockPool,
@@ -71,7 +71,6 @@ class ModelRunner:
         dtype: torch.dtype | None = None,
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
-        use_paged_kernel: bool = True,
         prefix_cache: bool = False,
         quant: str | None = None,
         quant_lm_head: bool = False,
@@ -82,8 +81,7 @@ class ModelRunner:
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
         logger.info("Loading %s on %s with dtype=%s", model_name, resolved, actual_dtype)
         tokenizer = Tokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=actual_dtype).to(resolved)
-        model.eval()
+        model = load_model(model_name, dtype=actual_dtype, device=resolved)
 
         if quant is not None:
             if quant != "int8":
@@ -94,29 +92,22 @@ class ModelRunner:
                 "Quantized %d nn.Linear modules to int8 (skip=%s)", n_replaced, sorted(skip)
             )
 
-        cfg = model.config
-        head_dim = cfg.hidden_size // cfg.num_attention_heads
+        # Each owned model exposes its KV-cache dims; the pool is built from
+        # them without re-loading HF's config.
+        dims = model.kv_cache_dims
         prefix_cache_obj = PrefixCache(block_size=block_size) if prefix_cache else None
         block_pool = BlockPool(
             num_blocks=num_blocks,
             block_size=block_size,
-            num_layers=cfg.num_hidden_layers,
-            num_kv_heads=cfg.num_key_value_heads,
-            head_dim=head_dim,
+            num_layers=dims.num_layers,
+            num_kv_heads=dims.num_kv_heads,
+            head_dim=dims.head_dim,
             dtype=actual_dtype,
             device=resolved,
             prefix_cache=prefix_cache_obj,
             kv_quant=kv_quant,
             attention_backend=attention_backend,
         )
-
-        # Apply the architecture-specific attention patch. The patched forward
-        # dispatches `packed_attention_forward`, which uses FlashAttention varlen
-        # on CUDA and a PyTorch reference elsewhere — so the patch is correct on
-        # every device. Set use_paged_kernel=False to A/B against HF's stock
-        # attention path.
-        if use_paged_kernel:
-            patch_model_attention(model)
 
         return cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)
 
@@ -194,11 +185,8 @@ class ModelRunner:
         # Per-request position ids: positions reset per request so RoPE applies
         # the right rotation for each request's absolute position.
         position_ids_flat: list[int] = []
-        max_seqlen_q = 0
         for batch_idx in range(batch_size):
             q_len = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
-            if q_len > max_seqlen_q:
-                max_seqlen_q = q_len
             position_ids_flat.extend(
                 range(position_offsets[batch_idx], position_offsets[batch_idx] + q_len)
             )
@@ -206,28 +194,13 @@ class ModelRunner:
 
         cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
 
-        # `attention_mask` and `cache_position` are required by HF's outer
-        # forward to size some internal computations, but our patched attention
-        # ignores them (it uses cu_seqlens_q + the cache's per-slot seq_lens).
-        max_kv_after = max(
-            position_offsets[batch_idx] + cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
-            for batch_idx in range(batch_size)
-        )
-        attention_mask = torch.ones((1, max_kv_after), device=device, dtype=torch.long)
-        cache_position = torch.tensor([max(position_offsets)], device=device, dtype=torch.long)
-
         with torch.inference_mode():
-            out = self._model(
-                input_ids,
-                attention_mask=attention_mask,
+            logits: torch.Tensor = self._model(
+                input_ids=input_ids,
                 position_ids=position_ids,
                 past_key_values=cache,
-                cache_position=cache_position,
-                use_cache=True,
                 cu_seqlens_q=cu_seqlens_q_t,
-                max_seqlen_q=max_seqlen_q,
             )
-        logits: torch.Tensor = out.logits
         return logits
 
     def prefill(self, prompt_tokens: list[int]) -> tuple[PagedKVCache, torch.Tensor]:
