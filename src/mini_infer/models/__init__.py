@@ -103,6 +103,7 @@ def _register_builtin_models() -> None:
     explicit function (vs a bare bottom-of-file import) so the side-effect
     has a name and a docstring.
     """
+    from mini_infer.models import llama as _llama  # noqa: F401
     from mini_infer.models import qwen2 as _qwen2  # noqa: F401
 
 
