@@ -31,6 +31,8 @@ Sorting the target models by what they share:
 | Mistral | RMSNorm + RoPE | GQA | SwiGLU | Llama-shape |
 | Mixtral | RMSNorm + RoPE | GQA | **MoE SwiGLU** | First MoE we need |
 | Gemma 2/3 | RMSNorm (+1 offset) + RoPE | GQA + **alternating SWA / global** | GeGLU | Sliding-window attention is mandatory |
+| Gemma 4 31B | RMSNorm + dual RoPE | GQA + **heterogeneous attention shape per layer** (sliding=`head_dim 256, kv_heads 16`; global=`head_dim 512, kv_heads 4`, K=V) | GeGLU | Same heterogeneous-KV layout that V4 needs; supporting one paves the road for both |
+| Gemma 4 E2B/E4B | RMSNorm + RoPE | GQA + SWA + **shared-KV tail layers** | GeGLU + **PLE** | Per-Layer Embeddings + shared KV layers; new primitives |
 | Nemotron | RMSNorm + RoPE | GQA | **squared-ReLU** | Mostly Llama-shape; activation differs. Nemotron-H (state-space) out of scope |
 | DeepSeek-V2/V3 | RMSNorm + RoPE | **MLA** | **MoE SwiGLU** | New attention shape (latent KV) |
 | DeepSeek-V4 | RMSNorm + RoPE | **Hybrid CSA + HCA + SWA** | **MoE SwiGLU** | New attention + heterogeneous KV layout |

@@ -21,11 +21,33 @@ class RotaryEmbedding(nn.Module):
 
     inv_freq: torch.Tensor
 
-    def __init__(self, head_dim: int, base: float = 10000.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        base: float = 10000.0,
+        partial_rotary_factor: float = 1.0,
+    ) -> None:
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        if not 0.0 < partial_rotary_factor <= 1.0:
+            raise ValueError(
+                f"partial_rotary_factor must be in (0, 1]; got {partial_rotary_factor}"
+            )
+        # Standard RoPE: rotate every dim. Partial RoPE (Gemma 4 global
+        # layers): only the first `head_dim * partial_rotary_factor` dims
+        # rotate; the remaining dims keep zero inv_freq so cos=1, sin=0
+        # and the rotation is a no-op for them. Same math as HF's
+        # `_compute_proportional_rope_parameters` with `factor=1.0`.
+        rope_angles = int(partial_rotary_factor * head_dim) // 2
+        rotated = 1.0 / (
+            base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / head_dim)
+        )
+        nope_pad = head_dim // 2 - rope_angles
+        if nope_pad > 0:
+            inv_freq = torch.cat([rotated, torch.zeros(nope_pad, dtype=torch.float32)])
+        else:
+            inv_freq = rotated
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(

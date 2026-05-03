@@ -1,15 +1,31 @@
-"""CUDA smoke test on Modal: load Qwen2.5-0.5B, generate, verify cuda device."""
+"""CUDA smoke test on Modal: load a model, generate, verify cuda device."""
 
 # Run with:
 #   uv run modal run scripts/modal_smoke.py                       # A10 default
 #   MINI_INFER_BENCH_GPU=B200 uv run modal run scripts/modal_smoke.py
+#   MINI_INFER_BENCH_GPU=B200 MINI_INFER_BENCH_MODEL=google/gemma-4-31B-it \
+#       uv run modal run scripts/modal_smoke.py
 
 import os
 
 import modal
 
 _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "A10")
+_BENCH_MODEL = os.environ.get("MINI_INFER_BENCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 _IS_BLACKWELL = _BENCH_GPU.upper().startswith("B200")
+
+# Gated HF repos (Google Gemma 2/3/4, Meta Llama, ...) need an auth token.
+# Pulled from the local `HF_TOKEN` env var and inlined into the container
+# via `Secret.from_dict`. For ungated repos `HF_TOKEN` can be unset; the
+# secrets list collapses to empty and downloads continue anonymously.
+_HF_TOKEN = os.environ.get("HF_TOKEN")
+_SECRETS = [modal.Secret.from_dict({"HF_TOKEN": _HF_TOKEN})] if _HF_TOKEN else []
+
+# Persistent volume for HF model cache. First run pays the full download
+# cost once and writes safetensors here; subsequent runs of any model
+# read from cache and skip the download. Modal auto-commits on clean
+# function exit so future invocations see the contents.
+_HF_CACHE = modal.Volume.from_name("hf-cache", create_if_missing=True)
 
 app = modal.App("mini-infer-cuda-smoke")
 
@@ -43,8 +59,14 @@ else:
     )
 
 
-@app.function(image=image, gpu=_BENCH_GPU, timeout=900)
-def smoke() -> str:
+@app.function(
+    image=image,
+    gpu=_BENCH_GPU,
+    timeout=3600,
+    secrets=_SECRETS,
+    volumes={"/root/.cache/huggingface": _HF_CACHE},
+)
+def smoke(model_name: str) -> str:
     import torch
 
     from mini_infer.device import is_blackwell_device
@@ -56,16 +78,10 @@ def smoke() -> str:
     gpu_name = torch.cuda.get_device_name()
 
     # Detect Blackwell at runtime via the CUDA compute-capability check.
-    # Module-level env vars (`MINI_INFER_BENCH_GPU`) drive image selection on
-    # the local side but don't propagate into the Modal container, so the
-    # backend choice has to be made from device info inside the function.
     # On Blackwell the only working attention path is FlashInfer (flash-attn
     # isn't installed in the cu128 image), so we flag it explicitly here.
     attention_backend = "flashinfer" if is_blackwell_device() else "flash_attn"
-    runner = ModelRunner.from_pretrained(
-        "Qwen/Qwen2.5-0.5B-Instruct",
-        attention_backend=attention_backend,
-    )
+    runner = ModelRunner.from_pretrained(model_name, attention_backend=attention_backend)
     assert runner.device == "cuda", f"expected cuda, got {runner.device!r}"
 
     scheduler = ContinuousScheduler(runner)
@@ -84,7 +100,7 @@ def smoke() -> str:
 
     model_dtype = next(runner._model.parameters()).dtype
     return (
-        f"OK | torch={torch.__version__} | gpu={gpu_name} | "
+        f"OK | model={model_name} | torch={torch.__version__} | gpu={gpu_name} | "
         f"runner.device={runner.device} | dtype={model_dtype} | "
         f"backend={attention_backend} | output={result.text!r}"
     )
@@ -92,4 +108,4 @@ def smoke() -> str:
 
 @app.local_entrypoint()
 def main() -> None:
-    print(smoke.remote())
+    print(smoke.remote(_BENCH_MODEL))
