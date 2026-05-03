@@ -1,0 +1,86 @@
+"""Grouped-Query Attention with native packed-varlen path.
+
+This block replaces the HF-attention monkey-patch we used to apply at
+runtime. The forward computes Q/K/V projections, applies RoPE,
+appends new K/V to the paged cache, dispatches the packed varlen
+attention kernel, and applies the output projection. One layer
+forward = one call to `packed_attention_forward`.
+
+Parameter names (`q_proj`, `k_proj`, `v_proj`, `o_proj`) align with HF
+Llama/Qwen2 so weight loading via `state_dict` is identity-rename.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+from torch import nn
+
+from mini_infer.cache.packed_attention import packed_attention_forward
+from mini_infer.models.blocks.rope import apply_rotary_pos_emb
+
+if TYPE_CHECKING:
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        qkv_bias: bool,
+        layer_idx: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.layer_idx = layer_idx
+        self.q_proj = nn.Linear(hidden_size, num_q_heads * head_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
+        self.o_proj = nn.Linear(num_q_heads * head_dim, hidden_size, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+    ) -> torch.Tensor:
+        # hidden_states: (1, total_q, hidden). The leading "1" is the engine's
+        # packed-batch convention; per-request boundaries live in cu_seqlens_q.
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        # (1, total_q, num_*_heads, head_dim) -> (1, num_*_heads, total_q, head_dim)
+        # because apply_rotary_pos_emb expects head dim at index 1 with unsqueeze_dim=1.
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Pack to (total_q, num_*_heads, head_dim) for both the cache append and
+        # the varlen attention call.
+        new_keys_packed = key_states.transpose(1, 2).squeeze(0).contiguous()
+        new_values_packed = value_states.transpose(1, 2).squeeze(0).contiguous()
+        queries_packed = query_states.transpose(1, 2).squeeze(0).contiguous()
+
+        past_key_values.append_kv_packed(
+            new_keys_packed, new_values_packed, cu_seqlens_q, self.layer_idx
+        )
+
+        attn_packed = packed_attention_forward(
+            queries_packed, past_key_values, self.layer_idx, cu_seqlens_q
+        )
+        # attn_packed: (total_q, num_q_heads, head_dim).
+
+        attn_output = attn_packed.unsqueeze(0).reshape(*input_shape, -1).contiguous()
+        out: torch.Tensor = self.o_proj(attn_output)
+        return out

@@ -46,8 +46,10 @@ env/
 .DS_Store
 Thumbs.db
 
-# Model weights and HF cache (these get LARGE)
-models/
+# Model weights and HF cache (these get LARGE).
+# `/models/` matches only a top-level dir, leaving `src/mini_infer/models/`
+# (our owned model implementations) tracked.
+/models/
 *.safetensors
 *.bin
 *.gguf

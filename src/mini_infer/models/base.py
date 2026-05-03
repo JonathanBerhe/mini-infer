@@ -1,0 +1,81 @@
+"""Contract every owned causal LM honors.
+
+Tighter than HF's `PreTrainedModel.forward`: we pass exactly what the
+scheduler builds (packed input_ids, position_ids, paged cache,
+varlen boundaries) and return the raw logits tensor — no
+`CausalLMOutputWithPast` wrapper.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, Protocol
+
+import torch
+from torch import nn
+
+if TYPE_CHECKING:
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+
+
+class ModelConfigLike(Protocol):
+    """Marker for per-model config dataclasses; each declares `from_hf` itself."""
+
+
+@dataclass(frozen=True)
+class KVCacheDims:
+    """Dimensions the `BlockPool` needs to size storage for an architecture.
+
+    Every owned model exposes these through `BaseCausalLM.kv_cache_dims` so
+    the model runner can build the pool without re-loading HF's config.
+    """
+
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+
+
+class BaseCausalLM(nn.Module):
+    """Common contract for owned causal LMs.
+
+    Subclasses declare:
+      - `HF_ARCHITECTURE`: the string in HF `config.architectures[0]`
+        used for registry lookup (e.g. `"Qwen2ForCausalLM"`).
+      - `Config`: a per-model dataclass with `from_hf(hf_config)`.
+      - `load_weights(model, hf_state_dict)`: in-place state_dict copy
+        with any name remapping.
+      - `kv_cache_dims`: the architectural dims for the block pool.
+      - `expected_missing_state_keys()` (optional): aliases of tied
+        weights or other parameters that `load_state_dict` will report
+        as missing but that aren't a real load failure.
+    """
+
+    HF_ARCHITECTURE: ClassVar[str] = ""
+    Config: ClassVar[type]
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns packed logits `(1, total_q, vocab_size)`."""
+        raise NotImplementedError
+
+    @property
+    def kv_cache_dims(self) -> KVCacheDims:
+        raise NotImplementedError
+
+    def expected_missing_state_keys(self) -> set[str]:
+        """Names present in the module hierarchy but expected to be absent
+        from the HF state_dict (e.g. aliases of tied weights).
+
+        `load_weights` should subtract these from `load_state_dict`'s
+        reported `missing` before declaring a load failure. Default: none.
+        """
+        return set()
+
+    @staticmethod
+    def load_weights(model: BaseCausalLM, hf_state_dict: dict[str, torch.Tensor]) -> None:
+        raise NotImplementedError

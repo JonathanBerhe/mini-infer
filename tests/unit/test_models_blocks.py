@@ -1,0 +1,91 @@
+"""Block-level parity vs HF's Qwen2 reference modules.
+
+Each owned block is checked against the corresponding HF Qwen2 module
+on shared random input + matching weights. Cosine similarity > 0.999
+catches drift in the math (RoPE half-rotation, RMSNorm fp32 promotion,
+SwiGLU activation order). These run on CPU; no model download needed.
+"""
+
+import torch
+
+from mini_infer.models.blocks import RMSNorm, RotaryEmbedding, SwiGLU, apply_rotary_pos_emb
+
+
+def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+    a_flat = a.flatten().to(torch.float32)
+    b_flat = b.flatten().to(torch.float32)
+    return float(torch.nn.functional.cosine_similarity(a_flat, b_flat, dim=0).item())
+
+
+def test_rmsnorm_matches_hf_qwen2() -> None:
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+    torch.manual_seed(0)
+    hidden = 64
+    x = torch.randn(1, 8, hidden, dtype=torch.float32)
+
+    ours = RMSNorm(hidden, eps=1e-6)
+    theirs = Qwen2RMSNorm(hidden, eps=1e-6)
+    # Sync weights.
+    with torch.no_grad():
+        theirs.weight.copy_(ours.weight)
+
+    out_ours = ours(x)
+    out_theirs = theirs(x)
+    assert _cos_sim(out_ours, out_theirs) > 0.999
+    # Element-wise close too (RMSNorm is small enough that drift is suspicious).
+    assert torch.allclose(out_ours, out_theirs, atol=1e-5)
+
+
+def test_rope_matches_hf_qwen2() -> None:
+    """`RotaryEmbedding` + `apply_rotary_pos_emb` round-trip vs HF's helper."""
+    from transformers.models.qwen2.modeling_qwen2 import (
+        apply_rotary_pos_emb as hf_apply_rope,
+    )
+
+    torch.manual_seed(0)
+    head_dim = 64
+    num_heads = 4
+    total_q = 12
+    base = 10000.0
+
+    rope = RotaryEmbedding(head_dim, base=base)
+    # `hidden_states` is just used for dtype/device; positions drive the math.
+    h = torch.zeros(1, total_q, num_heads * head_dim, dtype=torch.float32)
+    position_ids = torch.arange(total_q, dtype=torch.long).unsqueeze(0)
+    cos, sin = rope(h, position_ids)
+
+    q = torch.randn(1, num_heads, total_q, head_dim, dtype=torch.float32)
+    k = torch.randn(1, num_heads, total_q, head_dim, dtype=torch.float32)
+
+    q_ours, k_ours = apply_rotary_pos_emb(q, k, cos, sin)
+    q_theirs, k_theirs = hf_apply_rope(q, k, cos, sin)
+
+    assert _cos_sim(q_ours, q_theirs) > 0.999
+    assert _cos_sim(k_ours, k_theirs) > 0.999
+    assert torch.allclose(q_ours, q_theirs, atol=1e-5)
+    assert torch.allclose(k_ours, k_theirs, atol=1e-5)
+
+
+def test_swiglu_matches_hf_qwen2() -> None:
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+
+    torch.manual_seed(0)
+    hidden = 32
+    intermediate = 96
+    x = torch.randn(1, 4, hidden, dtype=torch.float32)
+
+    cfg = Qwen2Config(hidden_size=hidden, intermediate_size=intermediate)
+    ours = SwiGLU(hidden, intermediate)
+    theirs = Qwen2MLP(cfg)
+    # Sync weights.
+    with torch.no_grad():
+        ours.gate_proj.weight.copy_(theirs.gate_proj.weight)
+        ours.up_proj.weight.copy_(theirs.up_proj.weight)
+        ours.down_proj.weight.copy_(theirs.down_proj.weight)
+
+    out_ours = ours(x)
+    out_theirs = theirs(x)
+    assert _cos_sim(out_ours, out_theirs) > 0.999
+    assert torch.allclose(out_ours, out_theirs, atol=1e-5)

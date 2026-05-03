@@ -79,29 +79,18 @@ def run_benchmark(
         "paths": {},
     }
 
-    # Materialization path: paged kernel disabled even if the device supports it.
-    runner_mat = ModelRunner.from_pretrained(model_name, device=device, use_paged_kernel=False)
-    results["device"] = runner_mat.device
-    results["dtype"] = str(next(runner_mat._model.parameters()).dtype)
-    results["paths"]["materialization"] = {
-        str(seq_len): _bench_one_path(runner_mat, seq_len, n_iters, warmup) for seq_len in seq_lens
-    }
-    del runner_mat
-
-    # Kernel path (only meaningful where supports_paged_kernel returns True).
-    runner_ker = ModelRunner.from_pretrained(model_name, device=device, use_paged_kernel=True)
-    kernel_active = runner_ker.device == "cuda"  # crude proxy; refined check below
+    # Single attention path now: owned model always uses the packed kernel.
+    # The historical "materialization vs kernel" A/B disappeared with the
+    # owned-model rewrite (Phase 1 of multi-model support); the materialized
+    # path is the device-fallback inside `packed_attention_forward` and isn't
+    # reachable separately from the model runner.
+    runner = ModelRunner.from_pretrained(model_name, device=device)
+    results["device"] = runner.device
+    results["dtype"] = str(next(runner._model.parameters()).dtype)
+    kernel_active = runner.device == "cuda"
     results["paths"]["kernel"] = {
-        str(seq_len): _bench_one_path(runner_ker, seq_len, n_iters, warmup) for seq_len in seq_lens
+        str(seq_len): _bench_one_path(runner, seq_len, n_iters, warmup) for seq_len in seq_lens
     }
     results["paths"]["kernel"]["_active"] = kernel_active  # type: ignore[assignment]
-
-    # Speedup table (kernel vs materialization, median).
-    speedup: dict[str, float] = {}
-    for seq_len in seq_lens:
-        m = results["paths"]["materialization"][str(seq_len)]["median_us"]
-        k = results["paths"]["kernel"][str(seq_len)]["median_us"]
-        speedup[str(seq_len)] = m / k if k > 0 else 0.0
-    results["speedup_median"] = speedup
 
     return results
