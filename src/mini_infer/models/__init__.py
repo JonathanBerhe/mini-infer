@@ -105,8 +105,10 @@ def _register_builtin_models() -> None:
     """
     from mini_infer.models import gemma3 as _gemma3  # noqa: F401
     from mini_infer.models import llama as _llama  # noqa: F401
+    from mini_infer.models import mistral as _mistral  # noqa: F401
     from mini_infer.models import mixtral as _mixtral  # noqa: F401
     from mini_infer.models import qwen2 as _qwen2  # noqa: F401
+    from mini_infer.models import qwen3 as _qwen3  # noqa: F401
 
 
 _register_builtin_models()
