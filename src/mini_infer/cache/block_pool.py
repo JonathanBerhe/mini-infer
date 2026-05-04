@@ -231,28 +231,35 @@ class BlockPool:
         self._layer_attention: list[LayerAttentionSpec] = list(layer_attention)
 
         if kv_quant is None:
-            # Per-layer storage list: each entry is `(2, num_blocks,
-            # block_size, num_kv_heads_l, head_dim_l)` where the per-layer
-            # KV shape comes from `_layer_kv_shape[layer_idx]`. Block IDs
-            # remain global — `block_id` is a logical chunk of `block_size`
-            # tokens that physically lives at slot `block_id` in EVERY
-            # layer's tensor. For homogeneous pools the list is just
-            # `num_layers` copies of the same shape.
-            self._layer_storage: list[torch.Tensor] = [
-                torch.zeros(2, num_blocks, block_size, kv_l, hd_l, dtype=dtype, device=device)
-                for (kv_l, hd_l) in self._layer_kv_shape
-            ]
-            # `_storage` retained as the rectangular view used by the
-            # legacy `pool.storage` property, only when the pool is
-            # homogeneous. Heterogeneous pools leave this as a tiny empty
-            # placeholder; `pool.storage` raises in that case.
             if not self._is_heterogeneous:
-                self._storage = torch.stack(self._layer_storage, dim=0)
-                # Rebind per-layer entries so reads/writes through either
-                # `_storage[layer_idx]` or `_layer_storage[layer_idx]`
-                # touch the same memory.
-                self._layer_storage = [self._storage[layer_idx] for layer_idx in range(num_layers)]
+                # Homogeneous fast path: allocate ONE rectangular tensor and
+                # view per-layer slices into it. Avoids transient 2x peak
+                # memory during init that a per-layer-then-stack approach
+                # would incur on large pools (Phi-3 / 7B+ models on M1).
+                kv_l, hd_l = self._layer_kv_shape[0]
+                self._storage = torch.zeros(
+                    num_layers,
+                    2,
+                    num_blocks,
+                    block_size,
+                    kv_l,
+                    hd_l,
+                    dtype=dtype,
+                    device=device,
+                )
+                self._layer_storage: list[torch.Tensor] = [
+                    self._storage[layer_idx] for layer_idx in range(num_layers)
+                ]
             else:
+                # Heterogeneous: per-layer tensors of (potentially) different
+                # shapes. Block IDs are still global — slot `block_id` lives
+                # at index `block_id` in every layer's tensor. The legacy
+                # `pool.storage` property raises on heterogeneous pools so
+                # `_storage` is a tiny placeholder.
+                self._layer_storage = [
+                    torch.zeros(2, num_blocks, block_size, kv_l, hd_l, dtype=dtype, device=device)
+                    for (kv_l, hd_l) in self._layer_kv_shape
+                ]
                 self._storage = torch.empty(0, dtype=dtype, device=device)
             self._compressed_storage: torch.Tensor | None = None
             self._scales_storage: torch.Tensor | None = None
