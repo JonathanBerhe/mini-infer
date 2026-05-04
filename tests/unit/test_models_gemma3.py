@@ -59,18 +59,6 @@ def test_gemma3_loads_through_registry() -> None:
 
 
 @pytest.mark.requires_model
-@pytest.mark.xfail(
-    reason=(
-        "Gemma 3 logits drift to ~0.90 cosine vs HF reference on MPS fp16. "
-        "Per-layer hidden-state comparison shows ~0.005 cosine drop per "
-        "layer, compounding to ~10% by layer 24. The framework is right "
-        "(blocks load, shapes match, SWA mask works, top-3 outputs are "
-        "coherent), but greedy argmax flips Paris → France. Suspected "
-        "MPS fp16 numerical accumulation; unblocked by switching to bf16 "
-        "or running on CUDA — left as a follow-up."
-    ),
-    strict=False,
-)
 def test_gemma3_decodes_paris_for_france_prompt() -> None:
     """Greedy decode through Gemma 3 produces a coherent completion."""
     runner = ModelRunner.from_pretrained(MODEL_NAME)
