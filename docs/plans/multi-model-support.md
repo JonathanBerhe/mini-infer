@@ -20,6 +20,19 @@ This plan is about the plumbing first, then the per-model work, in cheapest-
 first order. The deepest single piece — V4's hybrid attention — is its own
 sub-plan at [docs/plans/deepseek-v4-attention.md](deepseek-v4-attention.md).
 
+## Status
+
+| Phase | Status | Notes |
+|---|---|---|
+| 1: Registry + canonical blocks | **shipped** | Replaced HF-model-plus-patch with owned `nn.Module`s |
+| 2: Llama-shape adds | **partial** | `LlamaForCausalLM` shipped (covers Llama 2/3/4 + SmolLM2/TinyLlama). Mistral, Qwen3, Nemotron pending — each a thin per-file add |
+| 3a: SWA primitive + Gemma 3 | **shipped** | Per-layer attention type, dual RoPE, partial RoPE, GemmaRMSNorm/GeGLU/GemmaDecoderLayer; Gemma 3 1B-it greedy-parity with HF |
+| 3b: Gemma 4 31B | **deferred** | Needs heterogeneous-KV (Stage C1, now shipped) plus `attention_k_eq_v` and `v_norm` (small follow-up). 26B-A4B and E2B/E4B remain out of scope |
+| 4: MoE FFN + Mixtral | **shipped** | `MixtralForCausalLM`, top-k MoE primitive bit-parity vs HF |
+| 5-prep (C1): heterogeneous-KV BlockPool | **shipped** | Per-layer `(num_kv_heads, head_dim)`. Foundation for MLA, V4, and Gemma 4 31B |
+| 5: MLA + DeepSeek-V2/V3 + Kimi-K2 | **pending** | MLA is a multi-stream KV (latent + RoPE-K) — generalizes the per-layer-shape primitive into a per-layer storage descriptor |
+| 6: DeepSeek-V4 hybrid attention | **pending** | See [V4 sub-plan](deepseek-v4-attention.md) |
+
 ## Architectural taxonomy
 
 Sorting the target models by what they share:
