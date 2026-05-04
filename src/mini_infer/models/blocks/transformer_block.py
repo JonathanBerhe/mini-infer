@@ -32,9 +32,15 @@ class TransformerBlock(nn.Module):
         rms_norm_eps: float,
         qkv_bias: bool,
         layer_idx: int,
+        with_qk_norm: bool = False,
     ) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Qwen3 (and similar) apply per-head RMSNorm on Q and K after the
+        # projections, before RoPE. Standard RMSNorm here (not Gemma's
+        # offset variant — those models use `GemmaDecoderLayer` instead).
+        q_norm = RMSNorm(head_dim, eps=rms_norm_eps) if with_qk_norm else None
+        k_norm = RMSNorm(head_dim, eps=rms_norm_eps) if with_qk_norm else None
         self.self_attn = GroupedQueryAttention(
             hidden_size=hidden_size,
             num_q_heads=num_q_heads,
@@ -42,6 +48,8 @@ class TransformerBlock(nn.Module):
             head_dim=head_dim,
             qkv_bias=qkv_bias,
             layer_idx=layer_idx,
+            q_norm=q_norm,
+            k_norm=k_norm,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = SwiGLU(hidden_size, intermediate_size)
