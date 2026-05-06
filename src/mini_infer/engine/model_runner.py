@@ -99,6 +99,20 @@ class ModelRunner:
         # additionally report per-layer (num_kv_heads, head_dim); the
         # default `None` keeps the pool homogeneous via `kv_cache_dims`.
         dims = model.kv_cache_dims
+        # Some models declare a hard kernel constraint that overrides the
+        # caller's `attention_backend` (e.g. Gemma 4 31B has head_dim=512
+        # on full layers, which neither flash-attn 2 nor FlashInfer
+        # prefill supports — they need our materialized SDPA fallback).
+        # Mirrors vLLM's `verify_and_update_config` model-side override.
+        required_backend = model.required_attention_backend()
+        if required_backend is not None and required_backend != attention_backend:
+            logger.info(
+                "Forcing attention_backend=%r for %s (required by model; was %r)",
+                required_backend,
+                type(model).__name__,
+                attention_backend,
+            )
+            attention_backend = required_backend
         prefix_cache_obj = PrefixCache(block_size=block_size) if prefix_cache else None
         block_pool = BlockPool(
             num_blocks=num_blocks,

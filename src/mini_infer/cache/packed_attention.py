@@ -100,6 +100,27 @@ def packed_attention_forward(
     layer_spec = cache._pool.layer_attention[layer_idx]
     window: int | None = layer_spec[1] if isinstance(layer_spec, tuple) else None
 
+    # Forced-torch backend: skip every CUDA fast path and run the
+    # materialized SDPA reference. The reference path handles arbitrary
+    # head_dim (no kernel-tile constraints), which is what models like
+    # Gemma 4 31B (head_dim=512 on full layers) need today — neither
+    # FlashInfer's prefill nor flash-attn 2 supports head_dim > 256.
+    # vLLM and SGLang reach the same conclusion via their Triton unified
+    # attention kernel; we don't ship a Triton kernel, so we accept the
+    # materialized-SDPA tax for the whole model. See ADR / model file
+    # `Gemma4ForCausalLM.required_attention_backend`.
+    if cache._pool.attention_backend == "torch":
+        keys_packed, values_packed, cu_seqlens_k, _ = cache.materialize_packed_kv(layer_idx)
+        return packed_attention_torch(
+            q,
+            keys_packed,
+            values_packed,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            softmax_scale,
+            window=window,
+        )
+
     # FlashInfer paged-attention backend (opt-in via the pool's
     # `attention_backend="flashinfer"`). Handles bf16, fp8 e4m3fn, and
     # nvfp4 paged storage (FlashInfer fuses dequant into the tensor-core

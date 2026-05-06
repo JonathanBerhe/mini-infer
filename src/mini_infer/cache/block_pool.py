@@ -48,7 +48,13 @@ _SUPPORTED_KV_QUANT = (None, "turbo4", "turbo3", "fp8", "nvfp4")
 #   "flash_attn" = `flash_attn_varlen_func` (default)
 #   "flashinfer" = FlashInfer's paged-attention wrappers; valid with
 #                  `kv_quant in {None, "fp8"}`
-_SUPPORTED_ATTENTION_BACKENDS = ("flash_attn", "flashinfer")
+#   "torch"      = materialize K/V from blocks then SDPA. Slow, but the
+#                  only path that handles head_dim > 256 (Gemma 4 31B
+#                  full layers, head_dim=512). vLLM's `TRITON_ATTN`
+#                  serves the same role; we don't ship a Triton kernel,
+#                  so we fall back to PyTorch SDPA on the materialized
+#                  packed buffer.
+_SUPPORTED_ATTENTION_BACKENDS = ("flash_attn", "flashinfer", "torch")
 
 
 class BlockPool:
