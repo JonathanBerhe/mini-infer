@@ -96,6 +96,21 @@ class BaseCausalLM(nn.Module):
         """
         return set()
 
+    def required_attention_backend(self) -> str | None:
+        """Name of an attention backend the model REQUIRES, overriding user choice.
+
+        Returned when no installed kernel handles the model's attention
+        shape — e.g. Gemma 4 31B has `head_dim=512` on full layers, which
+        FlashAttention 2 and FlashInfer's prefill kernel both reject.
+        `ModelRunner.from_pretrained` honors this (with a log line so the
+        override is visible) and the matching value gets threaded into
+        `BlockPool(attention_backend=...)`. Default: `None` — model is
+        compatible with any user-selected backend. Mirrors vLLM's
+        `verify_and_update_config` pattern (`gemma4` forces TRITON_ATTN
+        when `max_head_dim > 256`).
+        """
+        return None
+
     @staticmethod
     def load_weights(model: BaseCausalLM, hf_state_dict: dict[str, torch.Tensor]) -> None:
         raise NotImplementedError
