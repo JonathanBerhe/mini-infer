@@ -1,13 +1,13 @@
 # mini-infer
 
-An open-source LLM inference engine built from scratch in Python and Triton, implementing the techniques that production engines (vLLM, SGLang, TensorRT-LLM) are known for: continuous batching, PagedAttention with a Triton decode kernel, a multi-model registry of owned `nn.Module` implementations, and an OpenAI-compatible FastAPI server with SSE streaming. Six model families register today: Qwen2, Qwen3, Llama, Mistral, Gemma 3, Mixtral.
+An open-source LLM inference engine built from scratch in Python and Triton, implementing the techniques that production engines (vLLM, SGLang, TensorRT-LLM) are known for: continuous batching, PagedAttention with a Triton decode kernel, a multi-model registry of owned `nn.Module` implementations, and an OpenAI-compatible FastAPI server with SSE streaming. Seven model families register today: Qwen2, Qwen3, Llama, Mistral, Gemma 3, Gemma 4, Mixtral.
 
 ## What's working today
 
 * **Continuous batching scheduler** (`ContinuousScheduler`) on a dedicated engine thread with FIFO admission, per-request handles, and backpressure. One forward pass per step over all in-flight decoding requests.
 * **Chunked prefill + packed-varlen forward**: long prompts advance one chunk per step alongside in-flight decoders, eliminating head-of-line blocking. Single `model.forward(...)` per step via FlashAttention's varlen API on CUDA, PyTorch reference elsewhere.
-* **PagedAttention** with a fixed-size block pool and a batch-aware `PagedKVCache`. Supports per-layer heterogeneous KV shape — different `(num_kv_heads, head_dim)` per layer (Stage C1 of the multi-model plan), the foundation for Gemma 4 31B's mixed sliding/global head dims, DeepSeek MLA's latent KV, and DeepSeek-V4's CSA + HCA hybrid attention.
-* **Multi-model framework**: `ModelRegistry` looks up an HF `config.architectures[0]` string and dispatches to an owned `nn.Module` (Llama-style or family-specific). Six families register today: `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `LlamaForCausalLM` (covers Llama 2/3/4 + SmolLM2 + TinyLlama + the Llama-shape Nemotron variants), `MistralForCausalLM`, `Gemma3ForCausalLM`, `MixtralForCausalLM`. Adding a new model is one ~80-line file composing the shared block library — RMSNorm + RoPE + GQA + SwiGLU plus the family-specific extensions (sliding-window attention, dual RoPE, partial RoPE, per-head Q/K norm, sandwich norm, top-k MoE FFN). HF safetensors weights load identity-rename via `model.load_state_dict(...)`. No HF runtime monkey-patching.
+* **PagedAttention** with a fixed-size block pool and a batch-aware `PagedKVCache`. Supports per-layer heterogeneous KV shape — different `(num_kv_heads, head_dim)` per layer — already used by Gemma 4 31B (sliding `head_dim=256, kv=16` vs full `head_dim=512, kv=4`); the same primitive is the foundation DeepSeek-V2/V3 MLA's latent KV and DeepSeek-V4's CSA + HCA hybrid attention will extend.
+* **Multi-model framework**: `ModelRegistry` looks up an HF `config.architectures[0]` string and dispatches to an owned `nn.Module` (Llama-style or family-specific). Seven families register today: `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `LlamaForCausalLM` (covers Llama 2/3/4 + SmolLM2 + TinyLlama + the Llama-shape Nemotron variants), `MistralForCausalLM`, `Gemma3ForCausalLM`, `Gemma4ForConditionalGeneration` (Gemma 4 31B text-only), `MixtralForCausalLM`. Adding a new model is one ~80-line file composing the shared block library — RMSNorm + RoPE + GQA + SwiGLU plus the family-specific extensions (sliding-window attention, dual RoPE, partial RoPE, per-head Q/K norm, sandwich norm, top-k MoE FFN, k_eq_v / v_norm / per-layer attention-backend override). HF safetensors weights load identity-rename via `model.load_state_dict(...)`. No HF runtime monkey-patching.
 * **Prefix caching**: chained-hash, block-granular, refcounted LRU. Repeat or shared-prefix prompts skip prefill on the cached prefix; opt-in via `prefix_cache=True`. Verified token-for-token against the no-cache path.
 * **Weight-only INT8 quantization (W8A16)**: symmetric per-output-channel scales applied at load time; opt-in via `quant="int8"`. Drops model-weight HBM by ~30% on Qwen2.5-0.5B with cosine-sim > 0.99 on logits and first-token greedy parity preserved. Forward dispatches to a fused Triton W8A16 GEMM kernel on CUDA — keeps weights in INT8 in HBM and dequants tile-by-tile in registers, skipping the bf16-weight HBM round-trip the naive path pays.
 * **Speculative decoding** (vanilla two-model, greedy V1): small draft model proposes K tokens, large target verifies them in one forward, accept-reject emits target's argmax sequence. `PagedKVCache.truncate_to` rolls back on rejections. 1.14x decode throughput on Qwen2.5-7B target + 0.5B draft on A10 at bf16; the regime is constrained by the modest target/draft size ratio (the same implementation scales to the published 1.5–2x range at 70B+ on Hopper).
@@ -110,7 +110,7 @@ finally:
 
 ### Supported model families
 
-Six HF architecture keys register today; pass any HF model id whose config matches and `ModelRunner.from_pretrained(...)` will route through the right owned class.
+Seven HF architecture keys register today; pass any HF model id whose config matches and `ModelRunner.from_pretrained(...)` will route through the right owned class.
 
 | HF architecture | Examples | Family-specific primitives |
 |---|---|---|
@@ -119,15 +119,17 @@ Six HF architecture keys register today; pass any HF model id whose config match
 | `LlamaForCausalLM` | Llama 2 / 3 / 4, SmolLM2, TinyLlama, Llama-Nemotron variants | Standard Llama-shape baseline |
 | `MistralForCausalLM` | Mistral-7B-Instruct-v0.1/0.2/0.3, Mistral Small / Large | Same as Llama (registered separately for the HF arch key) |
 | `Gemma3ForCausalLM` | Gemma 3 1B / 4B (text-only) | Sliding-window + global alternating attention, dual RoPE, sandwich norms, GemmaRMSNorm (`(1+w)*x`), GeGLU (`gelu_pytorch_tanh`), embed scaling, Q/K norm |
+| `Gemma4ForConditionalGeneration` | Gemma 4 31B-it (text-only; vision/audio towers filtered at load) | Heterogeneous-KV per layer-type (sliding `head_dim=256, kv=16` / full `head_dim=512, kv=4`), `attention_k_eq_v` (full layers reuse `k_proj` output as V), unscaled `v_norm`, per-layer `layer_scalar`, dual RoPE with different `head_dim` per type (full layers use proportional rotation, `partial_rotary_factor=0.25`), final logit softcap, model-side attention-backend override (forces materialized SDPA because head_dim=512 exceeds flash-attn / FlashInfer limits — same conclusion vLLM and SGLang reach with their Triton unified kernel) |
 | `MixtralForCausalLM` | Mixtral-8x7B / 8x22B-Instruct | Top-k sparse MoE FFN (8 experts, top-2) |
 
-Validated path: each family has at least one CPU/MPS smoke test that loads an ungated checkpoint and produces "Paris" for `"The capital of France is"`. Mixtral 8x7B (47B params) is too large for M1 fp16 — the MoE block was bit-validated against HF's `MixtralSparseMoeBlock` on synthetic input instead.
+Validated path: each family has at least one CPU/MPS smoke test that loads an ungated checkpoint and produces "Paris" for `"The capital of France is"`. Mixtral 8x7B (47B params) is too large for M1 fp16 — the MoE block was bit-validated against HF's `MixtralSparseMoeBlock` on synthetic input instead. Gemma 4 31B (62 GB at bf16) is similarly out of M1 memory budget; validated end-to-end on a B200 Modal run.
 
-Adding a model family is a one-file change in `src/mini_infer/models/<family>.py`: declare a config + a class that composes the shared blocks, decorate with `@register_model`, and add the import to `_register_builtin_models()` in `src/mini_infer/models/__init__.py`. Examples to copy:
+Adding a model family is a one-file change in `src/mini_infer/models/<family>.py`: declare a config + a class that composes the shared blocks, decorate with `@register_model`, and add the import to `_register_builtin_models()` in `src/mini_infer/models/__init__.py`. Examples to copy, in order of complexity:
 
 * Pure Llama-shape (no biases, no quirks): [src/mini_infer/models/mistral.py](src/mini_infer/models/mistral.py) — 30 lines.
 * Llama-shape + Q/K norm + tied embeddings: [src/mini_infer/models/qwen3.py](src/mini_infer/models/qwen3.py) — ~140 lines.
-* Heavier per-family deltas (sandwich norm, GemmaRMSNorm, dual RoPE): [src/mini_infer/models/gemma3.py](src/mini_infer/models/gemma3.py) — ~170 lines.
+* Sandwich norm + dual RoPE + GemmaRMSNorm: [src/mini_infer/models/gemma3.py](src/mini_infer/models/gemma3.py) — ~170 lines.
+* Heterogeneous-KV + k_eq_v + v_norm + dual-RoPE-different-head_dim + softcap + multimodal weight prefix-strip + model-side backend override: [src/mini_infer/models/gemma4.py](src/mini_infer/models/gemma4.py) — ~280 lines.
 
 ### Picking a KV-cache mode
 
@@ -289,8 +291,7 @@ By design:
 
 Future model support (planned, see [docs/plans/multi-model-support.md](docs/plans/multi-model-support.md)):
 
-* **Gemma 4 31B** — heterogeneous-KV cache is in place; needs `attention_k_eq_v` (V = K on global layers) and `v_norm` to ship.
-* **DeepSeek-V2 / V3 + Kimi-K2** — Multi-head Latent Attention (MLA). Generalizes the per-layer-shape primitive into a per-layer storage descriptor (latent KV + RoPE-K).
+* **DeepSeek-V2 / V3 + Kimi-K2** — Multi-head Latent Attention (MLA). Generalizes the per-layer-shape primitive into a per-layer *storage descriptor* (latent KV + RoPE-K stream).
 * **DeepSeek-V4** — hybrid Compressed Sparse Attention + Heavily Compressed Attention. See [docs/plans/deepseek-v4-attention.md](docs/plans/deepseek-v4-attention.md).
 * **State-space hybrids** (Mamba, Nemotron-H, Jamba) — different cache abstraction entirely; deliberately out of scope.
 
