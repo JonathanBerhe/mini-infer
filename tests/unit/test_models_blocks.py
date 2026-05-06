@@ -67,6 +67,67 @@ def test_rope_matches_hf_qwen2() -> None:
     assert torch.allclose(k_ours, k_theirs, atol=1e-5)
 
 
+def test_rmsnorm_with_scale_false_matches_hf_gemma4() -> None:
+    """`RMSNorm(with_scale=False)` matches HF `Gemma4RMSNorm(with_scale=False)`.
+
+    Used by Gemma 4's `v_norm`: a pure RMS rescale with no learnable
+    weight. Keeping element-wise parity with HF here matters because any
+    drift propagates straight into the V tensor before SDPA.
+    """
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm
+
+    torch.manual_seed(0)
+    hidden = 64
+    x = torch.randn(1, 8, 4, hidden, dtype=torch.float32)  # (B, T, num_kv, head_dim)
+
+    ours = RMSNorm(hidden, eps=1e-6, with_scale=False)
+    theirs = Gemma4RMSNorm(hidden, eps=1e-6, with_scale=False)
+
+    # No weight to sync (with_scale=False ⇒ no parameter).
+    assert not hasattr(ours, "weight"), "with_scale=False should not allocate `weight`"
+    assert not hasattr(theirs, "weight")
+
+    out_ours = ours(x)
+    out_theirs = theirs(x)
+    assert _cos_sim(out_ours, out_theirs) > 0.999
+    assert torch.allclose(out_ours, out_theirs, atol=1e-5)
+
+
+def test_gqa_attention_k_eq_v_skips_v_proj() -> None:
+    """`GroupedQueryAttention(attention_k_eq_v=True)` does not construct v_proj.
+
+    Gemma 4 full layers reuse the post-`k_proj` tensor as V. The model
+    file relies on `self.v_proj is None` to know it should not build a
+    parameter and to filter the corresponding safetensors keys at load.
+    """
+    from mini_infer.models.blocks import GroupedQueryAttention
+
+    gqa = GroupedQueryAttention(
+        hidden_size=64,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=16,
+        qkv_bias=False,
+        layer_idx=0,
+        attention_k_eq_v=True,
+    )
+    assert gqa.v_proj is None
+    # state_dict should not contain v_proj keys.
+    assert not any(k.startswith("v_proj.") for k in gqa.state_dict())
+
+    # Sanity-check the homogeneous (default) path still wires v_proj.
+    gqa_default = GroupedQueryAttention(
+        hidden_size=64,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=16,
+        qkv_bias=False,
+        layer_idx=0,
+    )
+    assert gqa_default.v_proj is not None
+    assert any(k.startswith("v_proj.") for k in gqa_default.state_dict())
+
+
 def test_swiglu_matches_hf_qwen2() -> None:
     from transformers import Qwen2Config
     from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP

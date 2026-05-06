@@ -37,6 +37,8 @@ class GroupedQueryAttention(nn.Module):
         query_scale: float | None = None,
         q_norm: nn.Module | None = None,
         k_norm: nn.Module | None = None,
+        attention_k_eq_v: bool = False,
+        v_norm: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -44,9 +46,16 @@ class GroupedQueryAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.layer_idx = layer_idx
+        self.attention_k_eq_v = attention_k_eq_v
         self.q_proj = nn.Linear(hidden_size, num_q_heads * head_dim, bias=qkv_bias)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
+        # Gemma 4 full layers (`attention_k_eq_v=True`) reuse the post-`k_proj`
+        # tensor as V — there is no separate v_proj parameter. We keep the
+        # attribute as `None` so weight-load filters can detect the absence.
+        if attention_k_eq_v:
+            self.v_proj: nn.Linear | None = None
+        else:
+            self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
         self.o_proj = nn.Linear(num_q_heads * head_dim, hidden_size, bias=False)
         # Optional per-head norm on Q and K AFTER projection and BEFORE RoPE.
         # Gemma 3+ uses GemmaRMSNorm(head_dim) here; the names `q_norm` and
@@ -54,10 +63,13 @@ class GroupedQueryAttention(nn.Module):
         # identity rename. None = pass-through (Qwen2, Llama).
         self.q_norm = q_norm
         self.k_norm = k_norm
+        # Gemma 4 also normalizes V with an unscaled RMSNorm AFTER capturing
+        # V from k_proj output (or v_proj output). None = pass-through.
+        self.v_norm = v_norm
         # `query_scale` overrides the default `1/sqrt(head_dim)` softmax
-        # scale. Gemma uses `1/sqrt(query_pre_attn_scalar)` here, which is
-        # often (but not always) numerically identical to `1/sqrt(head_dim)`.
-        # `None` keeps the default (Qwen2, Llama).
+        # scale. Gemma 3 uses `1/sqrt(query_pre_attn_scalar)`. Gemma 4 sets
+        # this to 1.0 (q_norm/k_norm absorb the magnitude). `None` keeps the
+        # default (Qwen2, Llama).
         self._query_scale = query_scale
 
     def forward(
@@ -75,7 +87,15 @@ class GroupedQueryAttention(nn.Module):
         # because apply_rotary_pos_emb expects head dim at index 1 with unsqueeze_dim=1.
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # Gemma 4 full layers: V reuses the post-projection K tensor BEFORE
+        # k_norm and BEFORE RoPE. Capturing here keeps `value_states`
+        # pointing at the un-normalized k_proj output even after the
+        # `key_states = self.k_norm(...)` reassignment below (Python rebinds
+        # the name; the original tensor stays alive via `value_states`).
+        if self.v_proj is not None:
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        else:
+            value_states = key_states
 
         # Per-head Q/K norm (Gemma 3+). Acts on the last dim (head_dim).
         if self.q_norm is not None:
@@ -85,6 +105,12 @@ class GroupedQueryAttention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # v_norm is applied AFTER V is captured (so for k_eq_v layers, it
+        # operates on the un-k_normed, un-RoPE'd K tensor). Gemma 4's v_norm
+        # uses `with_scale=False` so it's a pure RMS rescale.
+        if self.v_norm is not None:
+            value_states = self.v_norm(value_states)
 
         # Pack to (total_q, num_*_heads, head_dim) for both the cache append and
         # the varlen attention call.

@@ -1,6 +1,7 @@
 """Canonical building blocks shared across owned model families."""
 
 from mini_infer.models.blocks.geglu import GeGLU
+from mini_infer.models.blocks.gemma4_decoder_layer import Gemma4DecoderLayer
 from mini_infer.models.blocks.gemma_decoder_layer import GemmaDecoderLayer
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
 from mini_infer.models.blocks.gqa import GroupedQueryAttention
@@ -13,6 +14,7 @@ from mini_infer.models.blocks.transformer_block import TransformerBlock
 
 __all__ = [
     "GeGLU",
+    "Gemma4DecoderLayer",
     "GemmaDecoderLayer",
     "GemmaRMSNorm",
     "GroupedQueryAttention",
