@@ -130,3 +130,66 @@ def apply_interleaved_rotary_pos_emb(
         return torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
 
     return _rotate(q), _rotate(k)
+
+
+def apply_partial_rope_last_n_dims(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    last_n_rotated: int,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Rotate only the LAST `last_n_rotated` dims of `x` via interleaved RoPE.
+
+    DeepSeek-V4 splits each KV head into `[nope_dims | rope_dims]` along the
+    last axis; only the rope tail rotates. The reference V4 code expresses
+    this as `apply_rotary_emb(x[..., -rd:], freqs_cis)` (in-place mutation
+    of a slice). We return a new tensor for safety.
+
+    Difference vs V2's `apply_interleaved_rotary_pos_emb`: V2 rotates the
+    whole input (which is already the rope-only slice); V4 takes the full
+    head and selectively rotates the tail. Centralizing the slice-and-rotate
+    keeps callers from re-implementing the split.
+
+    `inverse=True` rotates by the conjugate frequency. The reference uses
+    this on the attention output to recover relative position encoding —
+    `q · k^T` carries the position phase from both Q and K rotations, but
+    after attention the output keeps Q's phase; rotating output by `-i`
+    cancels it so subsequent layers see relative positions only.
+
+    Shapes:
+        x:   `(..., kv_head_dim)` where `kv_head_dim >= last_n_rotated`.
+        cos, sin: `(B, T, last_n_rotated)` (full-dim form, halves
+                  duplicated — matches our `RotaryEmbedding` output).
+        Returns: `x` with the last `last_n_rotated` dims rotated.
+    """
+    if last_n_rotated <= 0 or last_n_rotated > x.shape[-1]:
+        raise ValueError(
+            f"last_n_rotated={last_n_rotated} out of range for x.shape[-1]={x.shape[-1]}"
+        )
+    if last_n_rotated % 2 != 0:
+        raise ValueError(f"last_n_rotated must be even (interleaved RoPE), got {last_n_rotated}")
+
+    rope_part = x[..., -last_n_rotated:]
+    rest_part = x[..., :-last_n_rotated]
+
+    # Broadcast cos/sin over leading dims of rope_part.
+    while cos.ndim < rope_part.ndim:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+
+    # Take half — `RotaryEmbedding` emits `cat([freqs, freqs])` so the
+    # second half mirrors the first. Interleaved pairing only needs one half.
+    half = last_n_rotated // 2
+    cos_half = cos[..., :half]
+    sin_half = sin[..., :half] if not inverse else -sin[..., :half]
+
+    real = rope_part[..., 0::2]
+    imag = rope_part[..., 1::2]
+    rot_real = real * cos_half - imag * sin_half
+    rot_imag = real * sin_half + imag * cos_half
+    rotated = torch.stack([rot_real, rot_imag], dim=-1).flatten(-2)
+
+    if rest_part.shape[-1] == 0:
+        return rotated
+    return torch.cat([rest_part, rotated], dim=-1)

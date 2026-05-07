@@ -29,9 +29,7 @@ def _make_legacy_pool() -> BlockPool:
 
 
 def _make_mla_pool() -> BlockPool:
-    streams = [
-        [StreamSpec("kv_latent", 1, 16), StreamSpec("k_rope", 1, 4)]
-    ] * 2
+    streams = [[StreamSpec("kv_latent", 1, 16), StreamSpec("k_rope", 1, 4)]] * 2
     return BlockPool(
         num_blocks=8,
         block_size=4,
