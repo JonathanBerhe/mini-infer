@@ -31,7 +31,7 @@ class Tokenizer:
         # automatically despite the same flag).
         bos_id = self._tokenizer.bos_token_id
         if bos_id is not None and (not ids or ids[0] != bos_id):
-            ids = [int(bos_id)] + ids
+            ids = [int(bos_id), *ids]
         return ids
 
     def decode(self, token_ids: Sequence[int]) -> str:

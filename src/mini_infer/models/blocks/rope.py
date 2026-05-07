@@ -90,3 +90,43 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_interleaved_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RoPE with interleaved (real, imag) pairing — DeepSeek-V2 / V3 / Kimi-K2.
+
+    Matches HF's `apply_rotary_emb` (complex-number form) bit-for-bit but
+    expressed in real arithmetic. For each consecutive pair `(q[2i],
+    q[2i+1])` at position `p` and frequency `f_i`:
+        q[2i]_new   = q[2i]   * cos(p*f_i) - q[2i+1] * sin(p*f_i)
+        q[2i+1]_new = q[2i]   * sin(p*f_i) + q[2i+1] * cos(p*f_i)
+
+    Note `cos` / `sin` here have last dim `head_dim` (matching our
+    `RotaryEmbedding` output, which produces `cat([freqs, freqs])`); we
+    take the first half since the second half mirrors it. The pairing
+    convention differs from `apply_rotary_pos_emb`'s "stacked halves"
+    layout — DeepSeek's checkpoint stores rope-dim weights interleaved.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    # Take only the first half — second half is identical (cat-of-self).
+    rope_dim_half = q.shape[-1] // 2
+    cos_half = cos[..., :rope_dim_half]
+    sin_half = sin[..., :rope_dim_half]
+
+    def _rotate(t: torch.Tensor) -> torch.Tensor:
+        # Split into even / odd indices along the last dim.
+        t_even = t[..., 0::2]
+        t_odd = t[..., 1::2]
+        rot_even = t_even * cos_half - t_odd * sin_half
+        rot_odd = t_even * sin_half + t_odd * cos_half
+        # Interleave back: stack along a new dim, then flatten.
+        return torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
+
+    return _rotate(q), _rotate(k)
