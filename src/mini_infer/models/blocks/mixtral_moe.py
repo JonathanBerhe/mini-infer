@@ -62,28 +62,60 @@ class MoEFFN(nn.Module):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
+        n_shared_experts: int = 0,
+        shared_intermediate_size: int | None = None,
+        renormalize_topk: bool = True,
+        routed_scaling_factor: float = 1.0,
     ) -> None:
         super().__init__()
         if top_k <= 0 or top_k > num_experts:
             raise ValueError(f"top_k={top_k} must be in [1, num_experts={num_experts}]")
         self.num_experts = num_experts
         self.top_k = top_k
+        # Mixtral renormalizes the top-k softmax probs to sum to 1; DeepSeek
+        # keeps the raw probs and multiplies by `routed_scaling_factor`.
+        self.renormalize_topk = renormalize_topk
+        self.routed_scaling_factor = routed_scaling_factor
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
         self.experts = nn.ModuleList(
             [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_experts)]
         )
+        # Shared experts (DeepSeek-V2/V3): MLPs that fire on every token,
+        # added to the routed output. `n_shared_experts=0` keeps Mixtral's
+        # routed-only behavior.
+        self.n_shared_experts = n_shared_experts
+        if n_shared_experts > 0:
+            shared_inter = (
+                shared_intermediate_size
+                if shared_intermediate_size is not None
+                else intermediate_size
+            )
+            # DeepSeek collapses N shared experts into a single MLP with
+            # `N * intermediate_size` hidden width — bit-identical to
+            # running N separate experts in parallel and summing, but a
+            # single matmul. Match HF's `DeepseekV2MLP(intermediate_size *
+            # n_shared_experts)` shape so weight loading is identity.
+            self.shared_experts: MixtralExpert | None = MixtralExpert(
+                hidden_size, shared_inter * n_shared_experts
+            )
+        else:
+            self.shared_experts = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: (1, total_q, hidden) — flatten to (T, hidden) for routing.
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, hidden_states.shape[-1])
 
-        # Router: full-precision softmax for stability.
+        # Router: full-precision softmax for stability. Both Mixtral and
+        # DeepSeek-V2 use softmax-over-all-experts then top-k; what differs
+        # is whether they renormalize and what scaling factor they apply.
         router_logits = self.gate(flat).float()
         router_probs = functional.softmax(router_logits, dim=-1)
         top_k_weights, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        # Renormalize so the chosen `top_k` weights sum to 1 per token.
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        if self.renormalize_topk:
+            top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        if self.routed_scaling_factor != 1.0:
+            top_k_weights = top_k_weights * self.routed_scaling_factor
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
         out = torch.zeros_like(flat)
@@ -101,4 +133,8 @@ class MoEFFN(nn.Module):
             weights = top_k_weights[token_idx, top_k_pos, None]
             expert_out = self.experts[expert_idx](tokens) * weights
             out.index_add_(0, token_idx, expert_out)
+        # Shared experts run on every token; their output is added to the
+        # routed sum (no per-expert weighting — they fire unconditionally).
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(flat)
         return out.view(input_shape)
