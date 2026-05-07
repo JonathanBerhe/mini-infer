@@ -519,6 +519,136 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             for batch_idx in range(self.batch_size):
                 self._publish_filled_blocks(batch_idx)
 
+    def append_stream_packed(
+        self,
+        stream_packed: torch.Tensor,
+        cu_seqlens_q_new: torch.Tensor,
+        layer_idx: int,
+        stream_name: str,
+    ) -> None:
+        """Generalized varlen append for one named stream of one layer.
+
+        Counterpart to `append_kv_packed` for the stream-descriptor API.
+        Writes `stream_packed` (`(total_new_tokens, num_kv_heads_s,
+        head_dim_s)`) into the per-stream pool storage; on the first
+        stream of layer 0, also advances per-slot token counts and
+        allocates fresh blocks.
+
+        Used by MLA models that write per-layer streams of differing
+        shape (`compressed_kv` 1xkv_lora_rank, `k_rope` 1xqk_rope_head_dim)
+        rather than the standard K/V pair.
+        """
+        if cu_seqlens_q_new.shape[0] != self.batch_size + 1:
+            raise ValueError(
+                f"cu_seqlens_q_new has {cu_seqlens_q_new.shape[0]} entries; "
+                f"expected batch_size+1 = {self.batch_size + 1}"
+            )
+        if self._pool.kv_quant is not None:
+            raise RuntimeError(
+                f"`append_stream_packed` is uncompressed-only; got "
+                f"kv_quant={self._pool.kv_quant!r}."
+            )
+        # Advance counters + allocate blocks once per step. Callers append
+        # streams in the order returned by `pool.stream_names(0)`; the
+        # first stream of layer 0 is the trigger.
+        first_stream_of_layer_0 = self._pool.stream_names(0)[0]
+        if layer_idx == 0 and stream_name == first_stream_of_layer_0:
+            block_size = self._pool.block_size
+            for batch_idx in range(self.batch_size):
+                new_tokens = int(cu_seqlens_q_new[batch_idx + 1] - cu_seqlens_q_new[batch_idx])
+                if new_tokens == 0:
+                    continue
+                new_total = self._num_tokens[batch_idx] + new_tokens
+                required_blocks = (new_total + block_size - 1) // block_size
+                while len(self._block_ids[batch_idx]) < required_blocks:
+                    self._block_ids[batch_idx].append(self._pool.allocate())
+                self._num_tokens[batch_idx] = new_total
+        # Write data into per-stream storage. For legacy K/V layers this
+        # aliases `_layer_storage[layer_idx][0/1]` (no extra memory).
+        stream_pool = self._pool.storage_for_stream(layer_idx, stream_name)
+        block_size = self._pool.block_size
+        for batch_idx in range(self.batch_size):
+            packed_start = int(cu_seqlens_q_new[batch_idx])
+            packed_end = int(cu_seqlens_q_new[batch_idx + 1])
+            new_tokens = packed_end - packed_start
+            if new_tokens == 0:
+                continue
+            seq_len_after = self._num_tokens[batch_idx]
+            seq_len_before = seq_len_after - new_tokens
+            packed_slice = stream_packed[packed_start:packed_end]
+            for tok_idx in range(new_tokens):
+                abs_pos = seq_len_before + tok_idx
+                block_id = self._block_ids[batch_idx][abs_pos // block_size]
+                slot = abs_pos % block_size
+                stream_pool[block_id, slot] = packed_slice[tok_idx]
+        # Publish prompt blocks once the LAST stream of the LAST layer
+        # has been written this step (mirrors legacy `append_kv_packed`'s
+        # publish logic).
+        last_layer = self._pool.num_layers - 1
+        last_stream = self._pool.stream_names(last_layer)[-1]
+        if (
+            self._prefix_cache is not None
+            and layer_idx == last_layer
+            and stream_name == last_stream
+        ):
+            for batch_idx in range(self.batch_size):
+                self._publish_filled_blocks(batch_idx)
+
+    def materialize_packed_stream(
+        self, layer_idx: int, stream_name: str
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Gather one named stream's per-slot history into varlen-packed form.
+
+        Returns `(stream_packed, cu_seqlens_k, max_seqlen_k)` where
+        `stream_packed` is `(total_k, num_kv_heads_s, head_dim_s)` —
+        every request's full history of this stream concatenated along
+        dim 0, no padding.
+
+        Generalizes `materialize_packed_kv` to a single named stream.
+        Uncompressed pool only; compressed paths still go through the
+        legacy 2-stream `materialize_packed_kv`.
+        """
+        if self._pool.kv_quant is not None:
+            raise RuntimeError(
+                f"`materialize_packed_stream` is uncompressed-only; got "
+                f"kv_quant={self._pool.kv_quant!r}."
+            )
+        spec = self._pool.stream_spec(layer_idx, stream_name)
+        block_size = self._pool.block_size
+        dtype = self._pool.dtype
+        stream_pool = self._pool.storage_for_stream(layer_idx, stream_name)
+        device = stream_pool.device
+
+        seq_lens = self._num_tokens
+        if not seq_lens or all(seq_len == 0 for seq_len in seq_lens):
+            empty = torch.empty((0, spec.num_kv_heads, spec.head_dim), dtype=dtype, device=device)
+            cu_seqlens_k = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
+            return empty, cu_seqlens_k, 0
+
+        cu_seqlens_k_list = [0]
+        running = 0
+        for seq_len in seq_lens:
+            running += seq_len
+            cu_seqlens_k_list.append(running)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, device=device)
+        total_k = cu_seqlens_k_list[-1]
+        max_seqlen_k = max(seq_lens) if seq_lens else 0
+
+        stream_packed = torch.empty(
+            (total_k, spec.num_kv_heads, spec.head_dim), dtype=dtype, device=device
+        )
+        for batch_idx in range(self.batch_size):
+            seq_len = seq_lens[batch_idx]
+            if seq_len == 0:
+                continue
+            offset = cu_seqlens_k_list[batch_idx]
+            positions = torch.arange(seq_len, device=device)
+            block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
+            block_ids_per_pos = block_ids_lookup[positions // block_size]
+            slots_per_pos = positions % block_size
+            stream_packed[offset : offset + seq_len] = stream_pool[block_ids_per_pos, slots_per_pos]
+        return stream_packed, cu_seqlens_k, max_seqlen_k
+
     def get_seq_length(self, layer_idx: int = 0) -> int:
         """Returns max seq_len across the batch (HF assumes a single value).
 

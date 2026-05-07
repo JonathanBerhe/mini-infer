@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import torch
 from torch import nn
 
-from mini_infer.cache.block_pool import LayerAttentionSpec
+from mini_infer.cache.block_pool import LayerAttentionSpec, StreamSpec
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -84,6 +84,18 @@ class BaseCausalLM(nn.Module):
         Default: None — homogeneous, the pool synthesizes the list from
         `kv_cache_dims`. Models with per-layer-type heterogeneous attention
         (Gemma 4 31B, MLA, V4) override to return an explicit list.
+        """
+        return None
+
+    def per_layer_streams(self) -> list[list[StreamSpec]] | None:
+        """Per-layer storage descriptor for the block pool.
+
+        Default: None — the pool synthesizes the legacy `["k", "v"]` pair
+        per layer (with shape from `per_layer_kv_shape()` or
+        `kv_cache_dims`). Models that need a non-K/V stream layout —
+        DeepSeek-V2/V3 MLA stores `compressed_kv` (1xkv_lora_rank) plus
+        `k_rope` (1xqk_rope_head_dim) per layer rather than per-head K/V
+        — override to return the explicit per-layer descriptor.
         """
         return None
 

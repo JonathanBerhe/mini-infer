@@ -127,6 +127,7 @@ class ModelRunner:
             attention_backend=attention_backend,
             layer_attention=model.per_layer_attention(),
             layer_kv_shape=model.per_layer_kv_shape(),
+            layer_streams=model.per_layer_streams(),
         )
 
         return cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)

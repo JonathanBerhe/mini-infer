@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -20,6 +21,28 @@ from mini_infer.exceptions import OutOfMemoryError
 # specify `("sliding", window_size)` for their windowed layers; the
 # attention dispatcher honors the window when reading the cache.
 LayerAttentionSpec = Literal["full"] | tuple[Literal["sliding"], int]
+
+
+@dataclass(frozen=True)
+class StreamSpec:
+    """Per-layer storage descriptor for one named tensor stream.
+
+    Standard MHA / GQA layers carry two streams `("k", "v")` of identical
+    shape. MLA layers (DeepSeek-V2/V3, Kimi-K2) carry two streams of
+    DIFFERENT shape — `("compressed_kv", num_kv_heads=1, kv_lora_rank)`
+    plus `("k_rope", num_kv_heads=1, qk_rope_head_dim)` — both shared
+    across all attention heads (`num_kv_heads=1` is the giveaway).
+
+    Block IDs are global across all streams: slot `block_id` reserves a
+    chunk in EVERY stream's tensor at the same index. Each stream has
+    its own `(num_blocks, block_size, num_kv_heads_s, head_dim_s)`
+    storage tensor.
+    """
+
+    name: str
+    num_kv_heads: int
+    head_dim: int
+
 
 # Supported KV-cache compression modes:
 #   None     = legacy bf16/fp16 storage.
@@ -94,6 +117,7 @@ class BlockPool:
         attention_backend: str = "flash_attn",
         layer_attention: list[LayerAttentionSpec] | None = None,
         layer_kv_shape: list[tuple[int, int]] | None = None,
+        layer_streams: list[list[StreamSpec]] | None = None,
     ) -> None:
         if num_blocks <= 0:
             raise ValueError(f"num_blocks must be positive, got {num_blocks}")
@@ -194,6 +218,71 @@ class BlockPool:
         # The early gate above already rejected heterogeneous + quant, so by
         # the time we get here `is_heterogeneous` implies kv_quant is None.
 
+        # Per-layer storage descriptor (Stage C3). Default is the legacy K/V
+        # layout: each layer carries `[StreamSpec("k", kv, hd), StreamSpec("v",
+        # kv, hd)]` with shape derived from `layer_kv_shape`. Models with a
+        # different layout (DeepSeek-V2 / V3 MLA: compressed_kv + k_rope per
+        # layer) pass `layer_streams` directly.
+        if layer_streams is None:
+            layer_streams = [
+                [StreamSpec("k", kv_l, hd_l), StreamSpec("v", kv_l, hd_l)]
+                for (kv_l, hd_l) in layer_kv_shape
+            ]
+        elif kv_quant is not None:
+            # Compressed paths (turbo*, fp8, nvfp4) assume a rectangular
+            # K/V layout. Generalizing them to per-stream descriptors is
+            # a future stage.
+            raise ValueError(
+                f"explicit `layer_streams` requires kv_quant=None; got "
+                f"kv_quant={kv_quant!r}. Per-stream paths for compressed "
+                "KV are not yet supported."
+            )
+        if len(layer_streams) != num_layers:
+            raise ValueError(
+                f"layer_streams has {len(layer_streams)} entries; expected num_layers={num_layers}"
+            )
+        for layer_idx, streams in enumerate(layer_streams):
+            if not streams:
+                raise ValueError(
+                    f"layer_streams[{layer_idx}] is empty; every layer needs at least one stream"
+                )
+            seen: set[str] = set()
+            for spec in streams:
+                if not isinstance(spec, StreamSpec):
+                    raise ValueError(
+                        f"layer_streams[{layer_idx}] contains {spec!r}; "
+                        "expected StreamSpec instances"
+                    )
+                if spec.num_kv_heads <= 0 or spec.head_dim <= 0:
+                    raise ValueError(
+                        f"layer_streams[{layer_idx}].{spec.name}: "
+                        f"num_kv_heads={spec.num_kv_heads}, "
+                        f"head_dim={spec.head_dim} must be positive"
+                    )
+                if spec.name in seen:
+                    raise ValueError(
+                        f"layer_streams[{layer_idx}] has duplicate stream name {spec.name!r}"
+                    )
+                seen.add(spec.name)
+        # Legacy K/V layout: every layer has exactly the streams ["k", "v"]
+        # with identical shape. When True, the legacy `_layer_storage`
+        # rectangular tensors and `storage_for_layer` accessors are valid;
+        # when False, only the per-stream API works (legacy raises with a
+        # clear message pointing at the new accessors).
+        is_legacy_kv_layout = all(
+            len(streams) == 2
+            and {s.name for s in streams} == {"k", "v"}
+            and (
+                next(s for s in streams if s.name == "k").num_kv_heads
+                == next(s for s in streams if s.name == "v").num_kv_heads
+            )
+            and (
+                next(s for s in streams if s.name == "k").head_dim
+                == next(s for s in streams if s.name == "v").head_dim
+            )
+            for streams in layer_streams
+        )
+
         # Per-layer attention spec defaults to all-`"full"` so existing models
         # (Qwen2, Llama) get unchanged behavior. Sliding-window models pass an
         # explicit list of length `num_layers`.
@@ -204,19 +293,19 @@ class BlockPool:
                 f"layer_attention has {len(layer_attention)} entries; "
                 f"expected num_layers={num_layers}"
             )
-        for layer_idx, spec in enumerate(layer_attention):
-            if spec == "full":
+        for layer_idx, attn_spec in enumerate(layer_attention):
+            if attn_spec == "full":
                 continue
             if (
-                isinstance(spec, tuple)
-                and len(spec) == 2
-                and spec[0] == "sliding"
-                and isinstance(spec[1], int)
-                and spec[1] > 0
+                isinstance(attn_spec, tuple)
+                and len(attn_spec) == 2
+                and attn_spec[0] == "sliding"
+                and isinstance(attn_spec[1], int)
+                and attn_spec[1] > 0
             ):
                 continue
             raise ValueError(
-                f"layer_attention[{layer_idx}]={spec!r} is not a valid spec; "
+                f"layer_attention[{layer_idx}]={attn_spec!r} is not a valid spec; "
                 "use 'full' or ('sliding', positive_int)"
             )
 
@@ -231,13 +320,17 @@ class BlockPool:
         self._homogeneous_head_dim = head_dim
         self._layer_kv_shape: list[tuple[int, int]] = list(layer_kv_shape)
         self._is_heterogeneous = is_heterogeneous
+        self._layer_stream_specs: list[list[StreamSpec]] = [
+            list(streams) for streams in layer_streams
+        ]
+        self._is_legacy_kv_layout = is_legacy_kv_layout
         self.dtype = dtype
         self._kv_quant = kv_quant
         self._attention_backend = attention_backend
         self._layer_attention: list[LayerAttentionSpec] = list(layer_attention)
 
         if kv_quant is None:
-            if not self._is_heterogeneous:
+            if self._is_legacy_kv_layout and not self._is_heterogeneous:
                 # Homogeneous fast path: allocate ONE rectangular tensor and
                 # view per-layer slices into it. Avoids transient 2x peak
                 # memory during init that a per-layer-then-stack approach
@@ -256,17 +349,56 @@ class BlockPool:
                 self._layer_storage: list[torch.Tensor] = [
                     self._storage[layer_idx] for layer_idx in range(num_layers)
                 ]
-            else:
-                # Heterogeneous: per-layer tensors of (potentially) different
-                # shapes. Block IDs are still global — slot `block_id` lives
-                # at index `block_id` in every layer's tensor. The legacy
-                # `pool.storage` property raises on heterogeneous pools so
-                # `_storage` is a tiny placeholder.
+            elif self._is_legacy_kv_layout:
+                # Heterogeneous K/V (Gemma 4 31B): per-layer tensors of
+                # (potentially) different shapes. Block IDs still global —
+                # slot `block_id` lives at index `block_id` in every
+                # layer's tensor. Legacy `pool.storage` property raises on
+                # heterogeneous pools so `_storage` is a tiny placeholder.
                 self._layer_storage = [
                     torch.zeros(2, num_blocks, block_size, kv_l, hd_l, dtype=dtype, device=device)
                     for (kv_l, hd_l) in self._layer_kv_shape
                 ]
                 self._storage = torch.empty(0, dtype=dtype, device=device)
+            else:
+                # Stream-descriptor layout (DeepSeek MLA-style): no
+                # rectangular K/V tensor. Per-layer per-stream tensors get
+                # allocated below (in the unified `_layer_streams_storage`
+                # block); the legacy K/V handles stay empty so the legacy
+                # accessors raise with a clear migration message.
+                self._layer_storage = []
+                self._storage = torch.empty(0, dtype=dtype, device=device)
+            # Per-stream storage. For legacy K/V layers we ALIAS the
+            # `_layer_storage` rectangular slices (no extra memory); for
+            # MLA-style layers we allocate standalone tensors per stream.
+            # `_layer_streams_storage[layer_idx][stream_name]` always
+            # returns a `(num_blocks, block_size, num_kv_heads_s,
+            # head_dim_s)` tensor — same contract for both layouts.
+            self._layer_streams_storage: list[dict[str, torch.Tensor]] = []
+            for layer_idx, streams in enumerate(self._layer_stream_specs):
+                streams_for_layer: dict[str, torch.Tensor] = {}
+                if (
+                    len(streams) == 2
+                    and {s.name for s in streams} == {"k", "v"}
+                    and self._layer_storage
+                ):
+                    # Alias the legacy K/V rectangular layout. layer_storage
+                    # for layer i has shape (2, num_blocks, block_size,
+                    # num_kv_heads, head_dim) — slice 0 is K, 1 is V.
+                    layer_t = self._layer_storage[layer_idx]
+                    streams_for_layer["k"] = layer_t[0]
+                    streams_for_layer["v"] = layer_t[1]
+                else:
+                    for spec in streams:
+                        streams_for_layer[spec.name] = torch.zeros(
+                            num_blocks,
+                            block_size,
+                            spec.num_kv_heads,
+                            spec.head_dim,
+                            dtype=dtype,
+                            device=device,
+                        )
+                self._layer_streams_storage.append(streams_for_layer)
             self._compressed_storage: torch.Tensor | None = None
             self._scales_storage: torch.Tensor | None = None
             self._radii_storage: torch.Tensor | None = None
@@ -429,6 +561,11 @@ class BlockPool:
         # through `read_compressed_block`).
         if not hasattr(self, "_layer_storage"):
             self._layer_storage = []
+        # `_layer_streams_storage` follows the same pattern: only the
+        # uncompressed path populates it. The new stream accessors raise
+        # on compressed pools (same surface as `storage_for_layer`).
+        if not hasattr(self, "_layer_streams_storage"):
+            self._layer_streams_storage = []
 
         self._free_list: list[int] = list(range(num_blocks))
         self._prefix_cache = prefix_cache
@@ -483,11 +620,30 @@ class BlockPool:
         return self._layer_attention
 
     def num_kv_heads_for_layer(self, layer_idx: int) -> int:
-        """Per-layer `num_kv_heads` from the pool's `layer_kv_shape`."""
+        """Per-layer `num_kv_heads` from the pool's `layer_kv_shape`.
+
+        Legacy K/V accessor — valid only on layers whose stream layout is
+        the standard `["k", "v"]` pair with identical shape. Stream-
+        descriptor layouts (DeepSeek MLA) raise; callers must migrate to
+        `num_kv_heads_for_stream(layer_idx, name)`.
+        """
+        if not self._is_legacy_kv_layout:
+            raise RuntimeError(
+                "pool has a non-standard stream layout; use "
+                "`num_kv_heads_for_stream(layer_idx, name)` instead."
+            )
         return self._layer_kv_shape[layer_idx][0]
 
     def head_dim_for_layer(self, layer_idx: int) -> int:
-        """Per-layer `head_dim` from the pool's `layer_kv_shape`."""
+        """Per-layer `head_dim` from the pool's `layer_kv_shape`.
+
+        Same legacy-K/V constraint as `num_kv_heads_for_layer`.
+        """
+        if not self._is_legacy_kv_layout:
+            raise RuntimeError(
+                "pool has a non-standard stream layout; use "
+                "`head_dim_for_stream(layer_idx, name)` instead."
+            )
         return self._layer_kv_shape[layer_idx][1]
 
     def storage_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -497,14 +653,76 @@ class BlockPool:
         Uncompressed pools only. Compressed pools (`kv_quant != None`)
         raise; the dispatcher in `packed_attention_forward` uses
         `read_compressed_block` / the materialized fallback there.
+
+        Legacy K/V accessor — valid only on layers whose stream layout
+        is exactly `["k", "v"]` with identical shape. Stream-descriptor
+        layouts (DeepSeek MLA) raise; callers migrate to
+        `storage_for_stream(layer_idx, name)`.
         """
         if self._kv_quant is not None:
             raise RuntimeError(
                 f"`storage_for_layer` only valid for uncompressed pool; got "
                 f"kv_quant={self._kv_quant!r}. Use read_compressed_block instead."
             )
+        if not self._is_legacy_kv_layout:
+            raise RuntimeError(
+                "pool has a non-standard stream layout; use "
+                "`storage_for_stream(layer_idx, name)` instead."
+            )
         layer_storage = self._layer_storage[layer_idx]
         return layer_storage[0], layer_storage[1]
+
+    # --- Stream-descriptor API (Stage C3) ---------------------------------
+    # Generalizes the legacy K/V accessors. Every layer carries a list of
+    # named streams; the storage layout is the same for legacy K/V (where
+    # the streams alias the rectangular K/V tensors) and MLA-style models
+    # (where each stream is its own tensor). Standard MHA models can keep
+    # using the legacy accessors; MLA-aware code uses these.
+
+    def stream_specs(self, layer_idx: int) -> list[StreamSpec]:
+        """All `StreamSpec`s for `layer_idx`."""
+        return list(self._layer_stream_specs[layer_idx])
+
+    def stream_names(self, layer_idx: int) -> list[str]:
+        """Names of the streams on `layer_idx`."""
+        return [spec.name for spec in self._layer_stream_specs[layer_idx]]
+
+    def stream_spec(self, layer_idx: int, stream_name: str) -> StreamSpec:
+        """Lookup a specific stream's `StreamSpec` (raises on unknown name)."""
+        for spec in self._layer_stream_specs[layer_idx]:
+            if spec.name == stream_name:
+                return spec
+        raise KeyError(
+            f"layer {layer_idx} has no stream {stream_name!r}; "
+            f"expected one of {self.stream_names(layer_idx)}"
+        )
+
+    def num_kv_heads_for_stream(self, layer_idx: int, stream_name: str) -> int:
+        return self.stream_spec(layer_idx, stream_name).num_kv_heads
+
+    def head_dim_for_stream(self, layer_idx: int, stream_name: str) -> int:
+        return self.stream_spec(layer_idx, stream_name).head_dim
+
+    def storage_for_stream(self, layer_idx: int, stream_name: str) -> torch.Tensor:
+        """Returns the `(num_blocks, block_size, num_kv_heads_s, head_dim_s)`
+        storage tensor for one named stream in one layer.
+
+        For legacy K/V layers, `stream_name in {"k", "v"}` returns a view
+        aliasing the rectangular `_layer_storage[layer_idx][0/1]` tensor
+        (same memory). For MLA-style layers, returns the standalone tensor.
+        """
+        if self._kv_quant is not None:
+            raise RuntimeError(
+                f"`storage_for_stream` only valid for uncompressed pool; got "
+                f"kv_quant={self._kv_quant!r}."
+            )
+        try:
+            return self._layer_streams_storage[layer_idx][stream_name]
+        except KeyError as exc:
+            raise KeyError(
+                f"layer {layer_idx} has no stream {stream_name!r}; "
+                f"expected one of {self.stream_names(layer_idx)}"
+            ) from exc
 
     @property
     def rotation(self) -> torch.Tensor | None:
