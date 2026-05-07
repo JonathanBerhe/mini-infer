@@ -68,5 +68,9 @@ profiling/
 # Reference papers kept locally for planning, not tracked
 docs/papers/*.pdf
 
+# Vendored upstream inference code pulled by `scripts/clone_v4_reference.py`
+# (used as the parity oracle for HCA tests; not redistributed)
+third_party/
+
 # Local Claude Code state
 .claude/
