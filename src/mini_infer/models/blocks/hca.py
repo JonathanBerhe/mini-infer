@@ -40,12 +40,17 @@ Forward shape walk (single block, batch=B, len=T, multiple of `m`):
     Output partial RoPE INVERSE (recovers relative position)
     GroupedOutputProjection -> (B, T, d)
 
-This stage (C4a) is the standalone forward — no PagedKVCache integration.
-The cache wiring (per-stream paged compressed branch + per-request state
-cache for SWA) lands in C4c when we build the hybrid backbone.
+Two forward modes:
+  - `forward(...)`: standalone packed prefill, no cache. Used by the
+    HCA prefill parity test.
+  - `forward_decode(..., state_cache, layer_idx)`: single-token decode
+    that reads SWA + compressed history from a per-request `StateCache`
+    and updates the compressor's in-flight state for that layer.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -58,6 +63,9 @@ from mini_infer.models.blocks.v4 import (
     GroupedOutputProjection,
     TokenLevelCompressor,
 )
+
+if TYPE_CHECKING:
+    from mini_infer.cache.state_cache import StateCache
 
 
 def _build_window_topk_idxs(
@@ -81,6 +89,54 @@ def _build_window_topk_idxs(
     win_idxs = (base - window_size + 1).clamp(min=0) + torch.arange(win_slots, device=device)
     win_idxs = torch.where(win_idxs > base, -1, win_idxs)  # (seqlen, win_slots)
     return win_idxs.to(torch.int64)
+
+
+def _build_hca_decode_topk_idxs(
+    *,
+    window_size: int,
+    compression_ratio: int,
+    start_pos: int,
+    compressed_offset: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-query gather indices for one HCA decode step (single new token).
+
+    Returns a 1-D `(window_size + n_valid_compressed,)` int64 tensor of
+    indices into the concatenated `[swa_circular ; compressed_history]`
+    cache. Mirrors `get_window_topk_idxs` + `get_compress_topk_idxs` from
+    the reference at `start_pos > 0`.
+
+    Window section:
+        - When `start_pos >= window_size - 1` the SWA buffer is full and
+          we wrap: `[start_pos+1, ..., window_size-1, 0, ..., start_pos]`
+          (modulo `window_size`). All `window_size` indices are valid.
+        - When `0 < start_pos < window_size - 1` only the first
+          `start_pos + 1` slots are populated; the tail is `-1`-padded.
+
+    Compressed section:
+        Indices `[offset, offset + (start_pos + 1) // compression_ratio)`.
+        All causally-valid compressed entries surface (HCA = no sparse
+        selection). The newly-flushed entry (when this decode step closes
+        a block) is included because `n_compressed_blocks` was already
+        incremented before this helper runs.
+    """
+    if start_pos >= window_size - 1:
+        sp_mod = start_pos % window_size
+        win_idxs = torch.cat(
+            [
+                torch.arange(sp_mod + 1, window_size, device=device),
+                torch.arange(0, sp_mod + 1, device=device),
+            ]
+        )
+    else:
+        valid = torch.arange(start_pos + 1, device=device)
+        pad = torch.full((window_size - start_pos - 1,), -1, dtype=valid.dtype, device=device)
+        win_idxs = torch.cat([valid, pad])
+
+    n_valid_cmp = (start_pos + 1) // compression_ratio
+    cmp_idxs = torch.arange(0, n_valid_cmp, device=device) + compressed_offset
+
+    return torch.cat([win_idxs, cmp_idxs]).to(torch.int64)
 
 
 def _build_hca_topk_idxs(
@@ -260,6 +316,131 @@ class HCAAttention(nn.Module):
         )  # (B, T, n_h, c)
 
         # ---- Output partial RoPE inverse (relative-position recovery) ----
+        if rd > 0:
+            attn_out = apply_partial_rope_last_n_dims(attn_out, cos_t, sin_t, rd, inverse=True)
+
+        # ---- Grouped output projection ----
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
+    def forward_decode(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        start_pos: int,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """One decode step: read SWA + compressed history from cache, append, attend.
+
+        Args:
+            hidden_state: `(B, 1, hidden_size)` — hidden state of the new token.
+            start_pos: Global token position (0-indexed) of this token. The
+                FIRST decode step uses `start_pos = T_prefill`; each subsequent
+                step increments by 1.
+            state_cache: Per-request `StateCache`. The layer at `layer_idx`
+                holds the SWA circular buffer + compressed history + compressor
+                in-flight state for this layer.
+            layer_idx: Index into `state_cache._layers`.
+            token_position_embeddings: `(cos, sin)` for THIS token's position;
+                each `(B, 1, rope_head_dim)`.
+            block_position_embeddings: `(cos, sin)` for the just-flushed
+                compressed block (block `start_pos // m`, position `(start_pos
+                // m) * m`); each `(B, 1, rope_head_dim)`. Required iff
+                `rope_head_dim > 0` AND this step closes a block.
+
+        Returns:
+            `(B, 1, hidden_size)` attention output for the new token.
+
+        Side effects on `state_cache.layer(layer_idx)`:
+            - `swa_kv[:, start_pos % n_win]` overwritten with the new SWA entry.
+            - `swa_count` incremented (capped at `n_win`).
+            - `cmp_kv_state[:, start_pos % m]` and `cmp_score_state[:, ...]`
+              updated with the new token's compressor inputs.
+            - On block-flush: `compressed_kv[:, n_compressed_blocks]` written,
+              `n_compressed_blocks` incremented.
+
+        The caller is responsible for `state_cache.advance_start_pos(1)`
+        after the forward returns — this method does NOT advance the global
+        counter so a multi-layer stack can call it `n_layers` times for the
+        same `start_pos`.
+        """
+        bsz, seqlen_in, _ = hidden_state.shape
+        if seqlen_in != 1:
+            raise ValueError(f"forward_decode expects seqlen=1, got {seqlen_in}")
+        n_h = self.num_heads
+        c = self.kv_head_dim
+        rd = self.rope_head_dim
+        n_win = self.window_size
+        m = self.compression_ratio
+
+        state = state_cache.layer(layer_idx)
+
+        # ---- Q (same low-rank + per-head q-norm + partial RoPE as prefill) ----
+        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
+        q = self.q_b_proj(q_latent).view(bsz, 1, n_h, c)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_t, sin_t = token_position_embeddings
+        if rd > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rd)
+
+        # ---- New SWA KV: project + norm + RoPE; write to circular buffer ----
+        new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))  # (B, 1, c)
+        if rd > 0:
+            new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rd)
+        state.swa_kv[:, start_pos % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
+        state.swa_count = min(state.swa_count + 1, n_win)
+
+        # ---- Compressor decode step (may flush a compressed entry) ----
+        flushed = self.compressor.forward_decode_step(
+            hidden_state,
+            start_pos=start_pos,
+            cmp_kv_state=state.cmp_kv_state,
+            cmp_score_state=state.cmp_score_state,
+            block_position_embeddings=block_position_embeddings,
+        )
+        if flushed is not None:
+            if state.n_compressed_blocks >= state.compressed_kv.shape[1]:
+                raise RuntimeError(
+                    f"layer {layer_idx}: compressed history is full "
+                    f"({state.n_compressed_blocks} entries); raise max_n_compressed"
+                )
+            state.compressed_kv[:, state.n_compressed_blocks] = flushed.squeeze(1).to(
+                state.compressed_kv.dtype
+            )
+            state.n_compressed_blocks += 1
+
+        # ---- Build full_kv: SWA window (full circular) ; compressed history valid prefix ----
+        # The topk_idxs `-1` slots make uninitialized SWA tail safe (the dispatcher
+        # masks `-1` to `-inf` in the softmax).
+        n_valid_cmp = state.n_compressed_blocks
+        full_kv = torch.cat([state.swa_kv, state.compressed_kv[:, :n_valid_cmp]], dim=1)
+        # full_kv: (B, n_win + n_valid_cmp, c)
+
+        # ---- Per-query gather indices: window (size n_win) + compressed (n_valid_cmp) ----
+        topk_1d = _build_hca_decode_topk_idxs(
+            window_size=n_win,
+            compression_ratio=m,
+            start_pos=start_pos,
+            compressed_offset=n_win,
+            device=hidden_state.device,
+        )
+        topk_idxs = topk_1d.unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1).contiguous()
+
+        # ---- MQA with sink ----
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=full_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )  # (B, 1, n_h, c)
+
+        # ---- Output partial RoPE inverse ----
         if rd > 0:
             attn_out = apply_partial_rope_last_n_dims(attn_out, cos_t, sin_t, rd, inverse=True)
 
