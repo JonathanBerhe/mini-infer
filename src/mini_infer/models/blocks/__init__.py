@@ -1,6 +1,7 @@
 """Canonical building blocks shared across owned model families."""
 
 from mini_infer.cache.block_pool import StreamSpec
+from mini_infer.models.blocks.csa import CSAAttention
 from mini_infer.models.blocks.geglu import GeGLU
 from mini_infer.models.blocks.gemma4_decoder_layer import Gemma4DecoderLayer
 from mini_infer.models.blocks.gemma_decoder_layer import GemmaDecoderLayer
@@ -17,11 +18,13 @@ from mini_infer.models.blocks.transformer_block import TransformerBlock
 from mini_infer.models.blocks.v4 import (
     AttentionSink,
     GroupedOutputProjection,
+    LightningIndexer,
     TokenLevelCompressor,
 )
 
 __all__ = [
     "AttentionSink",
+    "CSAAttention",
     "GeGLU",
     "Gemma4DecoderLayer",
     "GemmaDecoderLayer",
@@ -29,6 +32,7 @@ __all__ = [
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HCAAttention",
+    "LightningIndexer",
     "MLAAttention",
     "MixtralDecoderLayer",
     "MixtralExpert",
