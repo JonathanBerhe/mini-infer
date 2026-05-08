@@ -60,6 +60,29 @@ from mini_infer.models.blocks.v4 import (
 )
 
 
+def _build_window_topk_idxs(
+    *,
+    seqlen: int,
+    window_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-query causal sliding-window gather indices.
+
+    Returns `(seqlen, min(seqlen, window_size))` int64 indices: for query
+    at position `i`, slot `j` of the window holds key index
+    `max(i - n_win + 1, 0) + j` if that key is causally valid, else `-1`.
+    Mirrors the reference's `get_window_topk_idxs` exactly so window-edge
+    bugs surface at the same `(query_idx, slot_idx)` pair.
+
+    Shared by HCA and CSA (both branches use the same window construction).
+    """
+    win_slots = min(seqlen, window_size)
+    base = torch.arange(seqlen, device=device).unsqueeze(1)  # (seqlen, 1)
+    win_idxs = (base - window_size + 1).clamp(min=0) + torch.arange(win_slots, device=device)
+    win_idxs = torch.where(win_idxs > base, -1, win_idxs)  # (seqlen, win_slots)
+    return win_idxs.to(torch.int64)
+
+
 def _build_hca_topk_idxs(
     *,
     seqlen: int,
@@ -76,26 +99,16 @@ def _build_hca_topk_idxs(
     marks padding (causally-future or out-of-window slots that the
     `hca_mqa_with_sink` dispatcher masks to `-inf` in the softmax).
 
-    Layout matches the reference exactly so any sparsity-correctness
-    bug shows up at the same query position with the same index.
+    Compressed section (mirror of `get_compress_topk_idxs`): for query
+    at position `i`, attend to compressed block `j` only when
+    `j < (i + 1) / m` (i.e. block `j` covers tokens `[j*m, (j+1)*m - 1]`,
+    all of which must precede `i`). The absolute index into the
+    concatenated tensor is `j + compressed_offset`.
 
-    Window section (mirror of `get_window_topk_idxs`):
-        For query at position `i`, attend to KV positions
-        `[max(i - n_win + 1, 0), i]`. Pad with `-1` if fewer than `n_win`.
-
-    Compressed section (mirror of `get_compress_topk_idxs`):
-        For query at position `i`, attend to compressed block `j`
-        only when `j < (i + 1) / m` (i.e. block `j` covers tokens
-        `[j*m, (j+1)*m - 1]`, all of which must precede `i`). The
-        absolute index into the concatenated tensor is `j + offset`
-        where `offset = seqlen` (compressed entries follow the
-        uncompressed window in the concat layout).
+    HCA includes ALL causally-valid compressed blocks (no sparse selection).
+    CSA replaces this section with a `LightningIndexer` top-k pick.
     """
-    win_slots = min(seqlen, window_size)
-    base = torch.arange(seqlen, device=device).unsqueeze(1)  # (seqlen, 1)
-    # Window: indices `start_q .. start_q + win_slots - 1` where `start_q = max(i - win + 1, 0)`.
-    win_idxs = (base - window_size + 1).clamp(min=0) + torch.arange(win_slots, device=device)
-    win_idxs = torch.where(win_idxs > base, -1, win_idxs)  # (seqlen, win_slots)
+    win_idxs = _build_window_topk_idxs(seqlen=seqlen, window_size=window_size, device=device)
 
     # Compressed: indices `j` for blocks `j < (i+1)/m`; otherwise `-1`.
     cmp_idxs = torch.arange(n_compressed, device=device).repeat(seqlen, 1)  # (seqlen, n_cmp)
