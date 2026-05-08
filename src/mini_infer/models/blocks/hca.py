@@ -337,6 +337,150 @@ class HCAAttention(nn.Module):
         out: torch.Tensor = self.grouped_output(attn_out)
         return out
 
+    def forward_prefill_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        state_cache: StateCache,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Cache-aware prefill: same output as `forward`, plus state writes.
+
+        Supports `seqlen` that is NOT a multiple of `compression_ratio` —
+        the trailing remainder lands in the in-flight accumulator so the
+        next decode step picks up exactly where prefill stopped.
+
+        Args:
+            hidden_states: `(B, T, hidden_size)`.
+            token_position_embeddings: `(cos, sin)` for the `T` raw token
+                positions; each `(B, T, rope_head_dim)`.
+            compressed_position_embeddings: `(cos, sin)` for the
+                `T // compression_ratio` compressed positions; each
+                `(B, T // compression_ratio, rope_head_dim)`.
+            state_cache: per-request `StateCache`. Layer at `layer_idx`
+                must have been allocated for HCA (overlap_mode=False,
+                no indexer spec).
+            layer_idx: index into `state_cache._layers`.
+
+        Returns:
+            `(B, T, hidden_size)` attention output. Identical to
+            `forward(hidden_states, token_pe, compressed_pe)` when
+            `seqlen % compression_ratio == 0`.
+
+        Side effects on `state_cache.layer(layer_idx)`:
+            - `swa_kv`: rotated to mirror the reference's layout — last
+              `min(seqlen, n_win)` tokens. For `seqlen > n_win`, the
+              circular indexing is `slot = pos % n_win` for the latest
+              `n_win` positions.
+            - `compressed_kv[:, :n_emitted]`: each of the
+              `seqlen // compression_ratio` compressed entries.
+            - `n_compressed_blocks = n_emitted`.
+            - `swa_count = min(seqlen, n_win)`.
+            - `cmp_kv_state` / `cmp_score_state`: trailing remainder (if any).
+
+        Caller must `state_cache.advance_start_pos(seqlen)` after this returns.
+        """
+        batch_size, seqlen, _ = hidden_states.shape
+        num_heads = self.num_heads
+        kv_head_dim = self.kv_head_dim
+        rope_dim = self.rope_head_dim
+        n_win = self.window_size
+        compression_ratio = self.compression_ratio
+
+        layer_state = state_cache.layer(layer_idx)
+        if layer_state.indexer is not None:
+            raise ValueError(
+                f"layer {layer_idx}: state cache has an indexer slot but HCA layers don't use one"
+            )
+
+        # ---- Q low-rank + per-head q-norm + partial RoPE (same as forward) ----
+        q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads, kv_head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_for_tokens, sin_for_tokens = token_position_embeddings
+        if rope_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_for_tokens, sin_for_tokens, rope_dim)
+
+        # ---- SWA K=V (single shared head) over the full sequence ----
+        swa_kv = self.swa_kv_proj(hidden_states)
+        swa_kv = self.kv_norm(swa_kv)
+        if rope_dim > 0:
+            swa_kv = apply_partial_rope_last_n_dims(
+                swa_kv, cos_for_tokens, sin_for_tokens, rope_dim
+            )
+
+        # ---- Compressed K=V via cache-aware compressor (mutates in-flight state) ----
+        compressed_kv = self.compressor.forward_prefill_with_cache(
+            hidden_states,
+            compressed_position_embeddings=compressed_position_embeddings,
+            cmp_kv_state=layer_state.cmp_kv_state,
+            cmp_score_state=layer_state.cmp_score_state,
+        )
+        n_emitted_blocks = compressed_kv.shape[1]
+
+        # ---- Write compressed history into the cache ----
+        if n_emitted_blocks > layer_state.compressed_kv.shape[1]:
+            raise RuntimeError(
+                f"layer {layer_idx}: compressed history capacity "
+                f"({layer_state.compressed_kv.shape[1]}) is too small for {n_emitted_blocks} "
+                "entries; raise max_n_compressed"
+            )
+        layer_state.compressed_kv[:, :n_emitted_blocks] = compressed_kv.to(
+            layer_state.compressed_kv.dtype
+        )
+        layer_state.n_compressed_blocks = n_emitted_blocks
+
+        # ---- Write SWA cache: last min(seqlen, n_win) tokens ----
+        # Mirrors reference's layout — for seqlen > n_win, the latest n_win
+        # tokens are placed via `slot = pos % n_win`.
+        if seqlen <= n_win:
+            layer_state.swa_kv[:, :seqlen] = swa_kv.to(layer_state.swa_kv.dtype)
+        else:
+            wrap_cutoff = seqlen % n_win
+            last_window = swa_kv[:, -n_win:]
+            layer_state.swa_kv[:, wrap_cutoff:n_win] = last_window[:, : n_win - wrap_cutoff].to(
+                layer_state.swa_kv.dtype
+            )
+            layer_state.swa_kv[:, :wrap_cutoff] = last_window[:, n_win - wrap_cutoff :].to(
+                layer_state.swa_kv.dtype
+            )
+        layer_state.swa_count = min(seqlen, n_win)
+
+        # ---- Build full_kv for THIS prefill's attention (uses fresh swa_kv) ----
+        full_kv = torch.cat([swa_kv, compressed_kv], dim=1)
+
+        # ---- Per-query gather indices (handles unaligned seqlen correctly) ----
+        topk_idxs = _build_hca_topk_idxs(
+            seqlen=seqlen,
+            window_size=n_win,
+            compression_ratio=compression_ratio,
+            n_compressed=n_emitted_blocks,
+            compressed_offset=seqlen,
+            device=hidden_states.device,
+        )
+        topk_idxs = topk_idxs.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+
+        # ---- MQA with sink ----
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=full_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+
+        # ---- Output partial RoPE inverse + grouped output projection ----
+        if rope_dim > 0:
+            attn_out = apply_partial_rope_last_n_dims(
+                attn_out, cos_for_tokens, sin_for_tokens, rope_dim, inverse=True
+            )
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
     def forward_decode(
         self,
         hidden_state: torch.Tensor,

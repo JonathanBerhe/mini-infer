@@ -218,6 +218,127 @@ class CSAAttention(nn.Module):
         out: torch.Tensor = self.grouped_output(attn_out)
         return out
 
+    def forward_prefill_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        state_cache: StateCache,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Cache-aware CSA prefill: same output as `forward`, plus state writes.
+
+        Writes the main compressor's output AND the indexer's compressor's
+        output into separate sub-caches, populating both in-flight
+        accumulators (overlap mode for both). Supports unaligned seqlen.
+
+        Returns `(B, T, hidden_size)` — identical to
+        `forward(hidden_states, token_pe, compressed_pe)` for aligned
+        seqlen. Caller must `state_cache.advance_start_pos(seqlen)` after.
+        """
+        batch_size, seqlen, _ = hidden_states.shape
+        num_heads = self.num_heads
+        kv_head_dim = self.kv_head_dim
+        rope_dim = self.rope_head_dim
+        n_win = self.window_size
+
+        layer_state = state_cache.layer(layer_idx)
+        if layer_state.indexer is None:
+            raise ValueError(
+                f"layer {layer_idx}: state cache must have an indexer slot for CSA layers"
+            )
+
+        # ---- Q low-rank latent (shared with the indexer) ----
+        q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
+
+        # ---- Full Q + per-head q-norm + partial RoPE ----
+        q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads, kv_head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_for_tokens, sin_for_tokens = token_position_embeddings
+        if rope_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_for_tokens, sin_for_tokens, rope_dim)
+
+        # ---- SWA K=V (single shared head) ----
+        swa_kv = self.kv_norm(self.swa_kv_proj(hidden_states))
+        if rope_dim > 0:
+            swa_kv = apply_partial_rope_last_n_dims(
+                swa_kv, cos_for_tokens, sin_for_tokens, rope_dim
+            )
+
+        # ---- Main compressor with state writes ----
+        compressed_kv = self.compressor.forward_prefill_with_cache(
+            hidden_states,
+            compressed_position_embeddings=compressed_position_embeddings,
+            cmp_kv_state=layer_state.cmp_kv_state,
+            cmp_score_state=layer_state.cmp_score_state,
+        )
+        n_emitted_blocks = compressed_kv.shape[1]
+        if n_emitted_blocks > layer_state.compressed_kv.shape[1]:
+            raise RuntimeError(
+                f"layer {layer_idx}: main compressed history capacity "
+                f"({layer_state.compressed_kv.shape[1]}) is too small for {n_emitted_blocks} "
+                "entries; raise max_n_compressed"
+            )
+        layer_state.compressed_kv[:, :n_emitted_blocks] = compressed_kv.to(
+            layer_state.compressed_kv.dtype
+        )
+        layer_state.n_compressed_blocks = n_emitted_blocks
+
+        # ---- SWA cache write: last min(seqlen, n_win) tokens (rotated layout) ----
+        if seqlen <= n_win:
+            layer_state.swa_kv[:, :seqlen] = swa_kv.to(layer_state.swa_kv.dtype)
+        else:
+            wrap_cutoff = seqlen % n_win
+            last_window = swa_kv[:, -n_win:]
+            layer_state.swa_kv[:, wrap_cutoff:n_win] = last_window[:, : n_win - wrap_cutoff].to(
+                layer_state.swa_kv.dtype
+            )
+            layer_state.swa_kv[:, :wrap_cutoff] = last_window[:, n_win - wrap_cutoff :].to(
+                layer_state.swa_kv.dtype
+            )
+        layer_state.swa_count = min(seqlen, n_win)
+
+        # ---- Indexer cache-aware prefill (drives its own compressor + writes history) ----
+        indexer_topk_idxs = self.indexer.forward_prefill_with_cache(
+            hidden_states,
+            q_lora_latent,
+            token_position_embeddings=token_position_embeddings,
+            compressed_position_embeddings=compressed_position_embeddings,
+            indexer_state=layer_state.indexer,
+            compressed_offset=seqlen,
+        )
+
+        # ---- Build full_kv for THIS prefill's attention ----
+        full_kv = torch.cat([swa_kv, compressed_kv], dim=1)
+
+        # ---- Window topk (handles unaligned seqlen) + concat with indexer top-k ----
+        window_topk_idxs = (
+            _build_window_topk_idxs(seqlen=seqlen, window_size=n_win, device=hidden_states.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+        )
+        topk_idxs = torch.cat([window_topk_idxs, indexer_topk_idxs], dim=-1).contiguous()
+
+        # ---- MQA with sink ----
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=full_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+
+        # ---- Output partial RoPE inverse + grouped output ----
+        if rope_dim > 0:
+            attn_out = apply_partial_rope_last_n_dims(
+                attn_out, cos_for_tokens, sin_for_tokens, rope_dim, inverse=True
+            )
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
     def forward_decode(
         self,
         hidden_state: torch.Tensor,
