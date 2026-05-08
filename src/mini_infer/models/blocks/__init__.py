@@ -2,6 +2,7 @@
 
 from mini_infer.cache.block_pool import StreamSpec
 from mini_infer.models.blocks.csa import CSAAttention
+from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
 from mini_infer.models.blocks.geglu import GeGLU
 from mini_infer.models.blocks.gemma4_decoder_layer import Gemma4DecoderLayer
 from mini_infer.models.blocks.gemma_decoder_layer import GemmaDecoderLayer
@@ -25,6 +26,7 @@ from mini_infer.models.blocks.v4 import (
 __all__ = [
     "AttentionSink",
     "CSAAttention",
+    "DeepseekV4DecoderLayer",
     "GeGLU",
     "Gemma4DecoderLayer",
     "GemmaDecoderLayer",
