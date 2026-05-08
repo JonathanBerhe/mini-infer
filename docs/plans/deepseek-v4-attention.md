@@ -1,5 +1,16 @@
 # Plan: DeepSeek-V4 hybrid attention support
 
+> **Status (2026-05-08):** Stages 1–3 shipped on `main` across five commits
+> (`b632256`, `8f90528`, `c08f3e1`, `0110253`, `4dabeb1`). Both attention
+> modes (CSA + HCA) and the multi-layer hybrid backbone are bit-parity
+> validated against the reference for prefill AND decode. Stage 4 (on-disk
+> KV) deferred — orthogonal storage layer, no concrete workload yet.
+> Outstanding for full V4 model loading: MoE-with-hash-routing FFN,
+> Hyper-Connections (V4 paper §2.5), YaRN long-context RoPE — each its
+> own primitive on the multi-model-support roadmap. See
+> [ADR-014](../decisions/ADR-014-deepseek-v4-hybrid-attention.md) for
+> the design choices and trade-offs.
+
 Source: `docs/papers/deepseek-v4.pdf` §2.3 (Hybrid Attention) and §3.6
 (Inference Framework). PDF is gitignored — read locally.
 
