@@ -37,11 +37,16 @@ hybrid CSA/HCA backbone come later.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from mini_infer.cache.hca_attention import hca_mqa_with_sink
-from mini_infer.models.blocks.hca import _build_window_topk_idxs
+from mini_infer.models.blocks.hca import (
+    _build_window_decode_topk_idxs,
+    _build_window_topk_idxs,
+)
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4 import (
@@ -50,6 +55,9 @@ from mini_infer.models.blocks.v4 import (
     LightningIndexer,
     TokenLevelCompressor,
 )
+
+if TYPE_CHECKING:
+    from mini_infer.cache.state_cache import StateCache
 
 
 class CSAAttention(nn.Module):
@@ -205,6 +213,151 @@ class CSAAttention(nn.Module):
         # ---- Output partial RoPE inverse ----
         if rd > 0:
             attn_out = apply_partial_rope_last_n_dims(attn_out, cos_t, sin_t, rd, inverse=True)
+
+        # ---- Grouped output projection ----
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
+    def forward_decode(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        start_pos: int,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """One CSA decode step: read SWA + main compressed history + indexer top-k from cache.
+
+        Args:
+            hidden_state: `(B, 1, hidden_size)` — hidden state of the new token.
+            start_pos: Global token position (0-indexed).
+            state_cache: Per-request `StateCache`. The layer at `layer_idx`
+                must have been allocated with `overlap_mode=True` and a
+                non-`None` `IndexerStateSpec`.
+            layer_idx: Index into `state_cache._layers`.
+            token_position_embeddings: `(cos, sin)` for THIS token's position;
+                each `(B, 1, rope_head_dim)`.
+            block_position_embeddings: `(cos, sin)` for the just-flushed block
+                (block index `start_pos // compression_ratio`, position
+                `(start_pos // compression_ratio) * compression_ratio`); each
+                `(B, 1, rope_head_dim)`. Required iff `rope_head_dim > 0` AND
+                this step closes a block — both the main compressor AND the
+                indexer's compressor share the same compression_ratio in V4
+                so they flush on the same step with the same block position.
+
+        Returns:
+            `(B, 1, hidden_size)` attention output for the new token.
+
+        Side effects (on `state_cache.layer(layer_idx)`):
+            - SWA circular buffer: write at `start_pos % window_size`.
+            - Main compressor in-flight state: write to slot
+              `compression_ratio + (start_pos % compression_ratio)`; on flush,
+              the previous-block slots are slid to make room.
+            - On flush: `compressed_kv[:, n_compressed_blocks]` written;
+              `n_compressed_blocks` incremented.
+            - Indexer's own compressor state + history advanced via
+              `LightningIndexer.forward_decode_step`.
+        """
+        batch_size, seqlen, _ = hidden_state.shape
+        if seqlen != 1:
+            raise ValueError(f"forward_decode expects seqlen=1, got {seqlen}")
+        num_heads = self.num_heads
+        kv_head_dim = self.kv_head_dim
+        rope_dim = self.rope_head_dim
+        window_size = self.window_size
+
+        layer_state = state_cache.layer(layer_idx)
+        if layer_state.indexer is None:
+            raise ValueError(
+                f"layer {layer_idx}: state_cache must be allocated with an indexer "
+                "(IndexerStateSpec) for CSA decode"
+            )
+
+        # ---- Q low-rank latent (shared with the indexer's `wq_b`) ----
+        q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
+
+        # ---- Full Q + per-head q-norm (no scale) + partial RoPE ----
+        q = self.q_b_proj(q_lora_latent).view(batch_size, 1, num_heads, kv_head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_for_token, sin_for_token = token_position_embeddings
+        if rope_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, rope_dim)
+
+        # ---- New SWA KV: project + norm + RoPE; write to circular buffer ----
+        new_swa_kv = self.kv_norm(self.swa_kv_proj(hidden_state))
+        if rope_dim > 0:
+            new_swa_kv = apply_partial_rope_last_n_dims(
+                new_swa_kv, cos_for_token, sin_for_token, rope_dim
+            )
+        layer_state.swa_kv[:, start_pos % window_size] = new_swa_kv.squeeze(1).to(
+            layer_state.swa_kv.dtype
+        )
+        layer_state.swa_count = min(layer_state.swa_count + 1, window_size)
+
+        # ---- Main compressor decode step (overlap mode) ----
+        flushed_main = self.compressor.forward_decode_step(
+            hidden_state,
+            start_pos=start_pos,
+            cmp_kv_state=layer_state.cmp_kv_state,
+            cmp_score_state=layer_state.cmp_score_state,
+            block_position_embeddings=block_position_embeddings,
+        )
+        if flushed_main is not None:
+            if layer_state.n_compressed_blocks >= layer_state.compressed_kv.shape[1]:
+                raise RuntimeError(
+                    f"layer {layer_idx}: main compressed history is full "
+                    f"({layer_state.n_compressed_blocks} entries); raise max_n_compressed"
+                )
+            layer_state.compressed_kv[:, layer_state.n_compressed_blocks] = flushed_main.squeeze(
+                1
+            ).to(layer_state.compressed_kv.dtype)
+            layer_state.n_compressed_blocks += 1
+
+        # ---- Indexer decode step: drives its own compressor + selects top-k ----
+        indexer_topk_idxs = self.indexer.forward_decode_step(
+            hidden_state,
+            q_lora_latent,
+            start_pos=start_pos,
+            indexer_state=layer_state.indexer,
+            token_position_embeddings=token_position_embeddings,
+            block_position_embeddings=block_position_embeddings,
+            compressed_offset=window_size,  # main compressed history starts at slot window_size
+        )  # (B, 1, actual_top_k)
+
+        # ---- Build full_kv: SWA window (full circular) ; main compressed history ----
+        n_valid_main_compressed = layer_state.n_compressed_blocks
+        full_kv = torch.cat(
+            [layer_state.swa_kv, layer_state.compressed_kv[:, :n_valid_main_compressed]],
+            dim=1,
+        )
+
+        # ---- Per-query gather indices: window section + indexer's top-k pick ----
+        window_idxs_1d = _build_window_decode_topk_idxs(
+            window_size=window_size, start_pos=start_pos, device=hidden_state.device
+        )
+        window_topk_idxs = (
+            window_idxs_1d.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1).contiguous()
+        )
+        topk_idxs = torch.cat([window_topk_idxs, indexer_topk_idxs], dim=-1).contiguous()
+
+        # ---- MQA with sink ----
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=full_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+
+        # ---- Output partial RoPE inverse ----
+        if rope_dim > 0:
+            attn_out = apply_partial_rope_last_n_dims(
+                attn_out, cos_for_token, sin_for_token, rope_dim, inverse=True
+            )
 
         # ---- Grouped output projection ----
         out: torch.Tensor = self.grouped_output(attn_out)

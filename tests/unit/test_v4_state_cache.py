@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mini_infer.cache.state_cache import StateCache, StateLayerSpec
+from mini_infer.cache.state_cache import IndexerStateSpec, StateCache, StateLayerSpec
 
 
 def _spec(**overrides) -> StateLayerSpec:
@@ -86,8 +86,8 @@ def test_state_cache_rejects_invalid_specs() -> None:
         StateCache([_spec(compression_ratio=0)], batch_size=1)
     with pytest.raises(ValueError, match="max_n_compressed"):
         StateCache([_spec(max_n_compressed=0)], batch_size=1)
-    with pytest.raises(NotImplementedError, match="overlap_mode"):
-        StateCache([_spec(overlap_mode=True)], batch_size=1)
+    # `overlap_mode=True` IS valid (CSA's main compressor). It just doubles
+    # the in-flight buffer dims — handled by `_build_layer_state`.
 
 
 def test_state_cache_layer_slots_are_independent() -> None:
@@ -97,3 +97,47 @@ def test_state_cache_layer_slots_are_independent() -> None:
     cache.layer(0).n_compressed_blocks = 5
     assert torch.all(cache.layer(1).swa_kv == 0.0)
     assert cache.layer(1).n_compressed_blocks == 0
+
+
+# ---------- Overlap-mode (CSA) allocation ----------
+
+
+def test_overlap_mode_doubles_compressor_buffer_dims() -> None:
+    """`overlap_mode=True` doubles slot count AND feature width of the in-flight buffer."""
+    plain = StateCache([_spec(kv_head_dim=8, compression_ratio=4)], batch_size=1)
+    overlap = StateCache(
+        [_spec(kv_head_dim=8, compression_ratio=4, overlap_mode=True)], batch_size=1
+    )
+    assert plain.layer(0).cmp_kv_state.shape == (1, 4, 8)
+    # Overlap: 2*ratio slots, 2*kv_head_dim features.
+    assert overlap.layer(0).cmp_kv_state.shape == (1, 8, 16)
+    assert overlap.layer(0).cmp_score_state.shape == (1, 8, 16)
+    # SWA + compressed_kv shapes are unchanged by overlap_mode.
+    assert overlap.layer(0).swa_kv.shape == plain.layer(0).swa_kv.shape
+    assert overlap.layer(0).compressed_kv.shape == plain.layer(0).compressed_kv.shape
+
+
+def test_indexer_state_allocated_only_when_spec_present() -> None:
+    """`IndexerStateSpec` triggers a second sub-cache; absence leaves it None."""
+    spec_with_indexer = _spec(
+        kv_head_dim=8,
+        compression_ratio=4,
+        overlap_mode=True,
+        indexer=IndexerStateSpec(head_dim=16),
+    )
+    spec_without = _spec(kv_head_dim=8, compression_ratio=4, overlap_mode=True)
+    cache = StateCache([spec_with_indexer, spec_without], batch_size=2)
+    layer_with = cache.layer(0)
+    assert layer_with.indexer is not None
+    # Indexer's compressor is always overlap mode: 2*ratio slots, 2*indexer_head_dim features.
+    assert layer_with.indexer.cmp_kv_state.shape == (2, 8, 32)
+    assert layer_with.indexer.cmp_score_state.shape == (2, 8, 32)
+    assert layer_with.indexer.compressed_kv.shape == (2, 16, 16)
+    assert layer_with.indexer.n_compressed_blocks == 0
+    # The other layer's indexer slot is None.
+    assert cache.layer(1).indexer is None
+
+
+def test_state_cache_rejects_zero_indexer_head_dim() -> None:
+    with pytest.raises(ValueError, match=r"indexer\.head_dim"):
+        StateCache([_spec(overlap_mode=True, indexer=IndexerStateSpec(head_dim=0))], batch_size=1)

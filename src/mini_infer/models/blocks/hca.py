@@ -91,6 +91,41 @@ def _build_window_topk_idxs(
     return win_idxs.to(torch.int64)
 
 
+def _build_window_decode_topk_idxs(
+    *,
+    window_size: int,
+    start_pos: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-query causal sliding-window gather indices for ONE decode step.
+
+    Returns a 1-D `(window_size,)` int64 tensor of indices into a circular
+    SWA buffer of length `window_size`. Mirrors `get_window_topk_idxs` from
+    the reference at `start_pos > 0`.
+
+      - When `start_pos >= window_size - 1` the SWA buffer is full; the
+        indices wrap: `[start_pos+1, ..., window_size-1, 0, ..., start_pos]`
+        (all modulo `window_size`). All slots are valid.
+      - When `0 < start_pos < window_size - 1` only the first
+        `start_pos + 1` slots are populated; the tail is `-1`-padded.
+
+    Shared by HCA decode and CSA decode (both use the same circular SWA).
+    """
+    if start_pos >= window_size - 1:
+        position_mod_window = start_pos % window_size
+        return torch.cat(
+            [
+                torch.arange(position_mod_window + 1, window_size, device=device),
+                torch.arange(0, position_mod_window + 1, device=device),
+            ]
+        ).to(torch.int64)
+    valid_indices = torch.arange(start_pos + 1, device=device)
+    padding = torch.full(
+        (window_size - start_pos - 1,), -1, dtype=valid_indices.dtype, device=device
+    )
+    return torch.cat([valid_indices, padding]).to(torch.int64)
+
+
 def _build_hca_decode_topk_idxs(
     *,
     window_size: int,
@@ -103,40 +138,19 @@ def _build_hca_decode_topk_idxs(
 
     Returns a 1-D `(window_size + n_valid_compressed,)` int64 tensor of
     indices into the concatenated `[swa_circular ; compressed_history]`
-    cache. Mirrors `get_window_topk_idxs` + `get_compress_topk_idxs` from
-    the reference at `start_pos > 0`.
+    cache. Window section comes from `_build_window_decode_topk_idxs`;
+    compressed section follows the reference's
+    `arange(0, (start_pos + 1) // compression_ratio) + offset`.
 
-    Window section:
-        - When `start_pos >= window_size - 1` the SWA buffer is full and
-          we wrap: `[start_pos+1, ..., window_size-1, 0, ..., start_pos]`
-          (modulo `window_size`). All `window_size` indices are valid.
-        - When `0 < start_pos < window_size - 1` only the first
-          `start_pos + 1` slots are populated; the tail is `-1`-padded.
-
-    Compressed section:
-        Indices `[offset, offset + (start_pos + 1) // compression_ratio)`.
-        All causally-valid compressed entries surface (HCA = no sparse
-        selection). The newly-flushed entry (when this decode step closes
-        a block) is included because `n_compressed_blocks` was already
-        incremented before this helper runs.
+    HCA includes ALL causally-valid compressed blocks (no sparse selection).
+    CSA replaces the compressed section with a `LightningIndexer` top-k pick.
     """
-    if start_pos >= window_size - 1:
-        sp_mod = start_pos % window_size
-        win_idxs = torch.cat(
-            [
-                torch.arange(sp_mod + 1, window_size, device=device),
-                torch.arange(0, sp_mod + 1, device=device),
-            ]
-        )
-    else:
-        valid = torch.arange(start_pos + 1, device=device)
-        pad = torch.full((window_size - start_pos - 1,), -1, dtype=valid.dtype, device=device)
-        win_idxs = torch.cat([valid, pad])
-
-    n_valid_cmp = (start_pos + 1) // compression_ratio
-    cmp_idxs = torch.arange(0, n_valid_cmp, device=device) + compressed_offset
-
-    return torch.cat([win_idxs, cmp_idxs]).to(torch.int64)
+    window_idxs = _build_window_decode_topk_idxs(
+        window_size=window_size, start_pos=start_pos, device=device
+    )
+    n_valid_compressed = (start_pos + 1) // compression_ratio
+    compressed_idxs = torch.arange(0, n_valid_compressed, device=device) + compressed_offset
+    return torch.cat([window_idxs, compressed_idxs]).to(torch.int64)
 
 
 def _build_hca_topk_idxs(

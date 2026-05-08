@@ -60,6 +60,103 @@ def test_overlap_compressor_widens_projection_outputs() -> None:
     assert overlap.position_bias.shape == (2, 8)
 
 
+def test_overlap_decode_step_writes_to_current_half_slot() -> None:
+    """`forward_decode_step` with `overlap_mode=True` writes to slot `m + (start_pos % m)`.
+
+    The "current" half of the in-flight buffer lives in slots `[m, 2m)`;
+    slots `[0, m)` are reserved for the previous block's overlap data.
+    """
+    torch.manual_seed(0)
+    compression_ratio = 4
+    kv_head_dim = 4
+    compressor = TokenLevelCompressor(
+        hidden_size=8,
+        kv_head_dim=kv_head_dim,
+        rope_head_dim=0,
+        compression_ratio=compression_ratio,
+        overlap_mode=True,
+    )
+    cmp_kv_state = torch.zeros(1, 2 * compression_ratio, 2 * kv_head_dim)
+    cmp_score_state = torch.full((1, 2 * compression_ratio, 2 * kv_head_dim), float("-inf"))
+    hidden = torch.randn(1, 1, 8)
+    flushed = compressor.forward_decode_step(
+        hidden,
+        start_pos=2,  # pos_in_block = 2, target slot = m + 2 = 6
+        cmp_kv_state=cmp_kv_state,
+        cmp_score_state=cmp_score_state,
+    )
+    # Mid-block: no flush.
+    assert flushed is None
+    # Slot 6 was written; slots 0..5 and 7 are unchanged.
+    assert torch.any(cmp_kv_state[0, 6] != 0)
+    assert torch.all(cmp_kv_state[0, :6] == 0)
+    assert torch.all(cmp_kv_state[0, 7] == 0)
+    # Score state: slot 6 written; others stay at -inf.
+    assert torch.all(torch.isfinite(cmp_score_state[0, 6]))
+    finite_count = torch.isfinite(cmp_score_state[0]).all(dim=-1).sum().item()
+    assert finite_count == 1
+
+
+def test_overlap_decode_matches_prefill_within_one_run() -> None:
+    """Strong test: 2 blocks via 8 decode steps == compressor.forward over 8 tokens.
+
+    Validates:
+      - slot indexing `m + start_pos % m`
+      - flush trigger on `(start_pos + 1) % m == 0`
+      - the slide that turns the just-completed block into the "previous overlap"
+      - softmax dimension and position-bias indexing match prefill
+    """
+    torch.manual_seed(0)
+    compression_ratio = 4
+    kv_head_dim = 8
+    rope_head_dim = 4
+    seq_len = 8
+
+    compressor = TokenLevelCompressor(
+        hidden_size=16,
+        kv_head_dim=kv_head_dim,
+        rope_head_dim=rope_head_dim,
+        compression_ratio=compression_ratio,
+        overlap_mode=True,
+    )
+    rope = RotaryEmbedding(head_dim=rope_head_dim)
+    hidden_states = torch.randn(1, seq_len, 16) * 0.5
+
+    # Prefill path: produce both compressed entries in one go.
+    n_blocks = seq_len // compression_ratio
+    block_positions = torch.arange(n_blocks).unsqueeze(0) * compression_ratio
+    cos_blocks, sin_blocks = rope(hidden_states[:, :n_blocks], block_positions)
+    with torch.no_grad():
+        prefill_compressed = compressor(hidden_states, (cos_blocks, sin_blocks))
+    assert prefill_compressed.shape == (1, n_blocks, kv_head_dim)
+
+    # Decode path: 8 steps, collect each flushed entry.
+    cmp_kv_state = torch.zeros(1, 2 * compression_ratio, 2 * kv_head_dim)
+    cmp_score_state = torch.full((1, 2 * compression_ratio, 2 * kv_head_dim), float("-inf"))
+    decode_compressed = []
+    with torch.no_grad():
+        for token_position in range(seq_len):
+            block_pe = None
+            if (token_position + 1) % compression_ratio == 0:
+                # Block flush this step. Position is (block_idx) * compression_ratio.
+                block_idx = token_position // compression_ratio
+                block_pos = torch.tensor([[block_idx * compression_ratio]])
+                block_pe = rope(torch.zeros(1, 1), block_pos)
+            flushed = compressor.forward_decode_step(
+                hidden_states[:, token_position : token_position + 1],
+                start_pos=token_position,
+                cmp_kv_state=cmp_kv_state,
+                cmp_score_state=cmp_score_state,
+                block_position_embeddings=block_pe,
+            )
+            if flushed is not None:
+                decode_compressed.append(flushed.squeeze(1))
+    assert len(decode_compressed) == n_blocks
+
+    decode_compressed_tensor = torch.stack(decode_compressed, dim=1)
+    torch.testing.assert_close(decode_compressed_tensor, prefill_compressed, rtol=1e-5, atol=1e-6)
+
+
 def test_overlap_block_zero_uses_padded_overlap_slots() -> None:
     """The first compressed block has no predecessor — its overlap slots are masked.
 

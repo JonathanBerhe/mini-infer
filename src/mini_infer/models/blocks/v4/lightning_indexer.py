@@ -33,12 +33,17 @@ main attention's `c` (paper: 128 vs 512).
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 from torch.nn.functional import relu
 
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4.compressor import TokenLevelCompressor
+
+if TYPE_CHECKING:
+    from mini_infer.cache.state_cache import _IndexerState
 
 
 class LightningIndexer(nn.Module):
@@ -182,3 +187,100 @@ class LightningIndexer(nn.Module):
         topk_invalid = topk_idxs >= cutoff  # (B, T, actual_k) via broadcasting
         topk_idxs = torch.where(topk_invalid, -1, topk_idxs + compressed_offset)
         return topk_idxs.to(torch.int64)
+
+    def forward_decode_step(
+        self,
+        hidden_state: torch.Tensor,
+        q_lora_latent: torch.Tensor,
+        *,
+        start_pos: int,
+        indexer_state: _IndexerState,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        compressed_offset: int,
+    ) -> torch.Tensor:
+        """One decode step: pick top-k indices into the parent attention's KV.
+
+        Drives the indexer's own compressor (separate weights from the
+        main attention's compressor) for one step, possibly appending a
+        new compressed entry to the indexer history. Then scores the
+        per-head Q against the indexer's compressed history and returns
+        the top-k absolute indices into the parent attention's
+        concatenated `[swa ; main_compressed_history]` tensor.
+
+        Args:
+            hidden_state: `(B, 1, hidden_size)`.
+            q_lora_latent: `(B, 1, q_lora_rank)` — the parent attention's
+                `q_a_layernorm(q_a_proj(x))` for this token. Reused so we
+                don't repeat the down-projection.
+            start_pos: Global token position.
+            indexer_state: Per-layer indexer state to read/mutate.
+            token_position_embeddings: `(cos, sin)` for the new token's
+                position; each `(B, 1, rope_head_dim)`. Used to rotate Q.
+            block_position_embeddings: `(cos, sin)` for the just-flushed
+                indexer block (position `(start_pos // compression_ratio)
+                * compression_ratio`); each `(B, 1, rope_head_dim)`.
+                Required iff `rope_head_dim > 0` AND this step closes a block.
+            compressed_offset: Offset into the parent's full KV layout
+                where the indexer's history would line up. The parent
+                concatenates `[swa ; main_compressed]`, so this is
+                typically `n_win` (selected indices live among the
+                main-compressed slots).
+
+        Returns:
+            `(B, 1, actual_top_k)` int64 indices, where
+            `actual_top_k = min(self.top_k, indexer_state.n_compressed_blocks)`.
+            Returns shape `(B, 1, 0)` when no compressed entries exist yet
+            (early decode steps before the first block flushes).
+        """
+        batch_size, seqlen, _ = hidden_state.shape
+        if seqlen != 1:
+            raise ValueError(f"forward_decode_step expects seqlen=1, got {seqlen}")
+        num_heads = self.num_heads
+        head_dim = self.head_dim
+
+        # ---- Q: shared latent -> per-head + partial RoPE ----
+        q = self.wq_b(q_lora_latent).view(batch_size, 1, num_heads, head_dim)
+        cos_for_token, sin_for_token = token_position_embeddings
+        if self.rope_head_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, self.rope_head_dim)
+
+        # ---- Indexer's own compressor decode step ----
+        flushed_compressed = self.compressor.forward_decode_step(
+            hidden_state,
+            start_pos=start_pos,
+            cmp_kv_state=indexer_state.cmp_kv_state,
+            cmp_score_state=indexer_state.cmp_score_state,
+            block_position_embeddings=block_position_embeddings,
+        )
+        if flushed_compressed is not None:
+            n_completed = indexer_state.n_compressed_blocks
+            if n_completed >= indexer_state.compressed_kv.shape[1]:
+                raise RuntimeError(
+                    f"indexer compressed history is full ({n_completed} entries); "
+                    "raise max_n_compressed"
+                )
+            indexer_state.compressed_kv[:, n_completed] = flushed_compressed.squeeze(1).to(
+                indexer_state.compressed_kv.dtype
+            )
+            indexer_state.n_compressed_blocks += 1
+
+        # ---- Score: per-head dot product, ReLU, weighted sum, top-k ----
+        n_valid_compressed = indexer_state.n_compressed_blocks
+        if n_valid_compressed == 0:
+            # No compressed entries yet — caller cats this with the window section
+            # and a zero-width compressed section is fine.
+            return torch.empty((batch_size, 1, 0), dtype=torch.int64, device=hidden_state.device)
+
+        compressed_keys = indexer_state.compressed_kv[:, :n_valid_compressed]
+        per_token_head_weights = self.weights_proj(hidden_state) * self._weight_scale  # (B, 1, n_h)
+
+        per_head_score = torch.einsum("bthd,bkd->bthk", q.float(), compressed_keys.float())
+        per_head_score = relu(per_head_score)
+        index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
+        # index_score: (B, 1, n_valid_compressed)
+
+        actual_top_k = min(self.top_k, n_valid_compressed)
+        topk_local_idxs = index_score.topk(actual_top_k, dim=-1)[1]  # (B, 1, actual_top_k)
+        topk_absolute: torch.Tensor = (topk_local_idxs + compressed_offset).to(torch.int64)
+        return topk_absolute
