@@ -156,6 +156,125 @@ class TokenLevelCompressor(nn.Module):
             compressed = apply_partial_rope_last_n_dims(compressed, cos, sin, self.rope_head_dim)
         return compressed
 
+    def forward_prefill_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cmp_kv_state: torch.Tensor,
+        cmp_score_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cache-aware prefill: emit compressed entries AND populate in-flight state.
+
+        Args:
+            hidden_states: `(B, T, hidden_size)`. `T` does NOT need to be a
+                multiple of `compression_ratio` — the trailing remainder
+                `T % compression_ratio` tokens are stashed in the in-flight
+                accumulator so the next decode step's flush sees them as if
+                the prefill had stopped at a block boundary.
+            compressed_position_embeddings: `(cos, sin)` for the
+                `T // compression_ratio` compressed positions (block index
+                `i` -> token position `i * compression_ratio`); each
+                `(B, T // compression_ratio, rope_head_dim)`.
+            cmp_kv_state, cmp_score_state: per-layer in-flight accumulator.
+                Mutated in place — see "side effects" below.
+
+        Returns:
+            `(B, T // compression_ratio, kv_head_dim)` compressed entries.
+            Identical to `forward(...)` when `T % compression_ratio == 0`.
+
+        Side effects (mirror the reference's `Compressor.forward(start_pos=0)`):
+            - Overlap mode AND `cutoff >= compression_ratio`: stash the LAST
+              `compression_ratio` tokens of the aligned prefix into
+              `cmp_kv_state[:, :compression_ratio]` (raw KV) and
+              `cmp_score_state[:, :compression_ratio]` (score + position bias).
+              These become the "previous overlap" half for the next decode
+              step's flush.
+            - Trailing remainder (`T % compression_ratio > 0`): stash the
+              remainder tokens at slots `[offset, offset+remainder)` where
+              `offset = compression_ratio` for overlap mode (that's the
+              "current" half of the doubled buffer) and `offset = 0`
+              otherwise. The next decode steps continue accumulating at
+              `(start_pos % compression_ratio)` from this point, with
+              earlier slots already populated.
+        """
+        batch_size, seqlen, _ = hidden_states.shape
+        compression_ratio = self.compression_ratio
+        kv_head_dim = self.kv_head_dim
+        feature_multiplier = 2 if self.overlap_mode else 1
+        expected_state_shape = (
+            batch_size,
+            compression_ratio * feature_multiplier,
+            kv_head_dim * feature_multiplier,
+        )
+        if cmp_kv_state.shape != expected_state_shape:
+            raise ValueError(
+                f"cmp_kv_state shape {tuple(cmp_kv_state.shape)} mismatches expected "
+                f"{expected_state_shape} (overlap_mode={self.overlap_mode})"
+            )
+        if cmp_score_state.shape != cmp_kv_state.shape:
+            raise ValueError("cmp_kv_state and cmp_score_state must have matching shapes")
+
+        remainder = seqlen % compression_ratio
+        aligned_cutoff = seqlen - remainder
+
+        # Run the full sequence through the projections in fp32.
+        hidden_fp32 = hidden_states.float()
+        full_kv = self.kv_proj(hidden_fp32)  # (B, T, coff*c)
+        full_score = self.weight_proj(hidden_fp32)  # (B, T, coff*c)
+
+        # ---- Stash the LAST aligned block as previous-overlap (CSA only) ----
+        if self.overlap_mode and aligned_cutoff >= compression_ratio:
+            cmp_kv_state[:, :compression_ratio] = full_kv[
+                :, aligned_cutoff - compression_ratio : aligned_cutoff
+            ]
+            cmp_score_state[:, :compression_ratio] = (
+                full_score[:, aligned_cutoff - compression_ratio : aligned_cutoff]
+                + self.position_bias
+            )
+
+        # ---- Stash the trailing remainder as the in-flight current block ----
+        if remainder > 0:
+            current_half_offset = compression_ratio if self.overlap_mode else 0
+            cmp_kv_state[:, current_half_offset : current_half_offset + remainder] = full_kv[
+                :, aligned_cutoff:
+            ]
+            cmp_score_state[:, current_half_offset : current_half_offset + remainder] = (
+                full_score[:, aligned_cutoff:] + self.position_bias[:remainder]
+            )
+
+        # ---- Compress the aligned prefix (the standalone forward path) ----
+        if aligned_cutoff == 0:
+            # No full blocks; nothing to emit.
+            return torch.zeros(
+                (batch_size, 0, kv_head_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        aligned_kv = full_kv[:, :aligned_cutoff].unflatten(1, (-1, compression_ratio))
+        aligned_score = (
+            full_score[:, :aligned_cutoff].unflatten(1, (-1, compression_ratio))
+            + self.position_bias
+        )
+        if self.overlap_mode:
+            aligned_kv = self._overlap_transform(aligned_kv, value=0.0)
+            aligned_score = self._overlap_transform(aligned_score, value=float("-inf"))
+
+        softmax_weights = aligned_score.softmax(dim=2)
+        compressed = (aligned_kv * softmax_weights).sum(dim=2)  # (B, n_blocks, c)
+        compressed = self.norm(compressed.to(hidden_states.dtype))
+
+        if self.rope_head_dim > 0:
+            cos_for_blocks, sin_for_blocks = compressed_position_embeddings
+            compressed = apply_partial_rope_last_n_dims(
+                compressed, cos_for_blocks, sin_for_blocks, self.rope_head_dim
+            )
+        # Re-bind to a Tensor-typed local so mypy doesn't widen through `Any`
+        # (the trailing-remainder branch above can return early without RoPE).
+        compressed_out: torch.Tensor = compressed
+        return compressed_out
+
     def forward_decode_step(
         self,
         hidden_state: torch.Tensor,

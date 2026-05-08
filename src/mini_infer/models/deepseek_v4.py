@@ -123,6 +123,7 @@ class DeepseekV4Config:
         guesses based on the reference inference code's `ModelArgs`. Adjust
         once the actual HF config schema lands.
         """
+
         # Pick the first attribute that's set on `hf_config` and not None,
         # falling back to `default_value` if none of the candidates apply.
         # mini-infer + paper field names sometimes diverge (e.g.
@@ -136,9 +137,7 @@ class DeepseekV4Config:
             return default_value
 
         rope_params = getattr(hf_config, "rope_parameters", None) or {}
-        rope_theta_raw = rope_params.get("rope_theta") or _pick(
-            "rope_theta", default_value=10000.0
-        )
+        rope_theta_raw = rope_params.get("rope_theta") or _pick("rope_theta", default_value=10000.0)
         compress_ratios_raw = _pick("compress_ratios", default_value=None)
         if compress_ratios_raw is None:
             raise ValueError("DeepseekV4Config.from_hf: HF config missing `compress_ratios` field")

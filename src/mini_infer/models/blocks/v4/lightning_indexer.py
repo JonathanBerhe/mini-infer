@@ -188,6 +188,104 @@ class LightningIndexer(nn.Module):
         topk_idxs = torch.where(topk_invalid, -1, topk_idxs + compressed_offset)
         return topk_idxs.to(torch.int64)
 
+    def forward_prefill_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        q_lora_latent: torch.Tensor,
+        *,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        indexer_state: _IndexerState,
+        compressed_offset: int,
+    ) -> torch.Tensor:
+        """Cache-aware prefill: same top-k output as `forward`, plus state writes.
+
+        Drives the indexer's own compressor with `forward_prefill_with_cache`
+        (so its in-flight accumulator picks up the trailing remainder + the
+        last aligned block's overlap data), then appends the emitted entries
+        into `indexer_state.compressed_kv`.
+
+        Args:
+            hidden_states: `(B, T, hidden_size)`.
+            q_lora_latent: `(B, T, q_lora_rank)` from the parent's
+                `q_a_layernorm(q_a_proj(...))`.
+            token_position_embeddings: `(cos, sin)` for raw token positions
+                `[0, T)`; each `(B, T, rope_head_dim)`.
+            compressed_position_embeddings: `(cos, sin)` for compressed
+                positions; each `(B, T // compression_ratio, rope_head_dim)`.
+            indexer_state: per-layer indexer sub-cache (mutated in place).
+            compressed_offset: parent attention's offset in the concatenated
+                full KV layout (typically `T` for prefill, where SWA occupies
+                slots `[0, T)` and the indexer's history maps to slots
+                `[T, T + n_emitted)`).
+
+        Returns:
+            `(B, T, top_k)` int64 indices — same shape contract as `forward`.
+
+        Side effects on `indexer_state`:
+            - `compressed_kv[:, :n_emitted]` populated.
+            - `n_compressed_blocks` advanced to `n_emitted`.
+            - `cmp_kv_state` / `cmp_score_state` populated with the trailing
+              remainder + previous-overlap (always overlap mode).
+        """
+        batch_size, seqlen, _ = hidden_states.shape
+        num_heads = self.num_heads
+        head_dim = self.head_dim
+        compression_ratio = self.compression_ratio
+
+        # ---- Q: shared latent -> per-head + partial RoPE ----
+        q = self.wq_b(q_lora_latent).view(batch_size, seqlen, num_heads, head_dim)
+        cos_for_tokens, sin_for_tokens = token_position_embeddings
+        if self.rope_head_dim > 0:
+            q = apply_partial_rope_last_n_dims(
+                q, cos_for_tokens, sin_for_tokens, self.rope_head_dim
+            )
+
+        # ---- K: indexer's own cache-aware compressor ----
+        compressed_keys = self.compressor.forward_prefill_with_cache(
+            hidden_states,
+            compressed_position_embeddings=compressed_position_embeddings,
+            cmp_kv_state=indexer_state.cmp_kv_state,
+            cmp_score_state=indexer_state.cmp_score_state,
+        )
+        n_emitted = compressed_keys.shape[1]
+        if n_emitted > indexer_state.compressed_kv.shape[1]:
+            raise RuntimeError(
+                f"indexer compressed history capacity ({indexer_state.compressed_kv.shape[1]}) "
+                f"is too small for {n_emitted} entries; raise max_n_compressed"
+            )
+        indexer_state.compressed_kv[:, :n_emitted] = compressed_keys.to(
+            indexer_state.compressed_kv.dtype
+        )
+        indexer_state.n_compressed_blocks = n_emitted
+
+        # ---- Per-token per-head weighting + score + causal-masked top-k ----
+        per_token_head_weights = self.weights_proj(hidden_states) * self._weight_scale
+
+        per_head_score = torch.einsum("bthd,bkd->bthk", q.float(), compressed_keys.float())
+        per_head_score = relu(per_head_score)
+        index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
+
+        cutoff_per_query = (
+            torch.arange(1, seqlen + 1, device=hidden_states.device) // compression_ratio
+        ).unsqueeze(1)
+        block_indices = torch.arange(n_emitted, device=hidden_states.device).unsqueeze(0)
+        invalid_block = block_indices >= cutoff_per_query
+        index_score = index_score.masked_fill(invalid_block.unsqueeze(0), float("-inf"))
+
+        actual_top_k = min(self.top_k, n_emitted)
+        if actual_top_k == 0:
+            # Whole prefill is shorter than one compressed block — return empty top-k slot.
+            return torch.empty(
+                (batch_size, seqlen, 0), dtype=torch.int64, device=hidden_states.device
+            )
+        topk_local_indices = index_score.topk(actual_top_k, dim=-1)[1]
+        topk_invalid = topk_local_indices >= cutoff_per_query
+        topk_absolute: torch.Tensor = torch.where(
+            topk_invalid, -1, topk_local_indices + compressed_offset
+        ).to(torch.int64)
+        return topk_absolute
+
     def forward_decode_step(
         self,
         hidden_state: torch.Tensor,
