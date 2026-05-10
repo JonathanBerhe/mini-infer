@@ -37,9 +37,12 @@ SWA circular buffer + per-layer compressed history + compressor in-flight
 accumulator. Helper `build_state_cache_layer_specs` translates a config
 into the per-layer specs `StateCache.__init__` expects.
 
-`load_weights` raises until V4 checkpoints are public — the architecture
-class is registered so that an HF config with `architectures=
-["DeepseekV4ForCausalLM"]` would resolve here.
+`load_weights` raises today: V4 weights are public on HF (V4-Flash
+158 GB, V4-Pro 862 GB) but exceed any single GPU's HBM, so loading
+needs tensor parallelism, which mini-infer doesn't have yet. The
+architecture class is registered so an HF config with
+`architectures=["DeepseekV4ForCausalLM"]` resolves here; the loader
+will land alongside TP infrastructure.
 """
 
 from __future__ import annotations
@@ -188,9 +191,10 @@ class DeepseekV4Config:
     def from_hf(cls, hf_config: Any) -> DeepseekV4Config:
         """Parse an HF config into our owned schema.
 
-        V4 checkpoints aren't public yet, so the field names are educated
-        guesses based on the reference inference code's `ModelArgs`. Adjust
-        once the actual HF config schema lands.
+        Field names are educated guesses based on the reference inference
+        code's `ModelArgs`. Once we audit a real V4-Flash / V4-Pro
+        `config.json` from HF (Phase 5 of the tensor-parallelism plan),
+        any diverging field names get fixed here.
         """
 
         # Pick the first attribute that's set on `hf_config` and not None,
@@ -540,10 +544,14 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         hf_state_dict: dict[str, torch.Tensor],
     ) -> None:
         raise NotImplementedError(
-            "DeepseekV4ForCausalLM.load_weights: V4 checkpoints aren't public yet, "
-            "and the published architecture uses MoE FFN + Hyper-Connections that "
-            "this implementation doesn't yet replicate. The class is registered so "
-            "the attention pieces (HCAAttention, CSAAttention, LightningIndexer, "
-            "TokenLevelCompressor, AttentionSink, GroupedOutputProjection) can be "
-            "exercised end-to-end on synthetic configs."
+            "DeepseekV4ForCausalLM.load_weights: V4 weights are public on HF "
+            "(V4-Flash 158 GB on disk, V4-Pro 862 GB) but exceed any single GPU's "
+            "HBM, so loading them requires tensor parallelism. mini-infer is "
+            "single-device today; multi-GPU TP infrastructure (column/row-parallel "
+            "linears, expert-parallel MoE, vocab-parallel embedding/LM-head) plus "
+            "FP8/FP4 dequant for V4's mixed-precision weights are the next steps. "
+            "Every V4 architecture primitive (HCA, CSA, Lightning Indexer, token "
+            "compressor, attention sink, grouped output, hash-routed MoE FFN, "
+            "Hyper-Connections, YaRN) is implemented and integrated; only the "
+            "weight loader + TP infrastructure remain."
         )

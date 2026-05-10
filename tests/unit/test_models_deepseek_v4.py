@@ -103,10 +103,12 @@ def test_is_csa_layer_matches_compress_ratios() -> None:
     assert cfg.is_csa_layer(3) is False
 
 
-def test_load_weights_raises_until_v4_weights_public() -> None:
+def test_load_weights_raises_pending_tensor_parallelism() -> None:
+    """V4 weights are public on HF but won't fit a single GPU; loading needs
+    tensor parallelism (planned but not implemented yet)."""
     cfg = _make_hybrid_config()
     model = DeepseekV4ForCausalLM(cfg)
-    with pytest.raises(NotImplementedError, match="V4 checkpoints"):
+    with pytest.raises(NotImplementedError, match="tensor parallelism"):
         DeepseekV4ForCausalLM.load_weights(model, {})
 
 

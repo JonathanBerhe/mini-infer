@@ -288,10 +288,14 @@ Considered" have since been implemented and wired through the model:
   `RotaryEmbedding` block now carries it.)
 
 **Status of "load real V4 weights":** every published architecture
-component is now implemented and wired. The remaining gate is the
-V4 weight release; `load_weights` will become a name-mapping
-exercise (`hf_state_dict[k]` → our parameter tree) once the upstream
-checkpoints are public.
+component is now implemented and wired. **The remaining gate is
+tensor parallelism**, NOT the weight release — V4 checkpoints are
+public on HF (V4-Flash 158 GB, V4-Pro 862 GB) but exceed any single
+GPU's HBM. `load_weights` raises today; once mini-infer has multi-GPU
+TP infrastructure (column/row-parallel linears, expert-parallel MoE,
+vocab-parallel embedding/LM-head) the weight loader becomes a name-
+mapping exercise plus FP8/FP4 dequant. Cleanest test target:
+V4-Flash on 2× B200.
 
 **Test count:** 100+ V4-related tests across the primitives + the
 integration matrix. The `test_hc_backbone_combines_with_moe_ffn` test
