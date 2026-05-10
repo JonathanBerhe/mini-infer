@@ -260,3 +260,58 @@ class HyperConnections(nn.Module):
         # sum over the FIRST hc_mult axis (the row index of comb / residual's own axis).
         residual_mix = torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
         return (scaled_sublayer + residual_mix).type_as(sublayer_output)
+
+
+class HCHeadReduction(nn.Module):
+    """Reduce `(B, T, hc_mult, dim)` -> `(B, T, dim)` for the LM head.
+
+    V4's `Transformer` keeps `hc_mult` copies of the hidden state through
+    every decoder layer; the LM head needs a single `(B, T, dim)` summary.
+    This sub-block computes per-copy weights via the same RMS-norm-then-
+    sigmoid recipe as `HyperConnections.hc_pre`, but without `post` /
+    `comb` (no expansion or mixing — just reduction). Mirrors the V4
+    reference's `ParallelHead.hc_head`.
+
+    Args:
+        hidden_size: Per-copy feature dim.
+        hc_mult: Number of copies to reduce.
+        hc_eps: Additive regularizer on the sigmoid output.
+        rms_norm_eps: Used by the rsqrt normalization (the kernel's `norm_eps`).
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        hc_mult: int,
+        hc_eps: float = 1e-6,
+        rms_norm_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if hc_mult <= 0:
+            raise ValueError(f"hc_mult must be positive, got {hc_mult}")
+        self.hidden_size = hidden_size
+        self.hc_mult = hc_mult
+        self.hc_eps = hc_eps
+        self.rms_norm_eps = rms_norm_eps
+
+        hc_dim = hc_mult * hidden_size
+        # `fn`: linear projection from `(B, T, hc_mult * dim)` to `(B, T, hc_mult)`.
+        self.fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32))
+        # `base`: per-copy additive bias, like `HyperConnections.base[:hc_mult]`.
+        self.base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+        # `scale`: single scalar (the head's reduction needs only one chunk's worth).
+        self.scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+
+    def forward(self, hc_state: torch.Tensor) -> torch.Tensor:
+        """Reduce per-token: `out[..., d] = sum_h(pre[..., h] * hc_state[..., h, d])`.
+
+        `pre = sigmoid(linear(flatten(hc_state)) * rsqrt * scale + base) + eps`.
+        """
+        original_dtype = hc_state.dtype
+        flat = hc_state.flatten(2).float()  # (B, T, hc_mult * dim)
+        rsqrt_factor = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + self.rms_norm_eps)
+        mixes = linear(flat, self.fn) * rsqrt_factor  # (B, T, hc_mult)
+        pre = torch.sigmoid(mixes * self.scale + self.base) + self.hc_eps
+        reduced = torch.sum(pre.unsqueeze(-1) * hc_state, dim=2)
+        return reduced.to(original_dtype)
