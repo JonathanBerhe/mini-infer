@@ -39,6 +39,7 @@ Two forward paths:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -48,6 +49,7 @@ from mini_infer.models.blocks.csa import CSAAttention
 from mini_infer.models.blocks.hash_routed_gate import RoutingMode, ScoreFunction
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 from mini_infer.models.blocks.hca import HCAAttention
+from mini_infer.models.blocks.hyper_connections import HyperConnections
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.swiglu import SwiGLU
 
@@ -55,6 +57,12 @@ if TYPE_CHECKING:
     from mini_infer.cache.state_cache import StateCache
 
 FFNType = Literal["swiglu", "hash_moe"]
+
+# Type alias for the per-mode attention call wrapped by `_forward_hc`. The
+# decoder's `forward` hands a closure over `(token_pe, compressed_pe)`;
+# `forward_decode` hands a closure over `(start_pos, state_cache, ...)`. Both
+# take a `(B, T, hidden_size)` tensor and return one of the same shape.
+_AttnRunner = Callable[[torch.Tensor], torch.Tensor]
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -93,11 +101,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         moe_route_scale: float = 1.0,
         moe_vocab_size: int | None = None,
         n_shared_experts: int = 0,
+        # Hyper-Connections knobs. Defaults disable HC -> vanilla pre-norm
+        # residuals are used.
+        use_hyper_connections: bool = False,
+        hc_mult: int = 0,
+        hc_sinkhorn_iters: int = 20,
+        hc_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.compression_ratio = compression_ratio
         self.is_csa_layer = compression_ratio == self.CSA_COMPRESSION_RATIO
         self.ffn_type = ffn_type
+        self.use_hyper_connections = use_hyper_connections
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -172,6 +187,26 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:  # pragma: no cover — Literal already constrains this
             raise ValueError(f"unknown ffn_type={ffn_type!r}")
 
+        # Hyper-Connections (V4 paper §2.5): when enabled, each sublayer is
+        # wrapped by a per-instance `(hc_pre, hc_post)` mediator that
+        # mixes `hc_mult` residual copies via Sinkhorn-normalized weights.
+        # When disabled, the standard pre-norm residual is used.
+        if use_hyper_connections:
+            if hc_mult <= 0:
+                raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {hc_mult}")
+            hc_kwargs = dict(
+                hidden_size=hidden_size,
+                hc_mult=hc_mult,
+                sinkhorn_iters=hc_sinkhorn_iters,
+                hc_eps=hc_eps,
+                rms_norm_eps=rms_norm_eps,
+            )
+            self.hc_attn: HyperConnections | None = HyperConnections(**hc_kwargs)  # type: ignore[arg-type]
+            self.hc_ffn: HyperConnections | None = HyperConnections(**hc_kwargs)  # type: ignore[arg-type]
+        else:
+            self.hc_attn = None
+            self.hc_ffn = None
+
     def _apply_ffn(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
     ) -> torch.Tensor:
@@ -193,19 +228,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         """Standalone packed prefill — no cache access.
 
         Args:
-            hidden_states: `(B, T, hidden_size)`. `T` must be a multiple
-                of `compression_ratio` (the standalone attention forward
-                rejects unaligned input).
+            hidden_states: `(B, T, hidden_size)` (vanilla residual mode) OR
+                `(B, T, hc_mult, hidden_size)` (HC mode). `T` must be a
+                multiple of `compression_ratio`.
             token_position_embeddings: `(cos, sin)` for the `T` raw token
                 positions; each `(B, T, rope_head_dim)`.
             compressed_position_embeddings: `(cos, sin)` for the
-                `T // compression_ratio` compressed positions (block `i`
-                -> token position `i * compression_ratio`); each
+                `T // compression_ratio` compressed positions; each
                 `(B, T // compression_ratio, rope_head_dim)`.
             input_ids: `(B, T)` token ids — required iff `ffn_type ==
-                "hash_moe"` AND the MoE gate uses hash routing. SwiGLU
-                FFN ignores it.
+                "hash_moe"` AND the MoE gate uses hash routing.
         """
+        if self.use_hyper_connections:
+            return self._forward_hc(
+                hidden_states,
+                token_position_embeddings,
+                compressed_position_embeddings,
+                input_ids=input_ids,
+                attn_runner=lambda x: self.self_attn(
+                    x, token_position_embeddings, compressed_position_embeddings
+                ),
+            )
+
         residual = hidden_states
         x = self.input_layernorm(hidden_states)
         x = self.self_attn(x, token_position_embeddings, compressed_position_embeddings)
@@ -230,9 +274,30 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Single-token decode through this layer. Mutates `state_cache.layer(layer_idx)`.
 
-        `input_ids` shape `(B, 1)` — required iff `ffn_type == "hash_moe"`
-        with hash routing. The new token's id drives the FFN's expert lookup.
+        `hidden_state`: `(B, 1, hidden_size)` (vanilla) OR `(B, 1, hc_mult,
+        hidden_size)` (HC mode). `input_ids` `(B, 1)` required iff
+        `ffn_type == "hash_moe"` with hash routing.
         """
+        if self.use_hyper_connections:
+
+            def attn_runner(x: torch.Tensor) -> torch.Tensor:
+                return self.self_attn.forward_decode(
+                    x,
+                    start_pos=start_pos,
+                    state_cache=state_cache,
+                    layer_idx=layer_idx,
+                    token_position_embeddings=token_position_embeddings,
+                    block_position_embeddings=block_position_embeddings,
+                )
+
+            return self._forward_hc(
+                hidden_state,
+                token_position_embeddings,
+                None,
+                input_ids=input_ids,
+                attn_runner=attn_runner,
+            )
+
         residual = hidden_state
         x = self.input_layernorm(hidden_state)
         x = self.self_attn.forward_decode(
@@ -250,3 +315,39 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self._apply_ffn(x, input_ids)
         out: torch.Tensor = residual + x
         return out
+
+    def _forward_hc(
+        self,
+        hc_state: torch.Tensor,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        input_ids: torch.Tensor | None,
+        attn_runner: _AttnRunner,
+    ) -> torch.Tensor:
+        """HC variant: hidden state shape is `(B, T, hc_mult, dim)`.
+
+        Mirrors the V4 reference's `Block.forward`: for each sublayer we
+        run `hc_pre` to reduce `hc_mult` copies into one (sublayer input),
+        run RMSNorm + sublayer, then `hc_post` to expand back to `hc_mult`
+        copies mixed with the residual via the Sinkhorn comb matrix.
+        """
+        # `hc_pre` does its own RMS-norm-style rsqrt pre-projection, but
+        # the V4 reference still applies the per-sublayer `attn_norm` /
+        # `ffn_norm` AFTER the reduction step. We follow the same structure.
+        del compressed_position_embeddings  # captured by attn_runner closure
+        assert self.hc_attn is not None and self.hc_ffn is not None  # set when HC enabled
+
+        attn_residual = hc_state
+        sublayer_input, post, comb = self.hc_attn.hc_pre(hc_state)
+        sublayer_input = self.input_layernorm(sublayer_input)
+        attn_out = attn_runner(sublayer_input)
+        hc_state = self.hc_attn.hc_post(attn_out, attn_residual, post, comb)
+
+        ffn_residual = hc_state
+        sublayer_input, post, comb = self.hc_ffn.hc_pre(hc_state)
+        sublayer_input = self.post_attention_layernorm(sublayer_input)
+        ffn_out = self._apply_ffn(sublayer_input, input_ids)
+        hc_state = self.hc_ffn.hc_post(ffn_out, ffn_residual, post, comb)
+
+        return hc_state

@@ -7,19 +7,22 @@ is the attention itself (V4 paper §2.3) — `HCAAttention`, `CSAAttention`,
 `GroupedOutputProjection`, all bit-parity validated against the upstream
 inference reference.
 
-Architectural deltas from V4-published vs what we ship:
+Architectural status vs V4-published:
 
-  - **No Hyper-Connections**: V4's `Block` (paper §2.5) replaces the
-    standard residual with a Sinkhorn-mixed `(B, T, hc_mult, dim)`
-    multi-residual. Orthogonal to the attention contribution; we use
-    vanilla pre-norm residuals so the backbone is reviewable.
-  - **No MoE FFN**: V4-Pro / V4-Flash use MoE with hash routing for
-    the first `n_hash_layers` layers and softmax-topk after. We use a
-    plain `SwiGLU` FFN. (mini-infer already has Mixtral-style MoE; the
-    V4-specific hash-routing piece is a separate stage.)
-  - **No YaRN long-context scaling**: V4's RoPE uses YaRN at >4k
-    contexts; we use vanilla RoPE.
-  - **No on-disk KV** (V4 paper §3.6.2): orthogonal storage layer.
+  - **Hyper-Connections** (V4 paper §2.5): supported. Toggle via
+    `cfg.use_hyper_connections=True` + `cfg.hc_mult > 0`. When enabled,
+    every decoder layer mediates residuals via Sinkhorn-mixed multi-
+    residuals (`HyperConnections`), and an `HCHeadReduction` collapses
+    the `hc_mult` copies before the LM head. Default off → vanilla
+    pre-norm residuals.
+  - **MoE FFN with hash routing** (V4 paper §2.2): supported. Toggle
+    via `cfg.use_moe_ffn=True`. The first `cfg.num_hash_routed_layers`
+    layers use per-token-id hash routing; the rest use score-topk.
+    Default off → SwiGLU FFN.
+  - **YaRN long-context scaling** (V4 paper §3.1): supported. Toggle
+    via `cfg.yarn_original_seq_len > 0`. Default off → vanilla RoPE.
+  - **No on-disk KV** (V4 paper §3.6.2): orthogonal storage layer; not
+    in scope for this implementation.
 
 Layer dispatch — per-layer attention type via `compress_ratios`:
 
@@ -51,6 +54,7 @@ from mini_infer.cache.state_cache import IndexerStateSpec, StateCache, StateLaye
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
+from mini_infer.models.blocks.hyper_connections import HCHeadReduction
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding
 
@@ -129,6 +133,15 @@ class DeepseekV4Config:
     moe_score_func: str = "softmax"
     moe_route_scale: float = 1.0
     n_shared_experts: int = 0
+    # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
+    # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
+    # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
+    # decoder layer mediates via Sinkhorn-mixed multi-residuals, and an
+    # `HCHeadReduction` reduces back to `(B, T, dim)` before the LM head.
+    use_hyper_connections: bool = False
+    hc_mult: int = 0
+    hc_sinkhorn_iters: int = 20
+    hc_eps: float = 1e-6
 
     def __post_init__(self) -> None:
         if len(self.compress_ratios) != self.num_hidden_layers:
@@ -157,6 +170,8 @@ class DeepseekV4Config:
                     f"num_hash_routed_layers ({self.num_hash_routed_layers}) cannot exceed "
                     f"num_hidden_layers ({self.num_hidden_layers})"
                 )
+        if self.use_hyper_connections and self.hc_mult <= 0:
+            raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {self.hc_mult}")
 
     def is_csa_layer(self, layer_idx: int) -> bool:
         """CSA layers have compression_ratio == 4 (paper §4.2.1)."""
@@ -300,6 +315,13 @@ class _DeepseekV4InnerModel(nn.Module):
                 moe_vocab_size=cfg.vocab_size if routing_mode == "hash" else None,
                 n_shared_experts=cfg.n_shared_experts,
             )
+        if cfg.use_hyper_connections:
+            layer_kwargs.update(
+                use_hyper_connections=True,
+                hc_mult=cfg.hc_mult,
+                hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
+                hc_eps=cfg.hc_eps,
+            )
         return DeepseekV4DecoderLayer(**layer_kwargs)  # type: ignore[arg-type]
 
 
@@ -330,6 +352,20 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        # When Hyper-Connections is on, hidden state through the layers
+        # carries `hc_mult` copies; the head needs a single (B, T, dim)
+        # summary, so this sub-block applies the reference's
+        # `ParallelHead.hc_head` reduction.
+        self.hc_head_reduction: HCHeadReduction | None
+        if cfg.use_hyper_connections:
+            self.hc_head_reduction = HCHeadReduction(
+                hidden_size=cfg.hidden_size,
+                hc_mult=cfg.hc_mult,
+                hc_eps=cfg.hc_eps,
+                rms_norm_eps=cfg.rms_norm_eps,
+            )
+        else:
+            self.hc_head_reduction = None
 
     def forward(
         self,
@@ -358,8 +394,20 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             )
 
         hidden_states = self.model.embed_tokens(input_ids)
+        # RoPE tables computed BEFORE expanding to hc_mult copies — they only
+        # depend on the per-token shape (B, T, ...), not on the residual fan-out.
         cos_for_tokens, sin_for_tokens = self.rotary_emb(hidden_states, position_ids)
         token_position_embeddings = (cos_for_tokens, sin_for_tokens)
+
+        if self.cfg.use_hyper_connections:
+            # Expand `(B, T, dim)` -> `(B, T, hc_mult, dim)` by replicating the
+            # embedded hidden state across the `hc_mult` axis. `contiguous()`
+            # because subsequent layers may slice on the hc axis.
+            hidden_states = (
+                hidden_states.unsqueeze(2)
+                .expand(batch_size, seqlen, self.cfg.hc_mult, self.cfg.hidden_size)
+                .contiguous()
+            )
 
         for layer_idx, layer in enumerate(self.model.layers):
             compression_ratio = self.cfg.compress_ratios[layer_idx]
@@ -370,7 +418,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 .expand(batch_size, -1)
             )
             cos_for_blocks, sin_for_blocks = self.rotary_emb(
-                hidden_states[:, :num_compressed_blocks], block_positions
+                torch.zeros(batch_size, num_compressed_blocks, device=input_ids.device),
+                block_positions,
             )
             compressed_position_embeddings = (cos_for_blocks, sin_for_blocks)
             hidden_states = layer(
@@ -379,6 +428,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 compressed_position_embeddings,
                 input_ids=input_ids if self.cfg.use_moe_ffn else None,
             )
+
+        if self.hc_head_reduction is not None:
+            hidden_states = self.hc_head_reduction(hidden_states)
 
         hidden_states = self.model.norm(hidden_states)
         logits: torch.Tensor = self.lm_head(hidden_states)
@@ -420,6 +472,13 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         cos_for_token, sin_for_token = self.rotary_emb(hidden_state, token_position)
         token_position_embeddings = (cos_for_token, sin_for_token)
 
+        if self.cfg.use_hyper_connections:
+            hidden_state = (
+                hidden_state.unsqueeze(2)
+                .expand(batch_size, 1, self.cfg.hc_mult, self.cfg.hidden_size)
+                .contiguous()
+            )
+
         for layer_idx, layer_module in enumerate(self.model.layers):
             # `nn.ModuleList` stores items as `nn.Module`; narrow for mypy so
             # `forward_decode` resolves on the concrete subclass.
@@ -447,6 +506,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 block_position_embeddings=block_position_embeddings,
                 input_ids=input_id if self.cfg.use_moe_ffn else None,
             )
+
+        if self.hc_head_reduction is not None:
+            hidden_state = self.hc_head_reduction(hidden_state)
 
         hidden_state = self.model.norm(hidden_state)
         logits: torch.Tensor = self.lm_head(hidden_state)

@@ -545,3 +545,179 @@ def test_swiglu_backbone_does_not_thread_input_ids_to_layers() -> None:
         layer = model.model.layers[layer_idx]
         assert layer.ffn_type == "swiglu"
         assert not isinstance(layer.mlp, HashRoutedMoEFFN)
+
+
+# ---------- Hyper-Connections integration (V4 paper §2.5) ----------
+
+
+def _make_hc_hybrid_config(
+    *,
+    num_hidden_layers: int = 4,
+    hc_mult: int = 4,
+    use_moe_ffn: bool = False,
+) -> DeepseekV4Config:
+    """4-layer hybrid backbone with HC residual mediation enabled."""
+    return DeepseekV4Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=4,
+        q_lora_rank=32,
+        kv_head_dim=32,
+        rope_head_dim=8,
+        o_num_groups=2,
+        o_lora_rank=32,
+        window_size=8,
+        compress_ratios=(4, 8, 4, 8),
+        index_num_heads=2,
+        index_head_dim=16,
+        index_top_k=2,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        use_moe_ffn=use_moe_ffn,
+        moe_intermediate_size=64 if use_moe_ffn else 0,
+        num_routed_experts=4 if use_moe_ffn else 0,
+        num_activated_experts=2 if use_moe_ffn else 0,
+        num_hash_routed_layers=0,
+        moe_score_func="softmax",
+        moe_route_scale=1.0,
+        n_shared_experts=1 if use_moe_ffn else 0,
+        # HC knobs
+        use_hyper_connections=True,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=20,
+        hc_eps=1e-6,
+    )
+
+
+def test_hc_config_validates_positive_hc_mult() -> None:
+    """`use_hyper_connections=True` rejects hc_mult <= 0."""
+    base_kwargs = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        q_lora_rank=32,
+        kv_head_dim=32,
+        rope_head_dim=8,
+        o_num_groups=2,
+        o_lora_rank=32,
+        window_size=8,
+        compress_ratios=(4, 8, 4, 8),
+        index_num_heads=2,
+        index_head_dim=16,
+        index_top_k=2,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        use_hyper_connections=True,
+        hc_mult=0,  # invalid
+    )
+    with pytest.raises(ValueError, match="hc_mult"):
+        DeepseekV4Config(**base_kwargs)  # type: ignore[arg-type]
+
+
+def test_hc_backbone_layers_carry_hyper_connections_pair() -> None:
+    """Each decoder layer with HC enabled owns hc_attn + hc_ffn instances."""
+    from mini_infer.models.blocks import HyperConnections
+
+    cfg = _make_hc_hybrid_config(hc_mult=4)
+    model = DeepseekV4ForCausalLM(cfg)
+    for layer_idx in range(cfg.num_hidden_layers):
+        layer = model.model.layers[layer_idx]
+        assert layer.use_hyper_connections is True
+        assert isinstance(layer.hc_attn, HyperConnections)
+        assert isinstance(layer.hc_ffn, HyperConnections)
+        # Both share hc_mult, distinct parameter sets.
+        assert layer.hc_attn.hc_mult == cfg.hc_mult
+        assert layer.hc_ffn.hc_mult == cfg.hc_mult
+        assert layer.hc_attn is not layer.hc_ffn
+
+
+def test_hc_backbone_owns_head_reduction_when_hc_enabled() -> None:
+    from mini_infer.models.blocks import HyperConnections  # noqa: F401  (import for clarity)
+    from mini_infer.models.blocks.hyper_connections import HCHeadReduction
+
+    cfg_hc_on = _make_hc_hybrid_config()
+    cfg_hc_off = _make_hybrid_config()
+    model_hc_on = DeepseekV4ForCausalLM(cfg_hc_on)
+    model_hc_off = DeepseekV4ForCausalLM(cfg_hc_off)
+    assert isinstance(model_hc_on.hc_head_reduction, HCHeadReduction)
+    assert model_hc_off.hc_head_reduction is None
+
+
+def test_hc_backbone_runs_prefill_end_to_end() -> None:
+    """HC-enabled V4 backbone runs prefill (B, T) -> (B, T, vocab)."""
+    cfg = _make_hc_hybrid_config(hc_mult=4)
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    batch_size = 1
+    seq_len = 16
+    input_ids = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=torch.long)
+    with torch.inference_mode():
+        logits = model(input_ids)
+    assert logits.shape == (batch_size, seq_len, cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
+
+
+def test_hc_backbone_runs_decode_end_to_end() -> None:
+    """HC-enabled decode through cache: (B, 1) -> (B, 1, vocab)."""
+    cfg = _make_hc_hybrid_config(hc_mult=4)
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    batch_size = 1
+    state_cache = StateCache(
+        build_state_cache_layer_specs(cfg, max_n_compressed=8),
+        batch_size=batch_size,
+    )
+    prefilled_seq_len = 16
+    for layer_idx, compression_ratio in enumerate(cfg.compress_ratios):
+        layer_state = state_cache.layer(layer_idx)
+        layer_state.n_compressed_blocks = prefilled_seq_len // compression_ratio
+        if layer_state.indexer is not None:
+            layer_state.indexer.n_compressed_blocks = prefilled_seq_len // compression_ratio
+    state_cache.start_pos = prefilled_seq_len
+
+    input_id = torch.randint(0, cfg.vocab_size, (batch_size, 1), dtype=torch.long)
+    with torch.inference_mode():
+        logits = model.forward_decode_with_cache(
+            input_id, start_pos=prefilled_seq_len, state_cache=state_cache
+        )
+    assert logits.shape == (batch_size, 1, cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
+
+
+def test_hc_backbone_combines_with_moe_ffn() -> None:
+    """Hyper-Connections AND hash-routed MoE FFN both active in the same model.
+
+    The most V4-faithful configuration shipped: every published primitive
+    is in play (CSA + HCA + sink + grouped output + cache + MoE + HC).
+    """
+    cfg = _make_hc_hybrid_config(hc_mult=4, use_moe_ffn=True)
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    batch_size = 1
+    seq_len = 16
+    input_ids = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=torch.long)
+    with torch.inference_mode():
+        logits = model(input_ids)
+    assert logits.shape == (batch_size, seq_len, cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
+
+
+def test_vanilla_backbone_does_not_carry_hc_instances() -> None:
+    """When `use_hyper_connections=False`, layers leave hc_attn / hc_ffn None."""
+    cfg = _make_hybrid_config()
+    model = DeepseekV4ForCausalLM(cfg)
+    assert cfg.use_hyper_connections is False
+    for layer_idx in range(cfg.num_hidden_layers):
+        layer = model.model.layers[layer_idx]
+        assert layer.use_hyper_connections is False
+        assert layer.hc_attn is None
+        assert layer.hc_ffn is None
