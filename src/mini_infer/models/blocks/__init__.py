@@ -11,6 +11,7 @@ from mini_infer.models.blocks.gqa import GroupedQueryAttention
 from mini_infer.models.blocks.hash_routed_gate import HashRoutedGate
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 from mini_infer.models.blocks.hca import HCAAttention
+from mini_infer.models.blocks.hyper_connections import HyperConnections, hc_split_sinkhorn
 from mini_infer.models.blocks.mixtral_decoder_layer import MixtralDecoderLayer
 from mini_infer.models.blocks.mixtral_moe import MixtralExpert, MoEFFN
 from mini_infer.models.blocks.mla import MLAAttention
@@ -38,6 +39,7 @@ __all__ = [
     "HCAAttention",
     "HashRoutedGate",
     "HashRoutedMoEFFN",
+    "HyperConnections",
     "LightningIndexer",
     "MLAAttention",
     "MixtralDecoderLayer",
@@ -50,5 +52,6 @@ __all__ = [
     "TokenLevelCompressor",
     "TransformerBlock",
     "apply_rotary_pos_emb",
+    "hc_split_sinkhorn",
     "rotate_half",
 ]
