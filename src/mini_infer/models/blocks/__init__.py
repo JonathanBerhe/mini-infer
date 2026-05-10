@@ -8,6 +8,7 @@ from mini_infer.models.blocks.gemma4_decoder_layer import Gemma4DecoderLayer
 from mini_infer.models.blocks.gemma_decoder_layer import GemmaDecoderLayer
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
 from mini_infer.models.blocks.gqa import GroupedQueryAttention
+from mini_infer.models.blocks.hash_routed_gate import HashRoutedGate
 from mini_infer.models.blocks.hca import HCAAttention
 from mini_infer.models.blocks.mixtral_decoder_layer import MixtralDecoderLayer
 from mini_infer.models.blocks.mixtral_moe import MixtralExpert, MoEFFN
@@ -34,6 +35,7 @@ __all__ = [
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HCAAttention",
+    "HashRoutedGate",
     "LightningIndexer",
     "MLAAttention",
     "MixtralDecoderLayer",
