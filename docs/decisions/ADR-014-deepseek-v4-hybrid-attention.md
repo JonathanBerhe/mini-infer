@@ -1,7 +1,17 @@
 # ADR-014: DeepSeek-V4 hybrid attention contribution
 
-Date: 2026-05-08
+Date: 2026-05-08 (initial), 2026-05-10 (full primitive integration)
 Status: Accepted
+
+> **Update (2026-05-10):** the original ADR scoped to "the attention math
+> end-to-end + a runnable hybrid backbone", deferring three primitives
+> as orthogonal stages: MoE FFN with hash routing (§2.2),
+> Hyper-Connections residuals (§2.5), and YaRN long-context RoPE (§3.1).
+> All three have since been implemented and integrated through the
+> registered model class. The "Decision" / "Alternatives Considered" /
+> "Consequences" sections below are kept verbatim as the original
+> trade-off record; the post-update state is summarised in
+> "Update — full primitive integration" at the bottom.
 
 ## Context
 
@@ -223,4 +233,68 @@ total**; all pass.
   `8f90528` (CSA prefill), `c08f3e1` (HCA decode + StateCache),
   `0110253` (CSA decode + StateCache overlap + indexer),
   `4dabeb1` (DeepseekV4ForCausalLM hybrid backbone).
+- Follow-up commits (2026-05-10): `93add37` (cache-aware prefill +
+  unaligned), `6ca690d` (YaRN), `67345ad` (HashRoutedGate),
+  `6b2ddf3` (HashRoutedMoEFFN), `0e02fdf` (decoder MoE integration),
+  `408e65a` (HyperConnections primitive), `eeb1b89` (HC decoder
+  integration).
 - Demo: `scripts/demo_deepseek_v4_hybrid.py`.
+
+## Update — full primitive integration (2026-05-10)
+
+All three primitives originally listed under "Out of scope" / "Alternatives
+Considered" have since been implemented and wired through the model:
+
+**MoE FFN with hash routing** (paper §2.2):
+
+- `HashRoutedGate` (`src/mini_infer/models/blocks/hash_routed_gate.py`):
+  per-token-id `tid2eid` lookup OR top-k of `score_func(scores) + bias`.
+  Three score functions (softmax / sigmoid / softplus_sqrt) with the
+  right renorm rule per V4. Bit-parity (cosine sim ≥ 0.99999, max abs
+  diff < 3e-9) vs reference `Gate` across all six (mode, score_func) cells.
+- `HashRoutedMoEFFN` (`hash_routed_moe_ffn.py`): composes the gate with
+  `MixtralExpert`-shaped MLPs + the V2/V3-style "collapse N shared
+  experts into one MLP" pattern. fp32 routed accumulator matches the
+  reference's `MoE.forward`.
+- Decoder integration: `DeepseekV4DecoderLayer` gains `ffn_type ∈
+  {"swiglu", "hash_moe"}`; per-layer routing mode (hash for the first
+  `cfg.num_hash_routed_layers`, score_topk after) derived from
+  `cfg.is_hash_routed_layer(layer_idx)`. The model's forward methods
+  thread `input_ids` to layers when MoE is enabled.
+
+**Hyper-Connections** (paper §2.5):
+
+- `hc_split_sinkhorn` (`hyper_connections.py`): pure-PyTorch transcription
+  of the reference's tilelang kernel. The kernel stub used by the V4
+  parity tests delegates to this PyTorch impl, making the reference's
+  `Block.hc_pre` / `Block.hc_post` actually runnable in test environments.
+- `HyperConnections`: `(hc_pre, hc_post)` wrapping one sublayer's
+  multi-residual mediation, with the trainable `(fn, base, scale)`
+  parameters. Bit-parity vs reference `Block.hc_pre` / `Block.hc_post`
+  for `hc_mult ∈ {2, 3, 4}`.
+- `HCHeadReduction`: collapses `(B, T, hc_mult, dim) → (B, T, dim)`
+  before the LM head — mirrors `ParallelHead.hc_head`.
+- Decoder integration: `DeepseekV4DecoderLayer` gains
+  `use_hyper_connections=True` mode owning per-sublayer
+  `HyperConnections` instances. Model expand/reduce: embed output
+  `(B, T, dim)` is unsqueezed + expanded to `(B, T, hc_mult, dim)` on
+  entry and reduced via `HCHeadReduction` before the LM head.
+
+**YaRN long-context RoPE** (paper §3.1):
+
+- Wired into `RotaryEmbedding` as a wave-frequency correction that
+  activates past `yarn_original_seq_len`. Same primitive serves V2 / V3
+  / V4. (Stage `6ca690d`, separate from the V4 attention work — the
+  `RotaryEmbedding` block now carries it.)
+
+**Status of "load real V4 weights":** every published architecture
+component is now implemented and wired. The remaining gate is the
+V4 weight release; `load_weights` will become a name-mapping
+exercise (`hf_state_dict[k]` → our parameter tree) once the upstream
+checkpoints are public.
+
+**Test count:** 100+ V4-related tests across the primitives + the
+integration matrix. The `test_hc_backbone_combines_with_moe_ffn` test
+in `tests/unit/test_models_deepseek_v4.py` exercises a single
+`DeepseekV4ForCausalLM` with all primitives composed (CSA + HCA + sink
++ grouped output + cache + hash MoE + Hyper-Connections) end-to-end.
