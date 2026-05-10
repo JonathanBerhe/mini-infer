@@ -358,3 +358,190 @@ def test_forward_decode_with_cache_rejects_layer_count_mismatch() -> None:
     input_id = torch.randint(0, cfg.vocab_size, (1, 1), dtype=torch.long)
     with pytest.raises(ValueError, match="layers"):
         model.forward_decode_with_cache(input_id, start_pos=8, state_cache=state_cache)
+
+
+# ---------- MoE FFN integration (V4 paper §2.2) ----------
+
+
+def _make_moe_hybrid_config(
+    *,
+    num_hidden_layers: int = 4,
+    num_hash_routed_layers: int = 2,
+) -> DeepseekV4Config:
+    """4-layer hybrid (CSA, HCA, CSA, HCA) backbone with `HashRoutedMoEFFN`.
+
+    Layers `[0, num_hash_routed_layers)` use hash routing; the rest use
+    score-topk. With `num_hash_routed_layers=2` and 4 layers total, we
+    cover both routing modes in the same forward pass.
+    """
+    return DeepseekV4Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,  # SwiGLU only — ignored when use_moe_ffn=True
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=4,
+        q_lora_rank=32,
+        kv_head_dim=32,
+        rope_head_dim=8,
+        o_num_groups=2,
+        o_lora_rank=32,
+        window_size=8,
+        compress_ratios=(4, 8, 4, 8),
+        index_num_heads=2,
+        index_head_dim=16,
+        index_top_k=2,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        # MoE knobs
+        use_moe_ffn=True,
+        moe_intermediate_size=64,
+        num_routed_experts=4,
+        num_activated_experts=2,
+        num_hash_routed_layers=num_hash_routed_layers,
+        moe_score_func="softmax",
+        moe_route_scale=1.0,
+        n_shared_experts=1,
+    )
+
+
+def test_moe_config_validates_required_fields() -> None:
+    """`use_moe_ffn=True` rejects zero/negative MoE knobs."""
+    base_kwargs = dict(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        q_lora_rank=32,
+        kv_head_dim=32,
+        rope_head_dim=8,
+        o_num_groups=2,
+        o_lora_rank=32,
+        window_size=8,
+        compress_ratios=(4, 8, 4, 8),
+        index_num_heads=2,
+        index_head_dim=16,
+        index_top_k=2,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        use_moe_ffn=True,
+        moe_intermediate_size=64,
+        num_routed_experts=4,
+        num_activated_experts=2,
+    )
+    # Missing num_routed_experts:
+    with pytest.raises(ValueError, match="num_routed_experts"):
+        DeepseekV4Config(**{**base_kwargs, "num_routed_experts": 0})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="num_activated_experts"):
+        DeepseekV4Config(**{**base_kwargs, "num_activated_experts": 0})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="moe_intermediate_size"):
+        DeepseekV4Config(**{**base_kwargs, "moe_intermediate_size": 0})  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="num_hash_routed_layers"):
+        DeepseekV4Config(**{**base_kwargs, "num_hash_routed_layers": 99})  # type: ignore[arg-type]
+
+
+def test_is_hash_routed_layer_returns_false_when_moe_disabled() -> None:
+    """SwiGLU (no MoE) backbones report no layer as hash-routed."""
+    cfg = _make_hybrid_config()
+    assert cfg.use_moe_ffn is False
+    for layer_idx in range(cfg.num_hidden_layers):
+        assert cfg.is_hash_routed_layer(layer_idx) is False
+
+
+def test_is_hash_routed_layer_partitions_layers_correctly() -> None:
+    cfg = _make_moe_hybrid_config(num_hidden_layers=4, num_hash_routed_layers=2)
+    assert cfg.is_hash_routed_layer(0) is True
+    assert cfg.is_hash_routed_layer(1) is True
+    assert cfg.is_hash_routed_layer(2) is False
+    assert cfg.is_hash_routed_layer(3) is False
+
+
+def test_moe_backbone_uses_hash_routed_moe_ffn_in_each_layer() -> None:
+    """With `use_moe_ffn=True`, every decoder layer's `mlp` is a `HashRoutedMoEFFN`."""
+    from mini_infer.models.blocks import HashRoutedMoEFFN
+
+    cfg = _make_moe_hybrid_config(num_hash_routed_layers=2)
+    model = DeepseekV4ForCausalLM(cfg)
+    for layer_idx in range(cfg.num_hidden_layers):
+        layer_mlp = model.model.layers[layer_idx].mlp
+        assert isinstance(layer_mlp, HashRoutedMoEFFN), (
+            f"layer {layer_idx} mlp should be HashRoutedMoEFFN, got {type(layer_mlp).__name__}"
+        )
+
+
+def test_moe_backbone_per_layer_routing_mode_matches_config() -> None:
+    cfg = _make_moe_hybrid_config(num_hidden_layers=4, num_hash_routed_layers=2)
+    model = DeepseekV4ForCausalLM(cfg)
+    for layer_idx in range(cfg.num_hidden_layers):
+        layer_mlp = model.model.layers[layer_idx].mlp
+        expected_mode = "hash" if layer_idx < 2 else "score_topk"
+        assert layer_mlp.gate.routing_mode == expected_mode  # type: ignore[union-attr]
+
+
+def test_moe_backbone_runs_prefill_end_to_end() -> None:
+    """Prefill 16 tokens through a 4-layer CSA/HCA stack with hash-routed MoE FFN."""
+    cfg = _make_moe_hybrid_config(num_hash_routed_layers=2)
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    batch_size = 1
+    seq_len = 16
+    input_ids = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=torch.long)
+    with torch.inference_mode():
+        logits = model(input_ids)
+    assert logits.shape == (batch_size, seq_len, cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
+
+
+def test_moe_backbone_runs_decode_end_to_end() -> None:
+    """Decode through the MoE backbone with both hash and score-topk layers active.
+
+    Verifies `input_ids` threads through `forward_decode_with_cache` -> per-layer
+    `forward_decode` -> `HashRoutedMoEFFN.forward(hidden_state, input_ids)`.
+    """
+    cfg = _make_moe_hybrid_config(num_hash_routed_layers=2)
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    batch_size = 1
+    state_cache = StateCache(
+        build_state_cache_layer_specs(cfg, max_n_compressed=8),
+        batch_size=batch_size,
+    )
+    # Simulate post-prefill state at start_pos=16.
+    prefilled_seq_len = 16
+    for layer_idx, compression_ratio in enumerate(cfg.compress_ratios):
+        layer_state = state_cache.layer(layer_idx)
+        layer_state.n_compressed_blocks = prefilled_seq_len // compression_ratio
+        if layer_state.indexer is not None:
+            layer_state.indexer.n_compressed_blocks = prefilled_seq_len // compression_ratio
+    state_cache.start_pos = prefilled_seq_len
+
+    input_id = torch.randint(0, cfg.vocab_size, (batch_size, 1), dtype=torch.long)
+    with torch.inference_mode():
+        logits = model.forward_decode_with_cache(
+            input_id, start_pos=prefilled_seq_len, state_cache=state_cache
+        )
+    assert logits.shape == (batch_size, 1, cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
+
+
+def test_swiglu_backbone_does_not_thread_input_ids_to_layers() -> None:
+    """When `use_moe_ffn=False`, `input_ids` is NOT passed to the layer FFN.
+
+    Sanity check: the SwiGLU FFN doesn't accept input_ids; passing them
+    would surface as a TypeError. We rely on the model's `use_moe_ffn`
+    branch to gate the threading. The existing `test_forward_runs_through_*`
+    tests prove the SwiGLU path runs; this one verifies layers were
+    constructed with `ffn_type="swiglu"`.
+    """
+    from mini_infer.models.blocks import HashRoutedMoEFFN
+
+    cfg = _make_hybrid_config()  # use_moe_ffn defaults to False
+    model = DeepseekV4ForCausalLM(cfg)
+    for layer_idx in range(cfg.num_hidden_layers):
+        layer = model.model.layers[layer_idx]
+        assert layer.ffn_type == "swiglu"
+        assert not isinstance(layer.mlp, HashRoutedMoEFFN)

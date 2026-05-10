@@ -112,6 +112,23 @@ class DeepseekV4Config:
     yarn_scaling_factor: float = 1.0
     yarn_beta_fast: int = 32
     yarn_beta_slow: int = 1
+    # MoE FFN (V4 paper §2.2). Defaults to "off" (every layer uses SwiGLU)
+    # for backward compatibility — existing tests built before MoE landed
+    # leave `use_moe_ffn=False`. When enabled, every decoder layer uses
+    # `HashRoutedMoEFFN`; the routing mode is per-layer:
+    #   - `layer_idx < num_hash_routed_layers`: hash routing (per-token-id
+    #     lookup table). The first few layers route deterministically by
+    #     token id — the V4 paper's design choice for hash routing as an
+    #     "early identification" pass.
+    #   - else: score-topk routing.
+    use_moe_ffn: bool = False
+    moe_intermediate_size: int = 0
+    num_routed_experts: int = 0
+    num_activated_experts: int = 0
+    num_hash_routed_layers: int = 0
+    moe_score_func: str = "softmax"
+    moe_route_scale: float = 1.0
+    n_shared_experts: int = 0
 
     def __post_init__(self) -> None:
         if len(self.compress_ratios) != self.num_hidden_layers:
@@ -119,10 +136,38 @@ class DeepseekV4Config:
                 f"compress_ratios length ({len(self.compress_ratios)}) must equal "
                 f"num_hidden_layers ({self.num_hidden_layers})"
             )
+        if self.use_moe_ffn:
+            if self.num_routed_experts <= 0:
+                raise ValueError(
+                    "use_moe_ffn=True requires num_routed_experts > 0; "
+                    f"got {self.num_routed_experts}"
+                )
+            if self.num_activated_experts <= 0:
+                raise ValueError(
+                    "use_moe_ffn=True requires num_activated_experts > 0; "
+                    f"got {self.num_activated_experts}"
+                )
+            if self.moe_intermediate_size <= 0:
+                raise ValueError(
+                    "use_moe_ffn=True requires moe_intermediate_size > 0; "
+                    f"got {self.moe_intermediate_size}"
+                )
+            if self.num_hash_routed_layers > self.num_hidden_layers:
+                raise ValueError(
+                    f"num_hash_routed_layers ({self.num_hash_routed_layers}) cannot exceed "
+                    f"num_hidden_layers ({self.num_hidden_layers})"
+                )
 
     def is_csa_layer(self, layer_idx: int) -> bool:
         """CSA layers have compression_ratio == 4 (paper §4.2.1)."""
         return self.compress_ratios[layer_idx] == DeepseekV4DecoderLayer.CSA_COMPRESSION_RATIO
+
+    def is_hash_routed_layer(self, layer_idx: int) -> bool:
+        """Layers `[0, num_hash_routed_layers)` use hash routing per V4 §2.2.
+
+        Always False if `use_moe_ffn` is False (no MoE -> no routing distinction).
+        """
+        return self.use_moe_ffn and layer_idx < self.num_hash_routed_layers
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> DeepseekV4Config:
@@ -213,27 +258,49 @@ class _DeepseekV4InnerModel(nn.Module):
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
-            [
-                DeepseekV4DecoderLayer(
-                    hidden_size=cfg.hidden_size,
-                    num_heads=cfg.num_attention_heads,
-                    q_lora_rank=cfg.q_lora_rank,
-                    kv_head_dim=cfg.kv_head_dim,
-                    rope_head_dim=cfg.rope_head_dim,
-                    num_groups=cfg.o_num_groups,
-                    o_lora_rank=cfg.o_lora_rank,
-                    window_size=cfg.window_size,
-                    compression_ratio=cfg.compress_ratios[layer_idx],
-                    intermediate_size=cfg.intermediate_size,
-                    rms_norm_eps=cfg.rms_norm_eps,
-                    index_num_heads=cfg.index_num_heads,
-                    index_head_dim=cfg.index_head_dim,
-                    index_top_k=cfg.index_top_k,
-                )
-                for layer_idx in range(cfg.num_hidden_layers)
-            ]
+            [self._build_layer(cfg, layer_idx) for layer_idx in range(cfg.num_hidden_layers)]
         )
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+
+    @staticmethod
+    def _build_layer(cfg: DeepseekV4Config, layer_idx: int) -> DeepseekV4DecoderLayer:
+        """Construct one decoder layer, picking SwiGLU vs MoE FFN per the config.
+
+        With `cfg.use_moe_ffn=True`, layer `i` gets:
+          - `moe_routing_mode="hash"` if `i < cfg.num_hash_routed_layers`
+            (V4 paper §2.2: early layers route by token-id lookup).
+          - `moe_routing_mode="score_topk"` otherwise.
+        """
+        layer_kwargs: dict[str, object] = dict(
+            hidden_size=cfg.hidden_size,
+            num_heads=cfg.num_attention_heads,
+            q_lora_rank=cfg.q_lora_rank,
+            kv_head_dim=cfg.kv_head_dim,
+            rope_head_dim=cfg.rope_head_dim,
+            num_groups=cfg.o_num_groups,
+            o_lora_rank=cfg.o_lora_rank,
+            window_size=cfg.window_size,
+            compression_ratio=cfg.compress_ratios[layer_idx],
+            intermediate_size=cfg.intermediate_size,
+            rms_norm_eps=cfg.rms_norm_eps,
+            index_num_heads=cfg.index_num_heads,
+            index_head_dim=cfg.index_head_dim,
+            index_top_k=cfg.index_top_k,
+        )
+        if cfg.use_moe_ffn:
+            routing_mode = "hash" if cfg.is_hash_routed_layer(layer_idx) else "score_topk"
+            layer_kwargs.update(
+                ffn_type="hash_moe",
+                moe_intermediate_size=cfg.moe_intermediate_size,
+                num_routed_experts=cfg.num_routed_experts,
+                num_activated_experts=cfg.num_activated_experts,
+                moe_routing_mode=routing_mode,
+                moe_score_func=cfg.moe_score_func,
+                moe_route_scale=cfg.moe_route_scale,
+                moe_vocab_size=cfg.vocab_size if routing_mode == "hash" else None,
+                n_shared_experts=cfg.n_shared_experts,
+            )
+        return DeepseekV4DecoderLayer(**layer_kwargs)  # type: ignore[arg-type]
 
 
 @register_model
@@ -310,6 +377,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 hidden_states,
                 token_position_embeddings,
                 compressed_position_embeddings,
+                input_ids=input_ids if self.cfg.use_moe_ffn else None,
             )
 
         hidden_states = self.model.norm(hidden_states)
@@ -377,6 +445,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 layer_idx=layer_idx,
                 token_position_embeddings=token_position_embeddings,
                 block_position_embeddings=block_position_embeddings,
+                input_ids=input_id if self.cfg.use_moe_ffn else None,
             )
 
         hidden_state = self.model.norm(hidden_state)
