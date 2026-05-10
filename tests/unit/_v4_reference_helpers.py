@@ -90,8 +90,29 @@ def make_kernel_stub() -> types.ModuleType:
         out = torch.einsum("bhmk,bmkd->bmhd", weights, gathered.float())
         return out.to(q.dtype)
 
-    def hc_split_sinkhorn(*args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("hc_split_sinkhorn not exercised by V4 attention parity")
+    def hc_split_sinkhorn(
+        mixes: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        hc_mult: int = 4,
+        sinkhorn_iters: int = 20,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # PyTorch transcription of the kernel — used by the V4 Hyper-Connections
+        # parity test. Imports lazily so this stub module doesn't pull in the
+        # owned mini_infer block at module-collection time.
+        from mini_infer.models.blocks.hyper_connections import (
+            hc_split_sinkhorn as owned_hc_split_sinkhorn,
+        )
+
+        return owned_hc_split_sinkhorn(
+            mixes,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            eps=eps,
+        )
 
     kernel.act_quant = act_quant  # type: ignore[attr-defined]
     kernel.fp4_act_quant = fp4_act_quant  # type: ignore[attr-defined]
