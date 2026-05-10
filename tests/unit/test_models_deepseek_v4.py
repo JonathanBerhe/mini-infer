@@ -299,6 +299,56 @@ def test_forward_decode_with_cache_handles_simultaneous_flush_layers() -> None:
         assert state_cache.layer(layer_idx).n_compressed_blocks == expected_count
 
 
+def test_v4_config_yarn_defaults_disable_correction() -> None:
+    """Default config has YaRN disabled (`yarn_original_seq_len == 0`),
+    matching V4-Pro/Flash at <= 4k context."""
+    cfg = _make_hybrid_config()
+    assert cfg.yarn_original_seq_len == 0
+    assert cfg.yarn_scaling_factor == 1.0
+    assert cfg.yarn_beta_fast == 32
+    assert cfg.yarn_beta_slow == 1
+
+
+def test_v4_model_threads_yarn_into_rotary_embedding() -> None:
+    """When YaRN is configured, the model's `inv_freq` table reflects the
+    correction (low-frequency components scaled by `1/factor`)."""
+    head_dim = 8  # rope_head_dim in the demo config
+    factor = 4.0
+    cfg = DeepseekV4Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        q_lora_rank=32,
+        kv_head_dim=32,
+        rope_head_dim=head_dim,
+        o_num_groups=2,
+        o_lora_rank=32,
+        window_size=8,
+        compress_ratios=(4, 8),
+        index_num_heads=2,
+        index_head_dim=16,
+        index_top_k=2,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        yarn_original_seq_len=512,
+        yarn_scaling_factor=factor,
+    )
+    model = DeepseekV4ForCausalLM(cfg)
+    standard_inv_freq = 1.0 / (
+        cfg.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+    )
+    # The lowest-frequency component (largest index) should be scaled by ~1/factor.
+    yarn_lowest = model.rotary_emb.inv_freq[-1].item()
+    standard_lowest = standard_inv_freq[-1].item()
+    assert abs(yarn_lowest * factor - standard_lowest) < 0.01 * standard_lowest, (
+        f"YaRN should scale lowest-freq by 1/factor; "
+        f"got {yarn_lowest} vs unscaled {standard_lowest}"
+    )
+
+
 def test_forward_decode_with_cache_rejects_layer_count_mismatch() -> None:
     cfg = _make_hybrid_config(num_hidden_layers=4)
     model = DeepseekV4ForCausalLM(cfg).eval()

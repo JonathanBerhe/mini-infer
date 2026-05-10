@@ -5,10 +5,140 @@ helper (`apply_rotary_pos_emb`) match HF's Llama/Qwen2 implementation
 exactly. Mirroring the math is important because per-token logits must
 match across the boundary between owned-model-code and the HF reference
 parity tests.
+
+Includes optional **YaRN** long-context correction (`Yet another RoPE
+extensioN`, [Peng et al. 2023](https://arxiv.org/abs/2309.00071)) used
+by DeepSeek-V2 / V3 / V4 / Kimi-K2 to extend the rotation past their
+training context. YaRN blends the high-frequency `inv_freq` components
+unchanged with the low-frequency components scaled by `1/factor` via a
+smooth linear ramp between two correction-wavelength thresholds —
+preserving short-range positions while preventing aliasing past the
+original training length.
 """
+
+import math
 
 import torch
 from torch import nn
+
+
+def _yarn_correction_dim(
+    num_rotations: float, head_dim: int, base: float, max_seq_len: int
+) -> float:
+    """Frequency-component index that completes `num_rotations` full rotations
+    over a sequence of length `max_seq_len`.
+
+    From the YaRN paper: a frequency component `f_i = base^(-2i/dim)` rotates
+    `max_seq_len * f_i / (2 * pi)` times across the sequence. Setting that to
+    `num_rotations` and solving for `i` gives the formula below. The two
+    thresholds (`beta_fast = 32`, `beta_slow = 1`) bound the smooth blend
+    region: components rotating much more than `beta_fast` times stay
+    high-frequency (unscaled); components rotating less than `beta_slow`
+    times get the `1/factor` extension.
+    """
+    return head_dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+
+def _yarn_correction_range(
+    beta_fast: int, beta_slow: int, head_dim: int, base: float, max_seq_len: int
+) -> tuple[int, int]:
+    """The `(low, high)` index range over `head_dim // 2` components where the
+    smooth ramp blends scaled and unscaled frequencies.
+
+    `beta_fast` corresponds to the lower-bound rotation count (so the
+    `low` index is for the highest-frequency end of the ramp); `beta_slow`
+    is the upper-bound (the lower-frequency end). Indices clamp into
+    `[0, head_dim - 1]` so degenerate corner cases don't escape the ramp.
+    """
+    low_index = math.floor(_yarn_correction_dim(beta_fast, head_dim, base, max_seq_len))
+    high_index = math.ceil(_yarn_correction_dim(beta_slow, head_dim, base, max_seq_len))
+    return max(low_index, 0), min(high_index, head_dim - 1)
+
+
+def _yarn_linear_ramp(min_index: int, max_index: int, num_components: int) -> torch.Tensor:
+    """A `(num_components,)` ramp tensor: 0.0 below `min_index`, 1.0 above
+    `max_index`, linearly blending in between.
+
+    Used as the YaRN smoothing window — components below `min_index` are
+    fully high-frequency (unscaled), above `max_index` are fully low-frequency
+    (scaled by `1/factor`), and between the two get a linear blend.
+    """
+    # Degenerate ramp (min_index == max_index) would divide by zero; nudge
+    # the upper bound by 0.001 so the boundary point lands cleanly at 0.
+    max_index_effective = max_index + 0.001 if min_index == max_index else float(max_index)
+    component_indices = torch.arange(num_components, dtype=torch.float32)
+    linear_func = (component_indices - min_index) / (max_index_effective - min_index)
+    return linear_func.clamp(0.0, 1.0)
+
+
+def apply_yarn_correction(
+    inv_freq: torch.Tensor,
+    *,
+    head_dim: int,
+    base: float,
+    original_seq_len: int,
+    scaling_factor: float,
+    beta_fast: int = 32,
+    beta_slow: int = 1,
+) -> torch.Tensor:
+    """Return YaRN-corrected `inv_freq` for long-context RoPE.
+
+    Math (matches DeepSeek-V4 reference's `precompute_freqs_cis` exactly):
+        smooth = 1 - linear_ramp(low, high, head_dim // 2)
+        inv_freq_yarn = inv_freq / scaling_factor * (1 - smooth) + inv_freq * smooth
+
+    The smooth tensor is 1.0 for high-frequency components (kept unscaled)
+    and 0.0 for low-frequency components (scaled by `1/scaling_factor`).
+    The linear blend in between lives over the range determined by
+    `beta_fast` / `beta_slow`.
+
+    Args:
+        inv_freq: `(head_dim // 2,)` standard RoPE inverse frequencies.
+        head_dim: Full RoPE head dimension (used to size the ramp).
+        base: RoPE base (used to compute correction-wavelength indices).
+        original_seq_len: The pre-extension training context length. YaRN
+            applies on top of frequencies that originally fit `original_seq_len`
+            tokens; pass `0` to disable YaRN (returns `inv_freq` unchanged).
+        scaling_factor: Multiplier for the new context length over the
+            original (e.g. `40.0` for 4k -> 160k extension).
+        beta_fast, beta_slow: Rotation-count thresholds bounding the smooth
+            ramp. Defaults match the YaRN paper / DeepSeek configs.
+
+    Returns:
+        `(head_dim // 2,)` YaRN-corrected inverse frequencies. Same dtype
+        and device as the input. Returns `inv_freq` unchanged when
+        `original_seq_len == 0`.
+    """
+    if original_seq_len <= 0:
+        return inv_freq
+    if scaling_factor <= 0:
+        raise ValueError(f"scaling_factor must be positive, got {scaling_factor}")
+    num_components = head_dim // 2
+    if inv_freq.shape[-1] != num_components:
+        raise ValueError(
+            f"inv_freq has {inv_freq.shape[-1]} components but head_dim={head_dim} "
+            f"implies {num_components}"
+        )
+
+    low_index, high_index = _yarn_correction_range(
+        beta_fast=beta_fast,
+        beta_slow=beta_slow,
+        head_dim=head_dim,
+        base=base,
+        max_seq_len=original_seq_len,
+    )
+    ramp = _yarn_linear_ramp(low_index, high_index, num_components).to(
+        device=inv_freq.device, dtype=inv_freq.dtype
+    )
+    # In the inv_freq table, INDEX 0 is the HIGHEST frequency (shortest
+    # wavelength). The correction range `[low, high]` lives among the
+    # low-frequency end — `low_index` covers the components that complete
+    # `beta_fast=32` rotations, `high_index` covers `beta_slow=1`. So
+    # `ramp == 0` at low indices (high freq, keep unscaled) and `ramp == 1`
+    # at high indices (low freq, scale by 1/factor). The blend follows the
+    # reference's `smooth = 1 - ramp` convention.
+    smooth = 1.0 - ramp  # 1.0 at high frequency (unscaled), 0.0 at low frequency (scaled)
+    return inv_freq / scaling_factor * (1.0 - smooth) + inv_freq * smooth
 
 
 class RotaryEmbedding(nn.Module):
@@ -26,7 +156,39 @@ class RotaryEmbedding(nn.Module):
         head_dim: int,
         base: float = 10000.0,
         partial_rotary_factor: float = 1.0,
+        *,
+        yarn_original_seq_len: int = 0,
+        yarn_scaling_factor: float = 1.0,
+        yarn_beta_fast: int = 32,
+        yarn_beta_slow: int = 1,
     ) -> None:
+        """Build the inverse-frequency table.
+
+        YaRN long-context correction (DeepSeek-V2 / V3 / V4 / Kimi-K2,
+        [Peng et al. 2023](https://arxiv.org/abs/2309.00071)) is opt-in:
+
+            - `yarn_original_seq_len = 0` (default): no YaRN. Standard
+              `inv_freq = base^(-2i/head_dim)`.
+            - `yarn_original_seq_len > 0`: apply `apply_yarn_correction`
+              with the given factor and beta thresholds. The corrected
+              `inv_freq` keeps high-frequency components (short-range
+              positions) intact and divides low-frequency components by
+              `yarn_scaling_factor` so they don't alias past the
+              extended context.
+
+        Standard kwargs:
+            head_dim: Full RoPE head dimension (must be even).
+            base: RoPE base, default 10000.0.
+            partial_rotary_factor: Fraction of `head_dim` that actually
+                rotates. The rest keep zero inv_freq (cos=1, sin=0,
+                no-op rotation). Used by Gemma 4 global layers.
+
+        YaRN kwargs:
+            yarn_original_seq_len: pre-extension training context. `0` disables.
+            yarn_scaling_factor: ratio between extended and original lengths.
+            yarn_beta_fast / yarn_beta_slow: rotation-count thresholds for
+                the smooth blend ramp. Defaults match the YaRN paper.
+        """
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
@@ -43,6 +205,18 @@ class RotaryEmbedding(nn.Module):
         rotated = 1.0 / (
             base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / head_dim)
         )
+        if yarn_original_seq_len > 0:
+            # YaRN reshapes inv_freq for the rotated dims; the nope tail
+            # (zeros) is unaffected.
+            rotated = apply_yarn_correction(
+                rotated,
+                head_dim=2 * rope_angles,
+                base=base,
+                original_seq_len=yarn_original_seq_len,
+                scaling_factor=yarn_scaling_factor,
+                beta_fast=yarn_beta_fast,
+                beta_slow=yarn_beta_slow,
+            )
         nope_pad = head_dim // 2 - rope_angles
         if nope_pad > 0:
             inv_freq = torch.cat([rotated, torch.zeros(nope_pad, dtype=torch.float32)])

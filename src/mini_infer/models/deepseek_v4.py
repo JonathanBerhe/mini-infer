@@ -103,6 +103,15 @@ class DeepseekV4Config:
     rms_norm_eps: float
     rope_theta: float
     tie_word_embeddings: bool
+    # YaRN long-context RoPE (V4 paper §3.1). Disabled (no-op) when
+    # `yarn_original_seq_len == 0`. The reference's `ModelArgs` carries
+    # these as `original_seq_len`, `rope_factor`, `beta_fast`, `beta_slow`;
+    # we expose mini-infer-style names that the `RotaryEmbedding` block
+    # already accepts. Defaults map to "no YaRN".
+    yarn_original_seq_len: int = 0
+    yarn_scaling_factor: float = 1.0
+    yarn_beta_fast: int = 32
+    yarn_beta_slow: int = 1
 
     def __post_init__(self) -> None:
         if len(self.compress_ratios) != self.num_hidden_layers:
@@ -160,6 +169,14 @@ class DeepseekV4Config:
             rms_norm_eps=float(_pick("rms_norm_eps", "norm_eps", default_value=1e-6)),
             rope_theta=float(rope_theta_raw),
             tie_word_embeddings=bool(getattr(hf_config, "tie_word_embeddings", False)),
+            yarn_original_seq_len=int(
+                _pick("yarn_original_seq_len", "original_seq_len", default_value=0)
+            ),
+            yarn_scaling_factor=float(
+                _pick("yarn_scaling_factor", "rope_factor", default_value=1.0)
+            ),
+            yarn_beta_fast=int(_pick("yarn_beta_fast", "beta_fast", default_value=32)),
+            yarn_beta_slow=int(_pick("yarn_beta_slow", "beta_slow", default_value=1)),
         )
 
 
@@ -233,7 +250,16 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         # Single rotary table for all layers (same `rope_theta`). Per-layer
         # `compressed_position_embeddings` are sliced from this table at
         # block positions — see `forward` below.
-        self.rotary_emb = RotaryEmbedding(cfg.rope_head_dim, base=cfg.rope_theta)
+        # Single rotary table for all layers — YaRN parameters are no-ops
+        # when `yarn_original_seq_len == 0` (the default).
+        self.rotary_emb = RotaryEmbedding(
+            cfg.rope_head_dim,
+            base=cfg.rope_theta,
+            yarn_original_seq_len=cfg.yarn_original_seq_len,
+            yarn_scaling_factor=cfg.yarn_scaling_factor,
+            yarn_beta_fast=cfg.yarn_beta_fast,
+            yarn_beta_slow=cfg.yarn_beta_slow,
+        )
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
