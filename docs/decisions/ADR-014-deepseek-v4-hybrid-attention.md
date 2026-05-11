@@ -184,10 +184,10 @@ demo script).
 
 **Negative:**
 
-- `DeepseekV4ForCausalLM.load_weights` raises until V4 weights are
-  public AND we add Hyper-Connections + MoE/hash-routing FFN. The
-  artifact is "validated attention math + runnable backbone on
-  synthetic configs", not "runs DeepSeek-V4-Pro out of the box."
+- The V4-Flash artefact is "TP-ready backbone with structurally
+  complete `load_weights` (FP8 dequant + MoE renames)", not "runs
+  DeepSeek-V4-Pro out of the box". NVFP4-packed expert dequant and
+  real-weight validation on 2× B200 are still ahead.
 - The `StateCache` lives outside `PagedKVCache`. A request that
   spans both V4 attention and a model that uses paged KV would need
   two separate cache lifecycles. Not a concern today; a real
@@ -288,14 +288,15 @@ Considered" have since been implemented and wired through the model:
   `RotaryEmbedding` block now carries it.)
 
 **Status of "load real V4 weights":** every published architecture
-component is now implemented and wired. **The remaining gate is
-tensor parallelism**, NOT the weight release — V4 checkpoints are
-public on HF (V4-Flash 158 GB, V4-Pro 862 GB) but exceed any single
-GPU's HBM. `load_weights` raises today; once mini-infer has multi-GPU
-TP infrastructure (column/row-parallel linears, expert-parallel MoE,
-vocab-parallel embedding/LM-head) the weight loader becomes a name-
-mapping exercise plus FP8/FP4 dequant. Cleanest test target:
-V4-Flash on 2× B200.
+component is implemented and wired, the multi-GPU tensor parallelism
+infrastructure (column/row-parallel linears, expert-parallel MoE,
+vocab-parallel embedding/LM-head) is in tree under
+`src/mini_infer/distributed/`, and `load_weights` walks the HF
+state_dict (FP8 e4m3fn dequant to BF16, V2/V3-style MoE expert
+renames, TP-aware dispatch through `load_state_dict_with_tp`).
+V4-Flash's NVFP4-packed expert weights raise a clear error pending
+the dequant kernel — that and a real-weight Modal smoke on 2× B200
+are the last steps.
 
 **Test count:** 100+ V4-related tests across the primitives + the
 integration matrix. The `test_hc_backbone_combines_with_moe_ffn` test
