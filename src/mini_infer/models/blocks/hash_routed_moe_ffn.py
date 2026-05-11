@@ -20,6 +20,11 @@ Shared-expert handling mirrors `MoEFFN`: V4's reference asserts
 shortcut from `MoEFFN` so the same primitive serves both V2/V3
 (`n_shared_experts == 2`) and V4 (`n_shared_experts == 1`) layouts.
 
+Expert parallelism: same scheme as `MoEFFN`. Gate (including the
+hash-routing tid2eid table) replicated; routed experts sharded across
+ranks; partial routed sums all-reduced; shared expert replicated and
+added once after the reduce.
+
 Bit-parity vs the reference's `MoE.forward` on synthetic input across
 both routing modes and the supported score functions.
 """
@@ -29,6 +34,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from mini_infer.distributed.comm import all_reduce_sum
+from mini_infer.distributed.linear import _split_size
 from mini_infer.models.blocks.hash_routed_gate import (
     HashRoutedGate,
     RoutingMode,
@@ -55,12 +62,26 @@ class HashRoutedMoEFFN(nn.Module):
         shared_intermediate_size: int | None = None,
     ) -> None:
         super().__init__()
+        from mini_infer.distributed.group import get_rank, get_world_size
+
+        world_size = get_world_size()
+        num_experts_per_rank = _split_size(
+            num_routed_experts, world_size, "num_routed_experts"
+        )
         self.hidden_size = hidden_size
-        self.num_routed_experts = num_routed_experts
+        self.num_routed_experts = num_routed_experts  # global
+        self.num_experts_per_rank = num_experts_per_rank
         self.num_activated_experts = num_activated_experts
         self.routing_mode = routing_mode
+        self.world_size = world_size
+        self.rank = get_rank()
+        # Range of *global* expert indices this rank owns.
+        self.local_expert_start = self.rank * num_experts_per_rank
+        self.local_expert_end = self.local_expert_start + num_experts_per_rank
 
         # Gate handles all (mode, score_func, route_scale, renorm) variants.
+        # Replicated under TP — every rank routes from the same hidden state
+        # and picks the same activated experts.
         self.gate = HashRoutedGate(
             hidden_size=hidden_size,
             num_routed_experts=num_routed_experts,
@@ -71,10 +92,10 @@ class HashRoutedMoEFFN(nn.Module):
             vocab_size=vocab_size,
         )
 
-        # One MLP per routed expert, named to match Mixtral's safetensors layout
-        # so the eventual V4 weight loader can do an identity rename.
+        # Local experts only. `self.experts[local_idx]` has global index
+        # `local_expert_start + local_idx`.
         self.experts = nn.ModuleList(
-            [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_routed_experts)]
+            [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_experts_per_rank)]
         )
 
         # Shared expert(s): always-on MLP added to the routed sum. V4 uses one;
@@ -120,9 +141,11 @@ class HashRoutedMoEFFN(nn.Module):
         # the per-expert weighted sums.
         routed_accumulator = torch.zeros_like(flat_hidden_states, dtype=torch.float32)
 
-        for expert_index in range(self.num_routed_experts):
-            # `(token_pos, top_k_slot)` pairs that selected `expert_index`.
-            token_positions, top_k_slots = torch.where(per_token_expert_indices == expert_index)
+        # Loop only over experts this rank owns; the all-reduce below
+        # accumulates partial sums across ranks.
+        for local_idx in range(self.num_experts_per_rank):
+            global_idx = self.local_expert_start + local_idx
+            token_positions, top_k_slots = torch.where(per_token_expert_indices == global_idx)
             if token_positions.numel() == 0:
                 continue
             tokens_for_this_expert = flat_hidden_states[token_positions]
@@ -132,12 +155,16 @@ class HashRoutedMoEFFN(nn.Module):
             # `w2` is linear and `w` is a per-row scalar, so the scalar
             # commutes through the down-projection.
             weighted_expert_output = (
-                self.experts[expert_index](tokens_for_this_expert) * weights_for_this_expert
+                self.experts[local_idx](tokens_for_this_expert) * weights_for_this_expert
             )
             routed_accumulator.index_add_(0, token_positions, weighted_expert_output.float())
 
+        # All-reduce the routed sum across ranks; no-op at world_size=1.
+        routed_accumulator = all_reduce_sum(routed_accumulator)
         result = routed_accumulator.to(flat_hidden_states.dtype)
 
+        # Shared expert is replicated and produces the same value on every
+        # rank; add it AFTER the reduce so it isn't scaled by world_size.
         if self.shared_experts is not None:
             result = result + self.shared_experts(flat_hidden_states)
 
