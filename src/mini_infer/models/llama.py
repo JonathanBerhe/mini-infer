@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from torch import nn
 
+from mini_infer.distributed.embedding import VocabParallelEmbedding
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import RMSNorm, RotaryEmbedding, TransformerBlock
@@ -87,7 +89,8 @@ class _LlamaInnerModel(nn.Module):
 
     def __init__(self, cfg: LlamaConfig) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        # Vocab-parallel under TP; bit-identical to `nn.Embedding` at ws=1.
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
@@ -116,8 +119,15 @@ class LlamaForCausalLM(BaseCausalLM):
         self.cfg = cfg
         self.model = _LlamaInnerModel(cfg)
         self.rotary_emb = RotaryEmbedding(cfg.head_dim, base=cfg.rope_theta)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        # Column-parallel along the vocab axis; gather_output=True returns the
+        # full logits tensor so sampling stays single-tensor.
+        self.lm_head = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
+        )
         if cfg.tie_word_embeddings:
+            # Both `embed_tokens.weight` and `lm_head.weight` are stored as
+            # `(vocab_per_rank, hidden_size)`; aliasing one to the other still
+            # works under TP. At ws=1 it's exactly the un-sharded tying.
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(

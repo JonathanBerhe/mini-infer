@@ -30,6 +30,7 @@ from mini_infer.distributed.group import (
     is_initialized,
 )
 from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
+from mini_infer.distributed.loader import load_state_dict_with_tp
 
 __all__ = [
     "ColumnParallelLinear",
@@ -45,4 +46,5 @@ __all__ = [
     "get_world_size",
     "init_distributed",
     "is_initialized",
+    "load_state_dict_with_tp",
 ]
