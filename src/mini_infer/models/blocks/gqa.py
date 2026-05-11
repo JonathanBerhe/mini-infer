@@ -8,6 +8,15 @@ forward = one call to `packed_attention_forward`.
 
 Parameter names (`q_proj`, `k_proj`, `v_proj`, `o_proj`) align with HF
 Llama/Qwen2 so weight loading via `state_dict` is identity-rename.
+
+Tensor parallelism
+------------------
+Q/K/V projections are column-parallel along the head axis (each rank
+holds a contiguous slice of heads). The output projection is
+row-parallel along its input. This is the standard Megatron pairing
+for self-attention: one all-reduce per block, none in between. The
+softmax / SDPA kernel itself operates per-head and so is unchanged
+under TP. At `world_size=1` both wrappers reduce to plain `nn.Linear`.
 """
 
 from __future__ import annotations
@@ -18,6 +27,7 @@ import torch
 from torch import nn
 
 from mini_infer.cache.packed_attention import packed_attention_forward
+from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mini_infer.models.blocks.rope import apply_rotary_pos_emb
 
 if TYPE_CHECKING:
@@ -47,16 +57,30 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim
         self.layer_idx = layer_idx
         self.attention_k_eq_v = attention_k_eq_v
-        self.q_proj = nn.Linear(hidden_size, num_q_heads * head_dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
+        # Q/K/V are column-parallel: each rank gets `num_*_heads // world_size`
+        # heads. Both `num_q_heads` and `num_kv_heads` therefore must divide
+        # `world_size`; ColumnParallelLinear validates that internally
+        # (because it sees `num_*_heads * head_dim` as the output dim and
+        # each head is `head_dim` columns).
+        self.q_proj = ColumnParallelLinear(
+            hidden_size, num_q_heads * head_dim, bias=qkv_bias
+        )
+        self.k_proj = ColumnParallelLinear(
+            hidden_size, num_kv_heads * head_dim, bias=qkv_bias
+        )
         # Gemma 4 full layers (`attention_k_eq_v=True`) reuse the post-`k_proj`
         # tensor as V — there is no separate v_proj parameter. We keep the
         # attribute as `None` so weight-load filters can detect the absence.
         if attention_k_eq_v:
-            self.v_proj: nn.Linear | None = None
+            self.v_proj: ColumnParallelLinear | None = None
         else:
-            self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
-        self.o_proj = nn.Linear(num_q_heads * head_dim, hidden_size, bias=False)
+            self.v_proj = ColumnParallelLinear(
+                hidden_size, num_kv_heads * head_dim, bias=qkv_bias
+            )
+        # Row-parallel output projection: input dim is the sharded
+        # head-merged activation, output is the replicated hidden state.
+        # Triggers exactly one all-reduce per attention block.
+        self.o_proj = RowParallelLinear(num_q_heads * head_dim, hidden_size, bias=False)
         # Optional per-head norm on Q and K AFTER projection and BEFORE RoPE.
         # Gemma 3+ uses GemmaRMSNorm(head_dim) here; the names `q_norm` and
         # `k_norm` align with HF's parameter naming so weight loading is

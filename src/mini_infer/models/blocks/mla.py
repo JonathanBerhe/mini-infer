@@ -35,6 +35,17 @@ Forward shape walk (single-token, batch=1):
   → broadcast k_rope to all heads, cat with k_nope → K
   → SDPA(Q, K, V) where V has different head_dim than Q/K
   → o_proj
+
+Tensor parallelism
+------------------
+Per-head matrices are column-parallel along the head axis (`q_proj` /
+`q_b_proj`, `kv_b_proj` — the latter holds K-nope + V interleaved per
+head). The shared low-rank inputs are replicated: `q_a_proj` /
+`q_a_layernorm` (latent fed into `q_b_proj`) and `kv_a_proj_with_mqa` /
+`kv_a_layernorm` (single shared MQA head, very small). The output
+projection `o_proj` is row-parallel and triggers the single all-reduce
+per attention block. At `world_size=1` all column/row-parallel layers
+reduce to plain `nn.Linear`.
 """
 
 from __future__ import annotations
@@ -46,6 +57,7 @@ import torch
 from torch import nn
 
 from mini_infer.cache.mla_attention import mla_packed_attention_forward
+from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_interleaved_rotary_pos_emb
 
@@ -71,8 +83,20 @@ class MLAAttention(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
+        from mini_infer.distributed.group import get_world_size
+
+        world_size = get_world_size()
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by world_size={world_size}"
+            )
+
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        # `num_heads_local` is what reshape sites in `forward` use: each
+        # rank only owns `num_heads // world_size` heads after the
+        # column-parallel projections.
+        self.num_heads_local = num_heads // world_size
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -82,25 +106,42 @@ class MLAAttention(nn.Module):
         self.layer_idx = layer_idx
         # Q path: direct projection (V2-Lite, q_lora_rank=None) or
         # low-rank decomposition (V2 / V3, q_lora_rank=1536).
+        # When sharded under TP: `q_a_proj` (input -> q_lora_rank latent) is
+        # *replicated* — the latent is small and downstream `q_b_proj` is
+        # column-parallel by head, which is what shards the heavy compute.
         if q_lora_rank is None:
-            self.q_proj = nn.Linear(hidden_size, num_heads * self.qk_head_dim, bias=False)
+            self.q_proj = ColumnParallelLinear(
+                hidden_size, num_heads * self.qk_head_dim, bias=False
+            )
             self.q_a_proj: nn.Linear | None = None
             self.q_a_layernorm: RMSNorm | None = None
-            self.q_b_proj: nn.Linear | None = None
+            self.q_b_proj: ColumnParallelLinear | None = None
         else:
             self.q_proj = None  # type: ignore[assignment]
             self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=attention_bias)
             self.q_a_layernorm = RMSNorm(q_lora_rank, eps=rms_norm_eps)
-            self.q_b_proj = nn.Linear(q_lora_rank, num_heads * self.qk_head_dim, bias=False)
+            self.q_b_proj = ColumnParallelLinear(
+                q_lora_rank, num_heads * self.qk_head_dim, bias=False
+            )
         # KV-down: one combined projection emitting [kv_latent | k_rope].
+        # Both branches are *single-head* (MQA pattern) — sharding makes no
+        # sense, so `kv_a_proj_with_mqa` is replicated. Storage cost is
+        # negligible (rank ~512 + ~64 dims).
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden_size, kv_lora_rank + qk_rope_head_dim, bias=attention_bias
         )
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
+        # `kv_b_proj` decompresses the shared latent into `num_heads`-many
+        # `(K-nope, V)` pairs. Column-parallel by head: each rank produces
+        # its head slice of the decompressed K and V.
+        self.kv_b_proj = ColumnParallelLinear(
             kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim), bias=False
         )
-        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=attention_bias)
+        # Row-parallel output: input is the per-head-sharded attention output
+        # (already split along the head axis). One all-reduce per block.
+        self.o_proj = RowParallelLinear(
+            num_heads * v_head_dim, hidden_size, bias=attention_bias
+        )
         # Softmax scale: 1/sqrt(qk_head_dim) per HF source line 335.
         self._softmax_scale = 1.0 / math.sqrt(self.qk_head_dim)
 
@@ -125,8 +166,11 @@ class MLAAttention(nn.Module):
             assert self.q_a_layernorm is not None
             assert self.q_b_proj is not None
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        # q: (1, total_q, num_heads * qk_head_dim) → (1, num_heads, total_q, qk_head_dim)
-        q = q.view(1, total_q, self.num_heads, self.qk_head_dim).transpose(1, 2)
+        # q: (1, total_q, num_heads_local * qk_head_dim)
+        # → (1, num_heads_local, total_q, qk_head_dim). Under TP each rank
+        # only computed its slice of heads; the reshape uses the *local*
+        # head count so the leading "num_heads" axis isn't off by 1/ws.
+        q = q.view(1, total_q, self.num_heads_local, self.qk_head_dim).transpose(1, 2)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # --- KV-down: project + split ---
@@ -168,27 +212,30 @@ class MLAAttention(nn.Module):
         # apply layernorm + decompression.
         kv_latent_2d = kv_latent_full.squeeze(1)  # (total_k, kv_lora_rank)
         decompressed = self.kv_b_proj(self.kv_a_layernorm(kv_latent_2d))
-        # decompressed: (total_k, num_heads * (qk_nope_head_dim + v_head_dim))
+        # decompressed: (total_k, num_heads_local * (qk_nope_head_dim + v_head_dim))
+        # `kv_b_proj` is column-parallel by head, so the per-rank output
+        # already only carries this rank's head slice.
         decompressed = decompressed.view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            -1, self.num_heads_local, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope_full, v_full = torch.split(
             decompressed, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
-        # k_nope_full: (total_k, num_heads, qk_nope_head_dim)
-        # v_full:      (total_k, num_heads, v_head_dim)
+        # k_nope_full: (total_k, num_heads_local, qk_nope_head_dim)
+        # v_full:      (total_k, num_heads_local, v_head_dim)
 
-        # Broadcast k_rope to all heads: (total_k, 1, qk_rope) -> (total_k, num_heads, qk_rope).
-        k_rope_broadcast = k_rope_full.expand(-1, self.num_heads, -1)
+        # Broadcast k_rope to this rank's local heads (k_rope is replicated
+        # across ranks since `kv_a_proj_with_mqa` itself is replicated).
+        k_rope_broadcast = k_rope_full.expand(-1, self.num_heads_local, -1)
         # Concatenate to form full K with head_dim = qk_head_dim (192 V2-Lite).
         k_full = torch.cat([k_nope_full, k_rope_broadcast], dim=-1)
-        # k_full: (total_k, num_heads, qk_head_dim)
+        # k_full: (total_k, num_heads_local, qk_head_dim)
 
-        # Pack Q for the dispatcher.
+        # Pack Q for the dispatcher (per-rank head slice).
         q_packed = (
             torch.cat([q_nope, q_pe], dim=-1)
             .transpose(1, 2)
-            .reshape(total_q, self.num_heads, self.qk_head_dim)
+            .reshape(total_q, self.num_heads_local, self.qk_head_dim)
             .contiguous()
         )
 
@@ -201,8 +248,12 @@ class MLAAttention(nn.Module):
             cu_seqlens_k,
             self._softmax_scale,
         )
-        # attn_out: (total_q, num_heads, v_head_dim)
+        # attn_out: (total_q, num_heads_local, v_head_dim)
 
-        attn_out = attn_out.reshape(1, total_q, self.num_heads * self.v_head_dim).contiguous()
+        attn_out = attn_out.reshape(
+            1, total_q, self.num_heads_local * self.v_head_dim
+        ).contiguous()
+        # `o_proj` is row-parallel: takes the (col-sharded) attention
+        # output and all-reduces to recover the full hidden state.
         out: torch.Tensor = self.o_proj(attn_out)
         return out

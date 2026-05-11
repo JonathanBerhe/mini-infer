@@ -15,12 +15,20 @@ of shape `(num_heads,)`. The actual softmax-incorporation lives in
 `hca_mqa_with_sink` (the dispatcher) — keeping the parameter and the
 math-that-uses-it separate matches how the reference V4 code organizes
 the same idea.
+
+Tensor parallelism
+------------------
+Sharded by head: each rank owns `num_heads // world_size` sink logits,
+indexed in lock-step with that rank's Q heads. At `world_size=1` the
+parameter is the full `(num_heads,)` tensor.
 """
 
 from __future__ import annotations
 
 import torch
 from torch import nn
+
+from mini_infer.distributed.group import get_rank, get_world_size
 
 
 class AttentionSink(nn.Module):
@@ -32,6 +40,29 @@ class AttentionSink(nn.Module):
         super().__init__()
         if num_heads <= 0:
             raise ValueError(f"num_heads must be positive, got {num_heads}")
+        world_size = get_world_size()
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by world_size={world_size}"
+            )
         # Reference initializes from `torch.empty` and trains; for inference-time
         # block construction we start at zero (a near-no-op sink, ~1/Nk weight).
-        self.sink_logits = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+        self.num_heads = num_heads
+        self.num_heads_per_rank = num_heads // world_size
+        self.world_size = world_size
+        self.rank = get_rank()
+        self.sink_logits = nn.Parameter(
+            torch.zeros(self.num_heads_per_rank, dtype=torch.float32)
+        )
+
+    def load_full_logits(self, full_logits: torch.Tensor) -> None:
+        """Slice this rank's per-head logit range out of the full vector."""
+        if full_logits.shape != (self.num_heads,):
+            raise ValueError(
+                f"full_logits shape {tuple(full_logits.shape)} does not match expected "
+                f"({self.num_heads},)"
+            )
+        start = self.rank * self.num_heads_per_rank
+        end = start + self.num_heads_per_rank
+        with torch.no_grad():
+            self.sink_logits.copy_(full_logits[start:end].to(self.sink_logits.dtype))

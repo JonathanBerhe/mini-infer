@@ -1,5 +1,17 @@
 """Heavily Compressed Attention (HCA) — DeepSeek-V4 §2.3.
 
+Tensor parallelism
+------------------
+- Q low-rank path: `q_a_proj` and `q_a_layernorm` are replicated (small
+  latent), `q_b_proj` is column-parallel by head. Each rank computes
+  its `num_heads // world_size` head slice.
+- SWA K=V branch (`swa_kv_proj` / `kv_norm`): replicated. The branch is
+  a single shared head (MQA-pattern), too small to shard usefully.
+- Main compressor: replicated (single shared head).
+- Sink: per-head, sharded.
+- Grouped output: sharded by group (one all-reduce at the end).
+At `world_size=1` everything is bit-identical to the un-sharded form.
+
 HCA is one of two attention modes V4 alternates between (the other is
 CSA — Compressed Sparse Attention, which adds a Lightning Indexer +
 top-k selector). HCA itself has three KV branches that all feed a
@@ -56,6 +68,7 @@ import torch
 from torch import nn
 
 from mini_infer.cache.hca_attention import hca_mqa_with_sink
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4 import (
@@ -214,8 +227,17 @@ class HCAAttention(nn.Module):
             raise ValueError(f"rope_head_dim must be even, got {rope_head_dim}")
         if window_size <= 0:
             raise ValueError(f"window_size must be positive, got {window_size}")
+        from mini_infer.distributed.group import get_world_size
+
+        world_size = get_world_size()
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by world_size={world_size}"
+            )
+
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.num_heads_local = num_heads // world_size
         self.q_lora_rank = q_lora_rank
         self.kv_head_dim = kv_head_dim
         self.rope_head_dim = rope_head_dim
@@ -224,12 +246,13 @@ class HCAAttention(nn.Module):
         self.rms_norm_eps = rms_norm_eps
 
         # --- Q low-rank path: H -> wq_a -> q_norm -> wq_b -> per-head q-norm (no scale).
-        # The first norm has a learnable weight (RMSNorm on q_lora_rank); the second is a
-        # plain rsqrt-of-mean-square per-head (no parameter) applied AFTER `wq_b`.
-        # The reference does it this way — both norms matter for parity.
+        # `q_a_proj` produces a small replicated latent; `q_b_proj` expands
+        # it to per-head Q with column-parallel sharding by head.
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=rms_norm_eps)
-        self.q_b_proj = nn.Linear(q_lora_rank, num_heads * kv_head_dim, bias=False)
+        self.q_b_proj = ColumnParallelLinear(
+            q_lora_rank, num_heads * kv_head_dim, bias=False
+        )
 
         # --- SWA K=V branch: H -> swa_kv_proj (single shared head) -> kv_norm -> partial RoPE.
         self.swa_kv_proj = nn.Linear(hidden_size, kv_head_dim, bias=False)
@@ -279,13 +302,15 @@ class HCAAttention(nn.Module):
             `(B, T, hidden_size)` attention output.
         """
         bsz, seqlen, _ = hidden_states.shape
-        n_h = self.num_heads
+        # Use the per-rank head count; under TP, the column-parallel
+        # `q_b_proj` only emitted `num_heads_local * c` features.
+        n_h_local = self.num_heads_local
         c = self.kv_head_dim
         rd = self.rope_head_dim
 
         # ---- Q low-rank + per-head q-norm (no scale) + partial RoPE ----
         q = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q).view(bsz, seqlen, n_h, c)
+        q = self.q_b_proj(q).view(bsz, seqlen, n_h_local, c)
         # Per-head q-norm: rsqrt(mean(q^2)) without learnable weight. Reference
         # does this AFTER `wq_b` and AFTER reshaping into per-head form.
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
@@ -383,7 +408,7 @@ class HCAAttention(nn.Module):
         Caller must `state_cache.advance_start_pos(seqlen)` after this returns.
         """
         batch_size, seqlen, _ = hidden_states.shape
-        num_heads = self.num_heads
+        num_heads_local = self.num_heads_local
         kv_head_dim = self.kv_head_dim
         rope_dim = self.rope_head_dim
         n_win = self.window_size
@@ -395,9 +420,9 @@ class HCAAttention(nn.Module):
                 f"layer {layer_idx}: state cache has an indexer slot but HCA layers don't use one"
             )
 
-        # ---- Q low-rank + per-head q-norm + partial RoPE (same as forward) ----
+        # ---- Q low-rank + per-head q-norm + partial RoPE (per-rank head slice) ----
         q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
-        q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads, kv_head_dim)
+        q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads_local, kv_head_dim)
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
             q.dtype
         )
@@ -528,7 +553,7 @@ class HCAAttention(nn.Module):
         bsz, seqlen_in, _ = hidden_state.shape
         if seqlen_in != 1:
             raise ValueError(f"forward_decode expects seqlen=1, got {seqlen_in}")
-        n_h = self.num_heads
+        n_h_local = self.num_heads_local
         c = self.kv_head_dim
         rd = self.rope_head_dim
         n_win = self.window_size
@@ -538,7 +563,7 @@ class HCAAttention(nn.Module):
 
         # ---- Q (same low-rank + per-head q-norm + partial RoPE as prefill) ----
         q_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
-        q = self.q_b_proj(q_latent).view(bsz, 1, n_h, c)
+        q = self.q_b_proj(q_latent).view(bsz, 1, n_h_local, c)
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
             q.dtype
         )

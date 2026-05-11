@@ -1,5 +1,12 @@
 """Compressed Sparse Attention (CSA) — DeepSeek-V4 §2.3.
 
+Tensor parallelism
+------------------
+Same scheme as HCA: replicated `q_a_proj` latent + replicated `swa_kv_proj`
++ replicated main compressor, with column-parallel `q_b_proj` (by head)
+and a TP-aware Lightning Indexer (per-head shards) feeding a TP-aware
+grouped output (sharded by group, row-parallel `wo_b`).
+
 CSA is HCA's three-branch design (compressor + sliding window + sink)
 plus a Lightning Indexer that decides *which* compressed entries each
 query gets to see — top-k sparse selection instead of HCA's
@@ -43,6 +50,7 @@ import torch
 from torch import nn
 
 from mini_infer.cache.hca_attention import hca_mqa_with_sink
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.hca import (
     _build_window_decode_topk_idxs,
     _build_window_topk_idxs,
@@ -89,8 +97,17 @@ class CSAAttention(nn.Module):
             raise ValueError(f"rope_head_dim must be even, got {rope_head_dim}")
         if window_size <= 0:
             raise ValueError(f"window_size must be positive, got {window_size}")
+        from mini_infer.distributed.group import get_world_size
+
+        world_size = get_world_size()
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by world_size={world_size}"
+            )
+
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.num_heads_local = num_heads // world_size
         self.q_lora_rank = q_lora_rank
         self.kv_head_dim = kv_head_dim
         self.rope_head_dim = rope_head_dim
@@ -101,7 +118,8 @@ class CSAAttention(nn.Module):
         # --- Q low-rank path (shared latent reused by the indexer below) ---
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=rms_norm_eps)
-        self.q_b_proj = nn.Linear(q_lora_rank, num_heads * kv_head_dim, bias=False)
+        # Column-parallel by head: each rank gets `num_heads_local` Q heads.
+        self.q_b_proj = ColumnParallelLinear(q_lora_rank, num_heads * kv_head_dim, bias=False)
 
         # --- SWA K=V (single shared head) ---
         self.swa_kv_proj = nn.Linear(hidden_size, kv_head_dim, bias=False)
@@ -154,15 +172,15 @@ class CSAAttention(nn.Module):
         its Q rotation and the compressed table for its own compressor.
         """
         bsz, seqlen, _ = hidden_states.shape
-        n_h = self.num_heads
+        n_h_local = self.num_heads_local
         c = self.kv_head_dim
         rd = self.rope_head_dim
 
         # ---- Q low-rank latent (shared with the indexer's `wq_b`) ----
         q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
 
-        # ---- Full Q + per-head q-norm (no scale) + partial RoPE ----
-        q = self.q_b_proj(q_lora_latent).view(bsz, seqlen, n_h, c)
+        # ---- Full Q + per-head q-norm (no scale) + partial RoPE (per-rank slice) ----
+        q = self.q_b_proj(q_lora_latent).view(bsz, seqlen, n_h_local, c)
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
             q.dtype
         )
@@ -238,7 +256,7 @@ class CSAAttention(nn.Module):
         seqlen. Caller must `state_cache.advance_start_pos(seqlen)` after.
         """
         batch_size, seqlen, _ = hidden_states.shape
-        num_heads = self.num_heads
+        num_heads_local = self.num_heads_local
         kv_head_dim = self.kv_head_dim
         rope_dim = self.rope_head_dim
         n_win = self.window_size
@@ -252,8 +270,8 @@ class CSAAttention(nn.Module):
         # ---- Q low-rank latent (shared with the indexer) ----
         q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
 
-        # ---- Full Q + per-head q-norm + partial RoPE ----
-        q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads, kv_head_dim)
+        # ---- Full Q + per-head q-norm + partial RoPE (per-rank head slice) ----
+        q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads_local, kv_head_dim)
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
             q.dtype
         )
@@ -384,7 +402,7 @@ class CSAAttention(nn.Module):
         batch_size, seqlen, _ = hidden_state.shape
         if seqlen != 1:
             raise ValueError(f"forward_decode expects seqlen=1, got {seqlen}")
-        num_heads = self.num_heads
+        num_heads_local = self.num_heads_local
         kv_head_dim = self.kv_head_dim
         rope_dim = self.rope_head_dim
         window_size = self.window_size
@@ -399,8 +417,8 @@ class CSAAttention(nn.Module):
         # ---- Q low-rank latent (shared with the indexer's `wq_b`) ----
         q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
 
-        # ---- Full Q + per-head q-norm (no scale) + partial RoPE ----
-        q = self.q_b_proj(q_lora_latent).view(batch_size, 1, num_heads, kv_head_dim)
+        # ---- Full Q + per-head q-norm (no scale) + partial RoPE (per-rank slice) ----
+        q = self.q_b_proj(q_lora_latent).view(batch_size, 1, num_heads_local, kv_head_dim)
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
             q.dtype
         )
