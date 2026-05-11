@@ -103,13 +103,45 @@ def test_is_csa_layer_matches_compress_ratios() -> None:
     assert cfg.is_csa_layer(3) is False
 
 
-def test_load_weights_raises_pending_tensor_parallelism() -> None:
-    """V4 weights are public on HF but won't fit a single GPU; loading needs
-    tensor parallelism (planned but not implemented yet)."""
+def test_load_weights_round_trips_via_state_dict() -> None:
+    """V4 weights pipeline: snapshot a freshly-initialised model's state_dict,
+    construct a second model, load via `load_weights`, and confirm every
+    parameter matches bit-for-bit.
+
+    This exercises the rename-rules + TP-aware load path against synthetic
+    (non-quantised) weights at world_size=1, which is the only environment
+    available to CPU unit tests. The FP8/FP4 dequant + real V4-Flash
+    end-to-end load are validated separately (Modal smoke)."""
     cfg = _make_hybrid_config()
-    model = DeepseekV4ForCausalLM(cfg)
-    with pytest.raises(NotImplementedError, match="tensor parallelism"):
-        DeepseekV4ForCausalLM.load_weights(model, {})
+    source = DeepseekV4ForCausalLM(cfg)
+    source_state_dict = {k: v.detach().clone() for k, v in source.state_dict().items()}
+
+    target = DeepseekV4ForCausalLM(cfg)
+    DeepseekV4ForCausalLM.load_weights(target, source_state_dict)
+
+    for name, target_param in target.named_parameters():
+        source_param = source_state_dict[name]
+        torch.testing.assert_close(target_param.detach(), source_param, rtol=0, atol=0)
+
+
+def test_load_weights_dequantizes_fp8_e4m3fn_weights() -> None:
+    """FP8 (e4m3fn) tensors in the HF state_dict are upcast to BF16 at load."""
+    cfg = _make_hybrid_config()
+    source = DeepseekV4ForCausalLM(cfg).to(torch.bfloat16)
+    target = DeepseekV4ForCausalLM(cfg).to(torch.bfloat16)
+
+    # Snapshot weights, then re-cast one matrix to FP8 to exercise the dequant.
+    state_dict = {k: v.detach().clone() for k, v in source.state_dict().items()}
+    fp8_key = next(
+        k for k, v in state_dict.items() if v.ndim == 2 and v.numel() > 0
+    )
+    state_dict[fp8_key] = state_dict[fp8_key].to(torch.float8_e4m3fn)
+
+    DeepseekV4ForCausalLM.load_weights(target, state_dict)
+    # After load the parameter should be BF16 (the model's working dtype),
+    # not FP8.
+    loaded_param = dict(target.named_parameters())[fp8_key]
+    assert loaded_param.dtype == torch.bfloat16
 
 
 # ---------- Per-layer dispatch ----------
