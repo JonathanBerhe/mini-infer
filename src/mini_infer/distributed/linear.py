@@ -49,11 +49,18 @@ def _split_size(total: int, world_size: int, axis_name: str) -> int:
     return total // world_size
 
 
-class ColumnParallelLinear(nn.Module):
+class ColumnParallelLinear(nn.Linear):
     """Linear layer sharded along the output dimension.
 
     Per-rank weight shape: `[out_features // world_size, in_features]`
     Per-rank output shape: `[..., out_features // world_size]`
+
+    Subclasses `nn.Linear` so that anywhere the codebase asks
+    `isinstance(m, nn.Linear)` (e.g. the int8 quantizer's module-walk),
+    a TP-aware linear at `world_size=1` is recognised and treated as
+    the plain `nn.Linear` it is bit-equivalent to. Quantizing under
+    `world_size > 1` doesn't make sense yet — we'll address that when
+    we ship a TP-aware Int8Linear.
 
     Args:
         in_features: input dim (replicated; same on every rank).
@@ -75,38 +82,25 @@ class ColumnParallelLinear(nn.Module):
         gather_output: bool = False,
         dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.gather_output = gather_output
-
         world_size = get_world_size()
+        out_features_per_rank = _split_size(out_features, world_size, "out_features")
+        # `nn.Linear.__init__` allocates `weight` of shape
+        # `[out_features_per_rank, in_features]` and `bias` of shape
+        # `[out_features_per_rank]`. We then overwrite `out_features` to
+        # the FULL dim so external callers (loaders, repr) see the
+        # logical / un-sharded value.
+        super().__init__(
+            in_features,
+            out_features_per_rank,
+            bias=bias,
+            dtype=dtype,
+        )
+        # Re-record the full output dim for the loader / external API.
+        self.out_features = out_features
+        self.out_features_per_rank = out_features_per_rank
+        self.gather_output = gather_output
         self.world_size = world_size
         self.rank = get_rank()
-        self.out_features_per_rank = _split_size(out_features, world_size, "out_features")
-
-        # Weight shape mirrors `nn.Linear`'s `[out_features, in_features]`,
-        # just with the `out_features` axis sliced.
-        weight_dtype = dtype if dtype is not None else torch.get_default_dtype()
-        self.weight = nn.Parameter(
-            torch.empty(self.out_features_per_rank, in_features, dtype=weight_dtype)
-        )
-        if bias:
-            self.bias: nn.Parameter | None = nn.Parameter(
-                torch.empty(self.out_features_per_rank, dtype=weight_dtype)
-            )
-        else:
-            self.register_parameter("bias", None)
-
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        # Match `nn.Linear`'s default initialisation so untrained sanity
-        # tests (the ones that just want a non-NaN forward pass) still
-        # behave like a vanilla `nn.Linear`.
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
 
     def load_full_weight(
         self, full_weight: torch.Tensor, full_bias: torch.Tensor | None = None
@@ -149,7 +143,7 @@ class ColumnParallelLinear(nn.Module):
         return local_output
 
 
-class RowParallelLinear(nn.Module):
+class RowParallelLinear(nn.Linear):
     """Linear layer sharded along the input dimension.
 
     Per-rank weight shape: `[out_features, in_features // world_size]`
@@ -157,6 +151,10 @@ class RowParallelLinear(nn.Module):
         the upstream column-parallel layer).
     Per-rank output shape: `[..., out_features]` (replicated, after
         all-reduce).
+
+    Subclasses `nn.Linear` for the same isinstance-detection reason as
+    `ColumnParallelLinear`. At `world_size=1` it's bit-equivalent to
+    plain `nn.Linear`.
 
     Args:
         in_features: full input dim (sharded; per-rank holds 1/world_size).
@@ -178,33 +176,23 @@ class RowParallelLinear(nn.Module):
         input_is_parallel: bool = True,
         dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.input_is_parallel = input_is_parallel
-
         world_size = get_world_size()
+        in_features_per_rank = _split_size(in_features, world_size, "in_features")
+        # `nn.Linear.__init__` allocates `weight` of shape
+        # `[out_features, in_features_per_rank]` (which is what we want
+        # for row-parallel) and `bias` of shape `[out_features]`.
+        super().__init__(
+            in_features_per_rank,
+            out_features,
+            bias=bias,
+            dtype=dtype,
+        )
+        # Re-record the full input dim for the loader / external API.
+        self.in_features = in_features
+        self.in_features_per_rank = in_features_per_rank
+        self.input_is_parallel = input_is_parallel
         self.world_size = world_size
         self.rank = get_rank()
-        self.in_features_per_rank = _split_size(in_features, world_size, "in_features")
-
-        weight_dtype = dtype if dtype is not None else torch.get_default_dtype()
-        self.weight = nn.Parameter(
-            torch.empty(out_features, self.in_features_per_rank, dtype=weight_dtype)
-        )
-        if bias:
-            self.bias: nn.Parameter | None = nn.Parameter(
-                torch.empty(out_features, dtype=weight_dtype)
-            )
-        else:
-            self.register_parameter("bias", None)
-
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
 
     def load_full_weight(
         self, full_weight: torch.Tensor, full_bias: torch.Tensor | None = None

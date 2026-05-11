@@ -31,8 +31,13 @@ from mini_infer.distributed.group import get_rank, get_world_size
 from mini_infer.distributed.linear import _split_size
 
 
-class VocabParallelEmbedding(nn.Module):
+class VocabParallelEmbedding(nn.Embedding):
     """Embedding sharded along the vocabulary axis.
+
+    Subclasses `nn.Embedding` so callers that walk modules looking for
+    `isinstance(m, nn.Embedding)` (any future quantizer, weight tying
+    detection, etc.) treat us as the plain embedding we are at
+    `world_size=1`.
 
     Args:
         vocab_size: full vocabulary size (sharded across ranks).
@@ -47,28 +52,21 @@ class VocabParallelEmbedding(nn.Module):
         *,
         dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__()
+        world_size = get_world_size()
+        vocab_per_rank = _split_size(vocab_size, world_size, "vocab_size")
+        # `nn.Embedding.__init__` builds a `weight` of shape
+        # `[vocab_per_rank, hidden_size]` and initialises it with
+        # `N(0, 1)`. We then overwrite `num_embeddings` to the FULL vocab
+        # size so loader code sees the logical (un-sharded) value.
+        super().__init__(vocab_per_rank, hidden_size, dtype=dtype)
+        self.num_embeddings = vocab_size  # logical, not per-rank
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-
-        world_size = get_world_size()
         self.world_size = world_size
         self.rank = get_rank()
-        self.vocab_per_rank = _split_size(vocab_size, world_size, "vocab_size")
-        self.vocab_start = self.rank * self.vocab_per_rank
-        self.vocab_end = self.vocab_start + self.vocab_per_rank
-
-        weight_dtype = dtype if dtype is not None else torch.get_default_dtype()
-        self.weight = nn.Parameter(
-            torch.empty(self.vocab_per_rank, hidden_size, dtype=weight_dtype)
-        )
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        # `nn.Embedding`'s default initialisation is `N(0, 1)`. Match it so
-        # that an untrained TP-vs-single comparison at world_size=1 is
-        # bit-identical.
-        nn.init.normal_(self.weight, mean=0.0, std=1.0)
+        self.vocab_per_rank = vocab_per_rank
+        self.vocab_start = self.rank * vocab_per_rank
+        self.vocab_end = self.vocab_start + vocab_per_rank
 
     def load_full_weight(self, full_weight: torch.Tensor) -> None:
         """Slice the rank's vocab range out of the full embedding table."""

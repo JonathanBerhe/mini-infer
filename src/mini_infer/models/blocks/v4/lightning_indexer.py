@@ -29,6 +29,16 @@ Compressor for the indexer is its OWN module (separate weights), uses
 `overlap_mode=True` because CSA's compression ratio is `m=4`. Its
 output dim `c_idx` is independent of and typically smaller than the
 main attention's `c` (paper: 128 vs 512).
+
+Tensor parallelism
+------------------
+Per-head matrices are column-parallel along the head axis (`wq_b` and
+`weights_proj` — the latter is `hidden -> num_heads`, sharded along
+output). The indexer's compressor is replicated (single shared head,
+small). The head-summed `index_score` is computed locally on each
+rank's heads, then all-reduced before top-k so every rank picks the
+same indices. At `world_size=1` everything reduces to the un-sharded
+form bit-identically.
 """
 
 from __future__ import annotations
@@ -39,6 +49,8 @@ import torch
 from torch import nn
 from torch.nn.functional import relu
 
+from mini_infer.distributed.comm import all_reduce_sum
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4.compressor import TokenLevelCompressor
 
@@ -76,28 +88,37 @@ class LightningIndexer(nn.Module):
         rms_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        from mini_infer.distributed.group import get_world_size
+
+        world_size = get_world_size()
         if num_heads <= 0:
             raise ValueError(f"num_heads must be positive, got {num_heads}")
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by world_size={world_size}"
+            )
         if top_k <= 0:
             raise ValueError(f"top_k must be positive, got {top_k}")
         if rope_head_dim < 0 or rope_head_dim > head_dim:
             raise ValueError(f"rope_head_dim={rope_head_dim} must be in [0, head_dim={head_dim}]")
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.num_heads_local = num_heads // world_size
         self.head_dim = head_dim
         self.rope_head_dim = rope_head_dim
         self.compression_ratio = compression_ratio
         self.top_k = top_k
 
         # Q up-projection from the SHARED q_lora latent (the main attention's
-        # `q_a_layernorm` output). Reusing the latent saves one large matmul
-        # vs projecting from raw `hidden_states`.
-        self.wq_b = nn.Linear(q_lora_rank, num_heads * head_dim, bias=False)
+        # `q_a_layernorm` output). Column-parallel by head: each rank emits
+        # its own slice of `num_heads_local` per-head Q vectors.
+        self.wq_b = ColumnParallelLinear(q_lora_rank, num_heads * head_dim, bias=False)
         # Per-token, per-head weighting scalar: `(B, T, hidden_size) -> (B, T, n_h_idx)`.
-        # Used to weight the per-head ReLU'd dot products before summing across heads.
-        self.weights_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        # Column-parallel by head (output is per-head): same head sharding as `wq_b`.
+        self.weights_proj = ColumnParallelLinear(hidden_size, num_heads, bias=False)
         # Indexer's own compressor — separate weights from the main attention's compressor.
         # Always overlap-mode (m=4 in V4). Uses `head_dim` as the compressed-entry width.
+        # Single-head and replicated under TP.
         self.compressor = TokenLevelCompressor(
             hidden_size=hidden_size,
             kv_head_dim=head_dim,
@@ -141,31 +162,35 @@ class LightningIndexer(nn.Module):
             masks them to `-inf` in the softmax).
         """
         bsz, seqlen, _ = hidden_states.shape
-        n_h = self.num_heads
+        n_h_local = self.num_heads_local
         d = self.head_dim
         m = self.compression_ratio
 
         # ---- Q: shared latent -> per-head + partial RoPE ----
-        q = self.wq_b(q_lora_latent).view(bsz, seqlen, n_h, d)
+        # Each rank computes its slice of heads via the column-parallel `wq_b`.
+        q = self.wq_b(q_lora_latent).view(bsz, seqlen, n_h_local, d)
         cos_t, sin_t = token_position_embeddings
         if self.rope_head_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, self.rope_head_dim)
 
-        # ---- K: indexer's own compressed KV (shared across heads) ----
+        # ---- K: indexer's own compressed KV (shared across heads, replicated) ----
         compressed_k = self.compressor(hidden_states, compressed_position_embeddings)
         # compressed_k: (B, n_compressed, head_dim)
         n_compressed = compressed_k.shape[1]
 
-        # ---- Per-head per-token weighting scalars ----
-        weights = self.weights_proj(hidden_states) * self._weight_scale  # (B, T, n_h)
+        # ---- Per-head per-token weighting scalars (per-rank slice of heads) ----
+        weights = self.weights_proj(hidden_states) * self._weight_scale  # (B, T, n_h_local)
 
         # ---- Score: per-head dot-product, ReLU'd, weighted-summed across heads ----
-        # einsum: (B, T, n_h, d) x (B, n_compressed, d) -> (B, T, n_h, n_compressed)
+        # einsum: (B, T, n_h_local, d) x (B, n_compressed, d) -> (B, T, n_h_local, n_compressed)
         per_head_score = torch.einsum("bthd,bkd->bthk", q.float(), compressed_k.float())
         per_head_score = relu(per_head_score)
-        # Weighted sum across heads: (B, T, n_h, n_compressed) * (B, T, n_h, 1) summed over n_h.
-        index_score = (per_head_score * weights.unsqueeze(-1)).sum(dim=2)
-        # index_score: (B, T, n_compressed)
+        # Weighted sum across this rank's heads. Under TP each rank holds
+        # only its head slice's contribution; we all-reduce so every rank
+        # has the full cross-head score before top-k.
+        local_index_score = (per_head_score * weights.unsqueeze(-1)).sum(dim=2)
+        index_score = all_reduce_sum(local_index_score)
+        # index_score: (B, T, n_compressed) — replicated after the reduce.
 
         # ---- Causal mask: query at position t can only see compressed blocks j < (t+1)/m ----
         cutoff = (torch.arange(1, seqlen + 1, device=hidden_states.device) // m).unsqueeze(
@@ -229,12 +254,12 @@ class LightningIndexer(nn.Module):
               remainder + previous-overlap (always overlap mode).
         """
         batch_size, seqlen, _ = hidden_states.shape
-        num_heads = self.num_heads
+        num_heads_local = self.num_heads_local
         head_dim = self.head_dim
         compression_ratio = self.compression_ratio
 
-        # ---- Q: shared latent -> per-head + partial RoPE ----
-        q = self.wq_b(q_lora_latent).view(batch_size, seqlen, num_heads, head_dim)
+        # ---- Q: shared latent -> per-head + partial RoPE (per-rank head slice) ----
+        q = self.wq_b(q_lora_latent).view(batch_size, seqlen, num_heads_local, head_dim)
         cos_for_tokens, sin_for_tokens = token_position_embeddings
         if self.rope_head_dim > 0:
             q = apply_partial_rope_last_n_dims(
@@ -264,7 +289,9 @@ class LightningIndexer(nn.Module):
 
         per_head_score = torch.einsum("bthd,bkd->bthk", q.float(), compressed_keys.float())
         per_head_score = relu(per_head_score)
-        index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
+        # Per-rank partial score; all-reduce to recover full cross-head sum.
+        local_index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
+        index_score = all_reduce_sum(local_index_score)
 
         cutoff_per_query = (
             torch.arange(1, seqlen + 1, device=hidden_states.device) // compression_ratio
@@ -334,11 +361,11 @@ class LightningIndexer(nn.Module):
         batch_size, seqlen, _ = hidden_state.shape
         if seqlen != 1:
             raise ValueError(f"forward_decode_step expects seqlen=1, got {seqlen}")
-        num_heads = self.num_heads
+        num_heads_local = self.num_heads_local
         head_dim = self.head_dim
 
-        # ---- Q: shared latent -> per-head + partial RoPE ----
-        q = self.wq_b(q_lora_latent).view(batch_size, 1, num_heads, head_dim)
+        # ---- Q: shared latent -> per-head + partial RoPE (per-rank head slice) ----
+        q = self.wq_b(q_lora_latent).view(batch_size, 1, num_heads_local, head_dim)
         cos_for_token, sin_for_token = token_position_embeddings
         if self.rope_head_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, self.rope_head_dim)
@@ -371,12 +398,16 @@ class LightningIndexer(nn.Module):
             return torch.empty((batch_size, 1, 0), dtype=torch.int64, device=hidden_state.device)
 
         compressed_keys = indexer_state.compressed_kv[:, :n_valid_compressed]
-        per_token_head_weights = self.weights_proj(hidden_state) * self._weight_scale  # (B, 1, n_h)
+        per_token_head_weights = (
+            self.weights_proj(hidden_state) * self._weight_scale
+        )  # (B, 1, n_h_local)
 
         per_head_score = torch.einsum("bthd,bkd->bthk", q.float(), compressed_keys.float())
         per_head_score = relu(per_head_score)
-        index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
-        # index_score: (B, 1, n_valid_compressed)
+        local_index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
+        # All-reduce across ranks to recover the full cross-head sum.
+        index_score = all_reduce_sum(local_index_score)
+        # index_score: (B, 1, n_valid_compressed) — replicated.
 
         actual_top_k = min(self.top_k, n_valid_compressed)
         topk_local_idxs = index_score.topk(actual_top_k, dim=-1)[1]  # (B, 1, actual_top_k)

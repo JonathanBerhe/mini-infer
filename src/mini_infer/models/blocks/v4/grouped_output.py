@@ -16,12 +16,26 @@ Layout matches the reference V4 inference code:
 Edge case `g == 1` reduces to a normal low-rank `o_proj` (one
 big matmul); the parity test sets g=1 to verify monolithic
 equivalence.
+
+Tensor parallelism
+------------------
+Sharded by group: each rank owns `num_groups // world_size` groups.
+`wo_a`'s first axis (`num_groups * o_lora_rank`) is sliced — each rank
+holds the wo_a entries that match its local groups. `wo_b` is
+row-parallel along its input (`num_groups * o_lora_rank`) so the final
+projection emits the full hidden state via one all-reduce. Constraint:
+`num_groups` must be divisible by `world_size`. For V4-Pro with
+`num_groups=2` this caps useful TP at 2 ranks for a single layer's
+output projection; future Phase-2 work can also support sharding
+within a group (along `heads_per_group`) for higher TP factors.
 """
 
 from __future__ import annotations
 
 import torch
 from torch import nn
+
+from mini_infer.distributed.linear import RowParallelLinear, _split_size
 
 
 class GroupedOutputProjection(nn.Module):
@@ -41,39 +55,74 @@ class GroupedOutputProjection(nn.Module):
             raise ValueError(
                 f"num_heads ({num_heads}) must be divisible by num_groups ({num_groups})"
             )
+        from mini_infer.distributed.group import get_rank, get_world_size
+
+        world_size = get_world_size()
+        num_groups_per_rank = _split_size(num_groups, world_size, "num_groups")
         self.num_heads = num_heads
         self.kv_head_dim = kv_head_dim
         self.num_groups = num_groups
+        self.num_groups_per_rank = num_groups_per_rank
         self.heads_per_group = num_heads // num_groups
         self.o_lora_rank = o_lora_rank
         self.hidden_size = hidden_size
+        self.world_size = world_size
+        self.rank = get_rank()
 
         # `wo_a` is logically `(num_groups, o_lora_rank, heads_per_group * kv_head_dim)`
-        # but we store it flat as `(num_groups * o_lora_rank, heads_per_group * kv_head_dim)`
-        # so it loads from a checkpoint via a single `nn.Linear`-shaped weight tensor
-        # (matching the reference `wo_a.weight` exactly).
+        # stored flat as `(num_groups * o_lora_rank, heads_per_group * kv_head_dim)`.
+        # Sharded by group: each rank holds `num_groups_per_rank * o_lora_rank` rows.
         self.wo_a = nn.Parameter(
-            torch.empty(num_groups * o_lora_rank, self.heads_per_group * kv_head_dim)
+            torch.empty(num_groups_per_rank * o_lora_rank, self.heads_per_group * kv_head_dim)
         )
-        # Final per-token projection.
-        self.wo_b = nn.Linear(num_groups * o_lora_rank, hidden_size, bias=False)
+        # `wo_b` is row-parallel: takes the (sharded) `num_groups * o_lora_rank`
+        # input and all-reduces to produce the full hidden state.
+        self.wo_b = RowParallelLinear(num_groups * o_lora_rank, hidden_size, bias=False)
+
+    def load_full_wo_a(self, full_wo_a: torch.Tensor) -> None:
+        """Slice this rank's group rows from the full `wo_a`.
+
+        Full shape: `(num_groups * o_lora_rank, heads_per_group * kv_head_dim)`.
+        """
+        expected_shape = (
+            self.num_groups * self.o_lora_rank,
+            self.heads_per_group * self.kv_head_dim,
+        )
+        if full_wo_a.shape != expected_shape:
+            raise ValueError(
+                f"full_wo_a shape {tuple(full_wo_a.shape)} does not match expected {expected_shape}"
+            )
+        rows_per_rank = self.num_groups_per_rank * self.o_lora_rank
+        start = self.rank * rows_per_rank
+        end = start + rows_per_rank
+        with torch.no_grad():
+            self.wo_a.copy_(full_wo_a[start:end].to(self.wo_a.dtype))
 
     def forward(self, attn_out: torch.Tensor) -> torch.Tensor:
-        """Project `(B, T, num_heads, kv_head_dim)` to `(B, T, hidden_size)`."""
-        bsz, seqlen, n_h, d = attn_out.shape
-        if n_h != self.num_heads or d != self.kv_head_dim:
+        """Project `(B, T, num_heads_local, kv_head_dim)` to `(B, T, hidden_size)`.
+
+        At `world_size=1`, `num_heads_local == num_heads` and the whole
+        chain is bit-identical to the un-sharded grouped-output formula.
+        """
+        bsz, seqlen, n_h_local, d = attn_out.shape
+        expected_n_h_local = self.num_groups_per_rank * self.heads_per_group
+        if n_h_local != expected_n_h_local or d != self.kv_head_dim:
             raise ValueError(
                 f"attn_out shape {attn_out.shape} does not match "
-                f"(num_heads={self.num_heads}, kv_head_dim={self.kv_head_dim})"
+                f"(num_heads_local={expected_n_h_local}, kv_head_dim={self.kv_head_dim})"
             )
         # Group the heads: each group holds `heads_per_group` head outputs flattened.
         per_group = attn_out.view(
-            bsz, seqlen, self.num_groups, self.heads_per_group * self.kv_head_dim
+            bsz,
+            seqlen,
+            self.num_groups_per_rank,
+            self.heads_per_group * self.kv_head_dim,
         )
-        # Per-group projection: (B, T, g, in_features) @ (g, r, in_features) -> (B, T, g, r).
-        wo_a = self.wo_a.view(self.num_groups, self.o_lora_rank, -1)
+        # Per-group projection: (B, T, g_local, in_features) @ (g_local, r, in_features)
+        # -> (B, T, g_local, r). Each rank only computes its own groups.
+        wo_a = self.wo_a.view(self.num_groups_per_rank, self.o_lora_rank, -1)
         out = torch.einsum("bsgd,grd->bsgr", per_group, wo_a)
-        # Concat groups + final projection.
-        out = out.flatten(2)  # (B, T, num_groups * o_lora_rank)
+        out = out.flatten(2)  # (B, T, num_groups_per_rank * o_lora_rank)
+        # `wo_b` is row-parallel: takes the sharded input and all-reduces.
         result: torch.Tensor = self.wo_b(out)
         return result
