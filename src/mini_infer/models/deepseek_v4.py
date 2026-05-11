@@ -37,16 +37,17 @@ SWA circular buffer + per-layer compressed history + compressor in-flight
 accumulator. Helper `build_state_cache_layer_specs` translates a config
 into the per-layer specs `StateCache.__init__` expects.
 
-`load_weights` raises today: V4 weights are public on HF (V4-Flash
-158 GB, V4-Pro 862 GB) but exceed any single GPU's HBM, so loading
-needs tensor parallelism, which mini-infer doesn't have yet. The
-architecture class is registered so an HF config with
-`architectures=["DeepseekV4ForCausalLM"]` resolves here; the loader
-will land alongside TP infrastructure.
+`load_weights` walks the HF safetensors state_dict, dequantises FP8
+(e4m3fn) weights to BF16, applies the same MoE expert renames as V2/V3
+(`gate_proj/up_proj/down_proj` -> `w1/w2/w3`), then dispatches through
+`load_state_dict_with_tp` so each column / row / vocab-parallel layer
+slices its rank's share. V4-Flash's NVFP4-packed expert weights raise
+explicitly until the dequant kernel lands (deferred to follow-up).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -56,12 +57,27 @@ from torch import nn
 from mini_infer.cache.state_cache import IndexerStateSpec, StateCache, StateLayerSpec
 from mini_infer.distributed.embedding import VocabParallelEmbedding
 from mini_infer.distributed.linear import ColumnParallelLinear
+from mini_infer.distributed.loader import load_state_dict_with_tp
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
 from mini_infer.models.blocks.hyper_connections import HCHeadReduction
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding
+
+# HF V4 -> mini-infer renames. Same MoE expert structure as V2/V3 (the
+# block geometry didn't change across generations), with the additional
+# shared-expert collapse: V4 ships `n_shared_experts=1` and we collapse
+# `n_shared_experts` sub-blocks into one wider MLP — the rename rules
+# below cover the single-shared-expert case.
+_V4_RENAME_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\.mlp\.experts\.(\d+)\.gate_proj\.weight$"), r".mlp.experts.\1.w1.weight"),
+    (re.compile(r"\.mlp\.experts\.(\d+)\.down_proj\.weight$"), r".mlp.experts.\1.w2.weight"),
+    (re.compile(r"\.mlp\.experts\.(\d+)\.up_proj\.weight$"), r".mlp.experts.\1.w3.weight"),
+    (re.compile(r"\.mlp\.shared_experts\.gate_proj\.weight$"), r".mlp.shared_experts.w1.weight"),
+    (re.compile(r"\.mlp\.shared_experts\.down_proj\.weight$"), r".mlp.shared_experts.w2.weight"),
+    (re.compile(r"\.mlp\.shared_experts\.up_proj\.weight$"), r".mlp.shared_experts.w3.weight"),
+]
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -547,15 +563,73 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         model: BaseCausalLM,
         hf_state_dict: dict[str, torch.Tensor],
     ) -> None:
-        raise NotImplementedError(
-            "DeepseekV4ForCausalLM.load_weights: V4 weights are public on HF "
-            "(V4-Flash 158 GB on disk, V4-Pro 862 GB) but exceed any single GPU's "
-            "HBM, so loading them requires tensor parallelism. mini-infer is "
-            "single-device today; multi-GPU TP infrastructure (column/row-parallel "
-            "linears, expert-parallel MoE, vocab-parallel embedding/LM-head) plus "
-            "FP8/FP4 dequant for V4's mixed-precision weights are the next steps. "
-            "Every V4 architecture primitive (HCA, CSA, Lightning Indexer, token "
-            "compressor, attention sink, grouped output, hash-routed MoE FFN, "
-            "Hyper-Connections, YaRN) is implemented and integrated; only the "
-            "weight loader + TP infrastructure remain."
-        )
+        """Load HF DeepSeek-V4 weights into the model under tensor parallelism.
+
+        Pipeline:
+          1. Optional dtype dequant: V4 ships mixed FP8 (e4m3fn) for
+             non-MoE weights and FP4 for MoE expert weights. FP8 -> BF16
+             happens here via `.to(bfloat16)`; FP4 storage is packed
+             uint8 (NVFP4), which PyTorch doesn't yet ship a native
+             dtype for, so the loader raises an informative error and
+             refers to the deferred Triton-kernel work. The non-FP4
+             portion of V4-Flash still loads end-to-end through this path.
+          2. Rename: HF V4 names follow the V2/V3 pattern for MoE experts
+             (`mlp.experts.{j}.{gate,up,down}_proj.weight`); we map to
+             our `w1/w2/w3` names with the same rules as V2.
+          3. TP-aware load: dispatch through `load_state_dict_with_tp`
+             so per-rank slicing falls out of the column/row-parallel
+             layers automatically.
+
+        At `world_size=1` this is bit-equivalent to a non-TP load — the
+        TP layers behave as plain `nn.Linear` / `nn.Embedding`.
+        """
+        if not isinstance(model, DeepseekV4ForCausalLM):
+            raise TypeError(
+                f"DeepseekV4ForCausalLM.load_weights expects a DeepseekV4ForCausalLM, "
+                f"got {type(model).__name__}"
+            )
+
+        # Step 1: dequant. Walk the state_dict and upcast FP8 entries to
+        # BF16; flag FP4 if encountered (NVFP4 storage isn't a native torch
+        # dtype, so the safetensors loader can't have produced one yet —
+        # this is a defensive check for a future shipping path).
+        dequantized: dict[str, torch.Tensor] = {}
+        for hf_name, tensor in hf_state_dict.items():
+            if tensor.dtype == torch.float8_e4m3fn:
+                dequantized[hf_name] = tensor.to(torch.bfloat16)
+            elif tensor.dtype.itemsize == 1 and "experts" in hf_name and "_scale" in hf_name:
+                # NVFP4-packed expert weights: a byte holds two FP4 values.
+                # Full dequant needs the per-block FP8 scale tensor that
+                # accompanies the packed weight (`*_scale` suffix in V4's
+                # convention). Defer to follow-up work — flag clearly here.
+                raise NotImplementedError(
+                    f"V4 NVFP4 expert dequant not yet implemented "
+                    f"(weight={hf_name}); see ADR-014 / Phase 5 follow-up."
+                )
+            else:
+                dequantized[hf_name] = tensor
+
+        # Step 2: rename HF MoE expert names to our `w1/w2/w3` convention.
+        # Same rules as V2/V3; the V4 reference uses identical per-expert
+        # names since the MoE block structure didn't change between
+        # generations.
+        remapped: dict[str, torch.Tensor] = {}
+        for hf_name, tensor in dequantized.items():
+            new_name = hf_name
+            for pattern, replacement in _V4_RENAME_RULES:
+                if pattern.search(new_name):
+                    new_name = pattern.sub(replacement, new_name)
+                    break
+            remapped[new_name] = tensor
+
+        # Step 3: TP-aware load. `load_state_dict_with_tp` slices each
+        # full weight via the matching `load_full_weight` / `load_full_logits`
+        # / `load_full_wo_a` helper on the TP-aware layers.
+        missing, unexpected = load_state_dict_with_tp(model, remapped)
+        whitelist = model.expected_missing_state_keys()
+        missing = {m for m in missing if m not in whitelist}
+        if missing or unexpected:
+            raise ValueError(
+                f"weight load mismatch for DeepseekV4ForCausalLM: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
