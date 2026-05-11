@@ -30,7 +30,11 @@ from torch import nn
 
 from mini_infer.distributed.embedding import VocabParallelEmbedding
 from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
-from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
+
+# `mini_infer.models.blocks.v4` cannot be imported at module-load time
+# without inducing a circular import — `deepseek_v4.py` imports this
+# loader, and the `models` package eagerly registers it at first import.
+# Resolve V4 sink / grouped-output lazily inside the function.
 
 
 def _find_parent_and_attr(model: nn.Module, param_name: str) -> tuple[nn.Module, str]:
@@ -65,6 +69,10 @@ def load_state_dict_with_tp(
         return: names present in the model but absent from `full_state_dict`,
         and names in `full_state_dict` that the model didn't consume.
     """
+    # Lazy import: `models.blocks.v4` triggers registry of `deepseek_v4`
+    # which imports this loader, so module-level import would deadlock.
+    from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
+
     consumed: set[str] = set()
     model_param_names = {n for n, _ in model.named_parameters()}
 
