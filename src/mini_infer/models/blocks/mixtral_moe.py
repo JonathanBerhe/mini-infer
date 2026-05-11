@@ -19,15 +19,37 @@ Naming convention is Mixtral's `w1/w2/w3` instead of Llama's
 V1 dispatch is the simple per-expert loop: gather tokens that picked
 this expert, run them through the expert's MLP, scatter weighted
 outputs back via `index_add_`. A fused grouped-GEMM is a follow-up.
+
+Expert parallelism
+------------------
+Each rank owns `num_experts // world_size` *contiguous* experts (rank
+`r` holds experts `[r*N/ws, (r+1)*N/ws)`). The gate is replicated so
+every rank computes the same top-k. Each rank's per-expert loop runs
+only over its local experts; tokens routed to off-rank experts produce
+no contribution on this rank. A final all-reduce sums the partial
+routed accumulators to recover the full result. Shared experts are
+replicated on every rank.
+
+This is the simplest correct form of EP; the all-to-all dispatch
+optimisation (lower comm cost when tokens cluster on a few experts) is
+a follow-up.
 """
 
 import torch
 from torch import nn
 from torch.nn import functional
 
+from mini_infer.distributed.comm import all_reduce_sum
+from mini_infer.distributed.linear import _split_size
+
 
 class MixtralExpert(nn.Module):
-    """One expert's MLP. SwiGLU-shaped, but with Mixtral's w1/w2/w3 names."""
+    """One expert's MLP. SwiGLU-shaped, but with Mixtral's w1/w2/w3 names.
+
+    Inside an expert-parallel MoE this is built only on the rank that owns
+    the expert; the un-sharded `nn.Linear`s here are *local* (no further
+    sharding), so the per-rank expert acts as a normal `SwiGLU`-shape FFN.
+    """
 
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
@@ -70,15 +92,30 @@ class MoEFFN(nn.Module):
         super().__init__()
         if top_k <= 0 or top_k > num_experts:
             raise ValueError(f"top_k={top_k} must be in [1, num_experts={num_experts}]")
-        self.num_experts = num_experts
+        from mini_infer.distributed.group import get_rank, get_world_size
+
+        world_size = get_world_size()
+        num_experts_per_rank = _split_size(num_experts, world_size, "num_experts")
+        self.num_experts = num_experts  # global, used for top-k correctness
+        self.num_experts_per_rank = num_experts_per_rank
+        self.world_size = world_size
+        self.rank = get_rank()
+        # Range of *global* expert indices this rank owns.
+        self.local_expert_start = self.rank * num_experts_per_rank
+        self.local_expert_end = self.local_expert_start + num_experts_per_rank
         self.top_k = top_k
         # Mixtral renormalizes the top-k softmax probs to sum to 1; DeepSeek
         # keeps the raw probs and multiplies by `routed_scaling_factor`.
         self.renormalize_topk = renormalize_topk
         self.routed_scaling_factor = routed_scaling_factor
+        # Gate is replicated: every rank computes the same routing decisions
+        # from the (replicated) hidden state.
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        # Local experts only — each rank owns `num_experts_per_rank` of them.
+        # `self.experts[local_idx]` is the expert with global index
+        # `local_expert_start + local_idx`.
         self.experts = nn.ModuleList(
-            [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_experts)]
+            [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_experts_per_rank)]
         )
         # Shared experts (DeepSeek-V2/V3): MLPs that fire on every token,
         # added to the routed output. `n_shared_experts=0` keeps Mixtral's
@@ -109,6 +146,7 @@ class MoEFFN(nn.Module):
         # Router: full-precision softmax for stability. Both Mixtral and
         # DeepSeek-V2 use softmax-over-all-experts then top-k; what differs
         # is whether they renormalize and what scaling factor they apply.
+        # Gate is replicated, so every rank picks the same top-k globally.
         router_logits = self.gate(flat).float()
         router_probs = functional.softmax(router_logits, dim=-1)
         top_k_weights, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
@@ -125,16 +163,23 @@ class MoEFFN(nn.Module):
         expert_mask = functional.one_hot(top_k_indices, num_classes=self.num_experts).permute(
             2, 1, 0
         )
-        for expert_idx in range(self.num_experts):
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        # Loop only over experts this rank owns. Tokens routed to experts on
+        # other ranks contribute zero here — the all-reduce below fills them in.
+        for local_idx in range(self.num_experts_per_rank):
+            global_idx = self.local_expert_start + local_idx
+            top_k_pos, token_idx = torch.where(expert_mask[global_idx])
             if token_idx.numel() == 0:
                 continue
             tokens = flat[token_idx]
             weights = top_k_weights[token_idx, top_k_pos, None]
-            expert_out = self.experts[expert_idx](tokens) * weights
+            expert_out = self.experts[local_idx](tokens) * weights
             out.index_add_(0, token_idx, expert_out)
-        # Shared experts run on every token; their output is added to the
-        # routed sum (no per-expert weighting — they fire unconditionally).
+        # All-reduce the partial routed sums across ranks. At world_size=1
+        # this is a no-op; existing single-device behaviour is bit-identical.
+        out = all_reduce_sum(out)
+        # Shared experts are replicated; their output is the same on every
+        # rank, so it's added AFTER the routed all-reduce (otherwise the
+        # reduce would multiply it by world_size).
         if self.shared_experts is not None:
             out = out + self.shared_experts(flat)
         return out.view(input_shape)
