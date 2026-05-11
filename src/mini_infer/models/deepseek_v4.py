@@ -54,6 +54,8 @@ import torch
 from torch import nn
 
 from mini_infer.cache.state_cache import IndexerStateSpec, StateCache, StateLayerSpec
+from mini_infer.distributed.embedding import VocabParallelEmbedding
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
@@ -275,7 +277,7 @@ class _DeepseekV4InnerModel(nn.Module):
     def __init__(self, cfg: DeepseekV4Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
             [self._build_layer(cfg, layer_idx) for layer_idx in range(cfg.num_hidden_layers)]
         )
@@ -353,7 +355,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             yarn_beta_fast=cfg.yarn_beta_fast,
             yarn_beta_slow=cfg.yarn_beta_slow,
         )
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
+        )
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         # When Hyper-Connections is on, hidden state through the layers

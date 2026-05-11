@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from torch import nn
 
+from mini_infer.distributed.embedding import VocabParallelEmbedding
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import MixtralDecoderLayer, RMSNorm, RotaryEmbedding
@@ -74,7 +76,7 @@ class _MixtralInnerModel(nn.Module):
 
     def __init__(self, cfg: MixtralConfig) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
             [
                 MixtralDecoderLayer(
@@ -104,7 +106,9 @@ class MixtralForCausalLM(BaseCausalLM):
         self.cfg = cfg
         self.model = _MixtralInnerModel(cfg)
         self.rotary_emb = RotaryEmbedding(cfg.head_dim, base=cfg.rope_theta)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
+        )
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 

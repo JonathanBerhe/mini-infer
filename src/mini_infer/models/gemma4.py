@@ -49,6 +49,8 @@ import torch
 from torch import nn
 
 from mini_infer.cache.block_pool import LayerAttentionSpec
+from mini_infer.distributed.embedding import VocabParallelEmbedding
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import Gemma4DecoderLayer, RMSNorm, RotaryEmbedding
@@ -152,7 +154,7 @@ class _Gemma4InnerModel(nn.Module):
     def __init__(self, cfg: Gemma4Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
         layers: list[nn.Module] = []
         for layer_idx in range(cfg.num_hidden_layers):
             num_kv_heads, head_dim = cfg.kv_shape_for_layer(layer_idx)
@@ -198,7 +200,9 @@ class Gemma4ForCausalLM(BaseCausalLM):
             base=cfg.rope_theta_global,
             partial_rotary_factor=cfg.rope_partial_rotary_factor_global,
         )
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
+        )
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 

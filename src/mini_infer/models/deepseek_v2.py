@@ -35,6 +35,8 @@ import torch
 from torch import nn
 
 from mini_infer.cache.block_pool import StreamSpec
+from mini_infer.distributed.embedding import VocabParallelEmbedding
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import MLAAttention, MoEFFN, RMSNorm, RotaryEmbedding, SwiGLU
@@ -172,7 +174,7 @@ class _DeepseekV2InnerModel(nn.Module):
     def __init__(self, cfg: DeepseekV2Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
             [_DeepseekV2DecoderLayer(cfg, layer_idx) for layer_idx in range(cfg.num_hidden_layers)]
         )
@@ -211,7 +213,9 @@ class DeepseekV2ForCausalLM(BaseCausalLM):
         # through the default path. (YaRN long-context scaling is a
         # separate primitive on the roadmap.)
         self.rotary_emb = RotaryEmbedding(cfg.qk_rope_head_dim, base=cfg.rope_theta)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
+        )
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 

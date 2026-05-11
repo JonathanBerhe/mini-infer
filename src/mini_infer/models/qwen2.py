@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from torch import nn
 
+from mini_infer.distributed.embedding import VocabParallelEmbedding
+from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import RMSNorm, RotaryEmbedding, TransformerBlock
@@ -69,7 +71,7 @@ class _Qwen2InnerModel(nn.Module):
 
     def __init__(self, cfg: Qwen2Config) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList(
             [
                 TransformerBlock(
@@ -104,7 +106,9 @@ class Qwen2ForCausalLM(BaseCausalLM):
         # embedding's weight; loading either updates both. Quantizing the
         # lm_head later naturally untangles the tie (the new Int8Linear has
         # its own packed weight) which matches HF's behavior.
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
+        )
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
