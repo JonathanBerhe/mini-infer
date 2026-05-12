@@ -165,11 +165,16 @@ class LlamaForCausalLM(BaseCausalLM):
                 f"LlamaForCausalLM.load_weights expects a LlamaForCausalLM, "
                 f"got {type(model).__name__}"
             )
-        missing, unexpected = model.load_state_dict(hf_state_dict, strict=False)
+        # `load_state_dict_with_tp` slices each weight through the TP layer's
+        # `load_full_weight` helper; at `world_size=1` it's bit-equivalent
+        # to `model.load_state_dict` (the slicing is the identity).
+        from mini_infer.distributed.loader import load_state_dict_with_tp
+
+        missing, unexpected = load_state_dict_with_tp(model, hf_state_dict)
         whitelist = model.expected_missing_state_keys()
-        missing = [m for m in missing if m not in whitelist]
+        missing = {m for m in missing if m not in whitelist}
         if missing or unexpected:
             raise ValueError(
                 f"weight load mismatch for LlamaForCausalLM: "
-                f"missing={missing}, unexpected={unexpected}"
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
