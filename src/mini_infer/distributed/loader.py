@@ -74,70 +74,77 @@ def load_state_dict_with_tp(
     from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
 
     consumed: set[str] = set()
-    model_param_names = {n for n, _ in model.named_parameters()}
+    loaded_param_ids: set[int] = set()
 
-    # Walk parameters in deterministic order so the loader's behaviour is
-    # reproducible across runs / ranks.
-    for param_name in sorted(model_param_names):
-        if param_name not in full_state_dict:
+    # Walk state_dict keys in deterministic order. For each key we try to
+    # find the corresponding model parameter and dispatch to its TP-aware
+    # load helper (or a plain copy for replicated params). State_dict keys
+    # that don't correspond to any model parameter are returned as
+    # `unexpected`; model parameters not loaded by ANY state_dict key are
+    # returned as `missing`.
+    #
+    # Iterating over state_dict keys (rather than `named_parameters`) is
+    # important for tied weights: under `tie_word_embeddings`,
+    # `lm_head.weight` and `model.embed_tokens.weight` are the SAME
+    # Parameter object, so `named_parameters()` only yields one of them.
+    # An HF checkpoint that ships both names would otherwise show the
+    # second as "unexpected". Walking state_dict keys instead lets us
+    # process both names — loading the same Parameter twice with bit-
+    # identical data is idempotent.
+    for sd_key in sorted(full_state_dict.keys()):
+        full_tensor = full_state_dict[sd_key]
+        try:
+            parent_module, attr_name = _find_parent_and_attr(model, sd_key)
+        except AttributeError:
+            # Path doesn't resolve — definitely unexpected.
             continue
-        full_tensor = full_state_dict[param_name]
-        parent_module, attr_name = _find_parent_and_attr(model, param_name)
+        param = getattr(parent_module, attr_name, None)
+        if param is None:
+            continue
 
         if isinstance(parent_module, ColumnParallelLinear | RowParallelLinear):
-            # `load_full_weight` handles both the slicing and the
-            # weight/bias distinction.
             if attr_name == "weight":
-                bias_key = param_name.rsplit(".", 1)[0] + ".bias"
+                bias_key = sd_key.rsplit(".", 1)[0] + ".bias"
                 bias_tensor = full_state_dict.get(bias_key)
                 parent_module.load_full_weight(full_tensor, bias_tensor)
-                consumed.add(param_name)
-                if bias_tensor is not None:
+                consumed.add(sd_key)
+                loaded_param_ids.add(id(parent_module.weight))
+                if bias_tensor is not None and parent_module.bias is not None:
                     consumed.add(bias_key)
+                    loaded_param_ids.add(id(parent_module.bias))
             elif attr_name == "bias":
-                # Bias was already consumed when we processed `weight` for
-                # this same parent module (or will be when we get there);
-                # mark it consumed so the unexpected-key check stays clean.
-                consumed.add(param_name)
+                # Bias was (or will be) loaded alongside `weight`; mark
+                # consumed without re-loading.
+                consumed.add(sd_key)
+                if parent_module.bias is not None:
+                    loaded_param_ids.add(id(parent_module.bias))
         elif isinstance(parent_module, VocabParallelEmbedding):
             if attr_name == "weight":
                 parent_module.load_full_weight(full_tensor)
-                consumed.add(param_name)
+                consumed.add(sd_key)
+                loaded_param_ids.add(id(parent_module.weight))
         elif isinstance(parent_module, AttentionSink) and attr_name == "sink_logits":
             parent_module.load_full_logits(full_tensor)
-            consumed.add(param_name)
+            consumed.add(sd_key)
+            loaded_param_ids.add(id(parent_module.sink_logits))
         elif isinstance(parent_module, GroupedOutputProjection) and attr_name == "wo_a":
             parent_module.load_full_wo_a(full_tensor)
-            consumed.add(param_name)
+            consumed.add(sd_key)
+            loaded_param_ids.add(id(parent_module.wo_a))
         else:
             # Replicated parameter — plain copy. Works for `nn.Linear`,
             # `nn.Embedding`, `nn.Parameter`, RMSNorm weights, etc.
-            param = getattr(parent_module, attr_name)
+            if not isinstance(param, torch.Tensor):
+                continue  # not a tensor attribute; can't be in state_dict
             with torch.no_grad():
                 param.copy_(full_tensor.to(param.dtype))
-            consumed.add(param_name)
+            consumed.add(sd_key)
+            loaded_param_ids.add(id(param))
 
-    missing = model_param_names - consumed
-    # Don't flag tied params as missing — if `lm_head.weight is
-    # embed_tokens.weight`, loading one populates both.
-    missing = {n for n in missing if not _is_tied_to_consumed(model, n, consumed)}
+    missing = {
+        name
+        for name, param in model.named_parameters()
+        if id(param) not in loaded_param_ids
+    }
     unexpected = set(full_state_dict.keys()) - consumed
     return missing, unexpected
-
-
-def _is_tied_to_consumed(
-    model: nn.Module, param_name: str, consumed: set[str]
-) -> bool:
-    """True iff `param_name`'s tensor is aliased to a parameter we already loaded.
-
-    Used to keep the `missing` set from spuriously flagging tied
-    `lm_head.weight` / `embed_tokens.weight` pairs.
-    """
-    parent_module, attr_name = _find_parent_and_attr(model, param_name)
-    target_param = getattr(parent_module, attr_name)
-    for other_name in consumed:
-        other_parent, other_attr = _find_parent_and_attr(model, other_name)
-        other_param = getattr(other_parent, other_attr, None)
-        if other_param is target_param:
-            return True
-    return False

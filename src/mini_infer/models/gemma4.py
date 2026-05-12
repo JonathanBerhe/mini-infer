@@ -315,11 +315,13 @@ class Gemma4ForCausalLM(BaseCausalLM):
                     continue
             remapped[new_key] = tensor
 
-        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        from mini_infer.distributed.loader import load_state_dict_with_tp
+
+        missing, unexpected = load_state_dict_with_tp(model, remapped)
         whitelist = model.expected_missing_state_keys()
-        missing = [m for m in missing if m not in whitelist]
+        missing = {m for m in missing if m not in whitelist}
         if missing or unexpected:
             raise ValueError(
                 f"weight load mismatch for Gemma4ForCausalLM: "
-                f"missing={missing}, unexpected={unexpected}"
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )

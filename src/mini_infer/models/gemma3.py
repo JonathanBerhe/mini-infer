@@ -184,11 +184,13 @@ class Gemma3ForCausalLM(BaseCausalLM):
                 f"Gemma3ForCausalLM.load_weights expects a Gemma3ForCausalLM, "
                 f"got {type(model).__name__}"
             )
-        missing, unexpected = model.load_state_dict(hf_state_dict, strict=False)
+        from mini_infer.distributed.loader import load_state_dict_with_tp
+
+        missing, unexpected = load_state_dict_with_tp(model, hf_state_dict)
         whitelist = model.expected_missing_state_keys()
-        missing = [m for m in missing if m not in whitelist]
+        missing = {m for m in missing if m not in whitelist}
         if missing or unexpected:
             raise ValueError(
                 f"weight load mismatch for Gemma3ForCausalLM: "
-                f"missing={missing}, unexpected={unexpected}"
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
