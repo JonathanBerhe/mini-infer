@@ -70,6 +70,42 @@ def test_registry_has_deepseek_v4() -> None:
     assert REGISTRY.lookup("DeepseekV4ForCausalLM") is DeepseekV4ForCausalLM
 
 
+def test_v4_model_constructs_and_runs_with_pure_swa_layer() -> None:
+    """A `compress_ratio = 0` layer dispatches to SWAAttention.
+
+    V4-Flash uses two SWA-only layers at the start of its 43-layer stack.
+    This test mirrors that with a tiny 4-layer model: layer 0 is SWA
+    (`ratio=0`), layers 1-3 alternate CSA/HCA. End-to-end forward must
+    construct without errors and produce finite logits.
+    """
+    cfg = _make_hybrid_config(seq_len_friendly_compress_ratios=(0, 4, 8, 4))
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    # `SWAAttention` is constructed for layer 0 (compression_ratio=0).
+    from mini_infer.models.blocks.swa import SWAAttention
+
+    layer_0 = model.model.layers[0]
+    assert isinstance(layer_0.self_attn, SWAAttention)
+    # Layers 1 and 3 are CSA, layer 2 is HCA.
+    from mini_infer.models.blocks.csa import CSAAttention
+    from mini_infer.models.blocks.hca import HCAAttention
+
+    assert isinstance(model.model.layers[1].self_attn, CSAAttention)
+    assert isinstance(model.model.layers[2].self_attn, HCAAttention)
+    assert isinstance(model.model.layers[3].self_attn, CSAAttention)
+
+    # Forward through the full stack: the SWA layer must not divide-by-zero
+    # on compressed_position_embeddings.
+    batch_size = 1
+    seq_len = 16  # multiple of all non-zero ratios in the schedule.
+    input_ids = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=torch.long)
+    with torch.inference_mode():
+        logits = model(input_ids)
+    assert logits.shape == (batch_size, seq_len, cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
+
+
 def test_config_validates_compress_ratios_length() -> None:
     """`compress_ratios` must have one entry per layer."""
     with pytest.raises(ValueError, match="compress_ratios"):
