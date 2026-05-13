@@ -487,17 +487,30 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
         for layer_idx, layer in enumerate(self.model.layers):
             compression_ratio = self.cfg.compress_ratios[layer_idx]
-            num_compressed_blocks = seqlen // compression_ratio
-            block_positions = (
-                (torch.arange(num_compressed_blocks, device=input_ids.device) * compression_ratio)
-                .unsqueeze(0)
-                .expand(batch_size, -1)
-            )
-            cos_for_blocks, sin_for_blocks = self.rotary_emb(
-                torch.zeros(batch_size, num_compressed_blocks, device=input_ids.device),
-                block_positions,
-            )
-            compressed_position_embeddings = (cos_for_blocks, sin_for_blocks)
+            # `compression_ratio = 0` marks a pure-SWA layer (no compressor,
+            # no indexer); it has nothing to compress, so the compressed
+            # position embeddings are empty-shaped placeholders that the
+            # SWAAttention forward ignores.
+            if compression_ratio == 0:
+                empty_block_table = torch.zeros(
+                    batch_size, 0, self.cfg.rope_head_dim, device=input_ids.device
+                )
+                compressed_position_embeddings = (empty_block_table, empty_block_table)
+            else:
+                num_compressed_blocks = seqlen // compression_ratio
+                block_positions = (
+                    (
+                        torch.arange(num_compressed_blocks, device=input_ids.device)
+                        * compression_ratio
+                    )
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
+                cos_for_blocks, sin_for_blocks = self.rotary_emb(
+                    torch.zeros(batch_size, num_compressed_blocks, device=input_ids.device),
+                    block_positions,
+                )
+                compressed_position_embeddings = (cos_for_blocks, sin_for_blocks)
             hidden_states = layer(
                 hidden_states,
                 token_position_embeddings,

@@ -51,6 +51,7 @@ from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 from mini_infer.models.blocks.hca import HCAAttention
 from mini_infer.models.blocks.hyper_connections import HyperConnections
 from mini_infer.models.blocks.rmsnorm import RMSNorm
+from mini_infer.models.blocks.swa import SWAAttention
 from mini_infer.models.blocks.swiglu import SwiGLU
 
 if TYPE_CHECKING:
@@ -117,8 +118,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.self_attn: HCAAttention | CSAAttention
-        if self.is_csa_layer:
+        self.self_attn: HCAAttention | CSAAttention | SWAAttention
+        if compression_ratio == 0:
+            # Pure-SWA layer: no compressor, no indexer (V4-Flash uses these
+            # at layers 0, 1 of its 43-layer stack — the reference treats
+            # `compress_ratio = 0` as the disable-everything-but-window case).
+            self.self_attn = SWAAttention(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                q_lora_rank=q_lora_rank,
+                kv_head_dim=kv_head_dim,
+                rope_head_dim=rope_head_dim,
+                num_groups=num_groups,
+                o_lora_rank=o_lora_rank,
+                window_size=window_size,
+                rms_norm_eps=rms_norm_eps,
+            )
+        elif self.is_csa_layer:
             if index_num_heads <= 0 or index_head_dim <= 0 or index_top_k <= 0:
                 raise ValueError(
                     "CSA layer (compression_ratio == 4) requires positive "
