@@ -38,11 +38,13 @@ accumulator. Helper `build_state_cache_layer_specs` translates a config
 into the per-layer specs `StateCache.__init__` expects.
 
 `load_weights` walks the HF safetensors state_dict, dequantises FP8
-(e4m3fn) weights to BF16, applies the same MoE expert renames as V2/V3
+(e4m3fn) and NVFP4 (`float4_e2m1fn_x2`, with per-block e8m0fnu scales)
+weights to BF16, applies the same MoE expert renames as V2/V3
 (`gate_proj/up_proj/down_proj` -> `w1/w2/w3`), then dispatches through
 `load_state_dict_with_tp` so each column / row / vocab-parallel layer
-slices its rank's share. V4-Flash's NVFP4-packed expert weights raise
-explicitly until the dequant kernel lands (deferred to follow-up).
+slices its rank's share. The full V4-Flash storage format is now
+supported end-to-end on the loader path; a Triton-fused FP4 GEMM is
+the optimization follow-up.
 """
 
 from __future__ import annotations
@@ -589,23 +591,34 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 f"got {type(model).__name__}"
             )
 
-        # Step 1: dequant. Walk the state_dict and upcast FP8 entries to
-        # BF16; flag FP4 if encountered (NVFP4 storage isn't a native torch
-        # dtype, so the safetensors loader can't have produced one yet —
-        # this is a defensive check for a future shipping path).
+        # Step 1: dequant.
+        # V4-Flash ships mixed precision:
+        #   - Non-MoE weights as `float8_e4m3fn` (1 byte, native PyTorch dtype).
+        #   - MoE expert weights as `float4_e2m1fn_x2` (packed NVFP4: 2x FP4
+        #     per byte), accompanied by a per-block `float8_e8m0fnu` scale
+        #     tensor under the matching `*_scale` key.
+        # Walk the state_dict, upcast FP8 to BF16, and dequantize NVFP4
+        # weight+scale pairs via `dequantize_nvfp4_to_bf16`.
+        from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16, is_packed_nvfp4
+
         dequantized: dict[str, torch.Tensor] = {}
+        consumed_scale_keys: set[str] = set()
         for hf_name, tensor in hf_state_dict.items():
+            if hf_name.endswith("_scale") and hf_name[:-len("_scale")] in hf_state_dict:
+                # Scale tensor belonging to a packed FP4 weight we'll handle
+                # alongside the weight itself; mark consumed and skip.
+                consumed_scale_keys.add(hf_name)
+                continue
             if tensor.dtype == torch.float8_e4m3fn:
                 dequantized[hf_name] = tensor.to(torch.bfloat16)
-            elif tensor.dtype.itemsize == 1 and "experts" in hf_name and "_scale" in hf_name:
-                # NVFP4-packed expert weights: a byte holds two FP4 values.
-                # Full dequant needs the per-block FP8 scale tensor that
-                # accompanies the packed weight (`*_scale` suffix in V4's
-                # convention). Defer to follow-up work — flag clearly here.
-                raise NotImplementedError(
-                    f"V4 NVFP4 expert dequant not yet implemented "
-                    f"(weight={hf_name}); see ADR-014 / Phase 5 follow-up."
+                continue
+            scale_key = hf_name + "_scale"
+            if is_packed_nvfp4(tensor) and scale_key in hf_state_dict:
+                # Native packed-FP4 dtype + matching scale → dequant to BF16.
+                dequantized[hf_name] = dequantize_nvfp4_to_bf16(
+                    tensor, hf_state_dict[scale_key]
                 )
+                consumed_scale_keys.add(scale_key)
             else:
                 dequantized[hf_name] = tensor
 
