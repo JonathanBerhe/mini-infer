@@ -1,8 +1,10 @@
-"""Llama TP smoke test on Modal: load Llama-3-8B onto 2 GPUs and run a forward.
+"""TP smoke test on Modal: load a real HF checkpoint onto 2 GPUs and run a forward.
 
 Validates the per-rank weight loader end-to-end on a real HF checkpoint.
-We use `meta-llama/Meta-Llama-3-8B` because at 16 GB it comfortably fits
-both single-device (for a reference) and two-rank TP on a 2xH100 node.
+We use `Qwen/Qwen2.5-7B` because at ~16 GB it comfortably fits both
+single-device (for a reference) and two-rank TP on a 2xH100 node, and
+it's open (no gate). The script is model-agnostic — any HF-registered
+model that mini-infer supports can be swapped in via `_MODEL_NAME`.
 
 The script:
   1. Initialises a `nccl` process group inside the container.
@@ -33,19 +35,10 @@ _HF_TOKEN = os.environ.get("HF_TOKEN")
 _SECRETS = [modal.Secret.from_dict({"HF_TOKEN": _HF_TOKEN})] if _HF_TOKEN else []
 _HF_CACHE = modal.Volume.from_name("hf-cache", create_if_missing=True)
 
-# Llama-3-8B (16 GB at bf16) fits 2x H100 with comfortable headroom; the
+# Qwen2.5-7B (~16 GB at bf16) fits 2x H100 with comfortable headroom; the
 # point is to exercise multi-GPU TP loading, not to fill memory.
-_MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
+_MODEL_NAME = "Qwen/Qwen2.5-7B"
 _GPU = "H100:2"
-
-# Llama-3-8B is gated on HF Hub. Without an `HF_TOKEN` the download fails
-# during `snapshot_download`. We fail loudly here rather than confusing the
-# user with a Hub 403 partway through.
-if _HF_TOKEN is None:
-    raise SystemExit(
-        "modal_llama_tp_smoke: meta-llama/Meta-Llama-3-8B is gated on HF Hub; "
-        "set HF_TOKEN in your local environment before running this script."
-    )
 
 app = modal.App("mini-infer-llama-tp-smoke")
 
@@ -60,10 +53,10 @@ image = (
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
     )
-    .pip_install(
-        "flash-attn>=2.8",
-        extra_options="--no-build-isolation",
-    )
+    # flash-attn is deliberately omitted: the smoke only exercises the
+    # column-parallel `q_proj` forward, not attention math. Adding flash-attn
+    # would need a CUDA-devel base image (the debian_slim path has no
+    # CUDA_HOME) and slow the image build by ~20 minutes for no gain here.
     .add_local_python_source("mini_infer")
 )
 
@@ -139,6 +132,21 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
             destroy_distributed()
 
 
+def _child_entry(rank: int, world_size: int, prompt: str, queue) -> None:
+    """Module-level entry-point for `mp.spawn` workers.
+
+    Must be top-level (not nested inside another function) so that
+    `multiprocessing` can pickle it for the `spawn` start method.
+    """
+    try:
+        result = _run_one_rank(rank, world_size, prompt)
+        queue.put(("ok", result))
+    except Exception as exc:  # ship the traceback back to the parent
+        import traceback
+
+        queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}\n{exc}"))
+
+
 @app.function(
     image=image,
     gpu=_GPU,
@@ -154,17 +162,9 @@ def smoke(prompt: str) -> dict:
     ctx = mp.get_context("spawn")
     queue: mp.Queue = ctx.Queue()
 
-    def _entry(rank: int, prompt: str) -> None:
-        try:
-            result = _run_one_rank(rank, world_size, prompt)
-            queue.put(("ok", result))
-        except Exception as exc:  # ship the traceback back to rank 0
-            import traceback
-
-            queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}\n{exc}"))
-
     processes = [
-        ctx.Process(target=_entry, args=(rank, prompt)) for rank in range(world_size)
+        ctx.Process(target=_child_entry, args=(rank, world_size, prompt, queue))
+        for rank in range(world_size)
     ]
     for p in processes:
         p.start()

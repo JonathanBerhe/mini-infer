@@ -131,6 +131,21 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
             destroy_distributed()
 
 
+def _child_entry(rank: int, world_size: int, prompt: str, queue) -> None:
+    """Module-level entry-point for `mp.spawn` workers.
+
+    Must be top-level (not nested inside `smoke`) so that
+    `multiprocessing.spawn` can pickle it.
+    """
+    try:
+        result = _run_one_rank(rank, world_size, prompt)
+        queue.put(("ok", result))
+    except Exception as exc:
+        import traceback
+
+        queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}\n{exc}"))
+
+
 @app.function(
     image=image,
     gpu=_GPU,
@@ -146,17 +161,9 @@ def smoke(prompt: str) -> dict:
     ctx = mp.get_context("spawn")
     queue: mp.Queue = ctx.Queue()
 
-    def _entry(rank: int, prompt: str) -> None:
-        try:
-            result = _run_one_rank(rank, world_size, prompt)
-            queue.put(("ok", result))
-        except Exception as exc:
-            import traceback
-
-            queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}\n{exc}"))
-
     processes = [
-        ctx.Process(target=_entry, args=(rank, prompt)) for rank in range(world_size)
+        ctx.Process(target=_child_entry, args=(rank, world_size, prompt, queue))
+        for rank in range(world_size)
     ]
     for p in processes:
         p.start()
