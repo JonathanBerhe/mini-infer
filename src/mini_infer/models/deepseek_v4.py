@@ -211,56 +211,106 @@ class DeepseekV4Config:
     def from_hf(cls, hf_config: Any) -> DeepseekV4Config:
         """Parse an HF config into our owned schema.
 
-        Field names are educated guesses based on the reference inference
-        code's `ModelArgs`. Once we audit a real V4-Flash / V4-Pro
-        `config.json` from HF (Phase 5 of the tensor-parallelism plan),
-        any diverging field names get fixed here.
+        Robust to both attribute-style and dict-style access: transformers
+        5.x's fallback PretrainedConfig for unknown model_types (like V4
+        before transformers ships native support) doesn't always promote
+        every dict key to an instance attribute. We look up via attr then
+        fall back to `to_dict()` / `__dict__`.
         """
 
-        # Pick the first attribute that's set on `hf_config` and not None,
-        # falling back to `default_value` if none of the candidates apply.
-        # mini-infer + paper field names sometimes diverge (e.g.
-        # `index_n_heads` vs `index_num_heads`); this isolates the alias
-        # logic from the typed dataclass call below.
+        # Materialise the underlying config dict once so dict-style lookups
+        # work even when attribute access doesn't.
+        if isinstance(hf_config, dict):
+            cfg_dict: dict[str, Any] = dict(hf_config)
+        elif hasattr(hf_config, "to_dict"):
+            cfg_dict = dict(hf_config.to_dict())
+        else:
+            cfg_dict = dict(getattr(hf_config, "__dict__", {}))
+
         def _pick(*candidate_names: str, default_value: Any) -> Any:
+            """First non-None value across `candidate_names`, attr-first then dict."""
             for name in candidate_names:
                 value = getattr(hf_config, name, None)
                 if value is not None:
                     return value
+                value = cfg_dict.get(name)
+                if value is not None:
+                    return value
             return default_value
 
-        rope_params = getattr(hf_config, "rope_parameters", None) or {}
-        rope_theta_raw = rope_params.get("rope_theta") or _pick("rope_theta", default_value=10000.0)
+        # YaRN params land under `rope_scaling` in the real V4-Flash config
+        # (`rope_scaling.original_max_position_embeddings`, `rope_scaling.factor`,
+        # ...). Older internal configs put them at the top level. Support both.
+        rope_scaling = _pick("rope_scaling", "rope_parameters", default_value=None) or {}
+        rope_theta_raw = rope_scaling.get("rope_theta") or _pick(
+            "rope_theta", default_value=10000.0
+        )
+
         compress_ratios_raw = _pick("compress_ratios", default_value=None)
         if compress_ratios_raw is None:
-            raise ValueError("DeepseekV4Config.from_hf: HF config missing `compress_ratios` field")
+            raise ValueError(
+                "DeepseekV4Config.from_hf: HF config missing `compress_ratios` field"
+            )
+
+        # V4-Flash's checkpoint also carries MTP (multi-token-prediction)
+        # head layers — `num_nextn_predict_layers` ratios are appended to
+        # `compress_ratios` after the standard transformer layers'.
+        # mini-infer doesn't implement MTP today, so truncate the tail.
+        num_hidden_layers_int = int(_pick("num_hidden_layers", default_value=0))
+        compress_ratios_tuple = tuple(int(ratio) for ratio in compress_ratios_raw)
+        if len(compress_ratios_tuple) > num_hidden_layers_int > 0:
+            compress_ratios_tuple = compress_ratios_tuple[:num_hidden_layers_int]
+
         return cls(
-            vocab_size=int(hf_config.vocab_size),
-            hidden_size=int(hf_config.hidden_size),
-            intermediate_size=int(hf_config.intermediate_size),
-            num_hidden_layers=int(hf_config.num_hidden_layers),
-            num_attention_heads=int(hf_config.num_attention_heads),
-            q_lora_rank=int(hf_config.q_lora_rank),
+            vocab_size=int(_pick("vocab_size", default_value=0)),
+            hidden_size=int(_pick("hidden_size", default_value=0)),
+            intermediate_size=int(_pick("intermediate_size", default_value=0)),
+            num_hidden_layers=num_hidden_layers_int,
+            num_attention_heads=int(_pick("num_attention_heads", default_value=0)),
+            q_lora_rank=int(_pick("q_lora_rank", default_value=0)),
             kv_head_dim=int(_pick("kv_head_dim", "head_dim", default_value=0)),
-            rope_head_dim=int(hf_config.rope_head_dim),
+            # HF: `qk_rope_head_dim`; older paper alias: `rope_head_dim`.
+            rope_head_dim=int(_pick("rope_head_dim", "qk_rope_head_dim", default_value=0)),
+            # HF: `o_groups`; older paper alias: `o_num_groups`.
             o_num_groups=int(_pick("o_num_groups", "o_groups", default_value=0)),
-            o_lora_rank=int(hf_config.o_lora_rank),
-            window_size=int(hf_config.window_size),
-            compress_ratios=tuple(int(ratio) for ratio in compress_ratios_raw),
+            o_lora_rank=int(_pick("o_lora_rank", default_value=0)),
+            # HF: `sliding_window`; older paper alias: `window_size`.
+            window_size=int(_pick("window_size", "sliding_window", default_value=0)),
+            compress_ratios=compress_ratios_tuple,
             index_num_heads=int(_pick("index_num_heads", "index_n_heads", default_value=0)),
             index_head_dim=int(_pick("index_head_dim", default_value=0)),
             index_top_k=int(_pick("index_top_k", "index_topk", default_value=0)),
             rms_norm_eps=float(_pick("rms_norm_eps", "norm_eps", default_value=1e-6)),
             rope_theta=float(rope_theta_raw),
-            tie_word_embeddings=bool(getattr(hf_config, "tie_word_embeddings", False)),
+            tie_word_embeddings=bool(_pick("tie_word_embeddings", default_value=False)),
             yarn_original_seq_len=int(
-                _pick("yarn_original_seq_len", "original_seq_len", default_value=0)
+                _pick(
+                    "yarn_original_seq_len",
+                    "original_seq_len",
+                    default_value=rope_scaling.get("original_max_position_embeddings", 0),
+                )
             ),
             yarn_scaling_factor=float(
-                _pick("yarn_scaling_factor", "rope_factor", default_value=1.0)
+                _pick(
+                    "yarn_scaling_factor",
+                    "rope_factor",
+                    default_value=rope_scaling.get("factor", 1.0),
+                )
             ),
-            yarn_beta_fast=int(_pick("yarn_beta_fast", "beta_fast", default_value=32)),
-            yarn_beta_slow=int(_pick("yarn_beta_slow", "beta_slow", default_value=1)),
+            yarn_beta_fast=int(
+                _pick(
+                    "yarn_beta_fast",
+                    "beta_fast",
+                    default_value=rope_scaling.get("beta_fast", 32),
+                )
+            ),
+            yarn_beta_slow=int(
+                _pick(
+                    "yarn_beta_slow",
+                    "beta_slow",
+                    default_value=rope_scaling.get("beta_slow", 1),
+                )
+            ),
         )
 
 
