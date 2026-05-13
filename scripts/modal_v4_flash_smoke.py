@@ -16,11 +16,11 @@ What this validates:
 What this does NOT validate (deferred follow-ups):
   - Full greedy generation through the scheduler (the scheduler isn't
     TP-aware yet).
-  - NVFP4-packed expert dequant — `load_weights` raises a clear error
-    when it encounters such tensors. Until that kernel lands, this
-    smoke runs on the non-FP4 portion of the checkpoint and will fail
-    at expert weights for V4-Flash. A future deliverable lands the
-    NVFP4 dequant and re-enables this smoke end-to-end.
+  - A fused FP4 GEMM kernel. Today's loader dequantises NVFP4 expert
+    weights to BF16 at load time, which doubles per-rank expert memory
+    over keeping them packed. On 2x B200 (192 GB HBM each) V4-Flash
+    still fits comfortably, but a fused FP4 GEMM is the throughput
+    follow-up for higher-density configurations.
 
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_smoke.py
