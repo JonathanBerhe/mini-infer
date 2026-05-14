@@ -55,7 +55,12 @@ class AttentionSink(nn.Module):
             torch.zeros(self.num_heads_per_rank, dtype=torch.float32)
         )
 
-    def load_full_logits(self, full_logits: torch.Tensor) -> None:
+    def load_full_logits(
+        self,
+        full_logits: torch.Tensor,
+        *,
+        target_device: torch.device | str | None = None,
+    ) -> None:
         """Slice this rank's per-head logit range out of the full vector."""
         if full_logits.shape != (self.num_heads,):
             raise ValueError(
@@ -64,5 +69,12 @@ class AttentionSink(nn.Module):
             )
         start = self.rank * self.num_heads_per_rank
         end = start + self.num_heads_per_rank
-        with torch.no_grad():
-            self.sink_logits.copy_(full_logits[start:end].to(self.sink_logits.dtype))
+        if self.sink_logits.is_meta:
+            sliced = full_logits[start:end].contiguous()
+            if target_device is not None:
+                sliced = sliced.to(device=target_device)
+            self.sink_logits = nn.Parameter(sliced, requires_grad=False)
+        else:
+            sliced = full_logits[start:end].to(self.sink_logits.dtype).contiguous()
+            with torch.no_grad():
+                self.sink_logits.copy_(sliced)

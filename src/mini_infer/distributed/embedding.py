@@ -68,15 +68,29 @@ class VocabParallelEmbedding(nn.Embedding):
         self.vocab_start = self.rank * vocab_per_rank
         self.vocab_end = self.vocab_start + vocab_per_rank
 
-    def load_full_weight(self, full_weight: torch.Tensor) -> None:
+    def load_full_weight(
+        self,
+        full_weight: torch.Tensor,
+        *,
+        target_device: torch.device | str | None = None,
+    ) -> None:
         """Slice the rank's vocab range out of the full embedding table."""
         if full_weight.shape != (self.vocab_size, self.hidden_size):
             raise ValueError(
                 f"full_weight shape {tuple(full_weight.shape)} does not match expected "
                 f"({self.vocab_size}, {self.hidden_size})"
             )
-        with torch.no_grad():
-            self.weight.copy_(full_weight[self.vocab_start : self.vocab_end].to(self.weight.dtype))
+        if self.weight.is_meta:
+            sliced = full_weight[self.vocab_start : self.vocab_end].contiguous()
+            if target_device is not None:
+                sliced = sliced.to(device=target_device)
+            self.weight = nn.Parameter(sliced, requires_grad=False)
+        else:
+            sliced = (
+                full_weight[self.vocab_start : self.vocab_end].to(self.weight.dtype).contiguous()
+            )
+            with torch.no_grad():
+                self.weight.copy_(sliced)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Look up `input_ids` against this rank's vocab slice; sum-reduce.

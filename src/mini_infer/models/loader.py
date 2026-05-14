@@ -47,6 +47,24 @@ def load_safetensors_state_dict(
         else target_device.type
     )
 
+    # Block-quantized dtypes (FP8 e4m3 / e8m0, packed FP4) must NOT be cast
+    # to BF16 here — their values only make sense after a per-block dequant
+    # that multiplies by the matching scale tensor. Casting prematurely
+    # would (a) destroy the per-block scale relationship and (b) blow up
+    # storage 2x-4x (FP8/FP4 are 0.5-1 byte/elem, BF16 is 2 bytes).
+    quantized_dtypes = {torch.float8_e4m3fn}
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None:
+        quantized_dtypes.add(e8m0_dtype)
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None:
+        quantized_dtypes.add(fp4_dtype)
+
+    def _maybe_cast(t: torch.Tensor) -> torch.Tensor:
+        if t.dtype in quantized_dtypes:
+            return t
+        return t.to(dtype=dtype) if t.dtype != dtype else t
+
     state_dict: dict[str, torch.Tensor] = {}
     if index_path.exists():
         with index_path.open() as f:
@@ -56,7 +74,7 @@ def load_safetensors_state_dict(
         for shard in shards:
             shard_dict = load_file(str(local_dir / shard), device=safetensors_device)
             for k, v in shard_dict.items():
-                state_dict[k] = v.to(dtype=dtype) if v.dtype != dtype else v
+                state_dict[k] = _maybe_cast(v)
     else:
         single_file = local_dir / "model.safetensors"
         if not single_file.exists():
@@ -65,7 +83,7 @@ def load_safetensors_state_dict(
             )
         loaded = load_file(str(single_file), device=safetensors_device)
         for k, v in loaded.items():
-            state_dict[k] = v.to(dtype=dtype) if v.dtype != dtype else v
+            state_dict[k] = _maybe_cast(v)
     return state_dict
 
 

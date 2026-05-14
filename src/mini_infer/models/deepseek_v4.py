@@ -762,6 +762,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def load_weights(
         model: BaseCausalLM,
         hf_state_dict: dict[str, torch.Tensor],
+        *,
+        target_device: torch.device | str | None = None,
     ) -> None:
         """Load HF DeepSeek-V4 weights into the model under tensor parallelism.
 
@@ -874,7 +876,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         # Step 3: TP-aware load. `load_state_dict_with_tp` slices each
         # full weight via the matching `load_full_weight` / `load_full_logits`
         # / `load_full_wo_a` helper on the TP-aware layers.
-        missing, unexpected = load_state_dict_with_tp(model, remapped)
+        missing, unexpected = load_state_dict_with_tp(
+            model, remapped, target_device=target_device
+        )
         whitelist = model.expected_missing_state_keys()
         missing = {m for m in missing if m not in whitelist}
         if missing or unexpected:

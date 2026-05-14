@@ -47,7 +47,10 @@ def _find_parent_and_attr(model: nn.Module, param_name: str) -> tuple[nn.Module,
 
 
 def load_state_dict_with_tp(
-    model: nn.Module, full_state_dict: dict[str, torch.Tensor]
+    model: nn.Module,
+    full_state_dict: dict[str, torch.Tensor],
+    *,
+    target_device: torch.device | str | None = None,
 ) -> tuple[set[str], set[str]]:
     """Load `full_state_dict` into a model that may contain TP-aware layers.
 
@@ -72,6 +75,17 @@ def load_state_dict_with_tp(
     # Lazy import: `models.blocks.v4` triggers registry of `deepseek_v4`
     # which imports this loader, so module-level import would deadlock.
     from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
+
+    # If the caller passed a target device, we move each loaded tensor
+    # there before constructing the replacement Parameter. Used by the
+    # V4-Flash smoke: state_dict lives in CPU RAM (158 GB doesn't fit on
+    # a single GPU), and load_full_weight slices the rank's share into
+    # GPU HBM (~80 GB per rank with TP=2). For non-meta callers, the
+    # existing param's device wins and target_device is ignored.
+    device_obj = torch.device(target_device) if target_device is not None else None
+
+    def _to_target(t: torch.Tensor) -> torch.Tensor:
+        return t.to(device=device_obj) if device_obj is not None else t
 
     consumed: set[str] = set()
     loaded_param_ids: set[int] = set()
@@ -106,7 +120,9 @@ def load_state_dict_with_tp(
             if attr_name == "weight":
                 bias_key = sd_key.rsplit(".", 1)[0] + ".bias"
                 bias_tensor = full_state_dict.get(bias_key)
-                parent_module.load_full_weight(full_tensor, bias_tensor)
+                parent_module.load_full_weight(
+                    full_tensor, bias_tensor, target_device=device_obj
+                )
                 consumed.add(sd_key)
                 loaded_param_ids.add(id(parent_module.weight))
                 if bias_tensor is not None and parent_module.bias is not None:
@@ -120,26 +136,40 @@ def load_state_dict_with_tp(
                     loaded_param_ids.add(id(parent_module.bias))
         elif isinstance(parent_module, VocabParallelEmbedding):
             if attr_name == "weight":
-                parent_module.load_full_weight(full_tensor)
+                parent_module.load_full_weight(full_tensor, target_device=device_obj)
                 consumed.add(sd_key)
                 loaded_param_ids.add(id(parent_module.weight))
         elif isinstance(parent_module, AttentionSink) and attr_name == "sink_logits":
-            parent_module.load_full_logits(full_tensor)
+            parent_module.load_full_logits(full_tensor, target_device=device_obj)
             consumed.add(sd_key)
             loaded_param_ids.add(id(parent_module.sink_logits))
         elif isinstance(parent_module, GroupedOutputProjection) and attr_name == "wo_a":
-            parent_module.load_full_wo_a(full_tensor)
+            parent_module.load_full_wo_a(full_tensor, target_device=device_obj)
             consumed.add(sd_key)
             loaded_param_ids.add(id(parent_module.wo_a))
         else:
-            # Replicated parameter — plain copy. Works for `nn.Linear`,
-            # `nn.Embedding`, `nn.Parameter`, RMSNorm weights, etc.
+            # Replicated parameter — works for `nn.Linear`, `nn.Embedding`,
+            # `nn.Parameter`, RMSNorm weights, etc. Handles two paths:
+            # meta-device construction (replace the parameter) and
+            # already-allocated (in-place copy). The meta path is required
+            # for multi-hundred-billion-parameter models where allocating
+            # random init for every layer at construction would OOM.
             if not isinstance(param, torch.Tensor):
                 continue  # not a tensor attribute; can't be in state_dict
-            with torch.no_grad():
-                param.copy_(full_tensor.to(param.dtype))
+            if param.is_meta:
+                # Meta-mode: preserve the source tensor's dtype, but route
+                # to `target_device` if the caller provided one (so the
+                # CPU-resident state_dict can yield per-GPU model params).
+                tensor_for_load = _to_target(full_tensor.contiguous())
+                new_param = nn.Parameter(tensor_for_load, requires_grad=False)
+                setattr(parent_module, attr_name, new_param)
+                loaded_param_ids.add(id(new_param))
+            else:
+                tensor_for_load = full_tensor.to(param.dtype).contiguous()
+                with torch.no_grad():
+                    param.copy_(tensor_for_load)
+                loaded_param_ids.add(id(param))
             consumed.add(sd_key)
-            loaded_param_ids.add(id(param))
 
     missing = {
         name
