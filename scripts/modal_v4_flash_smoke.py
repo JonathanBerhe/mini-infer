@@ -145,6 +145,25 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
 
         gc.collect()
 
+        # Re-materialize deterministic buffers (RotaryEmbedding's
+        # `inv_freq`) that meta-device construction left as meta tensors.
+        # These aren't in the state_dict — they're computed from config —
+        # so the loader can't populate them. V4 has one global rotary_emb
+        # at `model.rotary_emb`; we rebuild it from cfg and copy its
+        # freshly-computed inv_freq across.
+        from mini_infer.models.blocks.rope import RotaryEmbedding
+
+        rebuilt_rotary = RotaryEmbedding(
+            head_dim=cfg.rope_head_dim,
+            base=cfg.rope_theta,
+            yarn_original_seq_len=cfg.yarn_original_seq_len,
+            yarn_scaling_factor=cfg.yarn_scaling_factor,
+            yarn_beta_fast=cfg.yarn_beta_fast,
+            yarn_beta_slow=cfg.yarn_beta_slow,
+        )
+        model.rotary_emb.inv_freq = rebuilt_rotary.inv_freq.to(device=device)
+        _checkpoint(rank, "rotary buffers re-materialized; calling model(input_ids)...")
+
         tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
         encoded = tokenizer.encode(prompt)
         # V4 expects T to be a multiple of every NON-ZERO compression_ratio.
