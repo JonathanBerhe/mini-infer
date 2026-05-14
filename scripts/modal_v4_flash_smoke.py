@@ -159,7 +159,7 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
             ratio_lcm = lcm(ratio_lcm, r)
         target_len = ((len(encoded) + ratio_lcm - 1) // ratio_lcm) * ratio_lcm
         if target_len > len(encoded):
-            pad_token = tokenizer.eos_id or 0
+            pad_token = tokenizer.eos_token_id or 0
             encoded = encoded + [pad_token] * (target_len - len(encoded))
         input_ids = torch.tensor([encoded], device=device, dtype=torch.long)
         _checkpoint(
