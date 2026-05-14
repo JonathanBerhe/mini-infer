@@ -79,7 +79,12 @@ class GroupedOutputProjection(nn.Module):
         # input and all-reduces to produce the full hidden state.
         self.wo_b = RowParallelLinear(num_groups * o_lora_rank, hidden_size, bias=False)
 
-    def load_full_wo_a(self, full_wo_a: torch.Tensor) -> None:
+    def load_full_wo_a(
+        self,
+        full_wo_a: torch.Tensor,
+        *,
+        target_device: torch.device | str | None = None,
+    ) -> None:
         """Slice this rank's group rows from the full `wo_a`.
 
         Full shape: `(num_groups * o_lora_rank, heads_per_group * kv_head_dim)`.
@@ -95,8 +100,15 @@ class GroupedOutputProjection(nn.Module):
         rows_per_rank = self.num_groups_per_rank * self.o_lora_rank
         start = self.rank * rows_per_rank
         end = start + rows_per_rank
-        with torch.no_grad():
-            self.wo_a.copy_(full_wo_a[start:end].to(self.wo_a.dtype))
+        if self.wo_a.is_meta:
+            sliced = full_wo_a[start:end].contiguous()
+            if target_device is not None:
+                sliced = sliced.to(device=target_device)
+            self.wo_a = nn.Parameter(sliced, requires_grad=False)
+        else:
+            sliced = full_wo_a[start:end].to(self.wo_a.dtype).contiguous()
+            with torch.no_grad():
+                self.wo_a.copy_(sliced)
 
     def forward(self, attn_out: torch.Tensor) -> torch.Tensor:
         """Project `(B, T, num_heads_local, kv_head_dim)` to `(B, T, hidden_size)`.

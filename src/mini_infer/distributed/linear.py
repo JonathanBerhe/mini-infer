@@ -103,14 +103,18 @@ class ColumnParallelLinear(nn.Linear):
         self.rank = get_rank()
 
     def load_full_weight(
-        self, full_weight: torch.Tensor, full_bias: torch.Tensor | None = None
+        self,
+        full_weight: torch.Tensor,
+        full_bias: torch.Tensor | None = None,
+        *,
+        target_device: torch.device | str | None = None,
     ) -> None:
         """Slice the rank's portion out of the full (un-sharded) weight.
 
-        The Phase-4 safetensors loader gives every rank the *same* full
-        tensor and lets each rank pick its slice. This avoids a complex
-        per-rank-streaming loader at the cost of briefly holding the full
-        weight in memory; for V4-Flash with FP8/FP4 we'll revisit.
+        `target_device`: when the model was constructed on meta, the
+        sliced tensor is moved here before being wrapped as a Parameter.
+        Used by the V4-Flash loader: the full state_dict lives on CPU
+        and only the rank's slice ever touches GPU HBM.
         """
         if full_weight.shape != (self.out_features, self.in_features):
             raise ValueError(
@@ -119,17 +123,32 @@ class ColumnParallelLinear(nn.Linear):
             )
         start = self.rank * self.out_features_per_rank
         end = start + self.out_features_per_rank
-        with torch.no_grad():
-            self.weight.copy_(full_weight[start:end].to(self.weight.dtype))
-            if full_bias is not None:
-                if self.bias is None:
-                    raise ValueError("full_bias provided but layer was constructed with bias=False")
-                if full_bias.shape != (self.out_features,):
-                    raise ValueError(
-                        f"full_bias shape {tuple(full_bias.shape)} does not match expected "
-                        f"({self.out_features},)"
-                    )
-                self.bias.copy_(full_bias[start:end].to(self.bias.dtype))
+        if self.weight.is_meta:
+            sliced_weight = full_weight[start:end].contiguous()
+            if target_device is not None:
+                sliced_weight = sliced_weight.to(device=target_device)
+            self.weight = nn.Parameter(sliced_weight, requires_grad=False)
+        else:
+            sliced_weight = full_weight[start:end].to(self.weight.dtype).contiguous()
+            with torch.no_grad():
+                self.weight.copy_(sliced_weight)
+        if full_bias is not None:
+            if self.bias is None:
+                raise ValueError("full_bias provided but layer was constructed with bias=False")
+            if full_bias.shape != (self.out_features,):
+                raise ValueError(
+                    f"full_bias shape {tuple(full_bias.shape)} does not match expected "
+                    f"({self.out_features},)"
+                )
+            if self.bias.is_meta:
+                sliced_bias = full_bias[start:end].contiguous()
+                if target_device is not None:
+                    sliced_bias = sliced_bias.to(device=target_device)
+                self.bias = nn.Parameter(sliced_bias, requires_grad=False)
+            else:
+                sliced_bias = full_bias[start:end].to(self.bias.dtype).contiguous()
+                with torch.no_grad():
+                    self.bias.copy_(sliced_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """`x @ W_local.T (+ bias_local)`, optionally all-gathered.
@@ -195,7 +214,11 @@ class RowParallelLinear(nn.Linear):
         self.rank = get_rank()
 
     def load_full_weight(
-        self, full_weight: torch.Tensor, full_bias: torch.Tensor | None = None
+        self,
+        full_weight: torch.Tensor,
+        full_bias: torch.Tensor | None = None,
+        *,
+        target_device: torch.device | str | None = None,
     ) -> None:
         """Slice the rank's input-axis portion of the weight; bias is replicated."""
         if full_weight.shape != (self.out_features, self.in_features):
@@ -205,20 +228,35 @@ class RowParallelLinear(nn.Linear):
             )
         start = self.rank * self.in_features_per_rank
         end = start + self.in_features_per_rank
-        with torch.no_grad():
-            self.weight.copy_(full_weight[:, start:end].to(self.weight.dtype))
-            if full_bias is not None:
-                if self.bias is None:
-                    raise ValueError("full_bias provided but layer was constructed with bias=False")
-                if full_bias.shape != (self.out_features,):
-                    raise ValueError(
-                        f"full_bias shape {tuple(full_bias.shape)} does not match expected "
-                        f"({self.out_features},)"
-                    )
-                # Bias is the *full* unsharded bias on every rank; we only
-                # add it on rank 0 in forward to avoid double-counting after
-                # the all-reduce.
-                self.bias.copy_(full_bias.to(self.bias.dtype))
+        if self.weight.is_meta:
+            sliced_weight = full_weight[:, start:end].contiguous()
+            if target_device is not None:
+                sliced_weight = sliced_weight.to(device=target_device)
+            self.weight = nn.Parameter(sliced_weight, requires_grad=False)
+        else:
+            sliced_weight = full_weight[:, start:end].to(self.weight.dtype).contiguous()
+            with torch.no_grad():
+                self.weight.copy_(sliced_weight)
+        if full_bias is not None:
+            if self.bias is None:
+                raise ValueError("full_bias provided but layer was constructed with bias=False")
+            if full_bias.shape != (self.out_features,):
+                raise ValueError(
+                    f"full_bias shape {tuple(full_bias.shape)} does not match expected "
+                    f"({self.out_features},)"
+                )
+            # Bias is the *full* unsharded bias on every rank; we only
+            # add it on rank 0 in forward to avoid double-counting after
+            # the all-reduce.
+            if self.bias.is_meta:
+                bias_for_load = full_bias.contiguous()
+                if target_device is not None:
+                    bias_for_load = bias_for_load.to(device=target_device)
+                self.bias = nn.Parameter(bias_for_load, requires_grad=False)
+            else:
+                full_bias_typed = full_bias.to(self.bias.dtype).contiguous()
+                with torch.no_grad():
+                    self.bias.copy_(full_bias_typed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Per-rank partial output, then all-reduce.

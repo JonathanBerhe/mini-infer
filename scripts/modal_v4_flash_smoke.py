@@ -60,6 +60,17 @@ image = (
 )
 
 
+def _checkpoint(rank: int, msg: str) -> None:
+    """Print + flush so a hang's location is visible in Modal logs.
+
+    Modal's log capture batches stdout in lines but the underlying process
+    can hold a stalled write until the buffer is closed. Using `flush=True`
+    makes each checkpoint visible immediately, which is essential when the
+    next step (download / dequant / NCCL init) might block for many minutes.
+    """
+    print(f"[rank {rank}] {msg}", flush=True)
+
+
 def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
     """Per-rank container work: init PG, build model, load weights, run forward."""
     import torch
@@ -70,6 +81,7 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
     from mini_infer.models import REGISTRY
     from mini_infer.models.loader import load_safetensors_state_dict
 
+    _checkpoint(rank, "entering _run_one_rank; calling init_distributed (nccl)...")
     init_distributed(
         world_size=world_size,
         rank=rank,
@@ -77,25 +89,61 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
         master_addr="127.0.0.1",
         master_port=29500,
     )
+    _checkpoint(rank, "init_distributed done; setting cuda device")
     try:
         device = f"cuda:{rank}"
         torch.cuda.set_device(rank)
+        _checkpoint(rank, f"cuda device set to {device}; downloading config.json...")
 
-        from transformers import AutoConfig
+        # Load the raw `config.json` ourselves. AutoConfig.from_pretrained
+        # in transformers 5.x drops unknown-model-type fields (V4 isn't
+        # registered with transformers yet), so `compress_ratios` and the
+        # other V4-specific fields get filtered out. Reading the JSON
+        # directly preserves every published field.
+        import json
 
-        hf_config = AutoConfig.from_pretrained(_MODEL_NAME)
-        arch = hf_config.architectures[0]
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(_MODEL_NAME, "config.json")
+        with open(config_path) as f:
+            hf_config_dict = json.load(f)
+
+        _checkpoint(rank, f"config.json loaded ({len(hf_config_dict)} fields); building model...")
+        arch = hf_config_dict["architectures"][0]
         model_cls = REGISTRY.lookup(arch)
-        cfg = model_cls.Config.from_hf(hf_config)
-        model = model_cls(cfg).to(device=device, dtype=torch.bfloat16).eval()
-
-        # The state_dict carries mixed FP8/FP4 weights. Our V4 loader
-        # dequantises FP8 -> BF16 and raises for FP4 until the dequant
-        # kernel lands.
-        state_dict = load_safetensors_state_dict(
-            _MODEL_NAME, device=device, dtype=torch.bfloat16
+        cfg = model_cls.Config.from_hf(hf_config_dict)
+        _checkpoint(
+            rank,
+            f"V4 config built: {cfg.num_hidden_layers}L hidden={cfg.hidden_size} "
+            f"experts={cfg.num_routed_experts}; constructing model on meta...",
         )
-        model_cls.load_weights(model, state_dict)
+        # Construct on `meta` so we don't allocate ~275 GB of random-init
+        # parameters per rank before loading. `load_weights` replaces each
+        # meta Parameter with the corresponding sliced tensor from disk.
+        with torch.device("meta"):
+            model = model_cls(cfg)
+        model.eval()
+        _checkpoint(rank, "model constructed on meta; downloading safetensors to CPU...")
+
+        # CPU-resident state_dict: V4-Flash is ~158 GB on disk, doesn't
+        # fit on a single GPU. The loader slices each rank's share onto
+        # GPU via `target_device=device` in load_weights.
+        state_dict = load_safetensors_state_dict(
+            _MODEL_NAME, device="cpu", dtype=torch.bfloat16
+        )
+        _checkpoint(
+            rank,
+            f"safetensors loaded ({len(state_dict)} tensors on CPU); "
+            f"calling load_weights with target_device={device}...",
+        )
+        model_cls.load_weights(model, state_dict, target_device=device)
+        _checkpoint(rank, "load_weights done; freeing CPU state_dict + running prefill...")
+        # Free the CPU state_dict — `load_weights` has already populated
+        # the model's GPU parameters; the CPU originals are dead weight.
+        del state_dict
+        import gc
+
+        gc.collect()
 
         tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
         encoded = tokenizer.encode(prompt)
