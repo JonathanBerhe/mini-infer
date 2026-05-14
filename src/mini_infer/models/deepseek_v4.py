@@ -142,6 +142,54 @@ def _is_v4_flash_native_naming(state_dict_keys: list[str]) -> bool:
     return any(k.startswith("layers.") and ".attn." in k for k in state_dict_keys[:200])
 
 
+_EXPERT_KEY_RE = re.compile(r"(\.mlp\.experts\.)(\d+)(\.)")
+
+
+def _remap_expert_indices_to_local_rank(
+    state_dict: dict[str, torch.Tensor], *, num_routed_experts: int
+) -> dict[str, torch.Tensor]:
+    """Filter expert weights to this rank's slice and remap to local indices.
+
+    V4-Flash's safetensors store all `num_routed_experts` experts at their
+    GLOBAL indices (`experts.0`..`experts.255` for V4-Flash). mini-infer's
+    `HashRoutedMoEFFN` materialises only `num_routed_experts // world_size`
+    experts per rank at LOCAL indices `experts.0`..`experts.127`. Rank `r`
+    owns global indices `[r * per_rank, (r+1) * per_rank)`; we drop
+    out-of-range keys and rewrite in-range ones to `experts.{local_idx}`.
+
+    Non-expert keys pass through unchanged.
+    """
+    from mini_infer.distributed.group import get_rank, get_world_size
+
+    world_size = get_world_size()
+    if world_size <= 1 or num_routed_experts <= 0:
+        return state_dict
+    if num_routed_experts % world_size != 0:
+        raise ValueError(
+            f"num_routed_experts={num_routed_experts} must be divisible by "
+            f"world_size={world_size} for expert-parallel sharding"
+        )
+    per_rank = num_routed_experts // world_size
+    rank = get_rank()
+    local_start = rank * per_rank
+    local_end = local_start + per_rank
+
+    out: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        match = _EXPERT_KEY_RE.search(name)
+        if match is None:
+            out[name] = tensor
+            continue
+        global_idx = int(match.group(2))
+        if not (local_start <= global_idx < local_end):
+            # Not this rank's expert; drop silently.
+            continue
+        local_idx = global_idx - local_start
+        new_name = name[: match.start(2)] + str(local_idx) + name[match.end(2) :]
+        out[new_name] = tensor
+    return out
+
+
 def _apply_v4_flash_renames(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Rewrite V4-Flash native keys into mini-infer's naming.
 
@@ -872,6 +920,17 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                         new_name = pattern.sub(replacement, new_name)
                         break
                 remapped[new_name] = tensor
+
+        # Step 2.5: expert-parallel remap. V4-Flash ships ALL routed
+        # experts as global indices `experts.0`..`experts.{N-1}`, but the
+        # HashRoutedMoEFFN materialises only this rank's `N // world_size`
+        # share at LOCAL indices `experts.0`..`experts.{N/ws - 1}`. We
+        # remap in-range global indices to local, drop out-of-range ones,
+        # and leave non-expert keys untouched.
+        if model.cfg.use_moe_ffn:
+            remapped = _remap_expert_indices_to_local_rank(
+                remapped, num_routed_experts=model.cfg.num_routed_experts
+            )
 
         # Step 3: TP-aware load. `load_state_dict_with_tp` slices each
         # full weight via the matching `load_full_weight` / `load_full_logits`
