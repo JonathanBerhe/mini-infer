@@ -1,26 +1,22 @@
-"""NVFP4 (`float4_e2m1fn_x2`) dequantization to BF16.
+"""Block-quantized FP4 / FP8 dequantization helpers for V4-Flash.
 
-NVFP4 is NVIDIA's packed 4-bit floating-point format used by DeepSeek-V4-Flash
-to store MoE expert weights. Two FP4 values share a byte; a separate per-block
-FP8 scale tensor multiplies each block's values up to its full magnitude.
+V4-Flash ships weights in two block-quantized formats:
 
-Layout in V4-Flash (matches `third_party/deepseek_v4_reference/convert.py`):
-  - **Packed weight**: shape `(out_dim, in_dim // 2)`, dtype `int8` / `uint8`
-    (or `torch.float4_e2m1fn_x2` on PyTorch 2.6+). Each byte holds two FP4
-    values: low nibble = first element, high nibble = second.
-  - **Scale**: shape `(out_dim, in_dim // 32)`, dtype `torch.float8_e8m0fnu`
-    (power-of-2 scales). One scale per `fp4_block_size = 32` packed values.
+  - **NVFP4** (`float4_e2m1fn_x2`): MoE expert weights. Two FP4 values share
+    a byte (packed); a per-block FP8 `e8m0fnu` scale (block size 32 along
+    the inner dim) multiplies each block to its full magnitude.
+  - **Block-FP8** (`float8_e4m3fn` weight + `float8_e8m0fnu` scale): every
+    other quantized weight (attention projections, MoE gate, compressor /
+    indexer projections). The block is `[128, 128]` per `config.json`'s
+    `quantization_config.weight_block_size` — one scale per 128x128 tile.
 
-E2M1 lookup (1 sign bit, 2 exponent, 1 mantissa, NaN-free, no inf):
+E2M1 lookup (used by NVFP4; 1 sign bit, 2 exponent, 1 mantissa, NaN-free):
 
     bits 0xxx ->  0.0,  0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
     bits 1xxx ->  0.0, -0.5, ... -6.0   (sign-flipped)
 
-The dequantized BF16 weight = `FP4_TABLE[nibble] * scale_for_this_block`.
-
-This is a pure-PyTorch reference. It runs on any device (CPU smoke tests
-work). A Triton kernel that fuses dequant + GEMM is the optimization path
-once Modal validation lands.
+Both functions output BF16. They run on any device (CPU smoke tests work);
+a Triton kernel that fuses dequant + GEMM is the optimization path.
 """
 
 from __future__ import annotations
@@ -111,3 +107,51 @@ def dequantize_nvfp4_to_bf16(
 
     dequantized = fp4_fp32 * scale_expanded
     return dequantized.to(torch.bfloat16)
+
+
+def dequantize_block_fp8_to_bf16(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+) -> torch.Tensor:
+    """Dequantize a block-quantized FP8 e4m3 weight to BF16.
+
+    V4-Flash stores most non-MoE weights this way: shape `(M, N)` in
+    `torch.float8_e4m3fn`, paired with a `(M / block_M, N / block_N)`
+    scale tensor in `torch.float8_e8m0fnu`. Dequant is element-wise
+    multiplication after upcasting both sides to FP32 and broadcasting
+    the per-block scale over `(block_M, block_N)`.
+
+    Args:
+        fp8_weight: 2-D tensor of shape `(M, N)`, dtype `torch.float8_e4m3fn`
+            (or any 1-byte type if storage was reinterpreted).
+        fp8_scale: 2-D tensor of shape `(M // block_M, N // block_N)`,
+            typically dtype `torch.float8_e8m0fnu`.
+        block_size: per-block dims `(block_M, block_N)`. V4-Flash uses (128, 128).
+
+    Returns:
+        BF16 tensor of shape `(M, N)`.
+    """
+    if fp8_weight.ndim != 2:
+        raise ValueError(
+            f"fp8_weight must be 2-D; got shape {tuple(fp8_weight.shape)}"
+        )
+    if fp8_scale.ndim != 2:
+        raise ValueError(f"fp8_scale must be 2-D; got shape {tuple(fp8_scale.shape)}")
+    block_m, block_n = block_size
+    m, n = fp8_weight.shape
+    expected_scale = (m // block_m, n // block_n)
+    if fp8_scale.shape != expected_scale:
+        raise ValueError(
+            f"fp8_scale shape {tuple(fp8_scale.shape)} does not match expected "
+            f"{expected_scale} (block_size={block_size}, weight_shape={(m, n)})"
+        )
+    # Upcast both sides; the FP8 -> FP32 cast handles e4m3fn / e8m0fnu natively.
+    weight_fp32 = fp8_weight.float()
+    scale_fp32 = fp8_scale.float()
+    # Expand scale to per-element via repeat_interleave along both dims.
+    scale_expanded = (
+        scale_fp32.repeat_interleave(block_m, dim=0).repeat_interleave(block_n, dim=1)
+    )
+    return (weight_fp32 * scale_expanded).to(torch.bfloat16)

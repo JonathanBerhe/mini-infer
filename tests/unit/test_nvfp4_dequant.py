@@ -23,7 +23,11 @@ import math
 import pytest
 import torch
 
-from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16, is_packed_nvfp4
+from mini_infer.quant.nvfp4 import (
+    dequantize_block_fp8_to_bf16,
+    dequantize_nvfp4_to_bf16,
+    is_packed_nvfp4,
+)
 
 
 def _make_scale(out_dim: int, in_dim: int, block_size: int, value: float) -> torch.Tensor:
@@ -176,3 +180,58 @@ def test_dequant_matches_v4_reference_byte_layout() -> None:
     torch.testing.assert_close(out, expected_tensor, rtol=0, atol=0)
     # Sanity: BF16 represented these exactly (small fractions of 2^k).
     assert not math.isnan(out.sum().item())
+
+
+# ----------------------------- Block-FP8 dequant -----------------------------
+
+
+def test_block_fp8_dequant_recovers_scaled_weight_per_block() -> None:
+    """A (128, 128)-block FP8 dequant multiplies each block's values by its scale."""
+    # Build a small (M=4, N=4) weight + (2x2) scale so the block math is 2x2.
+    weight_fp32 = torch.tensor(
+        [
+            [1.0, 1.0,  2.0, 2.0],
+            [1.0, 1.0,  2.0, 2.0],
+            [4.0, 4.0,  8.0, 8.0],
+            [4.0, 4.0,  8.0, 8.0],
+        ],
+        dtype=torch.float32,
+    )
+    # FP8 e4m3fn quantization of the above (representable exactly).
+    weight_fp8 = weight_fp32.to(torch.float8_e4m3fn)
+    # Per-block scale: 4 distinct values for the four 2x2 blocks.
+    scale_fp32 = torch.tensor([[0.5, 1.5], [2.0, 0.25]], dtype=torch.float32)
+
+    out = dequantize_block_fp8_to_bf16(weight_fp8, scale_fp32, block_size=(2, 2)).float()
+    expected = torch.tensor(
+        [
+            [0.5, 0.5,  3.0, 3.0],   # block 0,0 * 0.5  |  block 0,1 * 1.5
+            [0.5, 0.5,  3.0, 3.0],
+            [8.0, 8.0,  2.0, 2.0],   # block 1,0 * 2.0  |  block 1,1 * 0.25
+            [8.0, 8.0,  2.0, 2.0],
+        ]
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_block_fp8_dequant_rejects_wrong_scale_shape() -> None:
+    weight = torch.zeros((4, 4), dtype=torch.float8_e4m3fn)
+    wrong_scale = torch.ones((4, 4), dtype=torch.float32)  # expected (2, 2) for block=(2,2)
+    with pytest.raises(ValueError, match="fp8_scale shape"):
+        dequantize_block_fp8_to_bf16(weight, wrong_scale, block_size=(2, 2))
+
+
+def test_block_fp8_dequant_rejects_wrong_rank() -> None:
+    weight_3d = torch.zeros((2, 4, 4), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((2, 2), dtype=torch.float32)
+    with pytest.raises(ValueError, match="fp8_weight must be 2-D"):
+        dequantize_block_fp8_to_bf16(weight_3d, scale)
+
+
+def test_block_fp8_dequant_returns_bf16() -> None:
+    """Result dtype should always be BF16 regardless of input scale dtype."""
+    weight = torch.zeros((128, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((1, 1), dtype=torch.float32)
+    out = dequantize_block_fp8_to_bf16(weight, scale, block_size=(128, 128))
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (128, 128)
