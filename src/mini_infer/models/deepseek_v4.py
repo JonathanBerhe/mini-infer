@@ -81,8 +81,111 @@ _V4_RENAME_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\.mlp\.shared_experts\.up_proj\.weight$"), r".mlp.shared_experts.w3.weight"),
 ]
 
+# Real V4-Flash safetensors use the reference (`deepseek_v4_reference/`)
+# *compact* naming convention rather than HF-style `model.layers.X.self_attn.…`.
+# The rules below remap those names into mini-infer's module hierarchy.
+# Applied in order; the order is critical for non-overlapping matches:
+#   - per-norm renames go BEFORE the generic `attn.` -> `self_attn.` rule so
+#     `attn_norm` isn't accidentally caught by it.
+#   - field renames inside the attention block (wq_a -> q_a_proj.weight, ...)
+#     run after `attn. -> self_attn.` so they match the post-rename names.
+#   - `layers.` -> `model.layers.` runs last on the layer-body keys so the
+#     earlier patterns can anchor on `layers.\d+.` cleanly.
+_V4_FLASH_RENAME_RULES: list[tuple[re.Pattern[str], str]] = [
+    # Layer-local norms.
+    (re.compile(r"^(layers\.\d+)\.attn_norm\.weight$"), r"\1.input_layernorm.weight"),
+    (re.compile(r"^(layers\.\d+)\.ffn_norm\.weight$"), r"\1.post_attention_layernorm.weight"),
+    # Hyper-Connections per-layer params: `hc_attn_base` -> `hc_attn.base`, etc.
+    (re.compile(r"^(layers\.\d+)\.hc_attn_(base|fn|scale)$"), r"\1.hc_attn.\2"),
+    (re.compile(r"^(layers\.\d+)\.hc_ffn_(base|fn|scale)$"), r"\1.hc_ffn.\2"),
+    # Attention prefix: `layers.X.attn.…` -> `layers.X.self_attn.…`.
+    (re.compile(r"^(layers\.\d+)\.attn\."), r"\1.self_attn."),
+    # FFN prefix: `layers.X.ffn.…` -> `layers.X.mlp.…`.
+    (re.compile(r"^(layers\.\d+)\.ffn\."), r"\1.mlp."),
+    # Attention sink: `self_attn.attn_sink` -> `self_attn.sink.sink_logits`.
+    (re.compile(r"\.self_attn\.attn_sink$"), r".self_attn.sink.sink_logits"),
+    # Q low-rank + norm renames.
+    (re.compile(r"\.self_attn\.wq_a\.(weight|scale)$"), r".self_attn.q_a_proj.\1"),
+    (re.compile(r"\.self_attn\.wq_b\.(weight|scale)$"), r".self_attn.q_b_proj.\1"),
+    (re.compile(r"\.self_attn\.q_norm\.weight$"), r".self_attn.q_a_layernorm.weight"),
+    # SWA K/V projection.
+    (re.compile(r"\.self_attn\.wkv\.(weight|scale)$"), r".self_attn.swa_kv_proj.\1"),
+    # Grouped output. `wo_a` is stored as a single Parameter (not nn.Linear)
+    # on our side — the `.weight` suffix is dropped.
+    (re.compile(r"\.self_attn\.wo_a\.weight$"), r".self_attn.grouped_output.wo_a"),
+    (re.compile(r"\.self_attn\.wo_a\.scale$"), r".self_attn.grouped_output.wo_a.scale"),
+    (re.compile(r"\.self_attn\.wo_b\.(weight|scale)$"), r".self_attn.grouped_output.wo_b.\1"),
+    # Compressor (HCA + CSA): wkv -> kv_proj, wgate -> weight_proj, ape -> position_bias.
+    (re.compile(r"\.compressor\.wkv\.(weight|scale)$"), r".compressor.kv_proj.\1"),
+    (re.compile(r"\.compressor\.wgate\.(weight|scale)$"), r".compressor.weight_proj.\1"),
+    (re.compile(r"\.compressor\.ape$"), r".compressor.position_bias"),
+    # Lightning Indexer.
+    (re.compile(r"\.indexer\.ws_proj\.(weight|scale)$"), r".indexer.weights_proj.\1"),
+    # Final: `layers.X.…` -> `model.layers.X.…` (after all per-layer rules).
+    (re.compile(r"^layers\."), r"model.layers."),
+    # Top-level renames.
+    (re.compile(r"^embed\."), r"model.embed_tokens."),
+    (re.compile(r"^norm\.weight$"), r"model.norm.weight"),
+    (re.compile(r"^head\."), r"lm_head."),
+    (re.compile(r"^hc_head_(base|fn|scale)$"), r"hc_head_reduction.\1"),
+]
+
+
+def _is_v4_flash_native_naming(state_dict_keys: list[str]) -> bool:
+    """Heuristic: does the checkpoint use V4-reference compact names?
+
+    V4-Flash ships keys like `embed.weight`, `layers.0.attn.wq_a.weight`,
+    `head.weight`. HF transformers ports of V2/V3-style models use the
+    longer `model.embed_tokens.weight`, `model.layers.0.self_attn.q_proj`,
+    `lm_head.weight`. We test the most distinctive prefix.
+    """
+    return any(k.startswith("layers.") and ".attn." in k for k in state_dict_keys[:200])
+
+
+def _apply_v4_flash_renames(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rewrite V4-Flash native keys into mini-infer's naming.
+
+    Walks `_V4_FLASH_RENAME_RULES` in order, applying the first matching
+    pattern per key. Drops `mtp.*` entries (multi-token-prediction head;
+    not implemented in mini-infer).
+    """
+    renamed: dict[str, torch.Tensor] = {}
+    for hf_name, tensor in state_dict.items():
+        if hf_name.startswith("mtp."):
+            # Drop MTP head weights — mini-infer's V4 doesn't model the
+            # next-token-prediction head, and these would otherwise show
+            # up as a flood of "unexpected" keys.
+            continue
+        new_name = hf_name
+        for pattern, replacement in _V4_FLASH_RENAME_RULES:
+            if pattern.search(new_name):
+                new_name = pattern.sub(replacement, new_name)
+        renamed[new_name] = tensor
+    return renamed
+
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
+
+
+# V4-Flash's `config.json` names its MoE gate scoring function
+# `"sqrtsoftplus"`; mini-infer's `HashRoutedGate` uses the equivalent
+# `"softplus_sqrt"` (sqrt(softplus(x)), the V4 paper's formula). Map at
+# config-parse time so neither side has to know about the other's spelling.
+_SCORE_FUNC_NAME_MAP: dict[str, str] = {
+    "sqrtsoftplus": "softplus_sqrt",
+    "softplus_sqrt": "softplus_sqrt",
+    "softmax": "softmax",
+    "sigmoid": "sigmoid",
+}
+
+
+def _map_score_func(hf_value: str) -> str:
+    """Translate an HF `scoring_func` string into our `moe_score_func`.
+
+    Falls back to the raw value if we don't have a mapping — that way an
+    HF-side rename surfaces as a downstream `ScoreFunction` validation
+    error with the actual offending name, rather than a silent default."""
+    return _SCORE_FUNC_NAME_MAP.get(hf_value, hf_value)
 
 
 @dataclass
@@ -311,6 +414,38 @@ class DeepseekV4Config:
                     default_value=rope_scaling.get("beta_slow", 1),
                 )
             ),
+            # MoE FFN. V4-Flash enables hash-routed MoE; we detect this from
+            # presence of expert-count fields and propagate the rest.
+            # HF spelling: `n_routed_experts`, `num_experts_per_tok`,
+            # `n_shared_experts`, `num_hash_layers`, `moe_intermediate_size`,
+            # `scoring_func` ("sqrtsoftplus" maps to our internal "softplus_sqrt").
+            use_moe_ffn=bool(
+                _pick("use_moe_ffn", default_value=None)
+                if _pick("use_moe_ffn", default_value=None) is not None
+                else _pick("n_routed_experts", default_value=0) > 0
+            ),
+            moe_intermediate_size=int(_pick("moe_intermediate_size", default_value=0)),
+            num_routed_experts=int(
+                _pick("num_routed_experts", "n_routed_experts", default_value=0)
+            ),
+            num_activated_experts=int(
+                _pick("num_activated_experts", "num_experts_per_tok", default_value=0)
+            ),
+            num_hash_routed_layers=int(
+                _pick("num_hash_routed_layers", "num_hash_layers", default_value=0)
+            ),
+            moe_score_func=_map_score_func(
+                _pick("moe_score_func", "scoring_func", default_value="softmax")
+            ),
+            moe_route_scale=float(
+                _pick("moe_route_scale", "routed_scaling_factor", default_value=1.0)
+            ),
+            n_shared_experts=int(_pick("n_shared_experts", default_value=0)),
+            # Hyper-Connections. V4-Flash sets `hc_mult=4`.
+            use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
+            hc_mult=int(_pick("hc_mult", default_value=0)),
+            hc_sinkhorn_iters=int(_pick("hc_sinkhorn_iters", default_value=20)),
+            hc_eps=float(_pick("hc_eps", default_value=1e-6)),
         )
 
 
@@ -655,48 +790,86 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             )
 
         # Step 1: dequant.
-        # V4-Flash ships mixed precision:
-        #   - Non-MoE weights as `float8_e4m3fn` (1 byte, native PyTorch dtype).
-        #   - MoE expert weights as `float4_e2m1fn_x2` (packed NVFP4: 2x FP4
-        #     per byte), accompanied by a per-block `float8_e8m0fnu` scale
-        #     tensor under the matching `*_scale` key.
-        # Walk the state_dict, upcast FP8 to BF16, and dequantize NVFP4
-        # weight+scale pairs via `dequantize_nvfp4_to_bf16`.
-        from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16, is_packed_nvfp4
+        # V4-Flash ships block-quantized weights in two storage formats:
+        #   - Most weights (attention projections, MoE gate, compressors)
+        #     are `float8_e4m3fn` paired with a `(M/128, N/128)` `e8m0fnu`
+        #     scale at the sibling `.scale` key.
+        #   - MoE expert weights are packed NVFP4 (`float4_e2m1fn_x2`),
+        #     paired with a `(M, N/32)` `e8m0fnu` scale at `.scale`.
+        # The pairing convention is "same stem with `.weight` -> `.scale`"
+        # (period prefix), NOT `_scale` suffix — `hc_attn_scale` is a real
+        # parameter, not a companion.
+        from mini_infer.quant.nvfp4 import (
+            dequantize_block_fp8_to_bf16,
+            dequantize_nvfp4_to_bf16,
+            is_packed_nvfp4,
+        )
+
+        def _sibling_scale_key(weight_key: str) -> str | None:
+            """Return the sibling scale-companion key if it exists.
+
+            Convention: `foo.bar.weight` -> `foo.bar.scale` (period prefix);
+            we deliberately do NOT match `foo_scale` (underscore prefix),
+            which is reserved for stand-alone scale parameters like the
+            HC `hc_attn_scale` that aren't companions.
+            """
+            if not weight_key.endswith(".weight"):
+                return None
+            candidate = weight_key[: -len(".weight")] + ".scale"
+            return candidate if candidate in hf_state_dict else None
 
         dequantized: dict[str, torch.Tensor] = {}
         consumed_scale_keys: set[str] = set()
         for hf_name, tensor in hf_state_dict.items():
-            if hf_name.endswith("_scale") and hf_name[:-len("_scale")] in hf_state_dict:
-                # Scale tensor belonging to a packed FP4 weight we'll handle
-                # alongside the weight itself; mark consumed and skip.
-                consumed_scale_keys.add(hf_name)
-                continue
-            if tensor.dtype == torch.float8_e4m3fn:
-                dequantized[hf_name] = tensor.to(torch.bfloat16)
-                continue
-            scale_key = hf_name + "_scale"
-            if is_packed_nvfp4(tensor) and scale_key in hf_state_dict:
-                # Native packed-FP4 dtype + matching scale → dequant to BF16.
-                dequantized[hf_name] = dequantize_nvfp4_to_bf16(
-                    tensor, hf_state_dict[scale_key]
-                )
+            # Sibling scale keys get consumed when we process their paired weight.
+            if hf_name.endswith(".scale"):
+                paired_weight_key = hf_name[: -len(".scale")] + ".weight"
+                if paired_weight_key in hf_state_dict:
+                    consumed_scale_keys.add(hf_name)
+                    continue
+                # No paired weight — fall through, treat as a regular tensor.
+
+            scale_key = _sibling_scale_key(hf_name)
+            if scale_key is not None:
+                scale_tensor = hf_state_dict[scale_key]
+                if is_packed_nvfp4(tensor):
+                    dequantized[hf_name] = dequantize_nvfp4_to_bf16(tensor, scale_tensor)
+                elif tensor.dtype == torch.float8_e4m3fn:
+                    dequantized[hf_name] = dequantize_block_fp8_to_bf16(
+                        tensor, scale_tensor, block_size=(128, 128)
+                    )
+                else:
+                    # Unknown quantization — pass through and hope the
+                    # downstream loader catches the dtype mismatch.
+                    dequantized[hf_name] = tensor
                 consumed_scale_keys.add(scale_key)
+            elif tensor.dtype == torch.float8_e4m3fn:
+                # Bare FP8 without a scale — direct cast (older paper-internal
+                # convention; not used by V4-Flash).
+                dequantized[hf_name] = tensor.to(torch.bfloat16)
             else:
                 dequantized[hf_name] = tensor
 
-        # Step 2: rename HF MoE expert names to our `w1/w2/w3` convention.
-        # Same rules as V2/V3; the V4 reference uses identical per-expert
-        # names since the MoE block structure didn't change between
-        # generations.
-        remapped: dict[str, torch.Tensor] = {}
-        for hf_name, tensor in dequantized.items():
-            new_name = hf_name
-            for pattern, replacement in _V4_RENAME_RULES:
-                if pattern.search(new_name):
-                    new_name = pattern.sub(replacement, new_name)
-                    break
-            remapped[new_name] = tensor
+        # Step 2: rename HF / V4-reference names into our module hierarchy.
+        # Two distinct conventions ship in the wild:
+        #   - HF transformers V2/V3-style (`model.embed_tokens.weight`,
+        #     `model.layers.0.self_attn.q_proj.weight`, ...). Original
+        #     `_V4_RENAME_RULES` cover the MoE expert sub-renames here.
+        #   - V4-reference compact (`embed.weight`,
+        #     `layers.0.attn.wq_a.weight`, `layers.0.ffn.experts.0.w1.weight`).
+        #     V4-Flash on HF ships in this convention.
+        # `_is_v4_flash_native_naming` heuristically picks the right path.
+        if _is_v4_flash_native_naming(list(dequantized.keys())):
+            remapped = _apply_v4_flash_renames(dequantized)
+        else:
+            remapped = {}
+            for hf_name, tensor in dequantized.items():
+                new_name = hf_name
+                for pattern, replacement in _V4_RENAME_RULES:
+                    if pattern.search(new_name):
+                        new_name = pattern.sub(replacement, new_name)
+                        break
+                remapped[new_name] = tensor
 
         # Step 3: TP-aware load. `load_state_dict_with_tp` slices each
         # full weight via the matching `load_full_weight` / `load_full_logits`
