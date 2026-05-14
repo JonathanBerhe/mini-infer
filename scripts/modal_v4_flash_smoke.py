@@ -147,19 +147,26 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
 
         tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
         encoded = tokenizer.encode(prompt)
-        # V4 expects T to be a multiple of every layer's compression_ratio.
-        # Pad up to the LCM if the prompt is too short.
-        compression_ratios = list(cfg.compress_ratios)
+        # V4 expects T to be a multiple of every NON-ZERO compression_ratio.
+        # ratio == 0 is a pure-SWA layer with no compressor; it imposes no
+        # divisibility constraint. lcm(0, x) == 0, so we filter zeros out
+        # before computing the LCM.
         from math import lcm
 
-        ratio_lcm = compression_ratios[0]
-        for r in compression_ratios[1:]:
+        non_zero_ratios = [r for r in cfg.compress_ratios if r > 0]
+        ratio_lcm = 1
+        for r in non_zero_ratios:
             ratio_lcm = lcm(ratio_lcm, r)
         target_len = ((len(encoded) + ratio_lcm - 1) // ratio_lcm) * ratio_lcm
         if target_len > len(encoded):
             pad_token = tokenizer.eos_id or 0
             encoded = encoded + [pad_token] * (target_len - len(encoded))
         input_ids = torch.tensor([encoded], device=device, dtype=torch.long)
+        _checkpoint(
+            rank,
+            f"prefill input ready ({target_len} tokens, lcm={ratio_lcm}); "
+            f"running model(input_ids)...",
+        )
 
         with torch.inference_mode():
             logits = model(input_ids)
