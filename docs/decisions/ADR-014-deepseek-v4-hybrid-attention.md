@@ -184,10 +184,11 @@ demo script).
 
 **Negative:**
 
-- The V4-Flash artefact is "TP-ready backbone with structurally
-  complete `load_weights` (FP8 dequant + MoE renames)", not "runs
-  DeepSeek-V4-Pro out of the box". NVFP4-packed expert dequant and
-  real-weight validation on 2× B200 are still ahead.
+- The V4-Flash artefact is "TP-ready backbone with a loader that
+  matches the published storage format end-to-end against real
+  safetensors", not "runs DeepSeek-V4-Pro out of the box". A full
+  forward pass through TP on 2× B200 is the remaining gate — load
+  is proven, runtime forward-path debugging is open work.
 - The `StateCache` lives outside `PagedKVCache`. A request that
   spans both V4 attention and a model that uses paged KV would need
   two separate cache lifecycles. Not a concern today; a real
@@ -287,16 +288,45 @@ Considered" have since been implemented and wired through the model:
   / V4. (Stage `6ca690d`, separate from the V4 attention work — the
   `RotaryEmbedding` block now carries it.)
 
-**Status of "load real V4 weights":** every published architecture
-component is implemented and wired, the multi-GPU tensor parallelism
-infrastructure (column/row-parallel linears, expert-parallel MoE,
-vocab-parallel embedding/LM-head) is in tree under
-`src/mini_infer/distributed/`, and `load_weights` walks the HF
-state_dict (FP8 e4m3fn dequant to BF16, V2/V3-style MoE expert
-renames, TP-aware dispatch through `load_state_dict_with_tp`).
-V4-Flash's NVFP4-packed expert weights raise a clear error pending
-the dequant kernel — that and a real-weight Modal smoke on 2× B200
-are the last steps.
+**Status of "load real V4 weights":** the full V4-Flash storage
+format is supported end-to-end and validated against the published
+`deepseek-ai/DeepSeek-V4-Flash` safetensors:
+
+- **Architecture**: every published V4 primitive (CSA + HCA + SWA +
+  AttentionSink + GroupedOutputProjection + LightningIndexer +
+  TokenLevelCompressor + HashRoutedMoEFFN + HyperConnections +
+  HCHeadReduction + YaRN RoPE) is implemented and integrated through
+  `DeepseekV4ForCausalLM`. V4-Flash's three-mode `compress_ratios`
+  (`0 → SWA`, `4 → CSA`, `128 → HCA`) dispatches correctly per layer.
+- **Tensor parallelism**: column/row-parallel linears, expert-parallel
+  MoE, and vocab-parallel embedding/LM-head live in
+  `src/mini_infer/distributed/`. All TP-aware modules degrade to
+  plain `nn.Linear` / `nn.Embedding` at `world_size=1`, so existing
+  single-device tests stay bit-identical. Validated on real H100
+  hardware via a Qwen2.5-7B two-rank TP smoke (each rank produces
+  finite per-head sliced outputs with the expected
+  `hidden_size / world_size` head dim).
+- **Loader** (`DeepseekV4ForCausalLM.load_weights`): block-FP8 dequant
+  for non-MoE weights (`e4m3fn` weight + 128×128 `e8m0fnu` scales),
+  NVFP4 dequant for MoE experts (int8/uint8 packed weight + block-32
+  `e8m0fnu` scales — the way V4-Flash's safetensors actually ship
+  them), V4-reference compact key rename (`layers.X.attn.wq_a` →
+  `model.layers.X.self_attn.q_a_proj.weight`, etc.), expert-parallel
+  global→local index remap, meta-device construction + CPU-resident
+  state_dict + per-slice GPU streaming (so peak memory is bounded by
+  one rank's share, never the full 158 GB).
+- **Validation**: dry-run against the real V4-Flash safetensors index
+  matches all 34,223 model parameters exactly (zero missing, zero
+  unexpected after dequant pairing consumes 33,389 sibling `.scale`
+  companions). Dequant numerically verified against a real V4-Flash
+  shard for both FP8 (`(1024, 4096) e4m3fn → bf16`) and NVFP4
+  (`(2048, 2048) int8 → (2048, 4096) bf16`) paths.
+
+**Remaining open work**: the full forward pass through TP on 2× B200.
+The load contract is proven; further runtime debugging of the
+forward path (additional meta buffers, dispatch quirks, cross-rank
+synchronization) is the last piece before a "V4-Flash generates
+coherent text" claim.
 
 **Test count:** 100+ V4-related tests across the primitives + the
 integration matrix. The `test_hc_backbone_combines_with_moe_ffn` test
