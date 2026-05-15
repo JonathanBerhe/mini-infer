@@ -61,7 +61,20 @@ def load_safetensors_state_dict(
         quantized_dtypes.add(fp4_dtype)
 
     def _maybe_cast(t: torch.Tensor) -> torch.Tensor:
+        # Skip quantized dtypes (they need a pre-block dequant to be
+        # meaningful; the caller's dequant handles them).
         if t.dtype in quantized_dtypes:
+            return t
+        # Preserve native FP32 sources. The DeepSeek-V4 Hyper-Connections
+        # parameters (`hc_*_fn`, `hc_*_base`, `hc_*_scale`) are stored as
+        # FP32 in the published safetensors and the V4 reference declares
+        # them under `with set_dtype(torch.float32)`; the Sinkhorn math
+        # inside `HyperConnections.hc_pre` casts the hidden state up to
+        # FP32 and then multiplies against the param. Downcasting the
+        # source to BF16 here would (a) silently lose precision and
+        # (b) cause a `mat1 != mat2 dtype` error in the eventual
+        # `F.linear(fp32_state, bf16_fn)`.
+        if t.dtype == torch.float32:
             return t
         return t.to(dtype=dtype) if t.dtype != dtype else t
 
