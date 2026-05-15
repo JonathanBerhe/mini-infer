@@ -126,12 +126,22 @@ def test_dequant_rejects_mismatched_scale_shape() -> None:
         dequantize_nvfp4_to_bf16(packed, wrong_scale, block_size=32)
 
 
-def test_is_packed_nvfp4_handles_missing_dtype() -> None:
-    """`float4_e2m1fn_x2` only exists in PyTorch >= 2.6; older versions just
-    return False without error so callers can degrade gracefully."""
-    # On any PyTorch the function shouldn't crash on a uint8 tensor.
+def test_is_packed_nvfp4_recognises_int_byte_storage() -> None:
+    """`is_packed_nvfp4` accepts int8/uint8 because V4-Flash's published
+    safetensors store packed FP4 weights with that dtype (the safetensors
+    metadata doesn't carry the FP4 type marker).
+
+    Note: the caller must independently verify a sibling `.scale` companion
+    exists before treating an int8 tensor as packed FP4; this predicate
+    is intentionally cheap and over-inclusive.
+    """
     uint8_tensor = torch.zeros(4, dtype=torch.uint8)
-    assert is_packed_nvfp4(uint8_tensor) is False
+    int8_tensor = torch.zeros(4, dtype=torch.int8)
+    assert is_packed_nvfp4(uint8_tensor) is True
+    assert is_packed_nvfp4(int8_tensor) is True
+    # Non-byte dtypes are not packed FP4.
+    bf16_tensor = torch.zeros(4, dtype=torch.bfloat16)
+    assert is_packed_nvfp4(bf16_tensor) is False
 
 
 def test_dequant_handles_negative_scale_block_with_negative_nibble() -> None:
