@@ -41,12 +41,18 @@ def _fp4_table(device: torch.device, dtype: torch.dtype = torch.float32) -> torc
 def is_packed_nvfp4(tensor: torch.Tensor) -> bool:
     """True iff this tensor is stored as packed NVFP4.
 
-    The packed-FP4 dtype `torch.float4_e2m1fn_x2` only exists in PyTorch
-    2.6+; on older builds the safetensors loader hands us `uint8` and we
-    detect that path by callers passing the name explicitly.
+    Two storage paths are recognised:
+      1. The native packed dtype `torch.float4_e2m1fn_x2` (PyTorch 2.6+).
+      2. Raw `int8` / `uint8` bytes (V4-Flash's published safetensors
+         convention — the safetensors metadata doesn't carry the FP4
+         type so the loader hands us int8 with the *packed* shape).
+    The companion `.scale` tensor tells the dequant function the true
+    unpacked shape regardless of which storage path is in use.
     """
     packed_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    return packed_dtype is not None and tensor.dtype == packed_dtype
+    if packed_dtype is not None and tensor.dtype == packed_dtype:
+        return True
+    return tensor.dtype in (torch.int8, torch.uint8)
 
 
 def dequantize_nvfp4_to_bf16(
