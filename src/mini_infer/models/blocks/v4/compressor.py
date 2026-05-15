@@ -127,15 +127,21 @@ class TokenLevelCompressor(nn.Module):
         if seqlen % m != 0:
             raise ValueError(f"seqlen={seqlen} must be a multiple of compression_ratio={m}")
 
-        # Stay in fp32 for the softmax math — the reference does this and
-        # the bf16 path is meaningfully lossy on small absolute values.
-        x = hidden_states.float()
-        kv = self.kv_proj(x)  # (B, T, coff*c)
-        score = self.weight_proj(x)  # (B, T, coff*c)
+        # Run the matmul in the input/weight native dtype (BF16 in V4-Flash
+        # production, FP32 in CPU tests). Casting the input to FP32 *before*
+        # the linear would mismatch BF16-loaded `kv_proj.weight` and produce
+        # the "mat1 and mat2 dtype" error. The softmax math below still runs
+        # in FP32 — we just defer the cast until after the matmul. The
+        # reference's compressor wraps `wkv` in a custom Linear that
+        # transparently upcasts; we accomplish the same correctness with
+        # plain `nn.Linear` by deferring the cast.
+        kv = self.kv_proj(hidden_states)  # (B, T, coff*c)
+        score = self.weight_proj(hidden_states)  # (B, T, coff*c)
 
-        # Reshape to (B, n_blocks, m, coff*c). Position bias broadcasts across batch + blocks.
-        kv = kv.unflatten(1, (-1, m))
-        score = score.unflatten(1, (-1, m)) + self.position_bias
+        # Reshape to (B, n_blocks, m, coff*c). Cast both to FP32 here so
+        # `position_bias` (FP32) adds cleanly and softmax is precision-safe.
+        kv = kv.unflatten(1, (-1, m)).float()
+        score = score.unflatten(1, (-1, m)).float() + self.position_bias
 
         if self.overlap_mode:
             # Overlap: each block's softmax spans 2m slots — its own m + the previous block's m.
@@ -218,10 +224,14 @@ class TokenLevelCompressor(nn.Module):
         remainder = seqlen % compression_ratio
         aligned_cutoff = seqlen - remainder
 
-        # Run the full sequence through the projections in fp32.
-        hidden_fp32 = hidden_states.float()
-        full_kv = self.kv_proj(hidden_fp32)  # (B, T, coff*c)
-        full_score = self.weight_proj(hidden_fp32)  # (B, T, coff*c)
+        # Run the projections in the input/weight native dtype (BF16 in
+        # V4-Flash production, FP32 in CPU tests), then cast outputs to
+        # FP32 — same reasoning as the standalone `forward` path: FP32
+        # input vs BF16 weight would mismatch in `F.linear`. State
+        # buffers (`cmp_kv_state`, `cmp_score_state`) are FP32, so the
+        # subsequent assignments below carry the cast automatically.
+        full_kv = self.kv_proj(hidden_states).float()  # (B, T, coff*c)
+        full_score = self.weight_proj(hidden_states).float()  # (B, T, coff*c)
 
         # ---- Stash the LAST aligned block as previous-overlap (CSA only) ----
         if self.overlap_mode and aligned_cutoff >= compression_ratio:
@@ -335,10 +345,13 @@ class TokenLevelCompressor(nn.Module):
         position_in_block = start_pos % compression_ratio
 
         # Project to KV + score; the in-flight accumulator is fp32, match it.
-        hidden_fp32 = hidden_state.float()
-        kv_for_token = self.kv_proj(hidden_fp32).squeeze(1)  # (B, c) HCA or (B, 2c) CSA
+        # Project in the input's native dtype (matches weight dtype), then
+        # cast to FP32 so the state-buffer assignments + softmax math run
+        # at FP32 precision.
+        kv_for_token = self.kv_proj(hidden_state).squeeze(1).float()
         score_for_token = (
-            self.weight_proj(hidden_fp32).squeeze(1) + self.position_bias[position_in_block]
+            self.weight_proj(hidden_state).squeeze(1).float()
+            + self.position_bias[position_in_block]
         )
 
         if self.overlap_mode:
