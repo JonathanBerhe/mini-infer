@@ -10,10 +10,14 @@ Runs a small CSA/HCA/CSA/HCA model on synthetic input to demonstrate:
      emit a new compressed entry every 4 decode steps; layers with
      `compression_ratio = 8` (HCA) emit one every 8.
 
-This is NOT a real inference workload — V4 weights aren't public and
-the model uses random weights. The point is to exercise the attention
-machinery end-to-end and show the per-layer state advancing correctly
-across decode steps.
+This is NOT a real inference workload: the model uses random weights
+on a 4-layer shrunken config so the demo runs in seconds on a laptop CPU.
+The point is to exercise the attention machinery end-to-end and show
+the per-layer state advancing correctly across decode steps. For the
+real V4-Flash storage format end-to-end (block-FP8 + NVFP4 dequant,
+expert-parallel sharding, meta-device per-rank loading on multi-GPU),
+see `src/mini_infer/models/deepseek_v4.py::load_weights` and the
+2x B200 smoke at `scripts/modal_v4_flash_smoke.py`.
 
 Run with:
     uv run python scripts/demo_deepseek_v4_hybrid.py
