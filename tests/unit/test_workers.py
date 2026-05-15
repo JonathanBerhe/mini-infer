@@ -78,6 +78,32 @@ def test_kvhandoff_carries_eos_optional() -> None:
     assert handoff.eos_token_id is None
 
 
+def test_kv_transfer_sampling_params_round_trip() -> None:
+    """The fixed-point header encoding round-trips SamplingParams values.
+
+    The wire format encodes temperature and top_p as int64 micros
+    (multiplied by 1e6). This test exercises the encode/decode pair
+    without spinning up a process group.
+    """
+    from mini_infer.workers.kv_transfer import (
+        _decode_sampling_params,
+        _encode_sampling_params,
+    )
+
+    cases = [
+        SamplingParams(temperature=0.0, top_k=0, top_p=1.0),  # greedy
+        SamplingParams(temperature=0.7, top_k=50, top_p=0.95),
+        SamplingParams(temperature=1.234567, top_k=0, top_p=0.9),
+    ]
+    for original in cases:
+        t, k, p = _encode_sampling_params(original)
+        restored = _decode_sampling_params(t, k, p)
+        # Fixed-point encoding loses precision past 1e-6; assert within that.
+        assert abs(restored.temperature - original.temperature) <= 1e-6
+        assert restored.top_k == original.top_k
+        assert abs(restored.top_p - original.top_p) <= 1e-6
+
+
 # ---------------------------------------------------------------------------
 # Real-model parity vs ContinuousScheduler (the headline Slice-1 contract)
 # ---------------------------------------------------------------------------

@@ -28,7 +28,23 @@ change output distribution.
 
 from mini_infer.workers.decode_worker import DecodeWorker
 from mini_infer.workers.kv_handoff import KVHandoff
+from mini_infer.workers.kv_transfer import recv_handoff, send_handoff
+from mini_infer.workers.multi_process import (
+    DECODE_RANK,
+    PREFILL_RANK,
+    pd_two_process_target,
+)
 from mini_infer.workers.orchestrator import Orchestrator
 from mini_infer.workers.prefill_worker import PrefillWorker
 
-__all__ = ["DecodeWorker", "KVHandoff", "Orchestrator", "PrefillWorker"]
+__all__ = [
+    "DECODE_RANK",
+    "PREFILL_RANK",
+    "DecodeWorker",
+    "KVHandoff",
+    "Orchestrator",
+    "PrefillWorker",
+    "pd_two_process_target",
+    "recv_handoff",
+    "send_handoff",
+]
