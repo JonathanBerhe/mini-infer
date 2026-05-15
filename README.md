@@ -281,6 +281,7 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 * [ADR-012](docs/decisions/ADR-012-fused-int8-kernel.md): fused W8A16 Triton kernel for `Int8Linear`
 * [ADR-013](docs/decisions/ADR-013-turboquant-kv.md): TurboQuant KV cache (V1 + V3 + V2a fused dequant; V2b deselected); FlashInfer FP8 + NVFP4 KV
 * [ADR-014](docs/decisions/ADR-014-deepseek-v4-hybrid-attention.md): DeepSeek-V4 hybrid attention contribution (CSA + HCA primitives, per-request StateCache, registered hybrid backbone)
+* [ADR-015](docs/decisions/ADR-015-tensor-parallelism.md): tensor parallelism (Megatron-style column/row/vocab linears, expert-parallel MoE, per-rank weight loader)
 
 ## Tests
 
@@ -310,7 +311,7 @@ Future model support (planned, see [docs/plans/multi-model-support.md](docs/plan
 
 * **DeepSeek-V3 (671B) + Kimi-K2 (1T)** — same MLA architecture as V2; `from_hf` and the registry already accept them once the larger checkpoints are exercised on a Modal run with sufficient HBM.
 * **Tensor parallelism** — Megatron-style column/row-parallel linears, vocab-parallel embedding, and expert-parallel MoE all live in `src/mini_infer/distributed/`. Every attention type and FFN primitive in the codebase is TP-aware (no-op at `world_size=1`). Required for >100B models that don't fit a single GPU; the remaining work is real-weight validation on Modal.
-* **DeepSeek-V4-Flash end-to-end forward on 2× B200** — every published V4 architecture primitive is implemented (see [ADR-014](docs/decisions/ADR-014-deepseek-v4-hybrid-attention.md)) and the V4-Flash loader handles the real published storage format end-to-end (block-FP8 + NVFP4 dequant, reference-compact key rename, expert-parallel sharding, meta-device + per-slice GPU streaming; load-path dry-run matches the real safetensors index exactly). The remaining gate is a full forward pass through TP on 2× B200 — load is proven; further runtime debugging of the forward path is open work.
+* **DeepSeek-V4-Flash end-to-end forward on 2× B200** — every published V4 architecture primitive is implemented (see [ADR-014](docs/decisions/ADR-014-deepseek-v4-hybrid-attention.md)) and the V4-Flash loader handles the real published storage format end-to-end (block-FP8 + NVFP4 dequant, reference-compact key rename, expert-parallel sharding, meta-device + per-slice GPU streaming; load-path dry-run matches the real safetensors index exactly). The remaining gate is a full forward pass through TP on 2× B200. Load is proven on real hardware; three dtype + meta-init fixes (compressor projection dtype, Hyper-Connections FP32 preservation, rotary `inv_freq` re-materialization) are statically clean. One end-to-end validation run remains.
 * **State-space hybrids** (Mamba, Nemotron-H, Jamba) — different cache abstraction entirely; deliberately out of scope.
 
 ## License
