@@ -92,6 +92,147 @@ class PrefillWorker:
         )
         return handoff
 
+    def prefill_batch(self, requests: list[Request]) -> list[KVHandoff]:
+        """Run prefill for a batch of requests in ONE packed-varlen forward.
+
+        Each request becomes its own slot in a fresh `PagedKVCache`; all
+        prompts are tokenized, packed into a single varlen tensor with
+        per-request `cu_seqlens_q`, and processed in one forward call. The
+        per-request last logits are sampled to produce each request's
+        first output token. Per-layer per-stream KV is then extracted
+        from the cache via a single `materialize_packed_stream` call
+        per (layer, stream), sliced per-request using `cu_seqlens_k`, and
+        packaged into B handoffs.
+
+        Equivalent in output to running `prefill(request)` once per
+        request (same sampled tokens, same KV bytes) — but it uses one
+        forward call instead of B, which is the throughput win
+        production engines deliver on the prefill side. Parity is
+        validated against the per-request loop in
+        `tests/unit/test_workers_batch.py`.
+
+        Limitations today:
+          - All requests share the cache's block pool. If the combined
+            prompt length exceeds pool capacity, this raises (the
+            single-request path is what falls back).
+          - No mid-batch admission. The batch is fixed at entry; a
+            ContinuousScheduler-style admission loop is out of scope here.
+
+        Caller invariants:
+          - Single-call: don't share a `PrefillWorker` instance across
+            concurrent batched calls.
+        """
+        if not requests:
+            return []
+        tokenizer = self._runner.tokenizer
+        pool = self._runner.block_pool
+        cache = PagedKVCache(pool)
+
+        per_request_token_ids: list[list[int]] = []
+        for request in requests:
+            token_ids = tokenizer.encode(request.prompt)
+            if not token_ids:
+                raise ValueError(
+                    f"PrefillWorker.prefill_batch received an empty prompt in batch slot "
+                    f"{len(per_request_token_ids)}"
+                )
+            per_request_token_ids.append(token_ids)
+
+        batch_idxs: list[int] = []
+        try:
+            packed_input_ids: list[int] = []
+            cu_seqlens_q: list[int] = [0]
+            for token_ids in per_request_token_ids:
+                cache.add_request_slot()
+                batch_idxs.append(cache.batch_size - 1)
+                packed_input_ids.extend(token_ids)
+                cu_seqlens_q.append(cu_seqlens_q[-1] + len(token_ids))
+            # All slots start at position 0 (fresh prefill).
+            position_offsets = [0] * len(requests)
+            per_request_logits = self._runner.forward_step(
+                cache, packed_input_ids, cu_seqlens_q, position_offsets
+            )
+            first_tokens = [
+                sample(per_request_logits[i], requests[i].sampling_params)
+                for i in range(len(requests))
+            ]
+            handoffs = self._extract_batch_handoff(
+                cache=cache,
+                requests=requests,
+                per_request_token_ids=per_request_token_ids,
+                first_sampled_token_ids=first_tokens,
+            )
+        finally:
+            # Remove slots in reverse order so each index stays valid as we shrink.
+            for batch_idx in reversed(batch_idxs):
+                cache.remove_request(batch_idx)
+        return handoffs
+
+    def _extract_batch_handoff(
+        self,
+        *,
+        cache: PagedKVCache,
+        requests: list[Request],
+        per_request_token_ids: list[list[int]],
+        first_sampled_token_ids: list[int],
+    ) -> list[KVHandoff]:
+        """Slice a multi-slot cache's per-stream packed KV into per-request handoffs.
+
+        `materialize_packed_stream` returns `(total_k, h, d)` plus a
+        `cu_seqlens_k` tensor with the per-request K boundaries. We
+        materialize each (layer, stream) once and slice it B ways using
+        those boundaries. This is the multi-slot generalization of
+        `_extract_handoff`.
+        """
+        pool = self._runner.block_pool
+        eos_token_id = self._runner.tokenizer.eos_token_id
+        batch_size = len(requests)
+
+        # Pre-build the empty per-request layer lists so we can index into them.
+        per_request_layer_streams: list[list[dict[str, torch.Tensor]]] = [
+            [] for _ in range(batch_size)
+        ]
+        for layer_idx in range(pool.num_layers):
+            for stream_name in pool.stream_names(layer_idx):
+                stream_packed, cu_seqlens_k, _max_seq = cache.materialize_packed_stream(
+                    layer_idx, stream_name
+                )
+                offsets = cu_seqlens_k.tolist()
+                if len(offsets) != batch_size + 1:
+                    raise RuntimeError(
+                        f"materialize_packed_stream returned cu_seqlens_k of length "
+                        f"{len(offsets)}, expected {batch_size + 1}"
+                    )
+                for r in range(batch_size):
+                    start, end = offsets[r], offsets[r + 1]
+                    expected = len(per_request_token_ids[r])
+                    if end - start != expected:
+                        raise RuntimeError(
+                            f"layer {layer_idx} stream {stream_name!r} request {r}: "
+                            f"got {end - start} positions, expected {expected}"
+                        )
+                    # Allocate a layer dict on demand for this request.
+                    if len(per_request_layer_streams[r]) <= layer_idx:
+                        per_request_layer_streams[r].append({})
+                    per_request_layer_streams[r][layer_idx][stream_name] = stream_packed[
+                        start:end
+                    ].clone()
+
+        handoffs: list[KVHandoff] = []
+        for r in range(batch_size):
+            handoffs.append(
+                KVHandoff(
+                    request_id=str(uuid.uuid4()),
+                    kv_streams_per_layer=per_request_layer_streams[r],
+                    prefill_len=len(per_request_token_ids[r]),
+                    first_sampled_token_id=first_sampled_token_ids[r],
+                    sampling_params=requests[r].sampling_params,
+                    max_tokens=requests[r].max_tokens,
+                    eos_token_id=eos_token_id,
+                )
+            )
+        return handoffs
+
     def _extract_handoff(
         self,
         *,
