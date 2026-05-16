@@ -295,6 +295,7 @@ Architecture walkthroughs (paper-section → reference-file:line → our-file:li
 * [Gemma 4 (text-only)](docs/architectures/gemma-4.md): heterogeneous-KV per layer-type (sliding 16h×256d vs full 4h×512d), dual RoPE with different head_dim per type, `attention_k_eq_v` (V shares K's pre-norm tensor), unscaled `v_norm`, per-layer `layer_scalar`, final logit softcap, multimodal weight prefix strip at load time, model-side attention backend override.
 * [Mixtral 8x7B / 8x22B](docs/architectures/mixtral.md): top-k sparse MoE (2-of-8 default), per-expert SwiGLU MLPs with `w1/w2/w3` naming, post-topk softmax renormalisation, expert-parallel dispatch. Cleanest MoE baseline; V2/V3/Kimi-K2 and V4 extend it.
 * [Qwen3](docs/architectures/qwen3.md): per-head Q/K norm before RoPE, no QKV biases, tied embeddings. Smallest family-specific delta over the Llama baseline; useful template for adding a new Llama-shape architecture with one or two quirks.
+* [Gemma 3 (text-only)](docs/architectures/gemma-3.md): sliding-window + global alternating attention (typical 5:1), dual RoPE (same head_dim, different theta), per-head Q/K norm with offset `GemmaRMSNorm` (`(1+w)*x`), sandwich norms around both attention and FFN, GeGLU activation, `sqrt(hidden_size)` embed scaling, tied embeddings.
 
 ## Tests
 
