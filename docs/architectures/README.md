@@ -15,15 +15,34 @@ The direct realization of mini-infer's research-paper-engine niche
 | Gemma 4 (text-only) | Gemma 4 release notes | HF transformers `modeling_gemma3.py` (text path) | [gemma-4.md](gemma-4.md) |
 | Mixtral 8x7B / 8x22B | Mixtral of Experts paper | HF transformers `modeling_mixtral.py` | [mixtral.md](mixtral.md) |
 | Qwen3 | Qwen3 technical report | HF transformers `modeling_qwen3.py` | [qwen3.md](qwen3.md) |
+| Gemma 3 (text-only) | Gemma 3 technical report | HF transformers `modeling_gemma3.py` | [gemma-3.md](gemma-3.md) |
 
 ## Pending walkthroughs
 
-The order tracks the roadmap's "medium-term" priorities. Each one is
-~1-3 days of careful work mapping paper → reference → our code.
+All currently-registered architectures have walkthroughs. Future
+additions trigger when a new paper architecture is implemented per
+the [roadmap-2026 §Paper-watch-list](../plans/roadmap-2026.md).
 
-- **Gemma 3** — sliding-window + global alternating attention, dual
-  RoPE, sandwich norms, GemmaRMSNorm (`(1+w)*x`), GeGLU
-  (`gelu_pytorch_tanh`), embed scaling, Q/K norm.
+Reading order suggestion if you're new to the codebase:
+
+1. **[Qwen3](qwen3.md)** — smallest delta over the Llama baseline.
+   Read this first to see what a minimal family file looks like.
+2. **[Mixtral](mixtral.md)** — the simplest MoE. Adds top-k sparse
+   FFN on top of the Llama baseline.
+3. **[Gemma 3](gemma-3.md)** — sandwich norms, offset RMSNorm, dual
+   RoPE, sliding+global alternation. Most family-specific quirks
+   without changing the cache shape.
+4. **[Gemma 4](gemma-4.md)** — adds heterogeneous-KV per layer-type
+   (different `(num_kv_heads, head_dim)` between sliding and full
+   layers) on top of Gemma 3's machinery.
+5. **[DeepSeek-V2 (MLA)](deepseek-v2-mla.md)** — the dense material
+   for the DeepSeek family. Two-stream KV cache (`kv_latent` +
+   `k_rope`), low-rank Q, interleaved RoPE, asymmetric Q/K vs V
+   head_dim, heterogeneous FFN (dense + MoE with shared experts).
+6. **[DeepSeek-V4](deepseek-v4.md)** — the headline. Hybrid
+   per-layer attention (SWA/CSA/HCA), Lightning Indexer, attention
+   sink, grouped output projection, hash-routed MoE,
+   Hyper-Connections. Read after V2 since V4 extends MLA.
 
 ## Walkthrough doc template
 
