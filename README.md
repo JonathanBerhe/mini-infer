@@ -293,6 +293,7 @@ Architecture walkthroughs (paper-section → reference-file:line → our-file:li
 * [DeepSeek-V4](docs/architectures/deepseek-v4.md): hybrid attention (SWA/CSA/HCA), token-level compressor, Lightning Indexer, attention sink, grouped output projection, hash-routed MoE, Hyper-Connections, YaRN long-context RoPE.
 * [DeepSeek-V2 / V3 / Kimi-K2 (MLA)](docs/architectures/deepseek-v2-mla.md): multi-head latent attention with two-stream KV cache (`kv_latent` + `k_rope`), low-rank Q, interleaved RoPE, asymmetric Q/K vs V head_dim, heterogeneous FFN (dense + MoE with shared experts).
 * [Gemma 4 (text-only)](docs/architectures/gemma-4.md): heterogeneous-KV per layer-type (sliding 16h×256d vs full 4h×512d), dual RoPE with different head_dim per type, `attention_k_eq_v` (V shares K's pre-norm tensor), unscaled `v_norm`, per-layer `layer_scalar`, final logit softcap, multimodal weight prefix strip at load time, model-side attention backend override.
+* [Mixtral 8x7B / 8x22B](docs/architectures/mixtral.md): top-k sparse MoE (2-of-8 default), per-expert SwiGLU MLPs with `w1/w2/w3` naming, post-topk softmax renormalisation, expert-parallel dispatch. Cleanest MoE baseline; V2/V3/Kimi-K2 and V4 extend it.
 
 ## Tests
 

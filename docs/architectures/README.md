@@ -13,14 +13,13 @@ The direct realization of mini-infer's research-paper-engine niche
 | DeepSeek-V4 | DeepSeek-V4 technical report | [DeepSeek-V4-Pro/inference](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main/inference) | [deepseek-v4.md](deepseek-v4.md) |
 | DeepSeek-V2 / V3 / Kimi-K2 (MLA) | DeepSeek-V2 technical report | HF transformers `modeling_deepseek_v2.py` | [deepseek-v2-mla.md](deepseek-v2-mla.md) |
 | Gemma 4 (text-only) | Gemma 4 release notes | HF transformers `modeling_gemma3.py` (text path) | [gemma-4.md](gemma-4.md) |
+| Mixtral 8x7B / 8x22B | Mixtral of Experts paper | HF transformers `modeling_mixtral.py` | [mixtral.md](mixtral.md) |
 
 ## Pending walkthroughs
 
 The order tracks the roadmap's "medium-term" priorities. Each one is
 ~1-3 days of careful work mapping paper → reference → our code.
 
-- **Mixtral** — top-k sparse MoE FFN (the simplest MoE in the registry,
-  good reference for V4's hash-routed variant).
 - **Qwen3** — per-head Q/K norm + tied embeddings (smallest delta over
   the Llama baseline, useful for "what does the family-specific block
   do" reading).
