@@ -26,7 +26,7 @@ workers may share a `ModelRunner`. The greedy-parity contract against
 change output distribution.
 """
 
-from mini_infer.workers.decode_worker import DecodeWorker
+from mini_infer.workers.decode_worker import DecodeSession, DecodeWorker
 from mini_infer.workers.kv_handoff import KVHandoff
 from mini_infer.workers.kv_transfer import recv_handoff, send_handoff
 from mini_infer.workers.multi_process import (
@@ -35,14 +35,17 @@ from mini_infer.workers.multi_process import (
     pd_two_process_target,
 )
 from mini_infer.workers.orchestrator import Orchestrator
+from mini_infer.workers.pd_scheduler import PDScheduler
 from mini_infer.workers.prefill_worker import PrefillWorker
 
 __all__ = [
     "DECODE_RANK",
     "PREFILL_RANK",
+    "DecodeSession",
     "DecodeWorker",
     "KVHandoff",
     "Orchestrator",
+    "PDScheduler",
     "PrefillWorker",
     "pd_two_process_target",
     "recv_handoff",
