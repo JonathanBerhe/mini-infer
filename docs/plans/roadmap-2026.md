@@ -214,8 +214,6 @@ code is available:
 
 - **DeepSeek-V5** (TBD). Expected to extend V4's hybrid attention.
   Our V4 primitives should compose forward.
-- **Kimi-K2 follow-ups.** Same MLA shape as V2/V3; should drop into
-  the existing path.
 - **Future Gemma generations.** Gemma 4 is in; future versions likely
   refine the heterogeneous-KV + dual-RoPE pattern.
 - **MoE-routing-novelty papers.** Anything that genuinely changes the
@@ -224,6 +222,39 @@ code is available:
   Linear attention, state-space hybrids (Mamba, Jamba, Nemotron-H) —
   these change the cache abstraction entirely; would be a separate
   big-piece engineering effort.
+
+### Evaluated and explicitly deferred
+
+- **Kimi K2.6** (Moonshot AI, April 2026). Multimodal release. Text
+  decoder is a relabeled `DeepseekV3ForCausalLM` (the K2.6 config's
+  `text_config.architectures` literally says so). Two real gaps
+  surfaced: (a) DeepSeek-V3's MoE routing primitives — `scoring_func:
+  sigmoid`, `topk_method: noaux_tc`, group-limited routing — aren't
+  in mini-infer's V2 path; (b) the published K2.6 weights are
+  `compressed-tensors` INT4 (group_size=32), a quantization format
+  not in our dequant inventory. The vision encoder (MoonViT) is
+  text-only-out-of-scope. The agent-swarm / long-horizon coding
+  features are training / system concerns, not inference
+  architecture. **Deferred** because the underlying architectural
+  innovation is DeepSeek-V3's, which is older than May 2026 and
+  doesn't trigger our "new architecture within 30 days" rule.
+  The V3-routing gap is tracked separately under "Tracked
+  open architectural gaps" below.
+
+## Tracked open architectural gaps
+
+These are claims our existing code or docs implicitly makes that we
+haven't fully delivered. Honest tracking, no immediate action.
+
+- **DeepSeek-V3 MoE routing.** The `DeepseekV2ForCausalLM` registry
+  entry covers V2-Lite / V2 / V3 / Kimi-K2 in terms of MLA attention,
+  but the V3-specific routing primitives (`scoring_func: sigmoid`,
+  `topk_method: noaux_tc`, group-limited routing via
+  `n_group / topk_group`) aren't in `MoEFFN`. V4's `HashRoutedGate`
+  has the `scoring_func` machinery; porting / sharing it with the
+  V2/V3 path is the next architectural improvement to consider.
+  Effort: ~3-5 days. Triggered if V5 or a future Kimi release uses
+  the same routing AND we want bit-parity coverage.
 
 ## Open questions
 
