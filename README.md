@@ -291,6 +291,7 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 Architecture walkthroughs (paper-section → reference-file:line → our-file:line) live in [docs/architectures/](docs/architectures/):
 
 * [DeepSeek-V4](docs/architectures/deepseek-v4.md): hybrid attention (SWA/CSA/HCA), token-level compressor, Lightning Indexer, attention sink, grouped output projection, hash-routed MoE, Hyper-Connections, YaRN long-context RoPE.
+* [DeepSeek-V2 / V3 / Kimi-K2 (MLA)](docs/architectures/deepseek-v2-mla.md): multi-head latent attention with two-stream KV cache (`kv_latent` + `k_rope`), low-rank Q, interleaved RoPE, asymmetric Q/K vs V head_dim, heterogeneous FFN (dense + MoE with shared experts).
 
 ## Tests
 
