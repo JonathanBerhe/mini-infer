@@ -29,6 +29,7 @@ from fastapi import Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from mini_infer.api.pd_scheduler import PDStreamingScheduler
 from mini_infer.api.schemas import (
     CompletionChoice,
     CompletionChunk,
@@ -41,6 +42,13 @@ from mini_infer.engine.sampler import SamplingParams
 from mini_infer.scheduler import ContinuousScheduler, Request, RequestHandle
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+# Set to "1" / "true" / "yes" to back the HTTP API with the PD pipeline
+# (`PrefillWorker` + `DecodeWorker` + `Orchestrator`) instead of the default
+# `ContinuousScheduler`. Same `/v1/completions` surface either way; the
+# pick is opaque to clients. The PD path is single-request serial today
+# (one prompt active at a time); ContinuousScheduler stays the default
+# for production-style concurrent serving.
+_USE_PD = os.environ.get("MINI_INFER_USE_PD", "").lower() in {"1", "true", "yes"}
 
 # Default bind is loopback; set MINI_INFER_HOST=0.0.0.0 (or a specific
 # interface) to expose. Pairing with MINI_INFER_API_KEY for any non-loopback
@@ -81,7 +89,12 @@ async def _verify_auth(
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_name = os.environ.get("MINI_INFER_MODEL", DEFAULT_MODEL)
     runner = ModelRunner.from_pretrained(model_name)
-    scheduler = ContinuousScheduler(runner)
+    scheduler: ContinuousScheduler | PDStreamingScheduler
+    if _USE_PD:
+        logger.info("Backing /v1/completions with PDStreamingScheduler (MINI_INFER_USE_PD set)")
+        scheduler = PDStreamingScheduler(runner)
+    else:
+        scheduler = ContinuousScheduler(runner)
     scheduler.start()
     app.state.scheduler = scheduler
     try:
@@ -114,7 +127,7 @@ async def completions(
     fastapi_req: FastAPIRequest,
     _auth: None = Depends(_verify_auth),
 ) -> StreamingResponse | CompletionResponse:
-    scheduler: ContinuousScheduler = fastapi_req.app.state.scheduler
+    scheduler: ContinuousScheduler | PDStreamingScheduler = fastapi_req.app.state.scheduler
     internal = Request(
         prompt=req.prompt,
         sampling_params=SamplingParams(
