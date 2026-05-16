@@ -59,6 +59,23 @@ def _decode_sampling_params(t_micros: int, top_k: int, p_micros: int) -> Samplin
     )
 
 
+def _infer_handoff_device(handoff: KVHandoff) -> torch.device:
+    """Pick the device for the wire-header from the handoff's KV tensors.
+
+    The handoff's KV streams are already on the prefill rank's device
+    (CUDA in production, CPU in tests); using the same device for the
+    header keeps `dist.send` on a single backend path (NCCL = CUDA,
+    gloo = either).
+    """
+    if not handoff.kv_streams_per_layer:
+        raise ValueError("KVHandoff has no layers; cannot infer device")
+    first_layer = handoff.kv_streams_per_layer[0]
+    if not first_layer:
+        raise ValueError("KVHandoff layer 0 has no streams; cannot infer device")
+    first_stream = next(iter(first_layer.values()))
+    return first_stream.device
+
+
 def send_handoff(
     handoff: KVHandoff, dst_rank: int, *, group: dist.ProcessGroup | None = None
 ) -> None:
@@ -74,6 +91,13 @@ def send_handoff(
     if dst_rank == dist.get_rank():
         raise ValueError(f"send_handoff: dst_rank {dst_rank} == current rank")
 
+    # NCCL requires CUDA tensors for send/recv; gloo accepts both. We place
+    # the header on whichever device the handoff's KV streams live on so a
+    # CUDA-backed handoff gets a CUDA header (NCCL works) and a CPU-backed
+    # handoff gets a CPU header (gloo works). The handoff is guaranteed to
+    # have at least one layer / stream by `KVHandoff.num_layers > 0` (empty
+    # handoffs are not produced by `PrefillWorker`).
+    device = _infer_handoff_device(handoff)
     t_micros, top_k, p_micros = _encode_sampling_params(handoff.sampling_params)
     header = torch.tensor(
         [
@@ -86,6 +110,7 @@ def send_handoff(
             p_micros,
         ],
         dtype=torch.int64,
+        device=device,
     )
     dist.send(header, dst=dst_rank, group=group)
 
@@ -114,7 +139,12 @@ def recv_handoff(
     if src_rank == dist.get_rank():
         raise ValueError(f"recv_handoff: src_rank {src_rank} == current rank")
 
-    header = torch.zeros(_HEADER_LEN, dtype=torch.int64)
+    # Match `send_handoff`'s device choice: place the header on the local
+    # pool's device. For NCCL groups both sides end up with CUDA headers;
+    # for gloo both sides get CPU headers. Mismatch (CUDA sender + CPU
+    # receiver or vice versa) is what causes the silent NCCL hang.
+    header_device = pool.storage_for_stream(0, pool.stream_names(0)[0]).device
+    header = torch.zeros(_HEADER_LEN, dtype=torch.int64, device=header_device)
     dist.recv(header, src=src_rank, group=group)
     prefill_len = int(header[0].item())
     first_sampled = int(header[1].item())
