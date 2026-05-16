@@ -14,15 +14,13 @@ The direct realization of mini-infer's research-paper-engine niche
 | DeepSeek-V2 / V3 / Kimi-K2 (MLA) | DeepSeek-V2 technical report | HF transformers `modeling_deepseek_v2.py` | [deepseek-v2-mla.md](deepseek-v2-mla.md) |
 | Gemma 4 (text-only) | Gemma 4 release notes | HF transformers `modeling_gemma3.py` (text path) | [gemma-4.md](gemma-4.md) |
 | Mixtral 8x7B / 8x22B | Mixtral of Experts paper | HF transformers `modeling_mixtral.py` | [mixtral.md](mixtral.md) |
+| Qwen3 | Qwen3 technical report | HF transformers `modeling_qwen3.py` | [qwen3.md](qwen3.md) |
 
 ## Pending walkthroughs
 
 The order tracks the roadmap's "medium-term" priorities. Each one is
 ~1-3 days of careful work mapping paper → reference → our code.
 
-- **Qwen3** — per-head Q/K norm + tied embeddings (smallest delta over
-  the Llama baseline, useful for "what does the family-specific block
-  do" reading).
 - **Gemma 3** — sliding-window + global alternating attention, dual
   RoPE, sandwich norms, GemmaRMSNorm (`(1+w)*x`), GeGLU
   (`gelu_pytorch_tanh`), embed scaling, Q/K norm.
