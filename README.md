@@ -288,6 +288,10 @@ Each non-trivial choice has an Architecture Decision Record under [docs/decision
 * [ADR-015](docs/decisions/ADR-015-tensor-parallelism.md): tensor parallelism (Megatron-style column/row/vocab linears, expert-parallel MoE, per-rank weight loader)
 * [ADR-016](docs/decisions/ADR-016-pd-disaggregation.md): prefill/decode disaggregation (PD) (`PrefillWorker` + `DecodeWorker` + `KVHandoff` + multi-process KV transport)
 
+Architecture walkthroughs (paper-section → reference-file:line → our-file:line) live in [docs/architectures/](docs/architectures/):
+
+* [DeepSeek-V4](docs/architectures/deepseek-v4.md): hybrid attention (SWA/CSA/HCA), token-level compressor, Lightning Indexer, attention sink, grouped output projection, hash-routed MoE, Hyper-Connections, YaRN long-context RoPE.
+
 ## Tests
 
 Three layers, each with a clear contract:
