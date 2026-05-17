@@ -13,28 +13,23 @@ multiple concurrent requests through:
   - **Per-request termination tracking** (EOS, `max_tokens`, cancel).
   - **Streaming output** to each handle's per-request queue.
 
-Single engine thread drives the loop. Each iteration:
+Two threading modes, selected by the `mode` constructor parameter:
 
-  1. Admit waiting requests up to `max_concurrent` total in-flight.
-  2. If any requests are in PREFILLING state, run one `prefill_batch`
-     over them. The resulting handoffs go to a `DecodeSession`; each
-     request transitions to DECODING and emits its first token (which
-     came from the handoff, not from a decode forward).
-  3. If the decode session has any active slots, run one batched
-     `session.step()`. Per slot: emit the new token, check termination,
-     reap if terminated.
+- **`mode="serial"`** (default): one engine thread runs both phases
+  in sequence — admit + batched prefill + batched decode step + reap.
+  Simple correctness story; bit-equivalent test surface. Prefill and
+  decode share the same thread, so on a 2-GPU host they don't
+  overlap (the prefill GPU idles while decode runs and vice versa).
+- **`mode="parallel"`**: two engine threads — a prefill thread admits
+  + runs `prefill_batch`, a decode thread reads handoffs and drives
+  the session. The threads are connected by a bounded handoff queue;
+  the queue's `maxsize=max_concurrent` provides backpressure. On a
+  2-GPU host the phases overlap: the prefill GPU produces while the
+  decode GPU consumes.
 
-Same threading shape as `ContinuousScheduler`: one engine thread,
-queue-based admission, API thread submits + drains handles. The
-cross-phase coordination (PD's "different GPU for different phase")
-is preserved because the underlying `PrefillWorker` and `DecodeWorker`
-each carry their own paged cache; the scheduler just orchestrates the
-calls.
-
-Slice 1 (this file's first commit) is the single-thread variant. The
-two-thread variant (prefill + decode on separate threads with a
-handoff queue between them) is a follow-up that gives real cross-GPU
-overlap. See `docs/plans/pd-scheduler.md`.
+Greedy output is identical between modes (the threading shape only
+affects timing). The two-thread mode's value shows up on real
+multi-GPU hardware where the two phases run on different devices.
 """
 
 from __future__ import annotations
@@ -42,6 +37,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from typing import Literal
 
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.scheduler.request_state import (
@@ -89,59 +85,104 @@ class PDScheduler:
         runner: ModelRunner,
         *,
         max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+        mode: Literal["serial", "parallel"] = "serial",
     ) -> None:
         self._runner = runner
         self._prefill_worker = PrefillWorker(runner)
         self._decode_worker = DecodeWorker(runner)
         self._max_concurrent = max_concurrent
+        self._mode = mode
 
-        # API-side state (mutated from API thread + engine thread).
+        # API-side state (mutated from API thread + engine threads).
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._stop_event = threading.Event()
+        # Per-mode threads. Serial uses `_thread` only; parallel uses both.
         self._thread: threading.Thread | None = None
+        self._decode_thread: threading.Thread | None = None
 
-        # Engine-thread-only state (no locks needed):
+        # Engine-thread-only state. In serial mode the single engine thread
+        # owns everything below. In parallel mode the prefill thread owns
+        # `_prefilling`; the decode thread owns `_decoding`, `_handoffs`,
+        # and `_session`. The two threads communicate exclusively via
+        # `_waiting` and `_handoff_queue`, both thread-safe `queue.Queue`s.
+        #
         # - `_prefilling`: requests that have been admitted but haven't
-        #   been through `prefill_batch` yet. Drained each step.
+        #   been through `prefill_batch` yet. Drained each prefill cycle.
         # - `_decoding`: slot_id -> RunningRequest for every in-flight
         #   decode slot. Updated as `session.add_handoff` / `remove_slot`.
         # - `_handoffs`: slot_id -> KVHandoff so the engine knows the
         #   sampling_params / eos_token_id / max_tokens for each slot.
-        #   (RunningRequest carries the original Request; the handoff has
-        #   the post-prefill bits.)
         # - `_session`: the long-lived `DecodeSession`. Lazy-init on first
-        #   prefill batch. Stays alive across batches; empty when no slots.
+        #   handoff. Stays alive until shutdown.
+        # - `_handoff_queue` (parallel mode only): prefill thread puts
+        #   `(running_request, handoff)` tuples; decode thread gets them.
+        #   `maxsize = max_concurrent` provides backpressure: when the
+        #   decode pool fills up, the prefill thread blocks on `put` and
+        #   stops admitting from `_waiting`.
         self._prefilling: list[RunningRequest] = []
         self._decoding: dict[int, RunningRequest] = {}
         self._handoffs: dict[int, KVHandoff] = {}
         self._session: DecodeSession | None = None
+        self._handoff_queue: queue.Queue[tuple[RunningRequest, KVHandoff]] | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Spawn the engine thread. Idempotent."""
+        """Spawn the engine thread(s). Idempotent.
+
+        Serial mode: one thread (`_thread`) running `_engine_loop`.
+        Parallel mode: two threads (`_thread` running the prefill loop,
+        `_decode_thread` running the decode loop), connected by a
+        bounded `_handoff_queue`.
+        """
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._engine_loop, name="mini-infer-pd-scheduler", daemon=True
-        )
-        self._thread.start()
+        if self._mode == "serial":
+            self._thread = threading.Thread(
+                target=self._engine_loop, name="mini-infer-pd-scheduler", daemon=True
+            )
+            self._thread.start()
+        elif self._mode == "parallel":
+            # Lazy-init the handoff queue at start, NOT at __init__: a
+            # fresh queue every start/stop cycle avoids stale state.
+            self._handoff_queue = queue.Queue(maxsize=self._max_concurrent)
+            self._thread = threading.Thread(
+                target=self._prefill_thread_loop,
+                name="mini-infer-pd-prefill",
+                daemon=True,
+            )
+            self._decode_thread = threading.Thread(
+                target=self._decode_thread_loop,
+                name="mini-infer-pd-decode",
+                daemon=True,
+            )
+            self._thread.start()
+            self._decode_thread.start()
+        else:
+            raise ValueError(f"unknown mode {self._mode!r}; expected 'serial' or 'parallel'")
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit; join.
+        """Signal engine thread(s) to exit; join; drain remaining state.
 
         Any in-flight slots are released so the block pool returns to
-        fully-free state. Already-emitted tokens stay in their per-request
-        output queues; final terminal steps with `finish_reason="cancelled"`
-        are pushed so API consumers don't hang on `get_step()`.
+        fully-free state. Final terminal steps with
+        `finish_reason="cancelled"` are pushed to every still-active
+        request so API consumers don't hang on `get_step()`.
         """
         self._stop_event.set()
+        # Wake up any thread blocked on a queue.get(timeout=...). The poll
+        # loops in the engine threads will see the stop event and return.
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
-        # Drain any remaining state. Slots first (so the block pool is
-        # released), then push terminal steps to the still-waiting handles.
+        if self._decode_thread is not None:
+            self._decode_thread.join(timeout=timeout)
+            self._decode_thread = None
+
+        # Drain remaining state in dependency order: free decode slots
+        # first (so the block pool releases), then emit terminal steps
+        # for any still-active handles.
         if self._session is not None:
             for slot_id in list(self._decoding.keys()):
                 if self._session.is_active(slot_id):
@@ -150,10 +191,21 @@ class PDScheduler:
             self._emit_terminal(r, reason="cancelled")
         self._decoding.clear()
         self._handoffs.clear()
+        # In parallel mode the handoff queue may hold un-decoded handoffs;
+        # they were prefilled but never reached the decode session. Their
+        # requests still need a terminal step.
+        if self._handoff_queue is not None:
+            while True:
+                try:
+                    r, _handoff = self._handoff_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._emit_terminal(r, reason="cancelled")
         for r in self._prefilling:
             self._emit_terminal(r, reason="cancelled")
         self._prefilling.clear()
         self._session = None
+        self._handoff_queue = None
 
     # ── API surface ──────────────────────────────────────────────────
 
@@ -282,6 +334,131 @@ class PDScheduler:
         ]
         for slot_id in cancelled_slots:
             self._terminate_slot(slot_id, self._decoding[slot_id], reason="cancelled")
+
+    # ── parallel mode: two threads ───────────────────────────────────
+
+    def _prefill_thread_loop(self) -> None:
+        """Prefill thread main loop (parallel mode).
+
+        Pull from the waiting queue, batch up to `max_concurrent`
+        requests at a time, run `prefill_batch`, push
+        `(running_request, handoff)` tuples to the handoff queue. The
+        handoff queue is bounded (`maxsize = max_concurrent`); a full
+        queue blocks the put, which naturally backpressures admission
+        when the decode side can't keep up.
+
+        Cancellation: requests with `cancel_event` set are skipped
+        (terminal emitted) without going through prefill.
+
+        Shutdown: when `_stop_event` is set, the loop exits at its
+        next iteration boundary. Any partially-claimed prefill batch
+        in `_prefilling` is cleaned up by `stop()`.
+        """
+        assert self._handoff_queue is not None
+        while not self._stop_event.is_set():
+            self._admit_waiting()
+            if not self._prefilling:
+                if self._stop_event.wait(_IDLE_SLEEP_SECONDS):
+                    return
+                continue
+            prefilling = self._prefilling
+            self._prefilling = []
+            requests = [r.request for r in prefilling]
+            try:
+                handoffs = self._prefill_worker.prefill_batch(requests)
+            except Exception as exc:
+                logger.exception("PDScheduler (parallel): prefill_batch failed; terminating batch")
+                for r in prefilling:
+                    self._emit_terminal(r, reason="cancelled", error=str(exc))
+                continue
+            for r, handoff in zip(prefilling, handoffs, strict=True):
+                if r.cancel_event.is_set():
+                    # Cancelled between admit and prefill completion; emit
+                    # terminal without enqueuing for decode.
+                    self._emit_terminal(r, reason="cancelled")
+                    continue
+                # Block on put if the handoff queue is full — this is the
+                # backpressure mechanism that bounds total in-flight to
+                # roughly `2 * max_concurrent` worst case (in-prefill +
+                # in-decode). Poll the stop event so we can exit cleanly.
+                while not self._stop_event.is_set():
+                    try:
+                        self._handoff_queue.put((r, handoff), timeout=_IDLE_SLEEP_SECONDS)
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    # Stop requested while the put was blocked; terminal
+                    # for this handoff (the decode thread won't see it).
+                    self._emit_terminal(r, reason="cancelled")
+
+    def _decode_thread_loop(self) -> None:
+        """Decode thread main loop (parallel mode).
+
+        Pull handoffs from the handoff queue and add them to the
+        long-lived `DecodeSession`. Each iteration: drain any
+        immediately-available handoffs (without blocking), run one
+        batched decode step, emit per-slot tokens, reap terminations
+        (EOS / max_tokens / cancel).
+
+        Shutdown: when `_stop_event` is set, the loop exits at its
+        next iteration boundary. Slots are freed by `stop()`.
+        """
+        assert self._handoff_queue is not None
+        self._session = self._decode_worker.start_session()
+        while not self._stop_event.is_set():
+            # Drain new handoffs without blocking. Adding handoffs to the
+            # session emits the first token (from the handoff itself) and
+            # may immediately terminate slots that have `max_tokens == 1`.
+            self._drain_new_handoffs()
+
+            if self._session.num_active_slots > 0:
+                self._run_decode_step()
+                self._reap_cancelled()
+            else:
+                # No active slots; park briefly while we wait for handoffs.
+                # Use the handoff queue's blocking get with a timeout so we
+                # don't busy-spin and don't miss handoff arrivals.
+                try:
+                    item = self._handoff_queue.get(timeout=_IDLE_SLEEP_SECONDS)
+                except queue.Empty:
+                    continue
+                self._absorb_handoff(item)
+
+    def _drain_new_handoffs(self) -> None:
+        """Move every immediately-available handoff into the session.
+
+        Non-blocking. Called once per decode-thread iteration so newly-
+        prefilled requests join the next decode forward.
+        """
+        assert self._handoff_queue is not None
+        while True:
+            try:
+                item = self._handoff_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._absorb_handoff(item)
+
+    def _absorb_handoff(self, item: tuple[RunningRequest, KVHandoff]) -> None:
+        """Add a (request, handoff) pair to the decode session.
+
+        Emits the first token (which came from the prefill worker, not
+        from a decode forward) and checks termination immediately. If
+        the request was cancelled between prefill and absorb, emit a
+        terminal step instead of adding to the session.
+        """
+        r, handoff = item
+        if r.cancel_event.is_set():
+            self._emit_terminal(r, reason="cancelled")
+            return
+        assert self._session is not None
+        slot_id = self._session.add_handoff(handoff)
+        r.state = RequestState.DECODING
+        self._decoding[slot_id] = r
+        self._handoffs[slot_id] = handoff
+        first_token = handoff.first_sampled_token_id
+        self._emit_token(r, first_token)
+        self._check_termination(slot_id, r, first_token)
 
     # ── per-request bookkeeping ──────────────────────────────────────
 
