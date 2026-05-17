@@ -308,13 +308,31 @@ Three layers, each with a clear contract:
 * **Golden** (`tests/golden/`): CPU/fp32. Token-for-token comparison against Hugging Face's reference output for a fixed set of prompts. Catches numerical drift before it ships.
 * **Modal smokes + benchmarks** (`scripts/`): real CUDA validation on Modal A10. Runs on demand only.
 
-Markers: `requires_model` (skipped in CI; needs an HF model download) and `requires_cuda` (skipped on non-CUDA hardware).
+Markers: `requires_model` (needs an HF model download) and `requires_cuda` (skipped on non-CUDA hardware).
 
 ```bash
-uv run pytest tests/unit/ -q                       # CI-equivalent
+uv run pytest tests/unit/ -q                       # CI-equivalent (no model loads)
 uv run pytest tests/golden/ -q                     # token-for-token vs HF
 uv run pytest tests/unit/ -m "not requires_model"  # skip model-dependent tests
+uv run pytest -m requires_model -v                 # run the bit-parity subset
 ```
+
+### Continuous bit-parity vs pinned upstream
+
+A separate CI workflow (`.github/workflows/bitparity.yml`) runs the `requires_model` tests against pinned HuggingFace model revisions on a schedule (weekly), on PRs that touch the model / cache / quant layers, and on manual dispatch. Pinned revisions live in `tests/_pinned_models.toml`; current entries:
+
+* `Qwen/Qwen2.5-0.5B-Instruct` — primary smoke + PD / API / spec-dec tests
+* `Qwen/Qwen3-0.6B` — Qwen3 family (per-head Q/K norm)
+* `HuggingFaceTB/SmolLM2-135M-Instruct` — Llama-family baseline
+* `unsloth/gemma-3-1b-it` — Gemma 3 family (sandwich norms + dual RoPE)
+
+The workflow downloads each model at its exact SHA before running tests, so upstream changes to the same model id's main branch don't affect us until we bump a pin. To check for drift without bumping, run:
+
+```bash
+uv run python scripts/prefetch_pinned_models.py --refresh
+```
+
+Bumping a pin is a deliberate action: re-run the bit-parity tests locally at the new SHA, confirm tokens still match, then update `tests/_pinned_models.toml`.
 
 ## What's NOT in here
 
