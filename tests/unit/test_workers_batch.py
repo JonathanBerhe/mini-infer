@@ -54,7 +54,13 @@ def test_prefill_batch_matches_sequential(qwen_runner: ModelRunner) -> None:
         )
         assert seq_h.max_tokens == batch_h.max_tokens
         assert seq_h.eos_token_id == batch_h.eos_token_id
-        # KV bytes: every layer x every stream tensor matches exactly.
+        # KV bytes: every layer x every stream tensor matches to within
+        # FP32 round-off. Strict bit-equality (`atol=0, rtol=0`) is
+        # platform-dependent because the matmul reduction order differs
+        # between batched and sequential prefill paths — Linux CI shows
+        # ULP-level deltas where macOS dev hardware happens to produce
+        # bit-identical output. The functional contract is "same tokens
+        # downstream", validated separately in `test_decode_batch_matches_sequential`.
         for layer_idx in range(seq_h.num_layers):
             seq_streams = seq_h.kv_streams_per_layer[layer_idx]
             batch_streams = batch_h.kv_streams_per_layer[layer_idx]
@@ -63,8 +69,8 @@ def test_prefill_batch_matches_sequential(qwen_runner: ModelRunner) -> None:
                 torch.testing.assert_close(
                     seq_streams[stream_name],
                     batch_streams[stream_name],
-                    rtol=0,
-                    atol=0,
+                    atol=1e-5,
+                    rtol=1e-5,
                     msg=(f"request {r} layer {layer_idx} stream {stream_name!r} differs"),
                 )
 

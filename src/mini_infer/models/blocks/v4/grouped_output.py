@@ -32,6 +32,8 @@ within a group (along `heads_per_group`) for higher TP factors.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -78,6 +80,16 @@ class GroupedOutputProjection(nn.Module):
         # `wo_b` is row-parallel: takes the (sharded) `num_groups * o_lora_rank`
         # input and all-reduces to produce the full hidden state.
         self.wo_b = RowParallelLinear(num_groups * o_lora_rank, hidden_size, bias=False)
+        # `wo_b` (a `RowParallelLinear`) self-initializes through `nn.Linear`.
+        # `wo_a` is a raw `nn.Parameter` so we initialize it explicitly here;
+        # leaving it as `torch.empty` left uninitialized memory in the
+        # synthetic / no-checkpoint code path, which propagated NaN through
+        # the V4 attention output on Linux CI.
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize `wo_a` to well-defined values (no-checkpoint case)."""
+        nn.init.kaiming_uniform_(self.wo_a, a=math.sqrt(5))
 
     def load_full_wo_a(
         self,
