@@ -2,8 +2,8 @@
 
 `PDScheduler` is the continuous-batching scheduler for the disaggregated
 pipeline. Same `start / stop / submit / run` surface as
-`ContinuousScheduler` and `PDStreamingScheduler`, but internally drives
-multiple concurrent requests through:
+`ContinuousScheduler`, but internally drives multiple concurrent
+requests through:
 
   - **Admission queue** for waiting requests.
   - **Batched prefill** via `PrefillWorker.prefill_batch` (one forward

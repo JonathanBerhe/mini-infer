@@ -201,7 +201,7 @@ print(f"acceptance: {stats.mean_acceptance_per_iter:.2f}/{runner.K}")
 
 ### HTTP server
 
-The `/v1/completions` endpoint mirrors the OpenAI Completions API (subset). The server entry point is `mini_infer.api.server`. Two env vars are wired: `MINI_INFER_MODEL` (default `Qwen/Qwen2.5-0.5B-Instruct`) and `MINI_INFER_USE_PD` (default off; set to `1` to back the API with the PD pipeline instead of the default `ContinuousScheduler` — same `/v1/completions` surface, different backend; the PD path is single-request serial today). For non-default KV quantization or attention backends, build the runner programmatically and pass it to `make_app(...)` in your own startup script — the server module is small enough to copy-and-modify.
+The `/v1/completions` endpoint mirrors the OpenAI Completions API (subset). The server entry point is `mini_infer.api.server`. Three env vars are wired: `MINI_INFER_MODEL` (default `Qwen/Qwen2.5-0.5B-Instruct`), `MINI_INFER_USE_PD` (default off; set to `1` to back the API with the PD pipeline instead of the default `ContinuousScheduler`), and `MINI_INFER_PD_MODE` (default `parallel`; set to `serial` for the single-engine-thread variant). Same `/v1/completions` surface either way; the pick is opaque to clients. For non-default KV quantization or attention backends, build the runner programmatically and pass it to `make_app(...)` in your own startup script — the server module is small enough to copy-and-modify.
 
 ```bash
 # Default: bf16 KV / flash-attn, model from MINI_INFER_MODEL or Qwen2.5-0.5B-Instruct
@@ -210,8 +210,11 @@ uv run python -m mini_infer.api.server
 # Override the model only
 MINI_INFER_MODEL="Qwen/Qwen2.5-7B-Instruct" uv run python -m mini_infer.api.server
 
-# Back the API with the PD pipeline (PrefillWorker + DecodeWorker + Orchestrator)
+# Back the API with the PD pipeline (PrefillWorker + DecodeWorker + PDScheduler)
 MINI_INFER_USE_PD=1 uv run python -m mini_infer.api.server
+
+# Same as above, but with the serial PDScheduler variant (one engine thread)
+MINI_INFER_USE_PD=1 MINI_INFER_PD_MODE=serial uv run python -m mini_infer.api.server
 ```
 
 ### Modal benchmarks

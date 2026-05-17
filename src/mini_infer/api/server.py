@@ -29,7 +29,6 @@ from fastapi import Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from mini_infer.api.pd_scheduler import PDStreamingScheduler
 from mini_infer.api.schemas import (
     CompletionChoice,
     CompletionChunk,
@@ -40,15 +39,23 @@ from mini_infer.api.schemas import (
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.scheduler import ContinuousScheduler, Request, RequestHandle
+from mini_infer.workers import PDScheduler
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 # Set to "1" / "true" / "yes" to back the HTTP API with the PD pipeline
-# (`PrefillWorker` + `DecodeWorker` + `Orchestrator`) instead of the default
+# (`PrefillWorker` + `DecodeWorker` + `PDScheduler`) instead of the default
 # `ContinuousScheduler`. Same `/v1/completions` surface either way; the
-# pick is opaque to clients. The PD path is single-request serial today
-# (one prompt active at a time); ContinuousScheduler stays the default
-# for production-style concurrent serving.
+# pick is opaque to clients.
 _USE_PD = os.environ.get("MINI_INFER_USE_PD", "").lower() in {"1", "true", "yes"}
+# When PD is enabled, pick the threading variant:
+#   - "serial":   one engine thread runs prefill + decode in sequence
+#   - "parallel": two engine threads (prefill + decode) with a bounded
+#                 handoff queue between them; phases overlap on multi-GPU
+# Default "parallel" because that's where the PD throughput win is.
+# Override with MINI_INFER_PD_MODE=serial to compare or to debug.
+_PD_MODE = os.environ.get("MINI_INFER_PD_MODE", "parallel").lower()
+if _PD_MODE not in {"serial", "parallel"}:
+    raise ValueError(f"MINI_INFER_PD_MODE must be 'serial' or 'parallel'; got {_PD_MODE!r}")
 
 # Default bind is loopback; set MINI_INFER_HOST=0.0.0.0 (or a specific
 # interface) to expose. Pairing with MINI_INFER_API_KEY for any non-loopback
@@ -89,10 +96,13 @@ async def _verify_auth(
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_name = os.environ.get("MINI_INFER_MODEL", DEFAULT_MODEL)
     runner = ModelRunner.from_pretrained(model_name)
-    scheduler: ContinuousScheduler | PDStreamingScheduler
+    scheduler: ContinuousScheduler | PDScheduler
     if _USE_PD:
-        logger.info("Backing /v1/completions with PDStreamingScheduler (MINI_INFER_USE_PD set)")
-        scheduler = PDStreamingScheduler(runner)
+        logger.info(
+            "Backing /v1/completions with PDScheduler (mode=%s; MINI_INFER_USE_PD set)",
+            _PD_MODE,
+        )
+        scheduler = PDScheduler(runner, mode=_PD_MODE)  # type: ignore[arg-type]
     else:
         scheduler = ContinuousScheduler(runner)
     scheduler.start()
@@ -127,7 +137,7 @@ async def completions(
     fastapi_req: FastAPIRequest,
     _auth: None = Depends(_verify_auth),
 ) -> StreamingResponse | CompletionResponse:
-    scheduler: ContinuousScheduler | PDStreamingScheduler = fastapi_req.app.state.scheduler
+    scheduler: ContinuousScheduler | PDScheduler = fastapi_req.app.state.scheduler
     internal = Request(
         prompt=req.prompt,
         sampling_params=SamplingParams(
