@@ -33,6 +33,7 @@ class on synthetic input across all six (mode x score-function) cells.
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import torch
@@ -114,6 +115,38 @@ class HashRoutedGate(nn.Module):
             # uses bias to learn "which experts to prefer" while keeping the
             # weighting math driven by the unbiased score function.
             self.bias = nn.Parameter(torch.empty(num_routed_experts, dtype=torch.float32))
+        # Initialize all parameters. In production, `load_state_dict` from
+        # a checkpoint overwrites these immediately; the init exists to
+        # make synthetic/random-weight uses (tests, demos) well-defined.
+        # Skipping it left `torch.empty` allocations carrying whatever
+        # bytes the allocator returned — values that happened to look
+        # sane on macOS dev hardware but produced wildly out-of-range
+        # int32s on Linux CI (e.g. -1095055515), crashing the hash-routed
+        # path with index-out-of-bounds errors.
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize learned + non-learned buffers to well-defined values.
+
+        Mirrors `nn.Linear.reset_parameters` for the score projection. The
+        `tid2eid` table is randomly assigned across `num_routed_experts`
+        (the paper's fix-at-train-time routing is captured at load time
+        from the checkpoint; this init is for the synthetic / no-checkpoint
+        case).
+        """
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+        if self.routing_mode == "hash":
+            with torch.no_grad():
+                self.tid2eid.copy_(
+                    torch.randint(
+                        low=0,
+                        high=self.num_routed_experts,
+                        size=self.tid2eid.shape,
+                        dtype=torch.int32,
+                    )
+                )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None

@@ -48,6 +48,8 @@ kernel's `eps` argument supplies.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn.functional import linear
@@ -181,6 +183,18 @@ class HyperConnections(nn.Module):
         self.base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         # `scale`: 3 scalars, one per chunk (pre, post, comb).
         self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        # In production these get overwritten by `load_state_dict`; the
+        # explicit init exists so synthetic / random-weight uses (tests,
+        # demos) start from well-defined values. Skipping it left
+        # `torch.empty` carrying uninitialized memory which fed NaN
+        # through the Sinkhorn iteration on Linux CI.
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize params to well-defined values for the no-checkpoint case."""
+        nn.init.kaiming_uniform_(self.fn, a=math.sqrt(5))
+        nn.init.zeros_(self.base)
+        nn.init.ones_(self.scale)
 
     def hc_pre(self, hc_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce `(B, T, hc_mult, dim)` → `(B, T, dim)` for sublayer input.
@@ -302,6 +316,13 @@ class HCHeadReduction(nn.Module):
         self.base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         # `scale`: single scalar (the head's reduction needs only one chunk's worth).
         self.scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize params to well-defined values for the no-checkpoint case."""
+        nn.init.kaiming_uniform_(self.fn, a=math.sqrt(5))
+        nn.init.zeros_(self.base)
+        nn.init.ones_(self.scale)
 
     def forward(self, hc_state: torch.Tensor) -> torch.Tensor:
         """Reduce per-token: `out[..., d] = sum_h(pre[..., h] * hc_state[..., h, d])`.
