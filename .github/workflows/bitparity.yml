@@ -1,0 +1,61 @@
+name: bit-parity
+
+# Runs the `@requires_model`-marked tests against pinned HuggingFace
+# model revisions. Catches:
+#   - Local regressions that break bit-parity (PR trigger; runs on
+#     changes to model / cache / quant code or the pin manifest).
+#   - Upstream drift, when an HF model id's main branch moves past
+#     our pinned SHA (scheduled weekly run flags it).
+#
+# Why a separate workflow from the main `ci.yml`:
+# `ci.yml` runs on every push and explicitly excludes
+# `requires_model` tests so it stays fast (no model downloads). This
+# workflow handles the slower bit-parity path on its own cadence.
+
+on:
+  schedule:
+    # Mondays at 06:00 UTC. Once a week is enough for our drift window;
+    # adjust here if a release cadence demands more.
+    - cron: "0 6 * * 1"
+  pull_request:
+    paths:
+      - "src/mini_infer/models/**"
+      - "src/mini_infer/cache/**"
+      - "src/mini_infer/quant/**"
+      - "tests/_pinned_models.toml"
+      - "tests/unit/test_models_*.py"
+      - ".github/workflows/bitparity.yml"
+  workflow_dispatch:
+
+jobs:
+  bitparity:
+    name: Bit-parity vs pinned HF revisions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Sync deps
+        run: uv sync --frozen
+      - name: Cache HuggingFace model store
+        # The cache key is the content hash of the pinned-models manifest,
+        # so any pin update busts the cache and re-downloads. Otherwise
+        # we reuse the prior run's snapshots (~5 GB total today).
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-pinned-${{ hashFiles('tests/_pinned_models.toml') }}
+          restore-keys: |
+            hf-pinned-
+      - name: Verify manifest parses
+        run: uv run python scripts/prefetch_pinned_models.py --check
+      - name: Prefetch pinned models
+        run: uv run python scripts/prefetch_pinned_models.py
+      - name: Bit-parity tests
+        # `-m requires_model` runs every test that loads an HF model.
+        # We rely on the cache being populated above so no download
+        # happens during the test run itself.
+        run: uv run pytest -m "requires_model and not requires_cuda and not gpu" -v
