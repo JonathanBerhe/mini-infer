@@ -94,9 +94,7 @@ class LightningIndexer(nn.Module):
         if num_heads <= 0:
             raise ValueError(f"num_heads must be positive, got {num_heads}")
         if num_heads % world_size != 0:
-            raise ValueError(
-                f"num_heads={num_heads} must be divisible by world_size={world_size}"
-            )
+            raise ValueError(f"num_heads={num_heads} must be divisible by world_size={world_size}")
         if top_k <= 0:
             raise ValueError(f"top_k must be positive, got {top_k}")
         if rope_head_dim < 0 or rope_head_dim > head_dim:

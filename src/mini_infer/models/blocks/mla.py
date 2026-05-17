@@ -87,9 +87,7 @@ class MLAAttention(nn.Module):
 
         world_size = get_world_size()
         if num_heads % world_size != 0:
-            raise ValueError(
-                f"num_heads={num_heads} must be divisible by world_size={world_size}"
-            )
+            raise ValueError(f"num_heads={num_heads} must be divisible by world_size={world_size}")
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -139,9 +137,7 @@ class MLAAttention(nn.Module):
         )
         # Row-parallel output: input is the per-head-sharded attention output
         # (already split along the head axis). One all-reduce per block.
-        self.o_proj = RowParallelLinear(
-            num_heads * v_head_dim, hidden_size, bias=attention_bias
-        )
+        self.o_proj = RowParallelLinear(num_heads * v_head_dim, hidden_size, bias=attention_bias)
         # Softmax scale: 1/sqrt(qk_head_dim) per HF source line 335.
         self._softmax_scale = 1.0 / math.sqrt(self.qk_head_dim)
 
@@ -250,9 +246,7 @@ class MLAAttention(nn.Module):
         )
         # attn_out: (total_q, num_heads_local, v_head_dim)
 
-        attn_out = attn_out.reshape(
-            1, total_q, self.num_heads_local * self.v_head_dim
-        ).contiguous()
+        attn_out = attn_out.reshape(1, total_q, self.num_heads_local * self.v_head_dim).contiguous()
         # `o_proj` is row-parallel: takes the (col-sharded) attention
         # output and all-reduces to recover the full hidden state.
         out: torch.Tensor = self.o_proj(attn_out)

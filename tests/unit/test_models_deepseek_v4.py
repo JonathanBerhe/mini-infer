@@ -168,9 +168,7 @@ def test_load_weights_dequantizes_fp8_e4m3fn_weights() -> None:
 
     # Snapshot weights, then re-cast one matrix to FP8 to exercise the dequant.
     state_dict = {k: v.detach().clone() for k, v in source.state_dict().items()}
-    fp8_key = next(
-        k for k, v in state_dict.items() if v.ndim == 2 and v.numel() > 0
-    )
+    fp8_key = next(k for k, v in state_dict.items() if v.ndim == 2 and v.numel() > 0)
     state_dict[fp8_key] = state_dict[fp8_key].to(torch.float8_e4m3fn)
 
     DeepseekV4ForCausalLM.load_weights(target, state_dict)

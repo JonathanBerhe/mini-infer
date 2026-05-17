@@ -120,9 +120,7 @@ def load_state_dict_with_tp(
             if attr_name == "weight":
                 bias_key = sd_key.rsplit(".", 1)[0] + ".bias"
                 bias_tensor = full_state_dict.get(bias_key)
-                parent_module.load_full_weight(
-                    full_tensor, bias_tensor, target_device=device_obj
-                )
+                parent_module.load_full_weight(full_tensor, bias_tensor, target_device=device_obj)
                 consumed.add(sd_key)
                 loaded_param_ids.add(id(parent_module.weight))
                 if bias_tensor is not None and parent_module.bias is not None:
@@ -172,9 +170,7 @@ def load_state_dict_with_tp(
             consumed.add(sd_key)
 
     missing = {
-        name
-        for name, param in model.named_parameters()
-        if id(param) not in loaded_param_ids
+        name for name, param in model.named_parameters() if id(param) not in loaded_param_ids
     }
     unexpected = set(full_state_dict.keys()) - consumed
     return missing, unexpected

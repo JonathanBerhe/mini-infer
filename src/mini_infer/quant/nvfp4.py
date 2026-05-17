@@ -25,8 +25,22 @@ import torch
 
 # E2M1 (no inf, no NaN; symmetric around zero). See class docstring.
 _FP4_LOOKUP_VALUES = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 # Block size matches the V4 reference: 32 FP4 values share one scale.
@@ -140,9 +154,7 @@ def dequantize_block_fp8_to_bf16(
         BF16 tensor of shape `(M, N)`.
     """
     if fp8_weight.ndim != 2:
-        raise ValueError(
-            f"fp8_weight must be 2-D; got shape {tuple(fp8_weight.shape)}"
-        )
+        raise ValueError(f"fp8_weight must be 2-D; got shape {tuple(fp8_weight.shape)}")
     if fp8_scale.ndim != 2:
         raise ValueError(f"fp8_scale must be 2-D; got shape {tuple(fp8_scale.shape)}")
     block_m, block_n = block_size
@@ -157,7 +169,5 @@ def dequantize_block_fp8_to_bf16(
     weight_fp32 = fp8_weight.float()
     scale_fp32 = fp8_scale.float()
     # Expand scale to per-element via repeat_interleave along both dims.
-    scale_expanded = (
-        scale_fp32.repeat_interleave(block_m, dim=0).repeat_interleave(block_n, dim=1)
-    )
+    scale_expanded = scale_fp32.repeat_interleave(block_m, dim=0).repeat_interleave(block_n, dim=1)
     return (weight_fp32 * scale_expanded).to(torch.bfloat16)

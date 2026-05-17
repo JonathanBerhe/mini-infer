@@ -76,7 +76,9 @@ class DeepseekV2Config:
         # older configs (e.g. the `auto_map`-loaded V2-Lite config which
         # still ships `rope_theta` directly).
         rope_params = getattr(hf_config, "rope_parameters", None) or {}
-        rope_theta = rope_params.get("rope_theta") or getattr(hf_config, "rope_theta", 10000.0)
+        rope_theta = float(
+            rope_params.get("rope_theta") or getattr(hf_config, "rope_theta", None) or 10000.0
+        )
         return cls(
             vocab_size=hf_config.vocab_size,
             hidden_size=hf_config.hidden_size,
@@ -96,7 +98,7 @@ class DeepseekV2Config:
             norm_topk_prob=bool(getattr(hf_config, "norm_topk_prob", False)),
             first_k_dense_replace=hf_config.first_k_dense_replace,
             rms_norm_eps=hf_config.rms_norm_eps,
-            rope_theta=float(rope_theta),
+            rope_theta=rope_theta,
             attention_bias=bool(getattr(hf_config, "attention_bias", False)),
             tie_word_embeddings=bool(getattr(hf_config, "tie_word_embeddings", False)),
         )

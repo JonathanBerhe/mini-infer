@@ -128,9 +128,7 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
         # CPU-resident state_dict: V4-Flash is ~158 GB on disk, doesn't
         # fit on a single GPU. The loader slices each rank's share onto
         # GPU via `target_device=device` in load_weights.
-        state_dict = load_safetensors_state_dict(
-            _MODEL_NAME, device="cpu", dtype=torch.bfloat16
-        )
+        state_dict = load_safetensors_state_dict(_MODEL_NAME, device="cpu", dtype=torch.bfloat16)
         _checkpoint(
             rank,
             f"safetensors loaded ({len(state_dict)} tensors on CPU); "

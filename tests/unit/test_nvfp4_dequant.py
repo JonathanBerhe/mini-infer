@@ -42,8 +42,24 @@ def _make_scale(out_dim: int, in_dim: int, block_size: int, value: float) -> tor
 
 def test_dequant_recovers_every_e2m1_value() -> None:
     """Packing nibble `n` then dequantizing gives `FP4_TABLE[n]` (scale=1)."""
-    expected_values = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                       0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    expected_values = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
     # Pack all 16 nibbles into 8 bytes (low nibble = even index, high = odd).
     # Byte i carries nibble (2i) as low and nibble (2i+1) as high.
     packed = torch.tensor(
@@ -70,9 +86,7 @@ def test_dequant_low_then_high_nibble_order() -> None:
     packed = torch.tensor([[0xC3, 0x71]], dtype=torch.uint8)
     scale = _make_scale(out_dim=1, in_dim=4, block_size=4, value=1.0)
     out = dequantize_nvfp4_to_bf16(packed, scale, block_size=4).float()
-    torch.testing.assert_close(
-        out, torch.tensor([[1.5, -2.0, 0.5, 6.0]]), rtol=0, atol=0
-    )
+    torch.testing.assert_close(out, torch.tensor([[1.5, -2.0, 0.5, 6.0]]), rtol=0, atol=0)
 
 
 def test_dequant_applies_per_block_scale() -> None:
@@ -85,9 +99,7 @@ def test_dequant_applies_per_block_scale() -> None:
     packed = torch.tensor([[0x21, 0x65]], dtype=torch.uint8)
     scale = torch.tensor([[2.0, 0.5]], dtype=torch.float32)
     out = dequantize_nvfp4_to_bf16(packed, scale, block_size=2).float()
-    torch.testing.assert_close(
-        out, torch.tensor([[1.0, 2.0, 1.5, 2.0]]), rtol=0, atol=0
-    )
+    torch.testing.assert_close(out, torch.tensor([[1.0, 2.0, 1.5, 2.0]]), rtol=0, atol=0)
 
 
 def test_dequant_full_block_size_32() -> None:
@@ -169,8 +181,24 @@ def test_dequant_matches_v4_reference_byte_layout() -> None:
         x = torch.stack([FP4_TABLE[low], FP4_TABLE[high]], dim=-1).flatten(...)
     Our dequant must produce the same byte ordering."""
     # Reference values reproduced inline to avoid importing `third_party`.
-    fp4_table = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    fp4_table = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
     # Random-looking bytes that exercise every nibble at least once.
     bytes_pattern = [0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E]
     packed = torch.tensor([bytes_pattern], dtype=torch.uint8)
@@ -200,10 +228,10 @@ def test_block_fp8_dequant_recovers_scaled_weight_per_block() -> None:
     # Build a small (M=4, N=4) weight + (2x2) scale so the block math is 2x2.
     weight_fp32 = torch.tensor(
         [
-            [1.0, 1.0,  2.0, 2.0],
-            [1.0, 1.0,  2.0, 2.0],
-            [4.0, 4.0,  8.0, 8.0],
-            [4.0, 4.0,  8.0, 8.0],
+            [1.0, 1.0, 2.0, 2.0],
+            [1.0, 1.0, 2.0, 2.0],
+            [4.0, 4.0, 8.0, 8.0],
+            [4.0, 4.0, 8.0, 8.0],
         ],
         dtype=torch.float32,
     )
@@ -215,10 +243,10 @@ def test_block_fp8_dequant_recovers_scaled_weight_per_block() -> None:
     out = dequantize_block_fp8_to_bf16(weight_fp8, scale_fp32, block_size=(2, 2)).float()
     expected = torch.tensor(
         [
-            [0.5, 0.5,  3.0, 3.0],   # block 0,0 * 0.5  |  block 0,1 * 1.5
-            [0.5, 0.5,  3.0, 3.0],
-            [8.0, 8.0,  2.0, 2.0],   # block 1,0 * 2.0  |  block 1,1 * 0.25
-            [8.0, 8.0,  2.0, 2.0],
+            [0.5, 0.5, 3.0, 3.0],  # block 0,0 * 0.5  |  block 0,1 * 1.5
+            [0.5, 0.5, 3.0, 3.0],
+            [8.0, 8.0, 2.0, 2.0],  # block 1,0 * 2.0  |  block 1,1 * 0.25
+            [8.0, 8.0, 2.0, 2.0],
         ]
     )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)

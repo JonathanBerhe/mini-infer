@@ -65,9 +65,7 @@ class HashRoutedMoEFFN(nn.Module):
         from mini_infer.distributed.group import get_rank, get_world_size
 
         world_size = get_world_size()
-        num_experts_per_rank = _split_size(
-            num_routed_experts, world_size, "num_routed_experts"
-        )
+        num_experts_per_rank = _split_size(num_routed_experts, world_size, "num_routed_experts")
         self.hidden_size = hidden_size
         self.num_routed_experts = num_routed_experts  # global
         self.num_experts_per_rank = num_experts_per_rank

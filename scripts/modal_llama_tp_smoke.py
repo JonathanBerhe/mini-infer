@@ -105,9 +105,7 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
         # (no cache) since the goal is "do the logits look sane", not
         # "scheduler runs end-to-end".
         with torch.inference_mode():
-            position_ids = (
-                torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
-            )
+            position_ids = torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
             # Llama's forward expects a PagedKVCache; the test doesn't need
             # a cache to validate the load path, so we build a minimal one
             # locally rather than wiring the runner. Easier: just call the

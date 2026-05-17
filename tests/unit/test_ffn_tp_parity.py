@@ -66,7 +66,10 @@ def test_moe_ffn_constructs_with_local_experts_at_world_size_1() -> None:
     from mini_infer.models.blocks.mixtral_moe import MoEFFN
 
     moe = MoEFFN(
-        hidden_size=16, intermediate_size=32, num_experts=4, top_k=2,
+        hidden_size=16,
+        intermediate_size=32,
+        num_experts=4,
+        top_k=2,
     )
     assert moe.num_experts == 4
     assert moe.num_experts_per_rank == 4

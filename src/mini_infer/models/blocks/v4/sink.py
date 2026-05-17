@@ -42,18 +42,14 @@ class AttentionSink(nn.Module):
             raise ValueError(f"num_heads must be positive, got {num_heads}")
         world_size = get_world_size()
         if num_heads % world_size != 0:
-            raise ValueError(
-                f"num_heads={num_heads} must be divisible by world_size={world_size}"
-            )
+            raise ValueError(f"num_heads={num_heads} must be divisible by world_size={world_size}")
         # Reference initializes from `torch.empty` and trains; for inference-time
         # block construction we start at zero (a near-no-op sink, ~1/Nk weight).
         self.num_heads = num_heads
         self.num_heads_per_rank = num_heads // world_size
         self.world_size = world_size
         self.rank = get_rank()
-        self.sink_logits = nn.Parameter(
-            torch.zeros(self.num_heads_per_rank, dtype=torch.float32)
-        )
+        self.sink_logits = nn.Parameter(torch.zeros(self.num_heads_per_rank, dtype=torch.float32))
 
     def load_full_logits(
         self,

@@ -68,9 +68,7 @@ def test_load_state_dict_with_tp_world_size_1_matches_state_dict_load() -> None:
     assert unexpected == set(), f"unexpected unexpected: {unexpected}"
     # Every parameter on the fresh model should now equal the source.
     for name, param in fresh_model.named_parameters():
-        torch.testing.assert_close(
-            param.detach(), source_state_dict[name], rtol=0, atol=0
-        )
+        torch.testing.assert_close(param.detach(), source_state_dict[name], rtol=0, atol=0)
 
 
 def _llama_tp_loader_worker(
