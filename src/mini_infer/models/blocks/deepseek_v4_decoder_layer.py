@@ -294,10 +294,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_size)` (HC mode). `input_ids` `(B, 1)` required iff
         `ffn_type == "hash_moe"` with hash routing.
         """
+        # `forward_decode` is only defined on HCA and CSA, not on SWA (the
+        # ratio=0 layer type runs through the standard `forward` path
+        # only). Narrow the union for type-checkers + fail fast at runtime
+        # if a caller routes an SWA layer through here by mistake.
+        if isinstance(self.self_attn, SWAAttention):
+            raise NotImplementedError(
+                "Block.forward_decode is HCA/CSA-only; SWA layers go through forward"
+            )
+        attn = self.self_attn
         if self.use_hyper_connections:
 
             def attn_runner(x: torch.Tensor) -> torch.Tensor:
-                return self.self_attn.forward_decode(
+                return attn.forward_decode(
                     x,
                     start_pos=start_pos,
                     state_cache=state_cache,
@@ -316,7 +325,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         residual = hidden_state
         x = self.input_layernorm(hidden_state)
-        x = self.self_attn.forward_decode(
+        x = attn.forward_decode(
             x,
             start_pos=start_pos,
             state_cache=state_cache,

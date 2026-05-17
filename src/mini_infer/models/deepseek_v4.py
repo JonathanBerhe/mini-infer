@@ -211,6 +211,7 @@ def _apply_v4_flash_renames(state_dict: dict[str, torch.Tensor]) -> dict[str, to
         renamed[new_name] = tensor
     return renamed
 
+
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
 
@@ -399,9 +400,7 @@ class DeepseekV4Config:
 
         compress_ratios_raw = _pick("compress_ratios", default_value=None)
         if compress_ratios_raw is None:
-            raise ValueError(
-                "DeepseekV4Config.from_hf: HF config missing `compress_ratios` field"
-            )
+            raise ValueError("DeepseekV4Config.from_hf: HF config missing `compress_ratios` field")
 
         # V4-Flash's checkpoint also carries MTP (multi-token-prediction)
         # head layers — `num_nextn_predict_layers` ratios are appended to
@@ -935,9 +934,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         # Step 3: TP-aware load. `load_state_dict_with_tp` slices each
         # full weight via the matching `load_full_weight` / `load_full_logits`
         # / `load_full_wo_a` helper on the TP-aware layers.
-        missing, unexpected = load_state_dict_with_tp(
-            model, remapped, target_device=target_device
-        )
+        missing, unexpected = load_state_dict_with_tp(model, remapped, target_device=target_device)
         whitelist = model.expected_missing_state_keys()
         missing = {m for m in missing if m not in whitelist}
         if missing or unexpected:

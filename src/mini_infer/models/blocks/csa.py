@@ -101,9 +101,7 @@ class CSAAttention(nn.Module):
 
         world_size = get_world_size()
         if num_heads % world_size != 0:
-            raise ValueError(
-                f"num_heads={num_heads} must be divisible by world_size={world_size}"
-            )
+            raise ValueError(f"num_heads={num_heads} must be divisible by world_size={world_size}")
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads

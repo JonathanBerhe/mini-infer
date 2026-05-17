@@ -231,9 +231,7 @@ class HCAAttention(nn.Module):
 
         world_size = get_world_size()
         if num_heads % world_size != 0:
-            raise ValueError(
-                f"num_heads={num_heads} must be divisible by world_size={world_size}"
-            )
+            raise ValueError(f"num_heads={num_heads} must be divisible by world_size={world_size}")
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -250,9 +248,7 @@ class HCAAttention(nn.Module):
         # it to per-head Q with column-parallel sharding by head.
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(q_lora_rank, eps=rms_norm_eps)
-        self.q_b_proj = ColumnParallelLinear(
-            q_lora_rank, num_heads * kv_head_dim, bias=False
-        )
+        self.q_b_proj = ColumnParallelLinear(q_lora_rank, num_heads * kv_head_dim, bias=False)
 
         # --- SWA K=V branch: H -> swa_kv_proj (single shared head) -> kv_norm -> partial RoPE.
         self.swa_kv_proj = nn.Linear(hidden_size, kv_head_dim, bias=False)

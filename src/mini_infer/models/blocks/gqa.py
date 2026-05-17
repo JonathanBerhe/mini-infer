@@ -62,21 +62,15 @@ class GroupedQueryAttention(nn.Module):
         # `world_size`; ColumnParallelLinear validates that internally
         # (because it sees `num_*_heads * head_dim` as the output dim and
         # each head is `head_dim` columns).
-        self.q_proj = ColumnParallelLinear(
-            hidden_size, num_q_heads * head_dim, bias=qkv_bias
-        )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size, num_kv_heads * head_dim, bias=qkv_bias
-        )
+        self.q_proj = ColumnParallelLinear(hidden_size, num_q_heads * head_dim, bias=qkv_bias)
+        self.k_proj = ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
         # Gemma 4 full layers (`attention_k_eq_v=True`) reuse the post-`k_proj`
         # tensor as V — there is no separate v_proj parameter. We keep the
         # attribute as `None` so weight-load filters can detect the absence.
         if attention_k_eq_v:
             self.v_proj: ColumnParallelLinear | None = None
         else:
-            self.v_proj = ColumnParallelLinear(
-                hidden_size, num_kv_heads * head_dim, bias=qkv_bias
-            )
+            self.v_proj = ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
         # Row-parallel output projection: input dim is the sharded
         # head-merged activation, output is the replicated hidden state.
         # Triggers exactly one all-reduce per attention block.

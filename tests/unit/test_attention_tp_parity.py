@@ -513,9 +513,7 @@ def _hca_projection_worker(
     # contiguous block of `num_heads_local` heads it owns.
     num_heads_local = num_heads // world_size
     head_start = rank * num_heads_local
-    attn_out_local = attn_out_full[
-        :, :, head_start : head_start + num_heads_local, :
-    ].contiguous()
+    attn_out_local = attn_out_full[:, :, head_start : head_start + num_heads_local, :].contiguous()
 
     return {
         "q_b": block.q_b_proj(q_lora_latent_for_b).detach().cpu(),  # col-par
@@ -544,9 +542,7 @@ def test_hca_projection_world_size_2_matches_reference() -> None:
 
     full_q_b_weight = torch.randn(num_heads * kv_head_dim, q_lora_rank)
     full_sink_logits = torch.randn(num_heads, dtype=torch.float32)
-    full_wo_a = torch.randn(
-        num_groups * o_lora_rank, (num_heads // num_groups) * kv_head_dim
-    )
+    full_wo_a = torch.randn(num_groups * o_lora_rank, (num_heads // num_groups) * kv_head_dim)
     full_wo_b_weight = torch.randn(hidden, num_groups * o_lora_rank)
     q_lora_latent_for_b = torch.randn(1, 4, q_lora_rank)
     attn_out_full = torch.randn(1, 4, num_heads, kv_head_dim)
