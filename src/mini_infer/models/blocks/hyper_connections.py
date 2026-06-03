@@ -54,8 +54,51 @@ import torch
 from torch import nn
 from torch.nn.functional import linear
 
+from mini_infer.models.blocks.hc_sinkhorn_kernel import (
+    hc_split_sinkhorn_triton,
+    supports_hc_kernel,
+)
+
 
 def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split `mixes` into (pre, post, comb) and Sinkhorn-normalize comb.
+
+    Dispatches to a fused Triton kernel on CUDA when ``hc_mult`` is a
+    power of 2 (the common case; V4 uses ``hc_mult=4``). Falls back to
+    the pure-PyTorch transcription on CPU / MPS, or when the Triton
+    kernel can't handle this shape. Both paths produce numerically
+    equivalent output within FP32 reduction-order tolerance.
+
+    Args / Returns: see ``_hc_split_sinkhorn_torch``.
+    """
+    if supports_hc_kernel(mixes.device, hc_mult):
+        return hc_split_sinkhorn_triton(
+            mixes,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            eps=eps,
+        )
+    return _hc_split_sinkhorn_torch(
+        mixes,
+        hc_scale,
+        hc_base,
+        hc_mult=hc_mult,
+        sinkhorn_iters=sinkhorn_iters,
+        eps=eps,
+    )
+
+
+def _hc_split_sinkhorn_torch(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,

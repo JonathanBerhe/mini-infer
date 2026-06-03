@@ -282,12 +282,22 @@ repo's kernel.py / model.py mixing math). Performs `n` Sinkhorn
 iterations on a learnable mixing matrix to produce a doubly-stochastic
 matrix.
 
-**Our code (`blocks/hyper_connections.py:56`, `hc_split_sinkhorn`)**:
-line-by-line transcription of the reference's tilelang kernel into
-pure PyTorch. Same fp32 accumulator, same iteration count
-(`hc_sinkhorn_iters = 20`), same `eps = 1e-6`. The transcription is the
-correctness-critical piece — see ADR-014 for why we chose tilelang →
-PyTorch transcription over a Triton port.
+**Our code (`blocks/hyper_connections.py`, `hc_split_sinkhorn`)**:
+two implementations behind one dispatcher.
+
+- `_hc_split_sinkhorn_torch`: line-by-line transcription of the
+  reference's tilelang kernel into pure PyTorch. Same fp32
+  accumulator, same iteration count (`hc_sinkhorn_iters = 20`), same
+  `eps = 1e-6`. The numerical oracle and the CPU / MPS path. See
+  ADR-014 for the original transcription decision.
+- `hc_split_sinkhorn_triton` (`blocks/hc_sinkhorn_kernel.py`): fused
+  Triton kernel, CUDA fast path. One launch replaces ~50 PyTorch op
+  dispatches per call; measured ~14x per-call latency reduction on
+  L40S at V4's `hc=4, iters=20`. Restored to kernel form because the
+  reference itself is a kernel. The Sinkhorn loop uses a scale-vector
+  formulation (loop carries 1D vectors, not the matrix) to dodge a
+  Triton 3.1 compiler crash on reductions over loop-carried tiles;
+  ADR-018 records the bisect and the parity contract.
 
 ### The block
 
