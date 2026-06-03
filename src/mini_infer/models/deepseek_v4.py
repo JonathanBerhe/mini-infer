@@ -815,13 +815,18 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         """Load HF DeepSeek-V4 weights into the model under tensor parallelism.
 
         Pipeline:
-          1. Optional dtype dequant: V4 ships mixed FP8 (e4m3fn) for
-             non-MoE weights and FP4 for MoE expert weights. FP8 -> BF16
-             happens here via `.to(bfloat16)`; FP4 storage is packed
-             uint8 (NVFP4), which PyTorch doesn't yet ship a native
-             dtype for, so the loader raises an informative error and
-             refers to the deferred Triton-kernel work. The non-FP4
-             portion of V4-Flash still loads end-to-end through this path.
+          1. Block dequant to BF16: V4 ships mixed FP8 (e4m3fn, with a
+             128x128 e8m0 block scale) for non-MoE weights and packed
+             NVFP4 (int8 bytes + a 32-wide e8m0 block scale) for MoE
+             expert weights. Both dequantize to BF16 here against their
+             sibling `.scale` tensor.
+
+             NOTE: dequantizing FP4 experts to BF16 is a 4x storage
+             blow-up that makes full V4-Flash exceed 2x B200 HBM (see
+             `scripts/profile_v4_dequant.py`). This path loads and is
+             unit-tested on tiny synthetic checkpoints, but the real
+             V4-Flash forward needs FP4-resident experts; that work is
+             tracked in the roadmap's open gaps.
           2. Rename: HF V4 names follow the V2/V3 pattern for MoE experts
              (`mlp.experts.{j}.{gate,up,down}_proj.weight`); we map to
              our `w1/w2/w3` names with the same rules as V2.

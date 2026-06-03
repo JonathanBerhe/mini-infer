@@ -13,14 +13,21 @@ What this validates:
      and per-rank slicing.
   3. The model produces FINITE logits for a real prompt.
 
+KNOWN BLOCKER (do not re-run until resolved): today's loader
+dequantizes NVFP4 expert weights to BF16 at load time. That is a 4x
+storage blow-up on the part of the model that dominates the parameter
+count (277B routed-expert params: ~130 GiB as FP4, ~518 GiB as BF16).
+The BF16 form does NOT fit 2x B200 (384 GiB HBM combined), and the CPU
+staging dict peaks near 648 GiB (packed + BF16 both live), which swaps.
+A run will stall in the CPU load and, even if it completed, would OOM
+on the GPUs. The forward needs FP4-resident experts with on-the-fly
+dequant (per-call or a fused FP4 GEMM), not a BF16 dequant at load.
+See `scripts/profile_v4_dequant.py` for the size math (computable with
+no GPU).
+
 What this does NOT validate (deferred follow-ups):
   - Full greedy generation through the scheduler (the scheduler isn't
     TP-aware yet).
-  - A fused FP4 GEMM kernel. Today's loader dequantises NVFP4 expert
-    weights to BF16 at load time, which doubles per-rank expert memory
-    over keeping them packed. On 2x B200 (192 GB HBM each) V4-Flash
-    still fits comfortably, but a fused FP4 GEMM is the throughput
-    follow-up for higher-density configurations.
 
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_smoke.py

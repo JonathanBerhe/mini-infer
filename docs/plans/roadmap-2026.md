@@ -79,9 +79,15 @@ The niche this fills, that neither vLLM nor SGLang fill today:
 
 ### Open gaps (statically clean, awaiting live hardware runs)
 
-- **V4-Flash forward end-to-end on 2× B200.** Load path proven against
-  real safetensors index; three dtype + meta-init fixes landed.
-  Remaining: one live run, blocked on Modal spend cycle.
+- **V4-Flash forward end-to-end on 2x B200.** Load path proven against
+  real safetensors index; FP8/FP4 dequant + dtype + meta-init fixes
+  landed. Blocked on a real architectural gap, not a live run: the
+  loader dequantizes FP4 experts to BF16, which is a 4x storage blow-up
+  (277B routed-expert params: ~130 GiB as FP4, ~518 GiB as BF16). The
+  BF16 form does not fit 2x B200 (384 GiB HBM), and the CPU staging dict
+  peaks near 648 GiB. The forward needs FP4-resident experts with
+  on-the-fly dequant (per-call or a fused FP4 GEMM), the path the smoke
+  deferred. See `scripts/profile_v4_dequant.py` for the size math.
 - **PD smoke end-to-end on 2× H100.** Wire protocol fix landed
   (NCCL CUDA device for handoff header). Remaining: one live run,
   blocked on Modal spend cycle (workspace limit reached).
