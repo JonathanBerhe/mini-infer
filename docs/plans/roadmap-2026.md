@@ -120,15 +120,28 @@ Secondary metrics:
    architecture lands (V5, new Kimi variant, MoE-with-attention-routing
    variants, etc.), implement from-scratch within 30 days. Track via
    a paper-watch list in this doc.
-6. **Continuous bit-parity CI.** Pin specific HF model commits and
-   reference-repo commits; run bit-parity tests in CI against pinned
-   versions. Detects upstream drift before it hits a contributor.
-7. **A `PDScheduler` with admission queue + multi-request batching.**
-   The natural follow-up identified in ADR-016. Lifts PD from
-   single-request serial to concurrent.
-8. **HTTP streaming for FlashInfer / TurboQuant / spec decoding paths.**
-   Same SSE endpoint, env-var toggles. Closes the "every technique
-   is reachable via the API" gap.
+6. ~~**Continuous bit-parity CI.**~~ **Shipped May 2026** (commit
+   `24517e4`). HF model commits pinned in `tests/_pinned_models.toml`;
+   the bit-parity workflow runs `requires_model`-marked tests against
+   those pins.
+7. ~~**A `PDScheduler` with admission queue + multi-request batching.**~~
+   **Shipped May 2026** (ADR-017). Serial + parallel modes; HTTP toggle
+   via `MINI_INFER_USE_PD=1`, mode via `MINI_INFER_PD_MODE`.
+8. **Uniform benchmark harness across techniques.** A single
+   entry point that runs the same workload through every technique
+   (baseline, INT8 W8A16, spec decoding, TurboQuant KV, FlashInfer
+   FP8/NVFP4, tensor parallelism, PD disaggregation) and emits a
+   comparable tok/s + per-request-latency table. Today each technique
+   has its own bench script under `scripts/`; the numbers don't line
+   up because the workloads differ. Lifts the bench surface from
+   "per-technique ad-hoc" to "one apples-to-apples table."
+
+   Supersedes the previous "HTTP streaming for every technique" item:
+   under the research-paper-engine niche the actual gap is bench
+   comparability, not API surface. The HTTP server stays minimal
+   (PDScheduler + baseline); curl-reachability of every quant /
+   spec-dec / KV-format toggle isn't load-bearing for a reader who's
+   running pytest and bench scripts.
 
 ### Long-term (12+ months)
 
@@ -141,10 +154,12 @@ Secondary metrics:
     architectures as they're published rather than back-porting old
     ones.
 11. **One real Triton kernel per quarter where the paper calls for it.**
-    DeepSeek-V4's Hyper-Connections includes a custom `hc_split_sinkhorn`
-    kernel in the reference (tilelang). We've ported it to plain PyTorch.
-    A Triton port for the hot path is a natural follow-up that aligns
-    with the niche (paper-faithful kernels, not generic optimization).
+    First ship landed June 2026: `hc_split_sinkhorn` (DeepSeek-V4
+    Hyper-Connections) ported from the reference's tilelang kernel to
+    Triton, ~14x per-call latency vs the PyTorch transcription on
+    L40S, parity-validated across 18 configurations (ADR-018). The
+    PyTorch transcription remains the oracle + CPU/MPS path. Next
+    candidates as papers call for them.
 
 ## Non-goals (deliberate)
 
