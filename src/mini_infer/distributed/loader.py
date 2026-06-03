@@ -154,6 +154,20 @@ def load_state_dict_with_tp(
             # random init for every layer at construction would OOM.
             if not isinstance(param, torch.Tensor):
                 continue  # not a tensor attribute; can't be in state_dict
+            # A replicated param is a plain copy: its shape must match the
+            # source exactly (TP-sharded params take the load_full_weight
+            # branches above instead). Meta construction otherwise replaces
+            # the param wholesale with no shape check, so a wrong-shaped
+            # source (e.g. an un-dequantized packed-FP4 weight still at its
+            # half-width `(out, in // 2)` shape) would load silently and only
+            # surface as a matmul shape error deep in the forward. Fail at the
+            # boundary instead, naming the param and both shapes.
+            if param.shape != full_tensor.shape:
+                raise ValueError(
+                    f"shape mismatch loading replicated param {sd_key!r}: "
+                    f"model expects {tuple(param.shape)}, "
+                    f"state_dict has {tuple(full_tensor.shape)}"
+                )
             if param.is_meta:
                 # Meta-mode: preserve the source tensor's dtype, but route
                 # to `target_device` if the caller provided one (so the
