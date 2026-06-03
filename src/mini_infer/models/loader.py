@@ -52,7 +52,16 @@ def load_safetensors_state_dict(
     # that multiplies by the matching scale tensor. Casting prematurely
     # would (a) destroy the per-block scale relationship and (b) blow up
     # storage 2x-4x (FP8/FP4 are 0.5-1 byte/elem, BF16 is 2 bytes).
-    quantized_dtypes = {torch.float8_e4m3fn}
+    #
+    # int8 / uint8 are preserved for the same reason: V4-Flash's safetensors
+    # store packed NVFP4 expert weights as raw int8 bytes (the format's
+    # `float4_e2m1fn_x2` type isn't carried in safetensors metadata, so two
+    # FP4 nibbles arrive packed into one int8 at shape `(out, in // 2)`).
+    # The downstream dequant detects them by this int8 dtype; casting to
+    # BF16 here both defeats that detection AND leaves the tensor at its
+    # packed half-width shape, so the un-dequantized `(out, in // 2)` weight
+    # loads silently and only blows up at the first forward matmul.
+    quantized_dtypes = {torch.float8_e4m3fn, torch.int8, torch.uint8}
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
     if e8m0_dtype is not None:
         quantized_dtypes.add(e8m0_dtype)

@@ -71,6 +71,38 @@ def test_load_state_dict_with_tp_world_size_1_matches_state_dict_load() -> None:
         torch.testing.assert_close(param.detach(), source_state_dict[name], rtol=0, atol=0)
 
 
+def test_load_state_dict_with_tp_rejects_shape_mismatch_on_replicated_param() -> None:
+    """A wrong-shaped replicated weight fails loudly at load, not at forward.
+
+    Regression for the V4-Flash expert bug: an un-dequantized packed-FP4
+    weight arrived at its half-width `(out, in // 2)` shape and the meta
+    loader replaced the param wholesale with no shape check, so it loaded
+    silently and only crashed deep in the forward. The loader now guards
+    replicated params (RMSNorm weights here) against shape drift.
+    """
+    _, source_state_dict = _tiny_llama_state_dict()
+    # `model.norm.weight` is a plain RMSNorm weight -> replicated branch
+    # (not one of the TP load_full_weight paths). Corrupt it to half width.
+    corrupted = dict(source_state_dict)
+    corrupted["model.norm.weight"] = source_state_dict["model.norm.weight"][:8].clone()
+
+    cfg = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+    )
+    fresh_model = LlamaForCausalLM(cfg)
+    with pytest.raises(ValueError, match="shape mismatch loading replicated param"):
+        load_state_dict_with_tp(fresh_model, corrupted)
+
+
 def _llama_tp_loader_worker(
     rank: int,
     world_size: int,

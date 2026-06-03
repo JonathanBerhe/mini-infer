@@ -563,6 +563,70 @@ def test_moe_backbone_runs_prefill_end_to_end() -> None:
     assert torch.all(torch.isfinite(logits))
 
 
+def test_moe_int8_packed_nvfp4_experts_load_at_full_width(tmp_path) -> None:
+    """Packed-int8 NVFP4 experts dequantize to full width through the real load chain.
+
+    Local reproduction of the 2x B200 smoke failure: V4-Flash ships routed
+    expert weights as NVFP4 packed into int8 bytes at shape `(out, in // 2)`.
+    `load_safetensors_state_dict` was casting those int8 tensors to BF16,
+    which (a) defeated the int8-based FP4 detection in `load_weights` and
+    (b) left them at the packed half-width shape, so the first expert
+    matmul died with `mat1 and mat2 shapes cannot be multiplied`.
+
+    Exercises the full `load_safetensors_state_dict -> load_weights` chain
+    (the bug lived in the former). Expert values are arbitrary; the
+    contract under test is dtype preservation + full-width dequant, not
+    numerical parity (that's the Modal smoke's job).
+    """
+    from safetensors.torch import save_file
+
+    from mini_infer.models.loader import load_safetensors_state_dict
+
+    cfg = _make_moe_hybrid_config(num_hash_routed_layers=2)
+    torch.manual_seed(0)
+    source = DeepseekV4ForCausalLM(cfg).to(torch.bfloat16)
+    state_dict = {k: v.detach().clone() for k, v in source.state_dict().items()}
+
+    block_size = 32
+    # Routed experts only (`.mlp.experts.`); `.mlp.shared_experts.` ship
+    # as FP8 on the real checkpoint and aren't the packed-FP4 path.
+    expert_weight_keys = [k for k in state_dict if ".mlp.experts." in k and k.endswith(".weight")]
+    assert expert_weight_keys, "expected routed-expert weights in the V4 MoE state_dict"
+
+    converted = dict(state_dict)
+    for key in expert_weight_keys:
+        out_dim, in_dim = state_dict[key].shape
+        assert in_dim % block_size == 0
+        # Packed int8: two FP4 nibbles per byte -> half width on the in dim.
+        packed = torch.randint(-128, 128, (out_dim, in_dim // 2), dtype=torch.int8)
+        # Per-block scale; fp32 is fine (dequant calls `.float()` on it).
+        scale = torch.ones(out_dim, in_dim // block_size, dtype=torch.float32)
+        converted[key] = packed
+        converted[key[: -len(".weight")] + ".scale"] = scale
+
+    save_file(
+        {k: v.contiguous() for k, v in converted.items()},
+        str(tmp_path / "model.safetensors"),
+    )
+    loaded = load_safetensors_state_dict(str(tmp_path), device="cpu", dtype=torch.bfloat16)
+
+    # Loader must preserve packed int8 experts (the fix); a BF16 cast here
+    # is the bug.
+    for key in expert_weight_keys:
+        assert loaded[key].dtype == torch.int8, f"{key} was cast away from int8 by the loader"
+
+    target = DeepseekV4ForCausalLM(cfg).to(torch.bfloat16)
+    DeepseekV4ForCausalLM.load_weights(target, loaded)
+
+    # Every routed expert param ends up full-width (out, in), NOT the
+    # packed (out, in // 2) that crashed the smoke.
+    target_params = dict(target.named_parameters())
+    for key in expert_weight_keys:
+        expected = tuple(state_dict[key].shape)
+        got = tuple(target_params[key].shape)
+        assert got == expected, f"{key}: expected full width {expected}, got {got}"
+
+
 def test_moe_backbone_runs_decode_end_to_end() -> None:
     """Decode through the MoE backbone with both hash and score-topk layers active.
 
