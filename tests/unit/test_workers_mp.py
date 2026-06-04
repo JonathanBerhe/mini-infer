@@ -6,24 +6,27 @@ loads its own `ModelRunner`, runs a single request through the pipeline
 with a `dist.send/recv` KV transfer in between, and asserts the output
 matches the single-process `Orchestrator` token-for-token.
 
-It is skipped by default. The wire-protocol coverage we rely on for CI
-lives in `test_kv_transfer_mp.py` (proves `send_handoff` /
-`recv_handoff` round-trip across processes in ~4 s using synthetic
-KV tensors). This module's full-real-model test is kept for
-documentation + manual local exercise + the Modal CUDA path.
+Marked `slow` + `requires_model` (downloads Qwen2.5-0.5B, ~1 GB), so it
+runs locally / on demand, not in the fast CI lane. The lightweight
+wire-protocol coverage lives in `test_kv_transfer_mp.py` (proves
+`send_handoff` / `recv_handoff` round-trip across processes in ~4 s
+using synthetic KV tensors).
 
-Why skipped
------------
+Previously skipped: a deadlock
+------------------------------
 
-The combination of (a) Qwen2.5-0.5B's forward pass on CPU, (b) two
-PyTorch processes on the same host, and (c) pytest's spawn-based child
-harness reliably stalls macOS Apple-silicon runs past usable test
-budgets (the forward never returns in the test's timeout window). The
-same `pd_two_process_target` runs cleanly on a multi-GPU CUDA host
-where each rank owns its own GPU and there's no thread contention — so
-the test is correct, but its CI venue is the Modal smoke (slice 4),
-not this file. We mark `skip` rather than `xfail` to keep the suite
-green and signal intent clearly.
+This test was skipped on the belief that the two-process forward
+"stalls on CPU / under pytest" but "runs cleanly on multi-GPU CUDA."
+That was a misdiagnosis. The real cause was a topology conflation: each
+PD rank built its model under the 2-rank process group, so the model's
+TP-aware layers inserted `all_reduce` collectives. Rank 0's prefill
+blocked on the very first collective (the token embedding) waiting for
+rank 1, which was parked in `recv_handoff`: a hard deadlock, on CPU
+*and* CUDA alike (the 2x H100 smoke hit the same hang). The fix is
+`replica_scope()` in `pd_two_process_target`: each rank builds + runs a
+full replica (world_size=1, no collectives) and the ranks communicate
+only via the explicit `send_handoff` / `recv_handoff`. With that in
+place this test runs end-to-end, so it's no longer skipped.
 """
 
 from __future__ import annotations
@@ -62,14 +65,6 @@ def _single_process_pd_baseline(prompt: str, max_tokens: int) -> list[int]:
 
 @pytest.mark.requires_model
 @pytest.mark.slow
-@pytest.mark.skip(
-    reason=(
-        "two-process Qwen2.5-0.5B forward + gloo PG stalls under pytest's "
-        "spawn harness on macOS. The same target runs end-to-end on the "
-        "Modal CUDA path (one rank per GPU). Wire-protocol coverage lives in "
-        "test_kv_transfer_mp.py."
-    )
-)
 def test_pd_two_process_matches_single_process() -> None:
     """Multi-process PD output equals single-process Orchestrator output."""
     if not is_multi_process_available():

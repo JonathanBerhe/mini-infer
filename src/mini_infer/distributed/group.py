@@ -27,9 +27,50 @@ Backend selection
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
+
+# When True, `get_world_size()` / `get_rank()` report (1, 0) regardless of the
+# active process group. This is for ranks that participate in a multi-rank PG
+# for some OTHER purpose than tensor parallelism, and need their model built +
+# run as a full, un-sharded replica with no TP collectives.
+#
+# The motivating case is prefill/decode (PD) disaggregation: the prefill rank
+# and decode rank form a 2-rank PG, but each runs a COMPLETE model and they
+# communicate only via an explicit `kv_transfer` send/recv handoff, never via
+# TP all-reduces. Without this, the model's TP-aware layers see world_size=2,
+# insert all-reduce collectives, and rank 0's prefill deadlocks on the first
+# collective (the token embedding) waiting for rank 1, which is parked in
+# `recv_handoff`. The handoff itself uses `dist.send`/`dist.recv` + the torch
+# `dist.get_rank()` directly, so it is unaffected by this override.
+#
+# It must stay active for the worker's whole lifetime (construction AND every
+# forward): some layers capture world_size at construction (embedding), but
+# others call `all_reduce_sum` unconditionally and rely on its live
+# world_size==1 no-op (MoE). A construction-only scope would miss the latter.
+_FORCE_REPLICA = False
+
+
+@contextmanager
+def replica_scope() -> Iterator[None]:
+    """Force single-replica (no-TP) topology for the duration of the scope.
+
+    Within the scope `get_world_size()` returns 1 and `get_rank()` returns 0,
+    so TP-aware modules build + run as plain replicas with no collective calls.
+    Wrap a PD worker's entire model lifetime (load + prefill / decode) in this;
+    the `kv_transfer` handoff inside the scope still uses the real process group
+    via `dist.send`/`dist.recv`. Nesting is supported.
+    """
+    global _FORCE_REPLICA
+    previous = _FORCE_REPLICA
+    _FORCE_REPLICA = True
+    try:
+        yield
+    finally:
+        _FORCE_REPLICA = previous
 
 
 def init_distributed(
@@ -101,18 +142,23 @@ def is_initialized() -> bool:
 
 
 def get_world_size() -> int:
-    """Number of ranks; 1 when no PG is active.
+    """Number of TP ranks; 1 when no PG is active or inside `replica_scope()`.
 
     Returning 1 (instead of raising) is what lets TP-aware modules build
-    transparently in single-device tests.
+    transparently in single-device tests. Inside `replica_scope()` it returns
+    1 even under a live multi-rank PG, so a PD worker builds a full replica.
     """
+    if _FORCE_REPLICA:
+        return 1
     if is_initialized():
         return dist.get_world_size()
     return 1
 
 
 def get_rank() -> int:
-    """This rank's index in the PG; 0 when no PG is active."""
+    """This rank's TP index; 0 when no PG is active or inside `replica_scope()`."""
+    if _FORCE_REPLICA:
+        return 0
     if is_initialized():
         return dist.get_rank()
     return 0

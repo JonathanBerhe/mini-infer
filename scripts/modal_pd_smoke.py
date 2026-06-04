@@ -74,7 +74,11 @@ def _run_one_rank(rank: int, world_size: int, prompt: str, max_tokens: int) -> d
     """
     import torch
 
-    from mini_infer.distributed.group import destroy_distributed, init_distributed
+    from mini_infer.distributed.group import (
+        destroy_distributed,
+        init_distributed,
+        replica_scope,
+    )
     from mini_infer.engine.model_runner import ModelRunner
     from mini_infer.engine.sampler import SamplingParams
     from mini_infer.scheduler.request_state import Request
@@ -96,39 +100,45 @@ def _run_one_rank(rank: int, world_size: int, prompt: str, max_tokens: int) -> d
     try:
         device = f"cuda:{rank}"
         torch.cuda.set_device(rank)
-        runner = ModelRunner.from_pretrained(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+        # PD runs a full model per rank; the ranks talk only via the
+        # send/recv handoff, not TP collectives. `replica_scope` makes the
+        # TP-aware layers see world_size=1 so they run with no all-reduce
+        # (which would deadlock against the handoff). The handoff uses
+        # dist.send/recv directly and is unaffected.
+        with replica_scope():
+            runner = ModelRunner.from_pretrained(_MODEL_NAME, device=device, dtype=torch.bfloat16)
 
-        if rank == PREFILL_RANK:
-            worker = PrefillWorker(runner)
-            request = Request(
-                prompt=prompt,
-                sampling_params=SamplingParams(),  # greedy
-                max_tokens=max_tokens,
-            )
-            handoff = worker.prefill(request)
-            send_handoff(handoff, dst_rank=DECODE_RANK)
-            return {
-                "rank": rank,
-                "role": "prefill",
-                "prefill_len": handoff.prefill_len,
-                "first_sampled_token_id": handoff.first_sampled_token_id,
-                "kv_layers": handoff.num_layers,
-            }
+            if rank == PREFILL_RANK:
+                worker = PrefillWorker(runner)
+                request = Request(
+                    prompt=prompt,
+                    sampling_params=SamplingParams(),  # greedy
+                    max_tokens=max_tokens,
+                )
+                handoff = worker.prefill(request)
+                send_handoff(handoff, dst_rank=DECODE_RANK)
+                return {
+                    "rank": rank,
+                    "role": "prefill",
+                    "prefill_len": handoff.prefill_len,
+                    "first_sampled_token_id": handoff.first_sampled_token_id,
+                    "kv_layers": handoff.num_layers,
+                }
 
-        if rank == DECODE_RANK:
-            worker = DecodeWorker(runner)
-            handoff = recv_handoff(src_rank=PREFILL_RANK, pool=runner.block_pool)
-            tokens = list(worker.decode(handoff))
-            text = runner.tokenizer.decode(tokens)
-            return {
-                "rank": rank,
-                "role": "decode",
-                "n_tokens": len(tokens),
-                "token_ids": tokens,
-                "text": text,
-            }
+            if rank == DECODE_RANK:
+                worker = DecodeWorker(runner)
+                handoff = recv_handoff(src_rank=PREFILL_RANK, pool=runner.block_pool)
+                tokens = list(worker.decode(handoff))
+                text = runner.tokenizer.decode(tokens)
+                return {
+                    "rank": rank,
+                    "role": "decode",
+                    "n_tokens": len(tokens),
+                    "token_ids": tokens,
+                    "text": text,
+                }
 
-        raise ValueError(f"unexpected rank {rank}")
+            raise ValueError(f"unexpected rank {rank}")
     finally:
         import torch.distributed as dist
 
