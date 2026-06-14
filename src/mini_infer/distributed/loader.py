@@ -146,12 +146,14 @@ def load_state_dict_with_tp(
             consumed.add(sd_key)
             loaded_param_ids.add(id(parent_module.wo_a))
         else:
-            # Replicated parameter — works for `nn.Linear`, `nn.Embedding`,
-            # `nn.Parameter`, RMSNorm weights, etc. Handles two paths:
-            # meta-device construction (replace the parameter) and
-            # already-allocated (in-place copy). The meta path is required
-            # for multi-hundred-billion-parameter models where allocating
-            # random init for every layer at construction would OOM.
+            # Replicated parameter OR buffer — works for `nn.Linear`,
+            # `nn.Embedding`, `nn.Parameter`, RMSNorm weights, and registered
+            # buffers (e.g. FP4Expert's packed-weight / scale companions).
+            # Handles two paths: meta-device construction (replace the
+            # param / buffer) and already-allocated (in-place copy). The meta
+            # path is required for multi-hundred-billion-parameter models
+            # where allocating random init for every layer at construction
+            # would OOM.
             if not isinstance(param, torch.Tensor):
                 continue  # not a tensor attribute; can't be in state_dict
             # A replicated param is a plain copy: its shape must match the
@@ -168,6 +170,25 @@ def load_state_dict_with_tp(
                     f"model expects {tuple(param.shape)}, "
                     f"state_dict has {tuple(full_tensor.shape)}"
                 )
+            # Buffers are NOT parameters: load them as buffers so they stay
+            # buffers (the meta path below would otherwise wrap them in an
+            # `nn.Parameter`, turning a zero-param FP4Expert into one with
+            # params). Cast to the buffer's declared dtype, matching the
+            # in-place copy path and preserving its storage contract (e.g.
+            # FP4Expert's fp32 scales). Buffers don't appear in
+            # `named_parameters()`, so they need no `loaded_param_ids` entry.
+            if attr_name in parent_module._buffers:
+                cast_tensor = full_tensor.to(param.dtype).contiguous()
+                if param.is_meta:
+                    persistent = attr_name not in parent_module._non_persistent_buffers_set
+                    parent_module.register_buffer(
+                        attr_name, _to_target(cast_tensor), persistent=persistent
+                    )
+                else:
+                    with torch.no_grad():
+                        param.copy_(cast_tensor)
+                consumed.add(sd_key)
+                continue
             if param.is_meta:
                 # Meta-mode: preserve the source tensor's dtype, but route
                 # to `target_device` if the caller provided one (so the

@@ -9,21 +9,22 @@ What this validates:
   1. The TP infrastructure (column / row / vocab-parallel layers,
      expert-parallel MoE) holds together on real Blackwell GPUs.
   2. `DeepseekV4ForCausalLM.load_weights` round-trips through the HF
-     safetensors index, FP8 e4m3fn dequant, V2/V3-style MoE renames,
-     and per-rank slicing.
+     safetensors index, FP8 e4m3fn dequant, FP4-resident routed experts,
+     V2/V3-style MoE renames, and per-rank slicing.
   3. The model produces FINITE logits for a real prompt.
 
-KNOWN BLOCKER (do not re-run until resolved): today's loader
-dequantizes NVFP4 expert weights to BF16 at load time. That is a 4x
-storage blow-up on the part of the model that dominates the parameter
-count (277B routed-expert params: ~130 GiB as FP4, ~518 GiB as BF16).
-The BF16 form does NOT fit 2x B200 (384 GiB HBM combined), and the CPU
-staging dict peaks near 648 GiB (packed + BF16 both live), which swaps.
-A run will stall in the CPU load and, even if it completed, would OOM
-on the GPUs. The forward needs FP4-resident experts with on-the-fly
-dequant (per-call or a fused FP4 GEMM), not a BF16 dequant at load.
-See `scripts/profile_v4_dequant.py` for the size math (computable with
-no GPU).
+PRIOR BLOCKER (resolved): the loader used to dequantize the NVFP4 routed
+experts to BF16 at load time, a 4x blow-up on the part of the model that
+dominates the parameter count (~130 GiB as FP4 -> ~518 GiB as BF16). That
+BF16 form does NOT fit 2x B200 (384 GiB HBM combined), and the CPU staging
+dict peaked near 648 GiB (packed + BF16 both live), which swapped. The
+routed experts now stay NVFP4-resident on `FP4Expert` buffers (packed int8
++ per-block scale, dequantized per call), so neither the GPU OOM nor the
+CPU staging peak occurs. Proven locally (no GPU) by the FP4Expert unit
+tests, the FP4-resident load test, and the size math in
+`scripts/profile_v4_dequant.py`, and confirmed here on 2x B200: both ranks
+load the real checkpoint and produce finite, rank-consistent logits. This
+is a finite-output smoke, not bit-parity against the upstream reference.
 
 What this does NOT validate (deferred follow-ups):
   - Full greedy generation through the scheduler (the scheduler isn't
@@ -228,7 +229,11 @@ def _child_entry(rank: int, world_size: int, prompt: str, queue) -> None:
 @app.function(
     image=image,
     gpu=_GPU,
-    timeout=3600,
+    # Hard wall-clock ceiling. A warm-cache load (weights already in the
+    # hf-cache volume) plus a single prefill completes well inside this; the
+    # cap exists only to bound a hung run (e.g. an NCCL deadlock) rather than
+    # hold the GPUs to a longer default.
+    timeout=1800,
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
@@ -247,7 +252,7 @@ def smoke(prompt: str) -> dict:
     for p in processes:
         p.start()
     try:
-        results = [queue.get(timeout=3000) for _ in range(world_size)]
+        results = [queue.get(timeout=1680) for _ in range(world_size)]
     finally:
         for p in processes:
             p.join(timeout=10)

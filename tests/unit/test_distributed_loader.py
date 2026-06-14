@@ -103,6 +103,44 @@ def test_load_state_dict_with_tp_rejects_shape_mismatch_on_replicated_param() ->
         load_state_dict_with_tp(fresh_model, corrupted)
 
 
+def test_load_state_dict_with_tp_meta_buffer_loads_as_buffer() -> None:
+    """A registered buffer constructed on `meta` loads back as a buffer.
+
+    Regression guard for FP4-resident experts: `FP4Expert` stores its packed
+    weight + per-block scale as buffers (zero params). The meta-construction
+    path wrapped every replicated tensor in `nn.Parameter`, which would turn
+    those buffers into parameters (a zero-param expert would suddenly have
+    params, and `register_buffer`'s slot would collide). Buffers must stay
+    buffers, while real parameters in the same module still load normally.
+    """
+
+    class _BufferAndParamModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # int8 buffer at half width — mirrors FP4Expert's packed weight.
+            self.register_buffer("packed", torch.zeros(4, 2, dtype=torch.int8))
+            self.weight = torch.nn.Parameter(torch.zeros(4, 4))
+
+    with torch.device("meta"):
+        model = _BufferAndParamModule()
+    source = {
+        "packed": torch.randint(-128, 128, (4, 2), dtype=torch.int8),
+        "weight": torch.ones(4, 4),
+    }
+
+    missing, unexpected = load_state_dict_with_tp(model, source, target_device="cpu")
+
+    assert not missing and not unexpected
+    # `packed` stayed a buffer; it was not promoted to a parameter.
+    assert "packed" in model._buffers
+    assert "packed" not in dict(model.named_parameters())
+    assert model.packed.dtype == torch.int8
+    assert model.packed.shape == (4, 2)
+    assert torch.equal(model.packed, source["packed"])
+    # The real parameter alongside it loaded the usual way.
+    assert torch.equal(model.weight.detach(), source["weight"])
+
+
 def _llama_tp_loader_worker(
     rank: int,
     world_size: int,
