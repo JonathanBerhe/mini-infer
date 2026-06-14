@@ -36,6 +36,7 @@ from torch import nn
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.fp4_expert import FP4Expert
 from mini_infer.models.blocks.hash_routed_gate import (
     HashRoutedGate,
     RoutingMode,
@@ -60,6 +61,7 @@ class HashRoutedMoEFFN(nn.Module):
         vocab_size: int | None = None,
         n_shared_experts: int = 0,
         shared_intermediate_size: int | None = None,
+        expert_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -91,10 +93,22 @@ class HashRoutedMoEFFN(nn.Module):
         )
 
         # Local experts only. `self.experts[local_idx]` has global index
-        # `local_expert_start + local_idx`.
-        self.experts = nn.ModuleList(
-            [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_experts_per_rank)]
-        )
+        # `local_expert_start + local_idx`. With `expert_dtype="fp4"` the
+        # routed experts stay NVFP4-resident (`FP4Expert`: packed int8 +
+        # per-block scale buffers, dequantized per call) instead of holding
+        # full-width BF16 weights -- the only way V4-Flash's routed experts
+        # fit in HBM. Shared experts below are unaffected (they ship FP8 and
+        # dequantize to BF16 at load).
+        if expert_dtype not in ("bf16", "fp4"):
+            raise ValueError(f"expert_dtype must be 'bf16' or 'fp4'; got {expert_dtype!r}")
+        self.expert_dtype = expert_dtype
+        routed_experts: list[nn.Module] = []
+        for _ in range(num_experts_per_rank):
+            if expert_dtype == "fp4":
+                routed_experts.append(FP4Expert(hidden_size, intermediate_size))
+            else:
+                routed_experts.append(MixtralExpert(hidden_size, intermediate_size))
+        self.experts = nn.ModuleList(routed_experts)
 
         # Shared expert(s): always-on MLP added to the routed sum. V4 uses one;
         # V2/V3 use two and we collapse them into a single MLP with a wider

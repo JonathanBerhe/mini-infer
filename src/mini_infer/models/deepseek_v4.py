@@ -37,14 +37,16 @@ SWA circular buffer + per-layer compressed history + compressor in-flight
 accumulator. Helper `build_state_cache_layer_specs` translates a config
 into the per-layer specs `StateCache.__init__` expects.
 
-`load_weights` walks the HF safetensors state_dict, dequantises FP8
-(e4m3fn) and NVFP4 (`float4_e2m1fn_x2`, with per-block e8m0fnu scales)
-weights to BF16, applies the same MoE expert renames as V2/V3
-(`gate_proj/up_proj/down_proj` -> `w1/w2/w3`), then dispatches through
-`load_state_dict_with_tp` so each column / row / vocab-parallel layer
-slices its rank's share. The full V4-Flash storage format is now
-supported end-to-end on the loader path; a Triton-fused FP4 GEMM is
-the optimization follow-up.
+`load_weights` walks the HF safetensors state_dict, dequantises the FP8
+(e4m3fn) weights to BF16, and (when `cfg.expert_dtype == "fp4"`) keeps the
+packed-NVFP4 routed experts resident on `FP4Expert` buffers rather than
+dequantising them (the 4x blow-up that overflows 2x B200 HBM). It applies
+the same MoE expert renames as V2/V3 (`gate_proj/up_proj/down_proj` ->
+`w1/w2/w3`), then dispatches through `load_state_dict_with_tp` so each
+column / row / vocab-parallel layer slices its rank's share. The full
+V4-Flash storage format is supported end-to-end on the loader path;
+per-call FP4 dequant is correct-first, and a Triton-fused FP4 GEMM is the
+optimization follow-up.
 """
 
 from __future__ import annotations
@@ -190,6 +192,35 @@ def _remap_expert_indices_to_local_rank(
     return out
 
 
+# Routed-expert weight/scale keys (post-rename canonical form) -> FP4Expert
+# buffer names. Matches `.mlp.experts.{j}.w{1,2,3}.{weight,scale}` only;
+# `.mlp.shared_experts.` is excluded (shared experts stay BF16 nn.Linear).
+_FP4_EXPERT_BUFFER_RE = re.compile(r"(\.mlp\.experts\.\d+\.)(w[123])\.(weight|scale)$")
+
+
+def _rename_fp4_expert_buffers(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Map routed-expert `w{n}.weight` / `w{n}.scale` onto FP4Expert buffers.
+
+    `FP4Expert` stores each weight as two buffers, `w{n}_packed` (packed
+    int8) and `w{n}_scale` (per-block scale), rather than an `nn.Linear`
+    `w{n}.weight` Parameter. Rewrite the loaded keys to match so the packed
+    weight and its scale land on the right buffers:
+
+        ...mlp.experts.{j}.w{n}.weight -> ...mlp.experts.{j}.w{n}_packed
+        ...mlp.experts.{j}.w{n}.scale  -> ...mlp.experts.{j}.w{n}_scale
+
+    Non-matching keys (shared experts, attention, gate, norms) pass through.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        suffix = "_packed" if match.group(3) == "weight" else "_scale"
+        return match.group(1) + match.group(2) + suffix
+
+    return {
+        _FP4_EXPERT_BUFFER_RE.sub(_replace, name): tensor for name, tensor in state_dict.items()
+    }
+
+
 def _apply_v4_flash_renames(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Rewrite V4-Flash native keys into mini-infer's naming.
 
@@ -235,6 +266,41 @@ def _map_score_func(hf_value: str) -> str:
     HF-side rename surfaces as a downstream `ScoreFunction` validation
     error with the actual offending name, rather than a silent default."""
     return _SCORE_FUNC_NAME_MAP.get(hf_value, hf_value)
+
+
+# Substrings that mark an NVFP4 / packed-FP4 expert format inside an HF
+# `quantization_config`. The published configs phrase this several ways
+# ("NVFP4", "float4_e2m1fn_x2", ...), so we scan rather than match an exact
+# schema. Detection is best-effort: the real V4-Flash `config.json` is
+# confirmed by the 2x B200 smoke; local FP4 tests set `expert_dtype`
+# explicitly and do not depend on this path.
+_FP4_CONFIG_MARKERS = ("nvfp4", "fp4", "e2m1", "float4")
+
+
+def _detect_expert_dtype(cfg_dict: dict[str, Any], explicit: Any) -> str:
+    """Resolve the routed-expert storage format from an HF config.
+
+    Precedence: an explicit top-level `expert_dtype` wins; otherwise we
+    look for an FP4 marker anywhere in `quantization_config`'s string
+    values. Defaults to "bf16" so non-quantized checkpoints are unaffected.
+    """
+    if isinstance(explicit, str) and explicit:
+        return explicit.lower()
+
+    def _has_fp4_marker(value: Any) -> bool:
+        if isinstance(value, str):
+            lowered = value.lower()
+            return any(marker in lowered for marker in _FP4_CONFIG_MARKERS)
+        if isinstance(value, dict):
+            return any(_has_fp4_marker(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(_has_fp4_marker(item) for item in value)
+        return False
+
+    quant_config = cfg_dict.get("quantization_config")
+    if isinstance(quant_config, dict) and _has_fp4_marker(quant_config):
+        return "fp4"
+    return "bf16"
 
 
 @dataclass
@@ -308,6 +374,14 @@ class DeepseekV4Config:
     moe_score_func: str = "softmax"
     moe_route_scale: float = 1.0
     n_shared_experts: int = 0
+    # Storage format of the ROUTED experts. "bf16" (default) materialises
+    # them as full-width BF16 `MixtralExpert` weights; "fp4" keeps them
+    # NVFP4-resident as `FP4Expert` buffers (packed int8 + per-block scale)
+    # and dequantizes per call. V4-Flash needs "fp4": dequantizing its
+    # routed-expert params to BF16 is a 4x blow-up that overflows 2x B200
+    # HBM (see scripts/profile_v4_dequant.py). Shared experts are
+    # unaffected (they ship FP8 and dequantize to BF16 regardless).
+    expert_dtype: str = "bf16"
     # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
     # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
     # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
@@ -344,6 +418,11 @@ class DeepseekV4Config:
                 raise ValueError(
                     f"num_hash_routed_layers ({self.num_hash_routed_layers}) cannot exceed "
                     f"num_hidden_layers ({self.num_hidden_layers})"
+                )
+            if self.expert_dtype not in ("bf16", "fp4"):
+                raise ValueError(
+                    "use_moe_ffn=True requires expert_dtype in ('bf16', 'fp4'); "
+                    f"got {self.expert_dtype!r}"
                 )
         if self.use_hyper_connections and self.hc_mult <= 0:
             raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {self.hc_mult}")
@@ -488,6 +567,7 @@ class DeepseekV4Config:
                 _pick("moe_route_scale", "routed_scaling_factor", default_value=1.0)
             ),
             n_shared_experts=int(_pick("n_shared_experts", default_value=0)),
+            expert_dtype=_detect_expert_dtype(cfg_dict, _pick("expert_dtype", default_value=None)),
             # Hyper-Connections. V4-Flash sets `hc_mult=4`.
             use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
             hc_mult=int(_pick("hc_mult", default_value=0)),
@@ -570,6 +650,7 @@ class _DeepseekV4InnerModel(nn.Module):
                 moe_route_scale=cfg.moe_route_scale,
                 moe_vocab_size=cfg.vocab_size if routing_mode == "hash" else None,
                 n_shared_experts=cfg.n_shared_experts,
+                expert_dtype=cfg.expert_dtype,
             )
         if cfg.use_hyper_connections:
             layer_kwargs.update(
@@ -815,24 +896,29 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         """Load HF DeepSeek-V4 weights into the model under tensor parallelism.
 
         Pipeline:
-          1. Block dequant to BF16: V4 ships mixed FP8 (e4m3fn, with a
-             128x128 e8m0 block scale) for non-MoE weights and packed
-             NVFP4 (int8 bytes + a 32-wide e8m0 block scale) for MoE
-             expert weights. Both dequantize to BF16 here against their
-             sibling `.scale` tensor.
+          1. Dequant non-expert weights to BF16: V4 ships FP8 (e4m3fn,
+             with a 128x128 e8m0 block scale) for attention projections,
+             the MoE gate, compressors, and shared experts. These
+             dequantize to BF16 here against their sibling `.scale`.
 
-             NOTE: dequantizing FP4 experts to BF16 is a 4x storage
-             blow-up that makes full V4-Flash exceed 2x B200 HBM (see
-             `scripts/profile_v4_dequant.py`). This path loads and is
-             unit-tested on tiny synthetic checkpoints, but the real
-             V4-Flash forward needs FP4-resident experts; that work is
-             tracked in the roadmap's open gaps.
+             The packed-NVFP4 routed experts (int8 bytes + a 32-wide
+             e8m0 block scale) are handled per `cfg.expert_dtype`:
+               - "fp4" (V4-Flash): kept NVFP4-resident. The packed weight
+                 and its scale are routed onto the `FP4Expert` buffers
+                 (Step 2b) and dequantized per call at forward time.
+                 Dequantizing them to BF16 here would be a 4x blow-up
+                 that overflows 2x B200 HBM (see
+                 `scripts/profile_v4_dequant.py`).
+               - "bf16": dequantized to BF16 like everything else (used
+                 by tiny synthetic checkpoints and non-FP4 families).
           2. Rename: HF V4 names follow the V2/V3 pattern for MoE experts
              (`mlp.experts.{j}.{gate,up,down}_proj.weight`); we map to
-             our `w1/w2/w3` names with the same rules as V2.
+             our `w1/w2/w3` names with the same rules as V2. Step 2b then
+             maps FP4-resident expert weights/scales onto FP4Expert's
+             `w{n}_packed` / `w{n}_scale` buffers.
           3. TP-aware load: dispatch through `load_state_dict_with_tp`
              so per-rank slicing falls out of the column/row-parallel
-             layers automatically.
+             layers automatically (and FP4Expert buffers load as buffers).
 
         At `world_size=1` this is bit-equivalent to a non-TP load — the
         TP layers behave as plain `nn.Linear` / `nn.Embedding`.
@@ -872,14 +958,27 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             candidate = weight_key[: -len(".weight")] + ".scale"
             return candidate if candidate in hf_state_dict else None
 
+        # When the config marks routed experts FP4-resident, their packed
+        # NVFP4 weights are kept as-is (no BF16 dequant: that's the 4x
+        # blow-up that overflows HBM) and their `.scale` companion -- which
+        # the dequant path would consume -- is propagated so Step 2b can
+        # route it onto the matching `FP4Expert.{w}_scale` buffer. Only
+        # packed-NVFP4 weights take this path; shared experts, the MoE gate,
+        # and attention all ship FP8 and dequantize to BF16 as before.
+        keep_experts_fp4 = model.cfg.expert_dtype == "fp4"
+
         dequantized: dict[str, torch.Tensor] = {}
-        consumed_scale_keys: set[str] = set()
         for hf_name, tensor in hf_state_dict.items():
-            # Sibling scale keys get consumed when we process their paired weight.
+            # Sibling scale keys are normally consumed by their paired
+            # weight's dequant. For FP4-resident experts they instead ride
+            # along to a `_scale` buffer, so propagate rather than drop them.
             if hf_name.endswith(".scale"):
                 paired_weight_key = hf_name[: -len(".scale")] + ".weight"
                 if paired_weight_key in hf_state_dict:
-                    consumed_scale_keys.add(hf_name)
+                    paired_weight = hf_state_dict[paired_weight_key]
+                    if keep_experts_fp4 and is_packed_nvfp4(paired_weight):
+                        dequantized[hf_name] = tensor
+                    # else: consumed by the paired weight's dequant; drop it.
                     continue
                 # No paired weight — fall through, treat as a regular tensor.
 
@@ -887,7 +986,13 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             if scale_key is not None:
                 scale_tensor = hf_state_dict[scale_key]
                 if is_packed_nvfp4(tensor):
-                    dequantized[hf_name] = dequantize_nvfp4_to_bf16(tensor, scale_tensor)
+                    if keep_experts_fp4:
+                        # Keep the packed int8 weight; its scale was
+                        # propagated above. Both are renamed onto FP4Expert
+                        # buffers in Step 2b.
+                        dequantized[hf_name] = tensor
+                    else:
+                        dequantized[hf_name] = dequantize_nvfp4_to_bf16(tensor, scale_tensor)
                 elif tensor.dtype == torch.float8_e4m3fn:
                     dequantized[hf_name] = dequantize_block_fp8_to_bf16(
                         tensor, scale_tensor, block_size=(128, 128)
@@ -896,7 +1001,6 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                     # Unknown quantization — pass through and hope the
                     # downstream loader catches the dtype mismatch.
                     dequantized[hf_name] = tensor
-                consumed_scale_keys.add(scale_key)
             elif tensor.dtype == torch.float8_e4m3fn:
                 # Bare FP8 without a scale — direct cast (older paper-internal
                 # convention; not used by V4-Flash).
@@ -924,6 +1028,13 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                         new_name = pattern.sub(replacement, new_name)
                         break
                 remapped[new_name] = tensor
+
+        # Step 2b: route FP4-resident routed experts onto their FP4Expert
+        # buffers (`w{n}.weight` -> `w{n}_packed`, `w{n}.scale` ->
+        # `w{n}_scale`). Runs on the canonical post-rename names, so it is
+        # naming-convention agnostic. No-op for BF16 experts.
+        if keep_experts_fp4:
+            remapped = _rename_fp4_expert_buffers(remapped)
 
         # Step 2.5: expert-parallel remap. V4-Flash ships ALL routed
         # experts as global indices `experts.0`..`experts.{N-1}`, but the

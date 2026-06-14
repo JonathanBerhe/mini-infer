@@ -1,15 +1,15 @@
 """DeepSeek-V4 owned model: registry, per-layer dispatch, end-to-end prefill + decode.
 
-V4 weights aren't public yet and the published architecture also uses MoE
-FFN + Hyper-Connections that we don't replicate. So `load_weights` raises.
-What we DO ship + test:
+V4-Flash's hybrid CSA/HCA attention, hash-routed MoE FFN, and
+Hyper-Connections are all replicated here; `load_weights` loads the real
+mixed FP8 / FP4-resident checkpoint. What we ship + test on CPU:
 
   - Per-layer CSA-or-HCA dispatch driven by `compress_ratios`.
-  - End-to-end forward (prefill) on a synthetic 4-layer hybrid backbone
-    — verifies the whole stack composes correctly (residual shape,
+  - End-to-end forward (prefill) on a synthetic 4-layer hybrid backbone:
+    verifies the whole stack composes correctly (residual shape,
     per-layer compressed RoPE, final norm + lm_head).
   - End-to-end decode (1 token) through the same stack with a per-layer
-    `StateCache` initialised from the prefill — verifies cache wiring
+    `StateCache` initialised from the prefill: verifies cache wiring
     works across mixed CSA/HCA layers, including the case where some
     layers flush a compressed block and others don't on the same step.
   - `build_state_cache_layer_specs` produces the right per-layer
@@ -435,6 +435,7 @@ def _make_moe_hybrid_config(
     *,
     num_hidden_layers: int = 4,
     num_hash_routed_layers: int = 2,
+    expert_dtype: str = "bf16",
 ) -> DeepseekV4Config:
     """4-layer hybrid (CSA, HCA, CSA, HCA) backbone with `HashRoutedMoEFFN`.
 
@@ -470,6 +471,7 @@ def _make_moe_hybrid_config(
         moe_score_func="softmax",
         moe_route_scale=1.0,
         n_shared_experts=1,
+        expert_dtype=expert_dtype,
     )
 
 
@@ -625,6 +627,100 @@ def test_moe_int8_packed_nvfp4_experts_load_at_full_width(tmp_path) -> None:
         expected = tuple(state_dict[key].shape)
         got = tuple(target_params[key].shape)
         assert got == expected, f"{key}: expected full width {expected}, got {got}"
+
+
+def test_moe_fp4_expert_dtype_builds_fp4_routed_experts() -> None:
+    """`expert_dtype="fp4"` makes routed experts FP4-resident, shared stay BF16.
+
+    Routed experts become `FP4Expert` (zero parameters: packed int8 + scale
+    buffers only). Shared experts ship FP8 on the real checkpoint and stay
+    BF16 `MixtralExpert`. This is the construction-time contract, independent
+    of weight loading.
+    """
+    from mini_infer.models.blocks import MixtralExpert
+    from mini_infer.models.blocks.fp4_expert import FP4Expert
+
+    cfg = _make_moe_hybrid_config(num_hash_routed_layers=2, expert_dtype="fp4")
+    model = DeepseekV4ForCausalLM(cfg)
+    for layer in model.model.layers:
+        for expert in layer.mlp.experts:
+            assert isinstance(expert, FP4Expert), (
+                f"routed expert should be FP4Expert, got {type(expert).__name__}"
+            )
+            assert sum(p.numel() for p in expert.parameters()) == 0
+        assert isinstance(layer.mlp.shared_experts, MixtralExpert)
+
+
+def test_moe_fp4_resident_experts_load_into_buffers_and_run() -> None:
+    """FP4-resident routed experts load onto FP4Expert buffers and run finite.
+
+    End-to-end check for the FP4-resident wiring: `load_weights` keeps the
+    packed NVFP4 routed-expert weights (no BF16 dequant, the 4x blow-up that
+    overflows HBM), routes each packed weight + its scale onto the matching
+    `FP4Expert.{w}_packed` / `{w}_scale` buffers, and the per-call dequant
+    runs a finite forward. Mirrors the int8 full-width test but with
+    `expert_dtype="fp4"`: half-width int8 buffers, not dequantized Parameters.
+    """
+    from mini_infer.models.blocks import MixtralExpert
+    from mini_infer.models.blocks.fp4_expert import FP4Expert
+
+    block_size = 32
+    torch.manual_seed(0)
+    # BF16 source gives a complete, valid V4 state_dict with canonical
+    # `...mlp.experts.{j}.w{n}.weight` keys to convert to packed FP4.
+    source = DeepseekV4ForCausalLM(_make_moe_hybrid_config(num_hash_routed_layers=2)).to(
+        torch.bfloat16
+    )
+    state_dict = {k: v.detach().clone() for k, v in source.state_dict().items()}
+
+    expert_weight_keys = [k for k in state_dict if ".mlp.experts." in k and k.endswith(".weight")]
+    assert expert_weight_keys, "expected routed-expert weights in the V4 MoE state_dict"
+
+    converted = dict(state_dict)
+    packed_by_buffer_key: dict[str, torch.Tensor] = {}
+    for key in expert_weight_keys:
+        out_dim, in_dim = state_dict[key].shape
+        assert in_dim % block_size == 0
+        # Packed int8 (two FP4 nibbles per byte) + arbitrary positive scale.
+        packed = torch.randint(-128, 128, (out_dim, in_dim // 2), dtype=torch.int8)
+        scale = torch.rand(out_dim, in_dim // block_size, dtype=torch.float32) + 0.5
+        stem = key[: -len(".weight")]  # ...mlp.experts.{j}.w{n}
+        converted[key] = packed
+        converted[stem + ".scale"] = scale
+        packed_by_buffer_key[stem + "_packed"] = packed
+
+    target = DeepseekV4ForCausalLM(
+        _make_moe_hybrid_config(num_hash_routed_layers=2, expert_dtype="fp4")
+    )
+    DeepseekV4ForCausalLM.load_weights(target, converted)
+
+    # Routed experts are FP4Expert with zero parameters; shared stay BF16.
+    for layer in target.model.layers:
+        for expert in layer.mlp.experts:
+            assert isinstance(expert, FP4Expert)
+            assert sum(p.numel() for p in expert.parameters()) == 0
+        assert isinstance(layer.mlp.shared_experts, MixtralExpert)
+
+    # No routed-expert weight got dequantized into a Parameter.
+    assert not any(".mlp.experts." in name for name in dict(target.named_parameters())), (
+        "routed-expert weights must be buffers, not parameters, under expert_dtype='fp4'"
+    )
+
+    # Packed weights + scales landed on the buffers (int8, half width), exact.
+    target_state = target.state_dict()
+    for buffer_key, packed in packed_by_buffer_key.items():
+        assert buffer_key in target_state, f"missing FP4 buffer {buffer_key}"
+        assert target_state[buffer_key].dtype == torch.int8
+        assert torch.equal(target_state[buffer_key], packed)
+        scale_key = buffer_key[: -len("_packed")] + "_scale"
+        assert target_state[scale_key].dtype == torch.float32
+
+    # Per-call dequant runs a finite forward.
+    input_ids = torch.randint(0, target.cfg.vocab_size, (1, 16), dtype=torch.long)
+    with torch.inference_mode():
+        logits = target(input_ids)
+    assert logits.shape == (1, 16, target.cfg.vocab_size)
+    assert torch.all(torch.isfinite(logits))
 
 
 def test_moe_backbone_runs_decode_end_to_end() -> None:
