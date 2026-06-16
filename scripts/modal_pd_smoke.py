@@ -160,7 +160,10 @@ def _child_entry(rank: int, world_size: int, prompt: str, max_tokens: int, queue
 @app.function(
     image=image,
     gpu=_GPU,
-    timeout=3600,
+    # Hard wall-clock ceiling. A warm-cache load plus prefill + handoff +
+    # decode finishes well inside this; the cap just bounds a hung run
+    # rather than holding both GPUs to the longer default.
+    timeout=1200,
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
@@ -179,7 +182,7 @@ def smoke(prompt: str, max_tokens: int) -> dict:
     for p in processes:
         p.start()
     try:
-        results = [queue.get(timeout=1800) for _ in range(world_size)]
+        results = [queue.get(timeout=1100) for _ in range(world_size)]
     finally:
         for p in processes:
             p.join(timeout=10)
