@@ -8,6 +8,8 @@ loading a model. The real model-driven run is exercised by `scripts/bench_all.py
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from mini_infer.bench import (
@@ -132,6 +134,34 @@ def test_run_suite_isolates_a_failing_technique() -> None:
 
     assert [r.technique for r in results] == ["ok"]
     assert skipped == [SkippedTechnique("bad", "failed: kaboom")]
+
+
+def test_run_suite_per_technique_timeout_records_hang() -> None:
+    """A technique that exceeds the timeout is recorded; completed ones survive."""
+
+    def _hang(workload: Workload, env: BenchEnv) -> list[BenchResult]:
+        time.sleep(1.0)
+        return [_result("slow", 1)]
+
+    techniques = [_stub("fast"), Technique(name="slow", run=_hang)]
+    results, skipped = run_suite(
+        _workload([1]), techniques, env=_CPU_ENV, per_technique_timeout=0.05
+    )
+
+    assert [r.technique for r in results] == ["fast"]
+    assert len(skipped) == 1
+    assert skipped[0].technique == "slow"
+    assert "timed out" in skipped[0].reason
+
+
+def test_run_suite_timeout_set_but_technique_completes() -> None:
+    """A timeout that isn't exceeded leaves results untouched."""
+    results, skipped = run_suite(
+        _workload([1, 2]), [_stub("fast")], env=_CPU_ENV, per_technique_timeout=5.0
+    )
+
+    assert [r.technique for r in results] == ["fast", "fast"]
+    assert skipped == []
 
 
 def test_parity_violations_flags_token_divergence() -> None:
