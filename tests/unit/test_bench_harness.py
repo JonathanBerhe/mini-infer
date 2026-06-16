@@ -179,3 +179,29 @@ def test_format_table_has_rows_and_skip_footnote() -> None:
     assert "baseline" in table
     assert "Skipped:" in table
     assert "kv_nvfp4: requires CUDA" in table
+
+
+def test_workload_attention_backend_default_and_override() -> None:
+    assert _workload().attention_backend == "flash_attn"
+    overridden = Workload(
+        model="m", prompts=["a"], concurrency_levels=[1], max_tokens=1, attention_backend="torch"
+    )
+    assert overridden.attention_backend == "torch"
+
+
+def test_build_registry_lists_expected_techniques() -> None:
+    """The registry assembles (no model load) and exposes the full surface."""
+    from mini_infer.bench import build_registry
+
+    assert [technique.name for technique in build_registry()] == [
+        "baseline",
+        "int8_w8a16",
+        "prefix_cache",
+        "pd_serial",
+        "pd_parallel",
+        "attn_flashinfer",
+        "kv_fp8",
+        "kv_nvfp4",
+        "spec_decode",
+        "tensor_parallel",
+    ]
