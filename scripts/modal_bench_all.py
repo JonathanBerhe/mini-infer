@@ -3,8 +3,8 @@
 The CPU run (`scripts/bench_all.py`) measures the CPU-runnable techniques and
 skips the CUDA-only ones (FlashInfer attention backend, FP8 / NVFP4 KV cache)
 plus shows INT8 only via its dequant fallback. This wrapper runs the SAME
-registry on a real GPU so those techniques actually execute and the INT8
-Triton W8A16 path shows its true speedup, all in one comparable table.
+registry on a real GPU so those techniques actually execute (INT8 via the
+Triton W8A16 kernel, not the CPU dequant fallback), all in one comparable table.
 
 The default run uses the "torch" attention backend (materialize K/V + SDPA),
 which needs neither flash-attn nor FlashInfer JIT, so it runs on a stock CUDA
@@ -19,9 +19,10 @@ The FlashInfer techniques (attn_flashinfer, kv_fp8, kv_nvfp4) are opt-in via
   - The FP8-KV prefill kernel does not compile on Hopper (SM90) for
     head_dim=128 ("no eligible GMMA operator"); run kv_fp8 / kv_nvfp4 on
     Blackwell with a FlashInfer build that supports them.
-  - A technique that hangs in JIT compilation (rather than raising) can blow
-    the function timeout and lose already-completed results; a per-technique
-    timeout in the harness is the follow-up that makes this robust.
+  - A technique that hangs in JIT compilation (rather than raising) would
+    otherwise blow the function timeout; the harness bounds each technique by
+    `_PER_TECHNIQUE_TIMEOUT_S` and records a hang as timed-out, so the suite
+    keeps the techniques that finished.
 
 Tensor parallelism and spec decode stay pending (separate drivers).
 
@@ -45,6 +46,11 @@ _HF_CACHE = modal.Volume.from_name("hf-cache", create_if_missing=True)
 
 _MODEL_NAME = "Qwen/Qwen2.5-7B"
 _GPU = "H100:1"
+# Per-technique wall-clock bound. Generous for a real technique (a 7B load +
+# sweep is ~1-3 min) but tight enough that a hung FlashInfer JIT compile is
+# recorded as timed-out and the suite keeps the techniques that finished,
+# rather than the function timeout taking the whole run down.
+_PER_TECHNIQUE_TIMEOUT_S = 300.0
 
 app = modal.App("mini-infer-bench-all")
 
@@ -101,7 +107,7 @@ def bench(
         wanted = set(techniques)
         registry = [technique for technique in registry if technique.name in wanted]
 
-    results, skipped = run_suite(workload, registry)
+    results, skipped = run_suite(workload, registry, per_technique_timeout=_PER_TECHNIQUE_TIMEOUT_S)
     lines = [
         f"Workload: model={workload.model} device=cuda "
         f"concurrency={workload.concurrency_levels} max_tokens={workload.max_tokens}",

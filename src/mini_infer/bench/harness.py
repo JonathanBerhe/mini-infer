@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import statistics
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -243,10 +244,51 @@ def make_scheduler_technique(
     )
 
 
+def _run_technique(
+    technique: Technique,
+    workload: Workload,
+    env: BenchEnv,
+    timeout: float | None,
+) -> tuple[list[BenchResult] | None, str | None]:
+    """Run one technique; return `(results, None)` or `(None, failure_reason)`.
+
+    With `timeout` set, the run happens in a daemon thread bounded by that many
+    seconds. A technique that exceeds it is reported as timed-out; its thread is
+    left running (Python cannot kill a thread stuck in a C extension such as an
+    nvcc / FlashInfer JIT compile) and dies when the process exits. So the
+    registry orders hang-prone techniques (FlashInfer) last, after the
+    fast-completing ones whose results are already captured.
+    """
+    if timeout is None:
+        try:
+            return technique.run(workload, env), None
+        except Exception as exc:  # one bad config must not kill the rest of the suite
+            return None, f"failed: {exc}"
+
+    outcome: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            outcome["results"] = technique.run(workload, env)
+        except Exception as exc:  # captured and surfaced as a skip in the parent
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return None, f"timed out after {timeout:g}s"
+    if "error" in outcome:
+        return None, f"failed: {outcome['error']}"
+    return outcome.get("results", []), None
+
+
 def run_suite(
     workload: Workload,
     techniques: Sequence[Technique],
     env: BenchEnv | None = None,
+    *,
+    per_technique_timeout: float | None = None,
 ) -> tuple[list[BenchResult], list[SkippedTechnique]]:
     """Run every applicable technique through `workload`; collect results.
 
@@ -254,6 +296,11 @@ def run_suite(
     list with a reason. A technique that raises mid-run is caught and recorded
     as skipped rather than aborting the whole suite, so one broken config does
     not cost the rest of the table.
+
+    `per_technique_timeout` (seconds) bounds each technique: one that hangs (a
+    slow FlashInfer JIT compile, a deadlock) is recorded as timed-out and the
+    suite keeps the results it already has, instead of a single hang taking the
+    whole run down with it. See `_run_technique` for the daemon-thread caveat.
     """
     if env is None:
         env = BenchEnv.detect(workload.device)
@@ -266,11 +313,12 @@ def run_suite(
             logger.info("Skipping %r: %s", technique.name, reason)
             skipped.append(SkippedTechnique(technique.name, reason))
             continue
-        try:
-            results.extend(technique.run(workload, env))
-        except Exception as exc:  # one bad config must not kill the rest of the suite
-            logger.warning("Technique %r failed: %s", technique.name, exc)
-            skipped.append(SkippedTechnique(technique.name, f"failed: {exc}"))
+        produced, failure = _run_technique(technique, workload, env, per_technique_timeout)
+        if failure is not None:
+            logger.warning("Technique %r skipped: %s", technique.name, failure)
+            skipped.append(SkippedTechnique(technique.name, failure))
+        else:
+            results.extend(produced or [])
     return results, skipped
 
 
