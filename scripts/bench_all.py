@@ -54,6 +54,11 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--device", default="cpu", help="cpu | cuda | auto (default cpu)")
     parser.add_argument(
+        "--attention-backend",
+        default="flash_attn",
+        help="backend for techniques that don't pin one: flash_attn | flashinfer | torch",
+    )
+    parser.add_argument(
         "--techniques",
         default="",
         help="comma-separated technique names to include (default: all registered)",
@@ -66,6 +71,7 @@ def main() -> None:
         concurrency_levels=_parse_int_list(args.concurrency),
         max_tokens=args.max_tokens,
         device=args.device,
+        attention_backend=args.attention_backend,
     )
 
     registry = build_registry()

@@ -6,11 +6,24 @@ plus shows INT8 only via its dequant fallback. This wrapper runs the SAME
 registry on a real GPU so those techniques actually execute and the INT8
 Triton W8A16 path shows its true speedup, all in one comparable table.
 
-Single GPU by default: the single-process techniques (baseline, int8_w8a16,
-prefix_cache, attn_flashinfer, kv_fp8, plus PD serial/parallel) all run on one
-device. NVFP4 KV needs Blackwell, so on a Hopper GPU `kv_nvfp4` fails its
-forward and is recorded as skipped (the harness isolates it). Tensor
-parallelism and spec decode stay pending (separate drivers).
+The default run uses the "torch" attention backend (materialize K/V + SDPA),
+which needs neither flash-attn nor FlashInfer JIT, so it runs on a stock CUDA
+image (verified green on H100 with Qwen2.5-7B). The default technique set is
+the Hopper-safe one: baseline, int8_w8a16 (the Triton W8A16 kernel on CUDA, vs
+the CPU dequant fallback), and prefix_cache. All run single-process on one GPU.
+
+The FlashInfer techniques (attn_flashinfer, kv_fp8, kv_nvfp4) are opt-in via
+`--techniques` and currently constrained:
+  - FlashInfer JIT-compiles its kernels at first use, which is slow; budget
+    generous time or precompile the kernels into the image.
+  - The FP8-KV prefill kernel does not compile on Hopper (SM90) for
+    head_dim=128 ("no eligible GMMA operator"); run kv_fp8 / kv_nvfp4 on
+    Blackwell with a FlashInfer build that supports them.
+  - A technique that hangs in JIT compilation (rather than raising) can blow
+    the function timeout and lose already-completed results; a per-technique
+    timeout in the harness is the follow-up that makes this robust.
+
+Tensor parallelism and spec decode stay pending (separate drivers).
 
 Defaults to Qwen2.5-7B (cached in the hf-cache volume), where the quant /
 KV-bandwidth wins are visible; a 0.5B model undersells them.
@@ -18,22 +31,8 @@ KV-bandwidth wins are visible; a 0.5B model undersells them.
 Run:
     uv run modal run scripts/modal_bench_all.py
     uv run modal run scripts/modal_bench_all.py --concurrency 1,4,8 --max-tokens 32
-    uv run modal run scripts/modal_bench_all.py --techniques baseline,int8_w8a16,kv_fp8
-
-KNOWN LIMITATIONS (this GPU wrapper has NOT yet produced a green run; the
-harness it drives is CPU-validated and the local entry point works):
-  - FlashInfer JIT-compiles its kernels at first use, which is slow; a run
-    must budget generous time or precompile the kernels into the image.
-  - The FlashInfer FP8-KV prefill kernel does not compile on Hopper (SM90)
-    for head_dim=128 ("no eligible GMMA operator"); exclude `kv_fp8` /
-    `kv_nvfp4` on Hopper, and run NVFP4 KV on Blackwell with a FlashInfer
-    build that supports it.
-  - This image does not install flash-attn, so techniques on the default
-    attention backend need flash-attn added here or an explicit
-    `attention_backend`.
-  - A technique that hangs in JIT compilation (rather than raising) can blow
-    the function timeout and lose already-completed results; a per-technique
-    timeout in the harness would make this robust.
+    # opt into a FlashInfer technique (slow JIT; FP8/NVFP4 KV need Blackwell):
+    uv run modal run scripts/modal_bench_all.py --techniques attn_flashinfer
 """
 
 import os
@@ -72,7 +71,13 @@ image = (
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
-def bench(model: str, concurrency: list[int], max_tokens: int, techniques: list[str]) -> str:
+def bench(
+    model: str,
+    concurrency: list[int],
+    max_tokens: int,
+    techniques: list[str],
+    attention_backend: str,
+) -> str:
     """Run the harness registry on the GPU; return the formatted table + parity line."""
     from mini_infer.bench import (
         DEFAULT_PROMPTS,
@@ -89,6 +94,7 @@ def bench(model: str, concurrency: list[int], max_tokens: int, techniques: list[
         concurrency_levels=concurrency,
         max_tokens=max_tokens,
         device="cuda",
+        attention_backend=attention_backend,
     )
     registry = build_registry()
     if techniques:
@@ -117,8 +123,11 @@ def main(
     model: str = _MODEL_NAME,
     concurrency: str = "1,4,8",
     max_tokens: int = 32,
-    techniques: str = "",
+    # Hopper-safe default set on the torch backend; FlashInfer techniques are
+    # opt-in (see the module docstring for why).
+    techniques: str = "baseline,int8_w8a16,prefix_cache",
+    attention_backend: str = "torch",
 ) -> None:
     levels = [int(part.strip()) for part in concurrency.split(",") if part.strip()]
     names = [part.strip() for part in techniques.split(",") if part.strip()]
-    print(bench.remote(model, levels, max_tokens, names))
+    print(bench.remote(model, levels, max_tokens, names, attention_backend))

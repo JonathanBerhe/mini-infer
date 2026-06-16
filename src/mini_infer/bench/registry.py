@@ -56,9 +56,21 @@ def build_registry() -> list[Technique]:
     from mini_infer.scheduler.continuous_scheduler import ContinuousScheduler
     from mini_infer.workers import PDScheduler
 
-    def runner_with(**kwargs: Any) -> Callable[[Workload], Any]:
+    def runner_with(
+        *, override_backend: str | None = None, **kwargs: Any
+    ) -> Callable[[Workload], Any]:
         def _build(workload: Workload) -> Any:
-            return ModelRunner.from_pretrained(workload.model, device=workload.device, **kwargs)
+            # Techniques that don't pin a backend use the workload's; the
+            # FlashInfer KV-quant techniques pass `override_backend`.
+            backend = (
+                override_backend if override_backend is not None else workload.attention_backend
+            )
+            return ModelRunner.from_pretrained(
+                workload.model,
+                device=workload.device,
+                attention_backend=backend,
+                **kwargs,
+            )
 
         return _build
 
@@ -89,14 +101,14 @@ def build_registry() -> list[Technique]:
         # --- CUDA-only: skip-with-reason on CPU, run on a GPU host ---
         make_scheduler_technique(
             "attn_flashinfer",
-            runner_with(attention_backend="flashinfer"),
+            runner_with(override_backend="flashinfer"),
             continuous,
             requires_cuda=True,
             note="FlashInfer attention backend",
         ),
         make_scheduler_technique(
             "kv_fp8",
-            runner_with(attention_backend="flashinfer", kv_quant="fp8"),
+            runner_with(override_backend="flashinfer", kv_quant="fp8"),
             continuous,
             requires_cuda=True,
             note="FlashInfer FP8 KV cache",
@@ -104,7 +116,7 @@ def build_registry() -> list[Technique]:
         ),
         make_scheduler_technique(
             "kv_nvfp4",
-            runner_with(attention_backend="flashinfer", kv_quant="nvfp4"),
+            runner_with(override_backend="flashinfer", kv_quant="nvfp4"),
             continuous,
             requires_cuda=True,
             note="FlashInfer NVFP4 KV cache (Blackwell)",

@@ -37,6 +37,11 @@ class Workload:
     concurrency_levels: list[int]
     max_tokens: int
     device: str = "cpu"
+    # Attention backend for techniques that don't pin their own. The FlashInfer
+    # KV-quant techniques force "flashinfer"; everything else uses this. Default
+    # "flash_attn" (CPU falls back to SDPA automatically); the GPU wrapper sets
+    # "torch" because its image doesn't ship flash-attn.
+    attention_backend: str = "flash_attn"
 
     def prompts_for(self, concurrency: int) -> list[str]:
         """Replicate the source prompts to fill `concurrency` slots.
