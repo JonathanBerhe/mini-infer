@@ -19,6 +19,21 @@ Run:
     uv run modal run scripts/modal_bench_all.py
     uv run modal run scripts/modal_bench_all.py --concurrency 1,4,8 --max-tokens 32
     uv run modal run scripts/modal_bench_all.py --techniques baseline,int8_w8a16,kv_fp8
+
+KNOWN LIMITATIONS (this GPU wrapper has NOT yet produced a green run; the
+harness it drives is CPU-validated and the local entry point works):
+  - FlashInfer JIT-compiles its kernels at first use, which is slow; a run
+    must budget generous time or precompile the kernels into the image.
+  - The FlashInfer FP8-KV prefill kernel does not compile on Hopper (SM90)
+    for head_dim=128 ("no eligible GMMA operator"); exclude `kv_fp8` /
+    `kv_nvfp4` on Hopper, and run NVFP4 KV on Blackwell with a FlashInfer
+    build that supports it.
+  - This image does not install flash-attn, so techniques on the default
+    attention backend need flash-attn added here or an explicit
+    `attention_backend`.
+  - A technique that hangs in JIT compilation (rather than raising) can blow
+    the function timeout and lose already-completed results; a per-technique
+    timeout in the harness would make this robust.
 """
 
 import os
