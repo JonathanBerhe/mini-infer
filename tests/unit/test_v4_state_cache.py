@@ -83,11 +83,32 @@ def test_state_cache_rejects_invalid_specs() -> None:
     with pytest.raises(ValueError, match="n_win"):
         StateCache([_spec(n_win=0)], batch_size=1)
     with pytest.raises(ValueError, match="compression_ratio"):
-        StateCache([_spec(compression_ratio=0)], batch_size=1)
+        StateCache([_spec(compression_ratio=-1)], batch_size=1)
     with pytest.raises(ValueError, match="max_n_compressed"):
         StateCache([_spec(max_n_compressed=0)], batch_size=1)
     # `overlap_mode=True` IS valid (CSA's main compressor). It just doubles
     # the in-flight buffer dims — handled by `_build_layer_state`.
+    # `compression_ratio=0` IS valid (pure-SWA layer); see the SWA tests below.
+
+
+def test_state_cache_allows_swa_ratio_zero_layer() -> None:
+    """compression_ratio == 0 is a pure-SWA layer: window only, zero-width compressed state."""
+    cache = StateCache([_spec(compression_ratio=0)], batch_size=2)
+    layer = cache.layer(0)
+    assert layer.swa_kv.shape == (2, 8, 8)
+    # No compressor accumulator for SWA: the in-flight tensors are zero-width.
+    assert layer.cmp_kv_state.shape == (2, 0, 8)
+    assert layer.cmp_score_state.shape == (2, 0, 8)
+    assert layer.indexer is None
+
+
+def test_state_cache_swa_layer_rejects_overlap_and_indexer() -> None:
+    with pytest.raises(ValueError, match="overlap_mode"):
+        StateCache([_spec(compression_ratio=0, overlap_mode=True)], batch_size=1)
+    with pytest.raises(ValueError, match="indexer"):
+        StateCache(
+            [_spec(compression_ratio=0, indexer=IndexerStateSpec(head_dim=16))], batch_size=1
+        )
 
 
 def test_state_cache_layer_slots_are_independent() -> None:

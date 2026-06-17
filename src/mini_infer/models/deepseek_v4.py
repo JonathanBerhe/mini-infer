@@ -958,7 +958,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             layer = cast(DeepseekV4DecoderLayer, layer_module)
             compression_ratio = self.cfg.compress_ratios[layer_idx]
             block_position_embeddings = None
-            if (start_pos + 1) % compression_ratio == 0:
+            # ratio 0 (SWA) has no compressor and never flushes a block.
+            if compression_ratio != 0 and (start_pos + 1) % compression_ratio == 0:
                 # This layer flushes a compressed block at this step;
                 # the new entry needs RoPE at position `(start_pos // m) * m`.
                 flushed_block_position_value = (start_pos // compression_ratio) * compression_ratio

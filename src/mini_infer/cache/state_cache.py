@@ -61,7 +61,8 @@ class StateLayerSpec:
         kv_head_dim: Width of one compressed/uncompressed KV entry — the
             shared MQA head dim. All `n_h` queries broadcast across this.
         compression_ratio: `m` (CSA) or `m'` (HCA). One compressed entry
-            per `compression_ratio` raw tokens.
+            per `compression_ratio` raw tokens. `0` marks a pure-SWA layer
+            (sliding window only, no compressor or indexer).
         n_win: Sliding-window size; number of raw entries kept uncompressed.
         max_n_compressed: Cap on the compressed history. The caller picks
             this based on the max sequence length they intend to support
@@ -158,12 +159,24 @@ class StateCache:
         for layer_idx, spec in enumerate(layer_specs):
             if spec.n_win <= 0:
                 raise ValueError(f"layer {layer_idx}: n_win must be positive, got {spec.n_win}")
-            if spec.compression_ratio <= 0:
+            if spec.compression_ratio < 0:
                 raise ValueError(
-                    f"layer {layer_idx}: compression_ratio must be positive, "
+                    f"layer {layer_idx}: compression_ratio must be non-negative, "
                     f"got {spec.compression_ratio}"
                 )
-            if spec.max_n_compressed <= 0:
+            if spec.compression_ratio == 0:
+                # Pure-SWA layer (V4's ratio-0 layers): sliding window only, no
+                # compressor or indexer. Only `swa_kv` is used; the compressed
+                # history and accumulator tensors allocate to zero width.
+                if spec.overlap_mode:
+                    raise ValueError(
+                        f"layer {layer_idx}: compression_ratio == 0 (SWA) cannot use overlap_mode"
+                    )
+                if spec.indexer is not None:
+                    raise ValueError(
+                        f"layer {layer_idx}: compression_ratio == 0 (SWA) cannot have an indexer"
+                    )
+            elif spec.max_n_compressed <= 0:
                 raise ValueError(
                     f"layer {layer_idx}: max_n_compressed must be positive, "
                     f"got {spec.max_n_compressed}"
