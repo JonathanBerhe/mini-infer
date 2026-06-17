@@ -36,15 +36,23 @@ plain forms.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from mini_infer.cache.hca_attention import hca_mqa_with_sink
 from mini_infer.distributed.linear import ColumnParallelLinear
-from mini_infer.models.blocks.hca import _build_window_topk_idxs
+from mini_infer.models.blocks.hca import (
+    _build_window_decode_topk_idxs,
+    _build_window_topk_idxs,
+)
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
+
+if TYPE_CHECKING:
+    from mini_infer.cache.state_cache import StateCache
 
 
 class SWAAttention(nn.Module):
@@ -181,5 +189,149 @@ class SWAAttention(nn.Module):
             )
 
         # ---- Grouped output projection ----
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
+    def forward_prefill_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        state_cache: StateCache,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Cache-aware SWA prefill: same output as `forward`, plus the window write.
+
+        SWA has no compressor or indexer, so `compressed_position_embeddings` is
+        ignored (accepted for call-site parity with HCA/CSA). Only the sliding
+        window is written into `state_cache.layer(layer_idx).swa_kv`.
+
+        Caller must `state_cache.advance_start_pos(seqlen)` after the stack runs.
+        """
+        del compressed_position_embeddings  # SWA has no compressed branch
+        bsz, seqlen, _ = hidden_states.shape
+        n_h_local = self.num_heads_local
+        c = self.kv_head_dim
+        rope_dim = self.rope_head_dim
+        n_win = self.window_size
+
+        layer_state = state_cache.layer(layer_idx)
+        if layer_state.indexer is not None:
+            raise ValueError(f"layer {layer_idx}: SWA layers must not have an indexer slot")
+
+        # ---- Q low-rank + per-head q-norm + partial RoPE ----
+        q = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q = self.q_b_proj(q).view(bsz, seqlen, n_h_local, c)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_t, sin_t = token_position_embeddings
+        if rope_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rope_dim)
+
+        # ---- SWA K=V (single shared head) ----
+        swa_kv = self.kv_norm(self.swa_kv_proj(hidden_states))
+        if rope_dim > 0:
+            swa_kv = apply_partial_rope_last_n_dims(swa_kv, cos_t, sin_t, rope_dim)
+
+        # ---- SWA cache write: last min(seqlen, n_win) tokens (rotated layout) ----
+        if seqlen <= n_win:
+            layer_state.swa_kv[:, :seqlen] = swa_kv.to(layer_state.swa_kv.dtype)
+        else:
+            wrap_cutoff = seqlen % n_win
+            last_window = swa_kv[:, -n_win:]
+            layer_state.swa_kv[:, wrap_cutoff:n_win] = last_window[:, : n_win - wrap_cutoff].to(
+                layer_state.swa_kv.dtype
+            )
+            layer_state.swa_kv[:, :wrap_cutoff] = last_window[:, n_win - wrap_cutoff :].to(
+                layer_state.swa_kv.dtype
+            )
+        layer_state.swa_count = min(seqlen, n_win)
+
+        # ---- Window-only gather indices + MQA with sink (over the fresh swa_kv) ----
+        topk_idxs = (
+            _build_window_topk_idxs(seqlen=seqlen, window_size=n_win, device=hidden_states.device)
+            .unsqueeze(0)
+            .expand(bsz, -1, -1)
+            .contiguous()
+        )
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=swa_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+        if rope_dim > 0:
+            attn_out = apply_partial_rope_last_n_dims(
+                attn_out, cos_t, sin_t, rope_dim, inverse=True
+            )
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
+    def forward_decode(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        start_pos: int,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """One SWA decode step: append the new token to the window, attend window + sink.
+
+        SWA never flushes a compressed block, so `block_position_embeddings` is
+        ignored (accepted for call-site parity with HCA/CSA). Mutates
+        `state_cache.layer(layer_idx).swa_kv` at slot `start_pos % n_win`.
+
+        Caller advances `state_cache.start_pos` after the stack runs.
+        """
+        del block_position_embeddings  # SWA never flushes a compressed block
+        bsz, seqlen_in, _ = hidden_state.shape
+        if seqlen_in != 1:
+            raise ValueError(f"forward_decode expects seqlen=1, got {seqlen_in}")
+        n_h_local = self.num_heads_local
+        c = self.kv_head_dim
+        rope_dim = self.rope_head_dim
+        n_win = self.window_size
+
+        state = state_cache.layer(layer_idx)
+
+        # ---- Q ----
+        q = self.q_a_layernorm(self.q_a_proj(hidden_state))
+        q = self.q_b_proj(q).view(bsz, 1, n_h_local, c)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_t, sin_t = token_position_embeddings
+        if rope_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rope_dim)
+
+        # ---- New SWA KV: project + norm + RoPE; write to circular buffer ----
+        new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))
+        if rope_dim > 0:
+            new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rope_dim)
+        state.swa_kv[:, start_pos % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
+        state.swa_count = min(state.swa_count + 1, n_win)
+
+        # ---- Window-only gather indices into the circular buffer ----
+        topk_1d = _build_window_decode_topk_idxs(
+            window_size=n_win, start_pos=start_pos, device=hidden_state.device
+        )
+        topk_idxs = topk_1d.unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1).contiguous()
+
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=state.swa_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+        if rope_dim > 0:
+            attn_out = apply_partial_rope_last_n_dims(
+                attn_out, cos_t, sin_t, rope_dim, inverse=True
+            )
         out: torch.Tensor = self.grouped_output(attn_out)
         return out
