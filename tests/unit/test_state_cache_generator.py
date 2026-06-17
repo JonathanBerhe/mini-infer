@@ -13,9 +13,8 @@ Covered here (CPU, synthetic configs, no GPU, no reference):
     EOS-terminated, count-capped, and consistent with a hand-written
     prefill+greedy loop. Handles prompt lengths that are not a multiple of
     every compression ratio (the cache-aware prefill supports it).
-  - The SWA (`compression_ratio == 0`) layers real V4-Flash uses are not yet
-    supported on the prefill-with-cache path; the guard is asserted so the
-    Slice 2 boundary is explicit.
+  - SWA (`compression_ratio == 0`) layers, which real V4-Flash uses at the
+    head of its stack, generate end-to-end through the cache path.
 """
 
 from __future__ import annotations
@@ -23,9 +22,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mini_infer.cache.state_cache import StateCache, StateLayerSpec
+from mini_infer.cache.state_cache import StateCache
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
-from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
 from mini_infer.models.deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
@@ -38,13 +36,16 @@ def _make_config(
     use_moe_ffn: bool = False,
     use_hyper_connections: bool = False,
     num_hidden_layers: int = 4,
+    compress_ratios: tuple[int, ...] | None = None,
 ) -> DeepseekV4Config:
-    """Small 4-layer hybrid (CSA, HCA, CSA, HCA), no SWA layers.
+    """Small 4-layer hybrid (CSA, HCA, CSA, HCA) by default; fits a laptop CPU.
 
-    Mirrors the shapes used elsewhere in the V4 unit suite so the model fits
-    a laptop CPU. `compress_ratios=(4, 8, 4, 8)` means any prompt length that
-    is a multiple of 8 is aligned for every layer.
+    `compress_ratios` defaults to `(4, 8, 4, 8)` (no SWA layers), so any prompt
+    length that is a multiple of 8 is aligned for every layer. Pass an explicit
+    tuple to include a pure-SWA (`0`) layer, e.g. `(0, 4, 8, 4)`.
     """
+    if compress_ratios is None:
+        compress_ratios = tuple(4 if i % 2 == 0 else 8 for i in range(num_hidden_layers))
     return DeepseekV4Config(
         vocab_size=128,
         hidden_size=64,
@@ -57,7 +58,7 @@ def _make_config(
         o_num_groups=2,
         o_lora_rank=32,
         window_size=8,
-        compress_ratios=tuple(4 if i % 2 == 0 else 8 for i in range(num_hidden_layers)),
+        compress_ratios=compress_ratios,
         index_num_heads=2,
         index_head_dim=16,
         index_top_k=2,
@@ -341,37 +342,30 @@ def test_build_state_cache_layer_specs_requires_exactly_one_sizing_arg() -> None
         build_state_cache_layer_specs(cfg, max_n_compressed=8, max_seq_len=32)
 
 
-# ---------- SWA boundary (Slice 2 prerequisite) ----------
+# ---------- SWA (compression_ratio == 0) layers ----------
 
 
-def test_decoder_layer_prefill_with_cache_raises_on_swa_layer() -> None:
-    """Pure-SWA (compression_ratio == 0) layers are not supported on the
-    prefill-with-cache path yet; the guard mirrors `forward_decode`."""
-    layer = DeepseekV4DecoderLayer(
-        hidden_size=64,
-        num_heads=4,
-        q_lora_rank=32,
-        kv_head_dim=32,
-        rope_head_dim=8,
-        num_groups=2,
-        o_lora_rank=32,
-        window_size=8,
-        compression_ratio=0,  # -> SWAAttention
-        intermediate_size=128,
-        rms_norm_eps=1e-6,
-    )
-    # The guard fires before any cache access; a valid HCA-shaped spec stands in.
-    dummy_cache = StateCache(
-        [StateLayerSpec(kv_head_dim=32, compression_ratio=8, n_win=8, max_n_compressed=8)],
-        batch_size=1,
-    )
-    hidden = torch.randn(1, 8, 64)
-    cos = torch.zeros(1, 8, 8)
-    with pytest.raises(NotImplementedError, match="SWA"):
-        layer.forward_prefill_with_cache(
-            hidden,
-            state_cache=dummy_cache,
-            layer_idx=0,
-            token_position_embeddings=(cos, cos),
-            compressed_position_embeddings=(cos, cos),
-        )
+def test_generate_ids_runs_with_swa_layer() -> None:
+    """A config whose head layer is pure-SWA (ratio 0), like real V4-Flash, generates."""
+    cfg = _make_config(compress_ratios=(0, 4, 8, 4))
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+    gen = StateCacheGenerator(model)
+
+    out = gen.generate_ids(list(range(8)), max_new_tokens=6)
+    assert len(out) == 6
+    assert all(0 <= t < cfg.vocab_size for t in out)
+
+
+def test_model_prefill_with_cache_matches_forward_with_swa_layer() -> None:
+    """Cache-aware prefill matches standalone forward when an SWA layer is present."""
+    cfg = _make_config(compress_ratios=(0, 4, 8, 4))
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 16), dtype=torch.long)
+    state_cache = StateCache(build_state_cache_layer_specs(cfg, max_seq_len=64), batch_size=1)
+    with torch.inference_mode():
+        standalone_logits = model(input_ids)
+        prefill_logits = model.forward_prefill_with_cache(input_ids, state_cache=state_cache)
+    torch.testing.assert_close(prefill_logits, standalone_logits, rtol=1e-4, atol=1e-5)

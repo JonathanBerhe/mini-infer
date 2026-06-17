@@ -299,15 +299,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         starting from a zeroed cache. `input_ids` `(B, T)` is required iff
         `ffn_type == "hash_moe"` with hash routing.
 
-        SWA (`compression_ratio == 0`) layers are not supported here yet, the
-        same restriction `forward_decode` carries.
+        SWA (`compression_ratio == 0`) layers dispatch to
+        `SWAAttention.forward_prefill_with_cache` (window only, no compressor).
 
         Caller must `state_cache.advance_start_pos(T)` after the full stack runs.
         """
-        if isinstance(self.self_attn, SWAAttention):
-            raise NotImplementedError(
-                "Block.forward_prefill_with_cache is HCA/CSA-only; SWA layers go through forward"
-            )
         attn = self.self_attn
         if self.use_hyper_connections:
 
@@ -362,14 +358,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_size)` (HC mode). `input_ids` `(B, 1)` required iff
         `ffn_type == "hash_moe"` with hash routing.
         """
-        # `forward_decode` is only defined on HCA and CSA, not on SWA (the
-        # ratio=0 layer type runs through the standard `forward` path
-        # only). Narrow the union for type-checkers + fail fast at runtime
-        # if a caller routes an SWA layer through here by mistake.
-        if isinstance(self.self_attn, SWAAttention):
-            raise NotImplementedError(
-                "Block.forward_decode is HCA/CSA-only; SWA layers go through forward"
-            )
+        # CSA, HCA, and SWA each implement `forward_decode` with the same
+        # signature; SWA ignores `block_position_embeddings` (no compressor).
         attn = self.self_attn
         if self.use_hyper_connections:
 
