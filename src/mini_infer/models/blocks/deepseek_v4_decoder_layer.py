@@ -279,6 +279,72 @@ class DeepseekV4DecoderLayer(nn.Module):
         out: torch.Tensor = residual + x
         return out
 
+    def forward_prefill_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        compressed_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Cache-aware prefill through this layer. Mutates `state_cache.layer(layer_idx)`.
+
+        Same shape and output contract as `forward` (`(B, T, hidden_size)` in
+        vanilla mode, `(B, T, hc_mult, hidden_size)` in HC mode), but the
+        attention sublayer runs its `forward_prefill_with_cache` path: it
+        writes the SWA window, compressed history, and in-flight compressor
+        state so a later `forward_decode` continues the prompt instead of
+        starting from a zeroed cache. `input_ids` `(B, T)` is required iff
+        `ffn_type == "hash_moe"` with hash routing.
+
+        SWA (`compression_ratio == 0`) layers are not supported here yet, the
+        same restriction `forward_decode` carries.
+
+        Caller must `state_cache.advance_start_pos(T)` after the full stack runs.
+        """
+        if isinstance(self.self_attn, SWAAttention):
+            raise NotImplementedError(
+                "Block.forward_prefill_with_cache is HCA/CSA-only; SWA layers go through forward"
+            )
+        attn = self.self_attn
+        if self.use_hyper_connections:
+
+            def attn_runner(x: torch.Tensor) -> torch.Tensor:
+                return attn.forward_prefill_with_cache(
+                    x,
+                    token_position_embeddings=token_position_embeddings,
+                    compressed_position_embeddings=compressed_position_embeddings,
+                    state_cache=state_cache,
+                    layer_idx=layer_idx,
+                )
+
+            return self._forward_hc(
+                hidden_states,
+                token_position_embeddings,
+                None,
+                input_ids=input_ids,
+                attn_runner=attn_runner,
+            )
+
+        residual = hidden_states
+        x = self.input_layernorm(hidden_states)
+        x = attn.forward_prefill_with_cache(
+            x,
+            token_position_embeddings=token_position_embeddings,
+            compressed_position_embeddings=compressed_position_embeddings,
+            state_cache=state_cache,
+            layer_idx=layer_idx,
+        )
+        hidden_states = residual + x
+
+        residual = hidden_states
+        x = self.post_attention_layernorm(hidden_states)
+        x = self._apply_ffn(x, input_ids)
+        out: torch.Tensor = residual + x
+        return out
+
     def forward_decode(
         self,
         hidden_state: torch.Tensor,

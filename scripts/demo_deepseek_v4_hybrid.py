@@ -90,10 +90,19 @@ def make_demo_config(
     )
 
 
-def run_prefill(model: DeepseekV4ForCausalLM, prefill_token_ids: torch.Tensor) -> torch.Tensor:
-    """Single packed-prefill forward through the hybrid stack."""
+def run_prefill(
+    model: DeepseekV4ForCausalLM,
+    prefill_token_ids: torch.Tensor,
+    *,
+    state_cache: StateCache,
+) -> torch.Tensor:
+    """Cache-aware prefill: populate `state_cache` and return the prompt logits.
+
+    Writes each layer's SWA window + compressed history + in-flight compressor
+    state into `state_cache`, so the decode loop continues this exact prompt.
+    """
     with torch.inference_mode():
-        return model(prefill_token_ids)
+        return model.forward_prefill_with_cache(prefill_token_ids, state_cache=state_cache)
 
 
 def run_decode_loop(
@@ -206,32 +215,23 @@ def main() -> None:
         f"ffn={ffn_kind}, residual={residual_kind}"
     )
 
-    # ---- Prefill: pack a synthetic token sequence through the full stack ----
+    # ---- Prefill: cache-aware forward that populates the StateCache ----
+    # The prefill itself writes each layer's SWA window + compressed history +
+    # in-flight compressor state, so the decode loop below continues this exact
+    # prompt (no faked counters, no zeroed buffers).
     prefill_token_ids = torch.randint(
         0, cfg.vocab_size, (args.batch_size, args.prefill_len), dtype=torch.long
     )
-    prefill_logits = run_prefill(model, prefill_token_ids)
-    print(
-        f"\nPrefill: {tuple(prefill_token_ids.shape)} -> logits "
-        f"{tuple(prefill_logits.shape)}, finite={torch.isfinite(prefill_logits).all().item()}"
-    )
-
-    # ---- Initialise StateCache as if we'd just finished prefill ----
-    # Real serving would write SWA + compressed entries during prefill via a
-    # cache-aware forward; we simulate "post-prefill" by setting the counters
-    # so the decode loop attends to them. Buffer contents are zero-initialised
-    # (the demo focuses on the bookkeeping; a parity test sets the contents).
     state_cache = StateCache(
         build_state_cache_layer_specs(cfg, max_n_compressed=64),
         batch_size=args.batch_size,
     )
-    for layer_idx, compression_ratio in enumerate(cfg.compress_ratios):
-        layer_state = state_cache.layer(layer_idx)
-        layer_state.n_compressed_blocks = args.prefill_len // compression_ratio
-        layer_state.swa_count = min(args.prefill_len, cfg.window_size)
-        if layer_state.indexer is not None:
-            layer_state.indexer.n_compressed_blocks = args.prefill_len // compression_ratio
-    state_cache.start_pos = args.prefill_len
+    prefill_logits = run_prefill(model, prefill_token_ids, state_cache=state_cache)
+    state_cache.advance_start_pos(args.prefill_len)
+    print(
+        f"\nPrefill: {tuple(prefill_token_ids.shape)} -> logits "
+        f"{tuple(prefill_logits.shape)}, finite={torch.isfinite(prefill_logits).all().item()}"
+    )
     summarize_per_layer_state(
         state_cache, label="After prefill", compress_ratios=cfg.compress_ratios
     )

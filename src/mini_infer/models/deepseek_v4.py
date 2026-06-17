@@ -577,23 +577,46 @@ class DeepseekV4Config:
 
 
 def build_state_cache_layer_specs(
-    cfg: DeepseekV4Config, *, max_n_compressed: int
+    cfg: DeepseekV4Config,
+    *,
+    max_n_compressed: int | None = None,
+    max_seq_len: int | None = None,
 ) -> list[StateLayerSpec]:
     """Per-layer state specs derived from the config.
 
-    `max_n_compressed` is the caller-chosen cap on compressed-history slots
-    per layer (typically `ceil(max_seq_len / min(compress_ratios))`).
+    Provide exactly one of:
+      - `max_n_compressed`: a single compressed-history cap applied to every
+        layer. Simple, but high-ratio layers over-allocate (a ratio-128 layer
+        needs 32x fewer slots than a ratio-4 layer for the same length).
+      - `max_seq_len`: size each layer to `ceil(max_seq_len / compression_ratio)`
+        so every layer holds exactly the history its ratio implies. Preferred
+        for real checkpoints, where the per-layer ratio spread is wide.
+
     Indexer state is allocated only for CSA layers.
     """
+    if (max_n_compressed is None) == (max_seq_len is None):
+        raise ValueError("provide exactly one of max_n_compressed or max_seq_len")
     layer_specs: list[StateLayerSpec] = []
     for compression_ratio in cfg.compress_ratios:
         is_csa_layer = compression_ratio == DeepseekV4DecoderLayer.CSA_COMPRESSION_RATIO
+        if max_seq_len is not None:
+            # A ratio-0 (SWA) layer can't be sized this way; StateLayerSpec
+            # rejects compression_ratio == 0 regardless, so use a placeholder
+            # here to avoid dividing by zero before that error surfaces.
+            per_layer_max = (
+                (max_seq_len + compression_ratio - 1) // compression_ratio
+                if compression_ratio > 0
+                else 1
+            )
+        else:
+            assert max_n_compressed is not None  # guaranteed by the guard above
+            per_layer_max = max_n_compressed
         layer_specs.append(
             StateLayerSpec(
                 kv_head_dim=cfg.kv_head_dim,
                 compression_ratio=compression_ratio,
                 n_win=cfg.window_size,
-                max_n_compressed=max_n_compressed,
+                max_n_compressed=per_layer_max,
                 overlap_mode=is_csa_layer,
                 indexer=(IndexerStateSpec(head_dim=cfg.index_head_dim) if is_csa_layer else None),
             )
@@ -787,6 +810,104 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         hidden_states = self.model.norm(hidden_states)
         logits: torch.Tensor = self.lm_head(hidden_states)
         return logits
+
+    def forward_prefill_with_cache(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        state_cache: StateCache,
+    ) -> torch.Tensor:
+        """Cache-aware prefill: process the full prompt and populate `state_cache`.
+
+        The counterpart to `forward`. Instead of discarding per-token KV, each
+        layer writes its SWA window + compressed history + in-flight compressor
+        state into `state_cache`, so `forward_decode_with_cache` continues the
+        prompt rather than decoding from a zeroed cache.
+
+        Unlike `forward`, `T` need NOT be a multiple of every layer's
+        `compression_ratio`: the cache-aware compressor stashes the trailing
+        remainder in the in-flight accumulator.
+
+        Args:
+            input_ids: `(B, T)`.
+            state_cache: pre-allocated for this model (use
+                `build_state_cache_layer_specs` + `StateCache(specs, ...)`).
+
+        Returns:
+            `(B, T, vocab_size)` logits; the last position predicts the first
+            generated token.
+
+        Prefill always starts at absolute position 0 (a fresh request), so the
+        token and compressed-block positions are both derived from `arange`.
+
+        SWA (`compression_ratio == 0`) layers are not supported yet (see
+        `DeepseekV4DecoderLayer.forward_prefill_with_cache`). The caller is
+        responsible for advancing `state_cache.start_pos` to `T` afterwards.
+        """
+        if state_cache.num_layers != self.cfg.num_hidden_layers:
+            raise ValueError(
+                f"state_cache has {state_cache.num_layers} layers, "
+                f"model has {self.cfg.num_hidden_layers}"
+            )
+
+        batch_size, seqlen = input_ids.shape
+        token_positions = (
+            torch.arange(seqlen, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        )
+
+        hidden_states = self.model.embed_tokens(input_ids)
+        cos_for_tokens, sin_for_tokens = self.rotary_emb(hidden_states, token_positions)
+        token_position_embeddings = (cos_for_tokens, sin_for_tokens)
+
+        if self.cfg.use_hyper_connections:
+            hidden_states = (
+                hidden_states.unsqueeze(2)
+                .expand(batch_size, seqlen, self.cfg.hc_mult, self.cfg.hidden_size)
+                .contiguous()
+            )
+
+        for layer_idx, layer_module in enumerate(self.model.layers):
+            layer = cast(DeepseekV4DecoderLayer, layer_module)
+            compression_ratio = self.cfg.compress_ratios[layer_idx]
+            # Same per-layer compressed-position setup as `forward`. For
+            # unaligned T, `num_compressed_blocks = T // m` (floor) matches
+            # the count the cache-aware compressor emits; the remainder rides
+            # in the in-flight accumulator with no compressed entry.
+            if compression_ratio == 0:
+                empty_block_table = torch.zeros(
+                    batch_size, 0, self.cfg.rope_head_dim, device=input_ids.device
+                )
+                compressed_position_embeddings = (empty_block_table, empty_block_table)
+            else:
+                num_compressed_blocks = seqlen // compression_ratio
+                block_positions = (
+                    (
+                        torch.arange(num_compressed_blocks, device=input_ids.device)
+                        * compression_ratio
+                    )
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
+                cos_for_blocks, sin_for_blocks = self.rotary_emb(
+                    torch.zeros(batch_size, num_compressed_blocks, device=input_ids.device),
+                    block_positions,
+                )
+                compressed_position_embeddings = (cos_for_blocks, sin_for_blocks)
+            hidden_states = layer.forward_prefill_with_cache(
+                hidden_states,
+                state_cache=state_cache,
+                layer_idx=layer_idx,
+                token_position_embeddings=token_position_embeddings,
+                compressed_position_embeddings=compressed_position_embeddings,
+                input_ids=input_ids if self.cfg.use_moe_ffn else None,
+            )
+
+        if self.hc_head_reduction is not None:
+            hidden_states = self.hc_head_reduction(hidden_states)
+
+        hidden_states = self.model.norm(hidden_states)
+        prefill_logits: torch.Tensor = self.lm_head(hidden_states)
+        return prefill_logits
 
     def forward_decode_with_cache(
         self,
