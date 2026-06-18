@@ -54,6 +54,10 @@ class BaseCausalLM(nn.Module):
 
     HF_ARCHITECTURE: ClassVar[str] = ""
     Config: ClassVar[type]
+    # True for models that decode via a per-request `StateCache` (DeepSeek-V4)
+    # rather than the shared `PagedKVCache`. The API server reads this to route
+    # to the StateCacheScheduler instead of the packed-varlen ContinuousScheduler.
+    USES_STATE_CACHE: ClassVar[bool] = False
 
     def forward(
         self,
