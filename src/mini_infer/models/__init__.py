@@ -96,6 +96,36 @@ def load_model(name: str, *, dtype: torch.dtype, device: str) -> BaseCausalLM:
     return model
 
 
+def architecture_uses_state_cache(name: str) -> bool:
+    """Whether `name`'s architecture decodes via a per-request StateCache.
+
+    Reads `config.json`'s `architectures[0]` directly (transformers drops
+    V4-only fields when building a fallback config, but `architectures` is
+    preserved) and checks the registered class's `USES_STATE_CACHE` marker.
+    The API server uses this to route V4 to the StateCacheScheduler. Returns
+    False (the PagedKVCache path) if the architecture is unregistered.
+    """
+    import json
+    from pathlib import Path
+
+    candidate = Path(name)
+    if candidate.is_dir():
+        config_path = candidate / "config.json"
+    else:
+        from huggingface_hub import hf_hub_download
+
+        config_path = Path(hf_hub_download(name, "config.json"))
+    with config_path.open() as config_file:
+        architectures = json.load(config_file).get("architectures") or []
+    if not architectures:
+        return False
+    try:
+        model_cls = REGISTRY.lookup(architectures[0])
+    except ValueError:
+        return False
+    return bool(model_cls.USES_STATE_CACHE)
+
+
 def _register_builtin_models() -> None:
     """Import builtin model modules so their `@register_model` decorators fire.
 
@@ -117,4 +147,10 @@ def _register_builtin_models() -> None:
 _register_builtin_models()
 
 
-__all__ = ["REGISTRY", "ModelRegistry", "load_model", "register_model"]
+__all__ = [
+    "REGISTRY",
+    "ModelRegistry",
+    "architecture_uses_state_cache",
+    "load_model",
+    "register_model",
+]

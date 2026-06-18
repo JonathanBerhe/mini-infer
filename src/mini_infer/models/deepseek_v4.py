@@ -692,6 +692,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
 
     HF_ARCHITECTURE: ClassVar[str] = "DeepseekV4ForCausalLM"
     Config: ClassVar[type] = DeepseekV4Config
+    # V4 decodes via a per-request StateCache, not the shared PagedKVCache.
+    USES_STATE_CACHE: ClassVar[bool] = True
 
     def __init__(self, cfg: DeepseekV4Config) -> None:
         super().__init__()
