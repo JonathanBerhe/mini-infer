@@ -62,6 +62,33 @@ class StateCacheGenerator:
         self.device = device if device is not None else str(reference_param.device)
         self.dtype = dtype if dtype is not None else reference_param.dtype
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        name_or_path: str,
+        *,
+        device: str = "auto",
+        dtype: torch.dtype | None = None,
+    ) -> StateCacheGenerator:
+        """Load a DeepSeek-V4 checkpoint onto one device and wrap it for generation.
+
+        This is the single-device entry (local CPU/MPS, or one GPU). For
+        multi-GPU tensor parallelism the model does not fit one device:
+        initialise the process group per rank, call
+        `DeepseekV4ForCausalLM.from_checkpoint(..., device=f"cuda:{rank}")`
+        directly, and construct `StateCacheGenerator(model, tokenizer)` around
+        the per-rank model.
+        """
+        from mini_infer.engine.model_runner import _dtype_for, _resolve_device
+
+        resolved_device = _resolve_device(device)
+        resolved_dtype = dtype if dtype is not None else _dtype_for(resolved_device)
+        model = DeepseekV4ForCausalLM.from_checkpoint(
+            name_or_path, device=resolved_device, dtype=resolved_dtype
+        )
+        tokenizer = Tokenizer.from_pretrained(name_or_path)
+        return cls(model, tokenizer, device=resolved_device, dtype=resolved_dtype)
+
     @property
     def tokenizer(self) -> Tokenizer:
         if self._tokenizer is None:

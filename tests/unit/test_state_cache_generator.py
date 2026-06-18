@@ -369,3 +369,48 @@ def test_model_prefill_with_cache_matches_forward_with_swa_layer() -> None:
         standalone_logits = model(input_ids)
         prefill_logits = model.forward_prefill_with_cache(input_ids, state_cache=state_cache)
     torch.testing.assert_close(prefill_logits, standalone_logits, rtol=1e-4, atol=1e-5)
+
+
+# ---------- from_checkpoint (real-model load path, synthetic round-trip) ----------
+
+
+def test_from_checkpoint_round_trips_a_synthetic_v4_checkpoint(tmp_path) -> None:
+    """The real-model load path round-trips a synthetic V4 checkpoint and generates.
+
+    Exercises the same sequence the 2x B200 smoke runs per rank
+    (config.json -> meta construction -> load_weights -> rotary rebuild), on a
+    CPU-sized config that includes an SWA (ratio 0) layer, so meta
+    construction, the weight load, and rotary `inv_freq` rematerialization are
+    all covered without the real 158 GB checkpoint or a GPU.
+    """
+    import dataclasses
+    import json
+
+    from safetensors.torch import save_file
+
+    cfg = _make_config(compress_ratios=(0, 4, 8, 4))
+    torch.manual_seed(0)
+    source = DeepseekV4ForCausalLM(cfg).eval()
+
+    # HF-style config.json (from_hf reads our field names) + a weights shard.
+    config_json = {**dataclasses.asdict(cfg), "architectures": ["DeepseekV4ForCausalLM"]}
+    (tmp_path / "config.json").write_text(json.dumps(config_json))
+    save_file(
+        {k: v.detach().clone().contiguous() for k, v in source.state_dict().items()},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    loaded = DeepseekV4ForCausalLM.from_checkpoint(str(tmp_path), device="cpu", dtype=torch.float32)
+
+    # inv_freq is a non-persistent buffer (absent from the checkpoint); meta
+    # construction left it meta, so from_checkpoint must have rebuilt it.
+    assert not loaded.rotary_emb.inv_freq.is_meta
+
+    # Weights loaded correctly: logits match the source model.
+    input_ids = torch.tensor([list(range(8))], dtype=torch.long)
+    with torch.inference_mode():
+        torch.testing.assert_close(loaded(input_ids), source(input_ids), rtol=1e-4, atol=1e-5)
+
+    # And the loaded model generates through the StateCache path.
+    out = StateCacheGenerator(loaded).generate_ids(list(range(8)), max_new_tokens=4)
+    assert len(out) == 4
