@@ -38,7 +38,14 @@ from mini_infer.api.schemas import (
 )
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import SamplingParams
-from mini_infer.scheduler import ContinuousScheduler, Request, RequestHandle
+from mini_infer.engine.state_cache_generator import StateCacheGenerator
+from mini_infer.models import architecture_uses_state_cache
+from mini_infer.scheduler import (
+    ContinuousScheduler,
+    Request,
+    RequestHandle,
+    StateCacheScheduler,
+)
 from mini_infer.workers import PDScheduler
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -95,16 +102,23 @@ async def _verify_auth(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_name = os.environ.get("MINI_INFER_MODEL", DEFAULT_MODEL)
-    runner = ModelRunner.from_pretrained(model_name)
-    scheduler: ContinuousScheduler | PDScheduler
-    if _USE_PD:
-        logger.info(
-            "Backing /v1/completions with PDScheduler (mode=%s; MINI_INFER_USE_PD set)",
-            _PD_MODE,
-        )
-        scheduler = PDScheduler(runner, mode=_PD_MODE)  # type: ignore[arg-type]
+    scheduler: ContinuousScheduler | PDScheduler | StateCacheScheduler
+    if architecture_uses_state_cache(model_name):
+        # StateCache models (DeepSeek-V4) don't use PagedKVCache; serve them
+        # one request at a time via the StateCacheScheduler. PD / continuous
+        # batching don't apply to the per-request StateCache path.
+        logger.info("Backing /v1/completions with StateCacheScheduler for %s", model_name)
+        scheduler = StateCacheScheduler(StateCacheGenerator.from_pretrained(model_name))
     else:
-        scheduler = ContinuousScheduler(runner)
+        runner = ModelRunner.from_pretrained(model_name)
+        if _USE_PD:
+            logger.info(
+                "Backing /v1/completions with PDScheduler (mode=%s; MINI_INFER_USE_PD set)",
+                _PD_MODE,
+            )
+            scheduler = PDScheduler(runner, mode=_PD_MODE)  # type: ignore[arg-type]
+        else:
+            scheduler = ContinuousScheduler(runner)
     scheduler.start()
     app.state.scheduler = scheduler
     try:
@@ -137,7 +151,9 @@ async def completions(
     fastapi_req: FastAPIRequest,
     _auth: None = Depends(_verify_auth),
 ) -> StreamingResponse | CompletionResponse:
-    scheduler: ContinuousScheduler | PDScheduler = fastapi_req.app.state.scheduler
+    scheduler: ContinuousScheduler | PDScheduler | StateCacheScheduler = (
+        fastapi_req.app.state.scheduler
+    )
     internal = Request(
         prompt=req.prompt,
         sampling_params=SamplingParams(

@@ -6,6 +6,7 @@ from mini_infer.scheduler.request_state import (
     RequestHandle,
     RequestState,
 )
+from mini_infer.scheduler.state_cache_scheduler import StateCacheScheduler
 
 __all__ = [
     "ContinuousScheduler",
@@ -14,4 +15,5 @@ __all__ = [
     "Request",
     "RequestHandle",
     "RequestState",
+    "StateCacheScheduler",
 ]

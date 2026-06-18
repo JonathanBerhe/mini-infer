@@ -20,6 +20,7 @@ dedicated driver reads more cleanly than a second branch through every
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 
 import torch
 
@@ -36,11 +37,13 @@ logger = logging.getLogger(__name__)
 
 
 class StateCacheGenerator:
-    """Greedy single-request generation over a per-request `StateCache`.
+    """Single-request generation over a per-request `StateCache`.
 
     Construct with an already-loaded model (and optionally a tokenizer). Use
-    `generate_ids` for token-level generation (no tokenizer needed, the path
-    exercised by CPU tests on synthetic configs) and `generate` for the
+    `generate_ids` for one-shot token-level generation (no tokenizer needed,
+    the path exercised by CPU tests on synthetic configs), `iter_generate_ids`
+    to stream tokens one at a time (what `StateCacheScheduler` drives so it can
+    emit and react to cancellation between tokens), and `generate` for the
     string-in / string-out convenience wrapper.
     """
 
@@ -98,24 +101,31 @@ class StateCacheGenerator:
             )
         return self._tokenizer
 
-    def generate_ids(
+    def iter_generate_ids(
         self,
         prompt_ids: list[int],
         *,
         max_new_tokens: int,
         eos_token_id: int | None = None,
-    ) -> list[int]:
-        """Greedy-decode up to `max_new_tokens` tokens after `prompt_ids`.
+        sampling_params: SamplingParams | None = None,
+    ) -> Iterator[int]:
+        """Yield generated token ids one at a time (the prompt is not echoed).
 
-        Returns the generated token ids only (the prompt is not echoed). Stops
-        early if `eos_token_id` is produced (the EOS token itself is not
-        included in the output).
+        Builds the StateCache, prefills, then yields each decoded token. Stops
+        before yielding `eos_token_id` (if given), or after `max_new_tokens`.
+        `sampling_params` defaults to greedy (temperature 0). Yielding per token
+        lets a scheduler stream output and react to cancellation between tokens.
+
+        Each forward + its sample run inside `torch.inference_mode()` that exits
+        before the `yield`, so inference mode never spans a suspension point
+        (which would leak it into the consumer between tokens).
         """
         if not prompt_ids:
             raise ValueError("prompt_ids must be non-empty")
         if max_new_tokens <= 0:
             raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
 
+        params = sampling_params if sampling_params is not None else SamplingParams(temperature=0.0)
         cfg: DeepseekV4Config = self._model.cfg
         # Size each layer's compressed history for the full prompt + output, so
         # high-ratio layers don't inherit the densest layer's slot count.
@@ -126,34 +136,49 @@ class StateCacheGenerator:
             device=self.device,
             dtype=self.dtype,
         )
-
         input_ids = torch.tensor([prompt_ids], device=self.device, dtype=torch.long)
-        greedy = SamplingParams(temperature=0.0)
-        generated: list[int] = []
 
         with torch.inference_mode():
             prefill_logits = self._model.forward_prefill_with_cache(
                 input_ids, state_cache=state_cache
             )
-            state_cache.advance_start_pos(len(prompt_ids))
-            next_token = sample(prefill_logits[0, -1, :], greedy)
+            next_token = sample(prefill_logits[0, -1, :], params)
+        state_cache.advance_start_pos(len(prompt_ids))
 
-            for _ in range(max_new_tokens):
-                if eos_token_id is not None and next_token == eos_token_id:
-                    break
-                generated.append(next_token)
-                if len(generated) == max_new_tokens:
-                    # Have the last requested token; skip the decode whose
-                    # logits we would only discard.
-                    break
-                token_tensor = torch.tensor([[next_token]], device=self.device, dtype=torch.long)
+        emitted = 0
+        while emitted < max_new_tokens:
+            if eos_token_id is not None and next_token == eos_token_id:
+                return
+            yield next_token
+            emitted += 1
+            if emitted == max_new_tokens:
+                return
+            token_tensor = torch.tensor([[next_token]], device=self.device, dtype=torch.long)
+            with torch.inference_mode():
                 step_logits = self._model.forward_decode_with_cache(
                     token_tensor, start_pos=state_cache.start_pos, state_cache=state_cache
                 )
-                state_cache.advance_start_pos(1)
-                next_token = sample(step_logits[0, -1, :], greedy)
+                next_token = sample(step_logits[0, -1, :], params)
+            state_cache.advance_start_pos(1)
 
-        return generated
+    def generate_ids(
+        self,
+        prompt_ids: list[int],
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+    ) -> list[int]:
+        """Greedy-decode up to `max_new_tokens` tokens after `prompt_ids`.
+
+        Returns the generated token ids only (the prompt is not echoed). Stops
+        early on `eos_token_id` (the EOS token itself is not included). Thin
+        greedy wrapper over `iter_generate_ids`.
+        """
+        return list(
+            self.iter_generate_ids(
+                prompt_ids, max_new_tokens=max_new_tokens, eos_token_id=eos_token_id
+            )
+        )
 
     def generate(self, prompt: str, *, max_new_tokens: int) -> str:
         """Tokenize `prompt`, greedy-generate `max_new_tokens`, return the text."""
