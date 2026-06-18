@@ -26,11 +26,10 @@ Architectural status vs V4-published:
 
 Layer dispatch — per-layer attention type via `compress_ratios`:
 
+  - `compression_ratio == 0` -> pure SWA (sliding window only, no
+    compressor or indexer). V4-Pro/Flash use this for the first 2 layers.
   - `compression_ratio == 4` -> CSA (Lightning Indexer + top-k).
   - any other ratio -> HCA (heavy compression, no indexer).
-  - V4-Pro/Flash have the first 2 layers as SWA-only (ratio=0); we
-    represent that with HCA at the configured ratio (the synthetic
-    test configs always start at layer 0 with a real ratio).
 
 Cache state lives in a per-request `StateCache` (NOT `PagedKVCache`):
 SWA circular buffer + per-layer compressed history + compressor in-flight
@@ -51,8 +50,10 @@ optimization follow-up.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -1180,3 +1181,68 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 f"weight load mismatch for DeepseekV4ForCausalLM: "
                 f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        name_or_path: str,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> DeepseekV4ForCausalLM:
+        """Load a V4 checkpoint into a ready-to-run model on `device`.
+
+        Factors out the load sequence the 2x B200 smoke runs per rank, so the
+        generator and the multi-GPU script share one path:
+
+          1. Read the raw `config.json`. transformers 5.x drops unknown-model
+             fields when it builds a fallback config, so V4-only keys
+             (`compress_ratios`, indexer dims, ...) are read straight from
+             JSON rather than via AutoConfig.
+          2. Construct on the `meta` device so no full-size random init is
+             allocated; `load_weights` then materialises each parameter from
+             the checkpoint (slicing per rank under tensor parallelism).
+          3. Re-materialise the rotary `inv_freq` buffer: it is computed from
+             config (a non-persistent buffer, absent from the checkpoint), so
+             meta construction leaves it a meta tensor that `load_weights`
+             does not fill.
+
+        `name_or_path` is a local checkpoint directory or an HF Hub repo id.
+        Under tensor parallelism, initialise the process group and set the
+        per-rank CUDA device BEFORE calling this; `load_weights` reads the
+        current rank / world size to slice each shard.
+        """
+        from mini_infer.models.loader import load_safetensors_state_dict
+
+        candidate = Path(name_or_path)
+        if candidate.is_dir():
+            config_path = candidate / "config.json"
+        else:
+            from huggingface_hub import hf_hub_download
+
+            config_path = Path(hf_hub_download(name_or_path, "config.json"))
+        with config_path.open() as config_file:
+            hf_config = json.load(config_file)
+        cfg = DeepseekV4Config.from_hf(hf_config)
+
+        # Meta construction: allocate parameter metadata without backing
+        # storage, then let `load_weights` place each tensor on `device`.
+        with torch.device("meta"):
+            model = cls(cfg)
+        model.eval()
+
+        state_dict = load_safetensors_state_dict(name_or_path, device="cpu", dtype=dtype)
+        cls.load_weights(model, state_dict, target_device=device)
+        del state_dict
+
+        # Rebuild the rotary `inv_freq` off-meta (config-derived, not loaded).
+        rebuilt_rotary = RotaryEmbedding(
+            cfg.rope_head_dim,
+            base=cfg.rope_theta,
+            yarn_original_seq_len=cfg.yarn_original_seq_len,
+            yarn_scaling_factor=cfg.yarn_scaling_factor,
+            yarn_beta_fast=cfg.yarn_beta_fast,
+            yarn_beta_slow=cfg.yarn_beta_slow,
+        )
+        model.rotary_emb.inv_freq = rebuilt_rotary.inv_freq.to(device=device)
+        return model
