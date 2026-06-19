@@ -22,8 +22,11 @@ on:
       - "src/mini_infer/models/**"
       - "src/mini_infer/cache/**"
       - "src/mini_infer/quant/**"
+      - "src/mini_infer/api/**"
+      - "src/mini_infer/scheduler/**"
       - "tests/_pinned_models.toml"
       - "tests/unit/test_models_*.py"
+      - "tests/unit/test_api*.py"
       - ".github/workflows/bitparity.yml"
   workflow_dispatch:
 
