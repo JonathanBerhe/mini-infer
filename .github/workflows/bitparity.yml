@@ -22,8 +22,11 @@ on:
       - "src/mini_infer/models/**"
       - "src/mini_infer/cache/**"
       - "src/mini_infer/quant/**"
+      - "src/mini_infer/api/**"
+      - "src/mini_infer/scheduler/**"
       - "tests/_pinned_models.toml"
       - "tests/unit/test_models_*.py"
+      - "tests/unit/test_api*.py"
       - ".github/workflows/bitparity.yml"
   workflow_dispatch:
 
@@ -32,6 +35,13 @@ jobs:
     name: Bit-parity vs pinned HF revisions
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # HF `tokenizers` starts a Rust thread pool on first use; forking after
+      # it is active (the multi-process PD test, test_workers_mp, does) can
+      # deadlock the child. Disable tokenizer parallelism so the fork is safe.
+      # Latent hazard surfaced once the API serving smokes (which load several
+      # tokenizers) began running before that test in this job.
+      TOKENIZERS_PARALLELISM: "false"
     steps:
       - uses: actions/checkout@v6
       - name: Install uv
@@ -54,8 +64,20 @@ jobs:
         run: uv run python scripts/prefetch_pinned_models.py --check
       - name: Prefetch pinned models
         run: uv run python scripts/prefetch_pinned_models.py
+      - name: API serving smokes
+        # Run the HTTP serving smokes in their OWN pytest process, isolated
+        # from the multi-process PD test in the next step. Those tests load
+        # several models and start scheduler threads; sharing a process with
+        # the forking test_workers_mp perturbed it (fork deadlock, then SIGTERM
+        # once the deadlock was fixed). Isolation (a separate process that
+        # exits and frees memory/threads first) keeps both green. Models are
+        # already prefetched + cached above.
+        run: >
+          uv run pytest tests/unit/test_api.py tests/unit/test_api_families.py
+          -m "requires_model and not requires_cuda and not gpu" -v
       - name: Bit-parity tests
-        # `-m requires_model` runs every test that loads an HF model.
-        # We rely on the cache being populated above so no download
-        # happens during the test run itself.
-        run: uv run pytest -m "requires_model and not requires_cuda and not gpu" -v
+        # `-m requires_model` runs every test that loads an HF model. The API
+        # serving smokes are excluded here; they run in their own step above.
+        run: >
+          uv run pytest -m "requires_model and not requires_cuda and not gpu"
+          --ignore=tests/unit/test_api.py --ignore=tests/unit/test_api_families.py -v
