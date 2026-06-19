@@ -35,6 +35,13 @@ jobs:
     name: Bit-parity vs pinned HF revisions
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # HF `tokenizers` starts a Rust thread pool on first use; forking after
+      # it is active (the multi-process PD test, test_workers_mp, does) can
+      # deadlock the child. Disable tokenizer parallelism so the fork is safe.
+      # Latent hazard surfaced once the API serving smokes (which load several
+      # tokenizers) began running before that test in this job.
+      TOKENIZERS_PARALLELISM: "false"
     steps:
       - uses: actions/checkout@v6
       - name: Install uv
