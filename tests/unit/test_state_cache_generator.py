@@ -514,3 +514,82 @@ def test_generate_ids_batched_validates_inputs() -> None:
         gen.generate_ids_batched([[1, 2, 3], [1, 2]], max_new_tokens=4)
     with pytest.raises(ValueError, match="max_new_tokens"):
         gen.generate_ids_batched([[1, 2, 3]], max_new_tokens=0)
+
+
+# ---------- iter_generate_ids_batched (streaming cohort + per-sequence cancel) ----------
+
+
+def test_iter_generate_ids_batched_collected_equals_generate_ids_batched() -> None:
+    """Each yielded step is length B, and collecting non-None tokens per slot
+    reproduces generate_ids_batched."""
+    cfg = _make_config()
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+    gen = StateCacheGenerator(model)
+
+    prompts = [list(range(8)), list(range(8, 16)), [3, 1, 4, 1, 5, 9, 2, 6]]
+    steps = list(gen.iter_generate_ids_batched(prompts, max_new_tokens=6))
+
+    assert all(len(step) == len(prompts) for step in steps)
+    collected: list[list[int]] = [[] for _ in prompts]
+    for step in steps:
+        for b, token in enumerate(step):
+            if token is not None:
+                collected[b].append(token)
+    assert collected == gen.generate_ids_batched(prompts, max_new_tokens=6)
+
+
+def test_iter_generate_ids_batched_cancellation_stops_one_sequence() -> None:
+    """Cancelling one sequence stops only its slot; the rest keep streaming and
+    match their solo run."""
+    cfg = _make_config()
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+    gen = StateCacheGenerator(model)
+
+    prompts = [list(range(8)), list(range(8, 16))]
+    cancel_after = 2
+    polls = [0, 0]
+
+    def should_cancel(b: int) -> bool:
+        # Cancel sequence 0 once it has been polled `cancel_after` times (so it
+        # emits exactly `cancel_after` tokens); never cancel sequence 1.
+        cancel = b == 0 and polls[0] >= cancel_after
+        polls[b] += 1
+        return cancel
+
+    steps = list(
+        gen.iter_generate_ids_batched(prompts, max_new_tokens=6, should_cancel=should_cancel)
+    )
+    seq0 = [step[0] for step in steps]
+    seq1 = [step[1] for step in steps]
+
+    # Sequence 0: `cancel_after` real tokens, then None forever after.
+    assert all(token is not None for token in seq0[:cancel_after])
+    assert all(token is None for token in seq0[cancel_after:])
+    assert [t for t in seq0 if t is not None] == (
+        gen.generate_ids(prompts[0], max_new_tokens=6)[:cancel_after]
+    )
+    # Sequence 1 was never cancelled: full run, identical to its solo decode.
+    assert [t for t in seq1 if t is not None] == gen.generate_ids(prompts[1], max_new_tokens=6)
+
+
+def test_iter_generate_ids_batched_yields_none_after_eos() -> None:
+    """A sequence that hits EOS yields None from then on; the emitted prefix
+    matches its solo run with the same EOS."""
+    cfg = _make_config()
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+    gen = StateCacheGenerator(model)
+
+    prompts = [list(range(8)), list(range(8, 16))]
+    eos = gen.generate_ids(prompts[0], max_new_tokens=6)[2]
+
+    steps = list(gen.iter_generate_ids_batched(prompts, max_new_tokens=6, eos_token_id=eos))
+    seq0 = [step[0] for step in steps]
+
+    first_none = next(i for i, token in enumerate(seq0) if token is None)
+    assert all(token is None for token in seq0[first_none:])
+    assert [t for t in seq0 if t is not None] == (
+        gen.generate_ids(prompts[0], max_new_tokens=6, eos_token_id=eos)
+    )

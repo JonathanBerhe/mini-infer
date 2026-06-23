@@ -20,7 +20,7 @@ dedicated driver reads more cleanly than a second branch through every
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -183,35 +183,34 @@ class StateCacheGenerator:
             )
         )
 
-    def generate_ids_batched(
+    def iter_generate_ids_batched(
         self,
         prompts: list[list[int]],
         *,
         max_new_tokens: int,
         eos_token_id: int | None = None,
         sampling_params: SamplingParams | None = None,
-    ) -> list[list[int]]:
-        """Lockstep batched generation for a cohort of equal-length prompts.
+        should_cancel: Callable[[int], bool] | None = None,
+    ) -> Iterator[list[int | None]]:
+        """Stream a lockstep cohort: yield one length-B list per decode step.
 
-        Every prompt must have the same length: the cohort prefills as one
-        `(B, T)` batch and decodes in lockstep, each step advancing all
-        sequences by one token at a single shared position. A sequence that
-        hits `eos_token_id` stops recording, but the batch keeps stepping
-        until all sequences finish or `max_new_tokens` is reached (the
-        static-batching contract: a finished sequence's slot is not freed
-        mid-cohort).
+        Element `b` of a yielded list is sequence `b`'s new token for that step,
+        or `None` once sequence `b` has stopped early. A sequence stops early the
+        step it would emit `eos_token_id` (the EOS itself is not emitted) or the
+        first step `should_cancel(b)` returns True; from then on its slot stays
+        `None`. Sequences that never stop early run until the iterator exhausts,
+        having emitted exactly `max_new_tokens` tokens (the length cap); no
+        terminal `None` is yielded for those, so the caller finalizes any still-
+        active sequence when the iterator ends.
 
-        This is the lockstep / cohort form of batching: one forward serves the
-        whole batch and the position counter is shared. It deliberately
-        requires equal lengths. Ragged per-request positions (a finished
-        sequence freeing its slot, a new request joining mid-flight) are the
-        separate continuous-batching path, not this method.
+        `should_cancel(b)` is polled once per step per still-active sequence, so
+        a scheduler can drop one request from the cohort without disturbing the
+        rest (the others keep stepping in lockstep). All prompts must be equal
+        length; see `generate_ids_batched` for the lockstep contract.
 
-        Returns one generated-token list per prompt, in input order (prompts
-        not echoed, EOS not included). For greedy decoding the result is
-        token-for-token identical to calling `generate_ids` on each prompt
-        alone, since each sequence attends only to its own state; batching
-        changes how the work is scheduled, not the math.
+        Each forward + its sampling runs inside a `torch.inference_mode()` that
+        exits before the `yield`, so inference mode never spans a suspension
+        point (mirrors `iter_generate_ids`).
         """
         if not prompts:
             raise ValueError("prompts must be non-empty")
@@ -245,22 +244,26 @@ class StateCacheGenerator:
             next_tokens = [sample(prefill_logits[b, -1, :], params) for b in range(batch_size)]
         state_cache.advance_start_pos(prompt_len)
 
-        outputs: list[list[int]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
         emitted = 0
         while emitted < max_new_tokens:
+            step: list[int | None] = [None] * batch_size
             for b in range(batch_size):
                 if finished[b]:
                     continue
+                if should_cancel is not None and should_cancel(b):
+                    finished[b] = True
+                    continue
                 if eos_token_id is not None and next_tokens[b] == eos_token_id:
                     finished[b] = True
-                else:
-                    outputs[b].append(next_tokens[b])
+                    continue
+                step[b] = next_tokens[b]
+            yield step
             if all(finished):
-                break
+                return
             emitted += 1
             if emitted == max_new_tokens:
-                break
+                return
             token_tensor = torch.tensor(
                 [[token] for token in next_tokens], device=self.device, dtype=torch.long
             )
@@ -271,6 +274,46 @@ class StateCacheGenerator:
                 next_tokens = [sample(step_logits[b, -1, :], params) for b in range(batch_size)]
             state_cache.advance_start_pos(1)
 
+    def generate_ids_batched(
+        self,
+        prompts: list[list[int]],
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+        sampling_params: SamplingParams | None = None,
+    ) -> list[list[int]]:
+        """Lockstep batched generation for a cohort of equal-length prompts.
+
+        Every prompt must have the same length: the cohort prefills as one
+        `(B, T)` batch and decodes in lockstep, each step advancing all
+        sequences by one token at a single shared position. A sequence that
+        hits `eos_token_id` stops recording, but the batch keeps stepping until
+        all sequences finish or `max_new_tokens` is reached (the static-batching
+        contract: a finished sequence's slot is not freed mid-cohort).
+
+        This is the lockstep / cohort form of batching: one forward serves the
+        whole batch and the position counter is shared. It deliberately requires
+        equal lengths. Ragged per-request positions (a finished sequence freeing
+        its slot, a new request joining mid-flight) are the separate
+        continuous-batching path, not this method.
+
+        Returns one generated-token list per prompt, in input order (prompts not
+        echoed, EOS not included). For greedy decoding the result is
+        token-for-token identical to calling `generate_ids` on each prompt
+        alone, since each sequence attends only to its own state; batching
+        changes how the work is scheduled, not the math. Thin collector over
+        `iter_generate_ids_batched`.
+        """
+        outputs: list[list[int]] = [[] for _ in range(len(prompts))]
+        for step in self.iter_generate_ids_batched(
+            prompts,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            sampling_params=sampling_params,
+        ):
+            for b, token in enumerate(step):
+                if token is not None:
+                    outputs[b].append(token)
         return outputs
 
     def generate(self, prompt: str, *, max_new_tokens: int) -> str:
