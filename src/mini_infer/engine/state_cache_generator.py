@@ -43,8 +43,11 @@ class StateCacheGenerator:
     `generate_ids` for one-shot token-level generation (no tokenizer needed,
     the path exercised by CPU tests on synthetic configs), `iter_generate_ids`
     to stream tokens one at a time (what `StateCacheScheduler` drives so it can
-    emit and react to cancellation between tokens), and `generate` for the
-    string-in / string-out convenience wrapper.
+    emit and react to cancellation between tokens), `generate_ids_batched` to
+    run a cohort of equal-length prompts through one batched forward in
+    lockstep (the same math as N separate `generate_ids` calls, scheduled
+    together), and `generate` for the string-in / string-out convenience
+    wrapper.
     """
 
     def __init__(
@@ -179,6 +182,96 @@ class StateCacheGenerator:
                 prompt_ids, max_new_tokens=max_new_tokens, eos_token_id=eos_token_id
             )
         )
+
+    def generate_ids_batched(
+        self,
+        prompts: list[list[int]],
+        *,
+        max_new_tokens: int,
+        eos_token_id: int | None = None,
+        sampling_params: SamplingParams | None = None,
+    ) -> list[list[int]]:
+        """Lockstep batched generation for a cohort of equal-length prompts.
+
+        Every prompt must have the same length: the cohort prefills as one
+        `(B, T)` batch and decodes in lockstep, each step advancing all
+        sequences by one token at a single shared position. A sequence that
+        hits `eos_token_id` stops recording, but the batch keeps stepping
+        until all sequences finish or `max_new_tokens` is reached (the
+        static-batching contract: a finished sequence's slot is not freed
+        mid-cohort).
+
+        This is the lockstep / cohort form of batching: one forward serves the
+        whole batch and the position counter is shared. It deliberately
+        requires equal lengths. Ragged per-request positions (a finished
+        sequence freeing its slot, a new request joining mid-flight) are the
+        separate continuous-batching path, not this method.
+
+        Returns one generated-token list per prompt, in input order (prompts
+        not echoed, EOS not included). For greedy decoding the result is
+        token-for-token identical to calling `generate_ids` on each prompt
+        alone, since each sequence attends only to its own state; batching
+        changes how the work is scheduled, not the math.
+        """
+        if not prompts:
+            raise ValueError("prompts must be non-empty")
+        if any(not prompt_ids for prompt_ids in prompts):
+            raise ValueError("every prompt must be non-empty")
+        prompt_len = len(prompts[0])
+        if any(len(prompt_ids) != prompt_len for prompt_ids in prompts):
+            raise ValueError(
+                "lockstep batched generation requires equal-length prompts; "
+                "ragged lengths need the continuous-batching path"
+            )
+        if max_new_tokens <= 0:
+            raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
+
+        params = sampling_params if sampling_params is not None else SamplingParams(temperature=0.0)
+        cfg: DeepseekV4Config = self._model.cfg
+        batch_size = len(prompts)
+        max_seq_len = prompt_len + max_new_tokens
+        state_cache = StateCache(
+            build_state_cache_layer_specs(cfg, max_seq_len=max_seq_len),
+            batch_size=batch_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        input_ids = torch.tensor(prompts, device=self.device, dtype=torch.long)
+
+        with torch.inference_mode():
+            prefill_logits = self._model.forward_prefill_with_cache(
+                input_ids, state_cache=state_cache
+            )
+            next_tokens = [sample(prefill_logits[b, -1, :], params) for b in range(batch_size)]
+        state_cache.advance_start_pos(prompt_len)
+
+        outputs: list[list[int]] = [[] for _ in range(batch_size)]
+        finished = [False] * batch_size
+        emitted = 0
+        while emitted < max_new_tokens:
+            for b in range(batch_size):
+                if finished[b]:
+                    continue
+                if eos_token_id is not None and next_tokens[b] == eos_token_id:
+                    finished[b] = True
+                else:
+                    outputs[b].append(next_tokens[b])
+            if all(finished):
+                break
+            emitted += 1
+            if emitted == max_new_tokens:
+                break
+            token_tensor = torch.tensor(
+                [[token] for token in next_tokens], device=self.device, dtype=torch.long
+            )
+            with torch.inference_mode():
+                step_logits = self._model.forward_decode_with_cache(
+                    token_tensor, start_pos=state_cache.start_pos, state_cache=state_cache
+                )
+                next_tokens = [sample(step_logits[b, -1, :], params) for b in range(batch_size)]
+            state_cache.advance_start_pos(1)
+
+        return outputs
 
     def generate(self, prompt: str, *, max_new_tokens: int) -> str:
         """Tokenize `prompt`, greedy-generate `max_new_tokens`, return the text."""
