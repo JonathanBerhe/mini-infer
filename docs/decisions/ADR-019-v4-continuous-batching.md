@@ -208,6 +208,18 @@ result, consistent with the project not competing on absolute throughput. A fuse
 attention/MoE path (Phase 3) would shift the decode toward memory-bound and raise
 the speedup further.
 
+## Serving wiring (2026-06-24)
+
+The `/v1/completions` server now backs V4 with `StateCacheContinuousScheduler`
+(single-process, single-GPU V4) and, for a model too big for one GPU, the
+HTTP-facing `TensorParallelStateCacheContinuousScheduler` (rank-0 leader over
+`TensorParallelStateCacheContinuousServer`, followers mirror via broadcast). The
+earlier one-at-a-time `StateCacheScheduler` and lockstep `StateCacheCohortScheduler`
+were removed once continuous batching subsumed them. GPU-validated: real V4-Flash
+served with continuous batching over `/v1/completions` on 2x B200, 6 concurrent
+requests, all HTTP 200, coherent output, clean follower teardown
+(`scripts/modal_v4_flash_cb_serve.py`), clean first run on real NCCL.
+
 ## Alternatives Considered
 
 - **Status quo (keep `StateCache`, one at a time):** zero risk, no throughput.
