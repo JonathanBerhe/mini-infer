@@ -1,10 +1,11 @@
 """API integration for the V4 (StateCache) serving path, on CPU, no model download.
 
 The HTTP layer (`/v1/completions`, SSE) is common to all of mini-infer and is
-already covered for the PagedKVCache path. What is V4-specific is the
-`StateCacheScheduler` behind it. This drives the REAL `completions` endpoint and
-the REAL `StateCacheScheduler` end to end (HTTP -> endpoint -> scheduler ->
-`StateCacheGenerator` -> response) over a small synthetic V4, so no real model,
+already covered for the PagedKVCache path. What is V4-specific is the scheduler
+behind it. This drives the REAL `completions` endpoint and the REAL
+`StateCacheCohortScheduler` (the server's default for V4) end to end (HTTP ->
+endpoint -> scheduler -> `StateCacheGenerator` -> response) over a small
+synthetic V4, so no real model,
 no tokenizer download, and no GPU are needed. Serving a 2-GPU model (V4-Flash)
 behind HTTP is a separate tensor-parallel deployment concern; real-model
 generation itself is proven by `scripts/modal_v4_flash_generate.py`.
@@ -23,7 +24,7 @@ from fastapi.testclient import TestClient
 from mini_infer.api.server import _unhandled_exception_handler, completions
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
 from mini_infer.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
-from mini_infer.scheduler import StateCacheScheduler
+from mini_infer.scheduler import StateCacheCohortScheduler
 
 
 def _make_config() -> DeepseekV4Config:
@@ -73,7 +74,9 @@ def v4_client() -> Iterator[TestClient]:
     cfg = _make_config()
     torch.manual_seed(0)
     model = DeepseekV4ForCausalLM(cfg).eval()
-    scheduler = StateCacheScheduler(StateCacheGenerator(model, _FakeTokenizer(cfg.vocab_size)))  # type: ignore[arg-type]
+    scheduler = StateCacheCohortScheduler(  # type: ignore[arg-type]
+        StateCacheGenerator(model, _FakeTokenizer(cfg.vocab_size))
+    )
     scheduler.start()
 
     # Mount the real route + error handler on a fresh app with the scheduler

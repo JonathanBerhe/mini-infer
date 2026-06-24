@@ -411,3 +411,86 @@ class LightningIndexer(nn.Module):
         topk_local_idxs = index_score.topk(actual_top_k, dim=-1)[1]  # (B, 1, actual_top_k)
         topk_absolute: torch.Tensor = (topk_local_idxs + compressed_offset).to(torch.int64)
         return topk_absolute
+
+    def forward_decode_step_ragged(
+        self,
+        hidden_state: torch.Tensor,
+        q_lora_latent: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        indexer_state: _IndexerState,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        compressed_offset: int,
+        n_compressed_max: int,
+    ) -> torch.Tensor:
+        """Ragged top-k pick: `(B, 1, actual_top_k)`, each row at its own position.
+
+        Per-request counterpart of `forward_decode_step`. Drives the indexer's
+        own compressor per row (flushing only the rows that close a block),
+        scores every row's Q against the compressed history up to
+        `n_compressed_max`, masks each row's not-yet-valid blocks to `-inf`, and
+        takes `min(top_k, n_compressed_max)` per row. A selected slot whose score
+        is `-inf` (a row with fewer valid blocks than the shared width) is mapped
+        to `-1` so the attention kernel ignores it.
+
+        `actual_top_k = min(top_k, n_compressed_max)` is uniform across rows; a
+        row with fewer real blocks simply gets `-1` padding in its tail, which is
+        equivalent (for the downstream softmax) to the scalar path's narrower
+        per-request width.
+        """
+        batch_size, seqlen, _ = hidden_state.shape
+        if seqlen != 1:
+            raise ValueError(f"forward_decode_step_ragged expects seqlen=1, got {seqlen}")
+        num_heads_local = self.num_heads_local
+        head_dim = self.head_dim
+        compression_ratio = self.compressor.compression_ratio
+        device = hidden_state.device
+
+        q = self.wq_b(q_lora_latent).view(batch_size, 1, num_heads_local, head_dim)
+        cos_for_token, sin_for_token = token_position_embeddings
+        if self.rope_head_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, self.rope_head_dim)
+
+        compressed, flush_mask = self.compressor.forward_decode_step_ragged(
+            hidden_state,
+            positions=positions,
+            cmp_kv_state=indexer_state.cmp_kv_state,
+            cmp_score_state=indexer_state.cmp_score_state,
+            block_position_embeddings=block_position_embeddings,
+        )
+        if bool(flush_mask.any()):
+            rows = torch.arange(batch_size, device=device)
+            write_slots = positions[flush_mask] // compression_ratio
+            if int(write_slots.max()) >= indexer_state.compressed_kv.shape[1]:
+                raise RuntimeError(
+                    f"indexer compressed history overflow at block {int(write_slots.max())}; "
+                    "raise max_n_compressed"
+                )
+            indexer_state.compressed_kv[rows[flush_mask], write_slots] = (
+                compressed[flush_mask].squeeze(1).to(indexer_state.compressed_kv.dtype)
+            )
+
+        if n_compressed_max == 0:
+            return torch.empty((batch_size, 1, 0), dtype=torch.int64, device=device)
+
+        compressed_keys = indexer_state.compressed_kv[:, :n_compressed_max]
+        per_token_head_weights = self.weights_proj(hidden_state) * self._weight_scale
+        per_head_score = relu(torch.einsum("bthd,bkd->bthk", q.float(), compressed_keys.float()))
+        local_index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
+        index_score = all_reduce_sum(local_index_score)  # (B, 1, n_compressed_max)
+
+        # Mask each row's not-yet-valid blocks: block k is valid iff k < (pos+1)//m.
+        n_valid = (positions.to(torch.int64) + 1) // compression_ratio  # (B,)
+        block_k = torch.arange(n_compressed_max, device=device).unsqueeze(
+            0
+        )  # (1, n_compressed_max)
+        valid = block_k < n_valid.unsqueeze(1)  # (B, n_compressed_max)
+        index_score = index_score.masked_fill(~valid.unsqueeze(1), float("-inf"))
+
+        actual_top_k = min(self.top_k, n_compressed_max)
+        topk_values, topk_local_idxs = index_score.topk(actual_top_k, dim=-1)
+        topk_absolute = (topk_local_idxs + compressed_offset).to(torch.int64)
+        # A selected slot with -inf score is padding (row had fewer valid blocks).
+        neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
+        return torch.where(torch.isneginf(topk_values), neg_one, topk_absolute)

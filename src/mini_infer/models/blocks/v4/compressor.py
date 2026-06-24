@@ -405,3 +405,100 @@ class TokenLevelCompressor(nn.Module):
                 compressed, cos_for_block, sin_for_block, self.rope_head_dim
             )
         return compressed
+
+    def forward_decode_step_ragged(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        cmp_kv_state: torch.Tensor,
+        cmp_score_state: torch.Tensor,
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Ragged decode step: one new token per request, each at its own position.
+
+        The per-request counterpart to `forward_decode_step`. Every batch row
+        `b` is at its own global position `positions[b]`, so the in-flight slot
+        `positions[b] % m`, the block-boundary test `(positions[b] + 1) % m == 0`,
+        and the just-flushed block's RoPE position `(positions[b] // m) * m` are
+        all per-row. State buffers are mutated in place via row-indexed scatter.
+
+        Args:
+            hidden_state: `(B, 1, hidden_size)`.
+            positions: `(B,)` int64 global positions, one per request.
+            cmp_kv_state / cmp_score_state: same shapes / meaning as
+                `forward_decode_step` (per-request rows).
+            block_position_embeddings: `(cos, sin)`, each `(B, 1, rope_head_dim)`,
+                the RoPE for each row's block position `(positions // m) * m`.
+                Required iff `rope_head_dim > 0`. Rows that do not flush this
+                step ignore their entry.
+
+        Returns:
+            `(compressed, flush_mask)` where `compressed` is `(B, 1, kv_head_dim)`
+            (valid only for rows where `flush_mask` is True) and `flush_mask` is
+            `(B,)` bool marking the rows that closed a block this step. The caller
+            writes `compressed[flush_mask]` into compressed history at slot
+            `positions[b] // m`, and only for those rows.
+
+        Unlike the scalar path this always computes `compressed` for every row
+        (the block softmax is cheap and lets the whole batch share one forward);
+        non-flushing rows produce a value the caller discards.
+        """
+        batch_size, seqlen, _ = hidden_state.shape
+        if seqlen != 1:
+            raise ValueError(f"forward_decode_step_ragged expects seqlen=1, got {seqlen}")
+
+        m = self.compression_ratio
+        c = self.kv_head_dim
+        rows = torch.arange(batch_size, device=hidden_state.device)
+        position_in_block = positions % m  # (B,)
+
+        kv_for_token = self.kv_proj(hidden_state).squeeze(1).float()  # (B, c) or (B, 2c)
+        score_for_token = (
+            self.weight_proj(hidden_state).squeeze(1).float()
+            + self.position_bias[position_in_block]  # (B, c) or (B, 2c)
+        )
+
+        if self.overlap_mode:
+            current_slot = m + position_in_block  # (B,)
+            cmp_kv_state[rows, current_slot] = kv_for_token
+            cmp_score_state[rows, current_slot] = score_for_token
+        else:
+            cmp_kv_state[rows, position_in_block] = kv_for_token
+            cmp_score_state[rows, position_in_block] = score_for_token
+
+        flush_mask = (positions + 1) % m == 0  # (B,) bool
+
+        # Compute the compressed entry for every row; the caller keeps only the
+        # flushing rows. Mirrors the scalar block-boundary math, vectorized.
+        if self.overlap_mode:
+            previous_block_kv = cmp_kv_state[:, :m, :c]
+            current_block_kv = cmp_kv_state[:, m:, c:]
+            flat_kv = torch.cat([previous_block_kv, current_block_kv], dim=1)
+            previous_block_score = cmp_score_state[:, :m, :c]
+            current_block_score = cmp_score_state[:, m:, c:]
+            flat_score = torch.cat([previous_block_score, current_block_score], dim=1)
+            softmax_weights = flat_score.softmax(dim=1)
+            compressed = (flat_kv * softmax_weights).sum(dim=1, keepdim=True)
+            # Slide only the rows that flushed: their current block becomes the
+            # next block's "previous overlap". Advanced-index read copies first,
+            # so the [:m] write does not alias the [m:] read.
+            cmp_kv_state[flush_mask, :m] = cmp_kv_state[flush_mask, m:]
+            cmp_score_state[flush_mask, :m] = cmp_score_state[flush_mask, m:]
+        else:
+            softmax_weights = cmp_score_state.softmax(dim=1)
+            compressed = (cmp_kv_state * softmax_weights).sum(dim=1, keepdim=True)
+
+        compressed = self.norm(compressed.to(hidden_state.dtype))
+
+        if self.rope_head_dim > 0:
+            if block_position_embeddings is None:
+                raise ValueError(
+                    "block_position_embeddings required when rope_head_dim > 0 "
+                    "(per-row block positions for ragged decode)"
+                )
+            cos_for_block, sin_for_block = block_position_embeddings
+            compressed = apply_partial_rope_last_n_dims(
+                compressed, cos_for_block, sin_for_block, self.rope_head_dim
+            )
+        return compressed, flush_mask

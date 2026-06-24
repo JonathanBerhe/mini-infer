@@ -991,6 +991,91 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         logits: torch.Tensor = self.lm_head(hidden_state)
         return logits
 
+    def forward_decode_with_cache_ragged(
+        self,
+        input_id: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        state_cache: StateCache,
+    ) -> torch.Tensor:
+        """One ragged decode step: B requests, each at its own `positions[b]`.
+
+        The per-request counterpart of `forward_decode_with_cache`: one batched
+        forward serves a cohort whose rows sit at different positions, so the
+        whole batch shares the model weights and attention kernels even though
+        each request is at a distinct point in its own generation.
+
+        Args:
+            input_id: `(B, 1)` integer token ids (one new token per request).
+            positions: `(B,)` global position of each request's new token. The
+                caller owns these; this method advances no counter.
+            state_cache: per-request `StateCache` (row `b` is request `b`).
+
+        Returns `(B, 1, vocab_size)` logits.
+        """
+        if input_id.shape[-1] != 1:
+            raise ValueError(
+                f"forward_decode_with_cache_ragged expects (B, 1), got {tuple(input_id.shape)}"
+            )
+        if state_cache.num_layers != self.cfg.num_hidden_layers:
+            raise ValueError(
+                f"state_cache has {state_cache.num_layers} layers, "
+                f"model has {self.cfg.num_hidden_layers}"
+            )
+        batch_size = input_id.shape[0]
+        if positions.shape != (batch_size,):
+            raise ValueError(f"positions shape {tuple(positions.shape)} != (B={batch_size},)")
+        positions = positions.to(torch.int64)
+
+        hidden_state = self.model.embed_tokens(input_id)  # (B, 1, hidden_size)
+        cos_for_token, sin_for_token = self.rotary_emb(hidden_state, positions.unsqueeze(1))
+        token_position_embeddings = (cos_for_token, sin_for_token)
+
+        # max over rows; (pos + 1) // m is monotonic in pos, so the widest valid
+        # compressed prefix for any layer is (positions_max + 1) // m. One sync.
+        positions_max = int(positions.max())
+
+        if self.cfg.use_hyper_connections:
+            hidden_state = (
+                hidden_state.unsqueeze(2)
+                .expand(batch_size, 1, self.cfg.hc_mult, self.cfg.hidden_size)
+                .contiguous()
+            )
+
+        for layer_idx, layer_module in enumerate(self.model.layers):
+            layer = cast(DeepseekV4DecoderLayer, layer_module)
+            compression_ratio = self.cfg.compress_ratios[layer_idx]
+            block_position_embeddings = None
+            n_compressed_max = 0
+            if compression_ratio != 0:
+                # Every row gets RoPE for its own block position `(pos // m) * m`;
+                # rows that do not flush this step ignore it.
+                block_position = (positions // compression_ratio) * compression_ratio
+                cos_for_block, sin_for_block = self.rotary_emb(
+                    torch.zeros(batch_size, 1, device=input_id.device),
+                    block_position.unsqueeze(1),
+                )
+                block_position_embeddings = (cos_for_block, sin_for_block)
+                n_compressed_max = (positions_max + 1) // compression_ratio
+
+            hidden_state = layer.forward_decode_ragged(
+                hidden_state,
+                positions=positions,
+                state_cache=state_cache,
+                layer_idx=layer_idx,
+                token_position_embeddings=token_position_embeddings,
+                block_position_embeddings=block_position_embeddings,
+                n_compressed_max=n_compressed_max,
+                input_ids=input_id if self.cfg.use_moe_ffn else None,
+            )
+
+        if self.hc_head_reduction is not None:
+            hidden_state = self.hc_head_reduction(hidden_state)
+
+        hidden_state = self.model.norm(hidden_state)
+        logits: torch.Tensor = self.lm_head(hidden_state)
+        return logits
+
     @property
     def kv_cache_dims(self) -> KVCacheDims:
         """Reported size — V4 uses StateCache, not PagedKVCache; consumers that
