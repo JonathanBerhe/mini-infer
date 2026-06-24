@@ -96,6 +96,11 @@ class StateCacheGenerator:
         return cls(model, tokenizer, device=resolved_device, dtype=resolved_dtype)
 
     @property
+    def model(self) -> DeepseekV4ForCausalLM:
+        """The wrapped model (for schedulers that drive prefill / decode directly)."""
+        return self._model
+
+    @property
     def tokenizer(self) -> Tokenizer:
         if self._tokenizer is None:
             raise ValueError(
