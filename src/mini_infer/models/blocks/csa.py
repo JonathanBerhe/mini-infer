@@ -355,6 +355,32 @@ class CSAAttention(nn.Module):
         out: torch.Tensor = self.grouped_output(attn_out)
         return out
 
+    def forward_decode_ragged(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        n_compressed_max: int | None = None,
+    ) -> torch.Tensor:
+        """Ragged (per-request positions) CSA decode. Not yet implemented.
+
+        CSA adds a LightningIndexer top-k over the compressed history on top of
+        the HCA decode; the ragged indexer (per-row masked top-k) is the next
+        milestone. Until it lands, a model with CSA layers must decode through
+        the scalar `forward_decode_with_cache`. SWA and HCA ragged decode are
+        implemented, so SWA/HCA-only configs already work batched.
+        """
+        del hidden_state, positions, state_cache, layer_idx
+        del token_position_embeddings, block_position_embeddings, n_compressed_max
+        raise NotImplementedError(
+            "ragged CSA decode (per-request positions) is not implemented yet; "
+            "CSA layers must use the scalar forward_decode path"
+        )
+
     def forward_decode(
         self,
         hidden_state: torch.Tensor,

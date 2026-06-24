@@ -399,6 +399,66 @@ class DeepseekV4DecoderLayer(nn.Module):
         out: torch.Tensor = residual + x
         return out
 
+    def forward_decode_ragged(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        n_compressed_max: int | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Ragged single-token decode: B requests, each at its own `positions[b]`.
+
+        Per-request counterpart of `forward_decode`. Identical residual / FFN /
+        Hyper-Connections structure (those are position-independent); only the
+        attention call switches to `forward_decode_ragged`, threading
+        `positions` and the per-layer `n_compressed_max`.
+        """
+        attn = self.self_attn
+        if self.use_hyper_connections:
+
+            def attn_runner(x: torch.Tensor) -> torch.Tensor:
+                return attn.forward_decode_ragged(
+                    x,
+                    positions=positions,
+                    state_cache=state_cache,
+                    layer_idx=layer_idx,
+                    token_position_embeddings=token_position_embeddings,
+                    block_position_embeddings=block_position_embeddings,
+                    n_compressed_max=n_compressed_max,
+                )
+
+            return self._forward_hc(
+                hidden_state,
+                token_position_embeddings,
+                None,
+                input_ids=input_ids,
+                attn_runner=attn_runner,
+            )
+
+        residual = hidden_state
+        x = self.input_layernorm(hidden_state)
+        x = attn.forward_decode_ragged(
+            x,
+            positions=positions,
+            state_cache=state_cache,
+            layer_idx=layer_idx,
+            token_position_embeddings=token_position_embeddings,
+            block_position_embeddings=block_position_embeddings,
+            n_compressed_max=n_compressed_max,
+        )
+        hidden_state = residual + x
+
+        residual = hidden_state
+        x = self.post_attention_layernorm(hidden_state)
+        x = self._apply_ffn(x, input_ids)
+        out: torch.Tensor = residual + x
+        return out
+
     def _forward_hc(
         self,
         hc_state: torch.Tensor,
