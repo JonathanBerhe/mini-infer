@@ -241,13 +241,17 @@ def test_swa_forward_decode_ragged_matches_scalar_per_request() -> None:
         )
 
 
-# ---------- model-level ragged decode (SWA + HCA layers, no CSA yet) ----------
+# ---------- model-level ragged decode (full hybrid: SWA + CSA + HCA) ----------
 
 
 def _model_config(
     *, use_moe_ffn: bool = False, use_hyper_connections: bool = False
 ) -> DeepseekV4Config:
-    """SWA + HCA only (compress_ratios with no `4`), so no CSA / indexer."""
+    """Full hybrid stack: layer ratios (0, 4, 8, 4) = SWA, CSA, HCA, CSA.
+
+    Exercises every V4 attention mode in the ragged decode, including the CSA
+    LightningIndexer (ratio 4) with its per-row masked top-k.
+    """
     return DeepseekV4Config(
         vocab_size=128,
         hidden_size=64,
@@ -260,7 +264,7 @@ def _model_config(
         o_num_groups=2,
         o_lora_rank=32,
         window_size=8,
-        compress_ratios=(0, 8, 8, 0),
+        compress_ratios=(0, 4, 8, 4),
         index_num_heads=2,
         index_head_dim=16,
         index_top_k=2,
@@ -283,15 +287,23 @@ def _model_config(
 
 
 def _clone_all_layers(cache: StateCache) -> list[dict[str, torch.Tensor]]:
-    return [
-        {
-            "swa_kv": cache.layer(i).swa_kv.clone(),
-            "compressed_kv": cache.layer(i).compressed_kv.clone(),
-            "cmp_kv_state": cache.layer(i).cmp_kv_state.clone(),
-            "cmp_score_state": cache.layer(i).cmp_score_state.clone(),
+    """Clone every per-layer buffer (incl. the CSA indexer sub-state) so a
+    prefilled B=1 cache can be reassembled into one row of a batched cache."""
+    snapshot: list[dict[str, torch.Tensor]] = []
+    for i in range(cache.num_layers):
+        layer = cache.layer(i)
+        entry = {
+            "swa_kv": layer.swa_kv.clone(),
+            "compressed_kv": layer.compressed_kv.clone(),
+            "cmp_kv_state": layer.cmp_kv_state.clone(),
+            "cmp_score_state": layer.cmp_score_state.clone(),
         }
-        for i in range(cache.num_layers)
-    ]
+        if layer.indexer is not None:
+            entry["indexer.compressed_kv"] = layer.indexer.compressed_kv.clone()
+            entry["indexer.cmp_kv_state"] = layer.indexer.cmp_kv_state.clone()
+            entry["indexer.cmp_score_state"] = layer.indexer.cmp_score_state.clone()
+        snapshot.append(entry)
+    return snapshot
 
 
 @pytest.mark.parametrize(
@@ -362,6 +374,11 @@ def test_model_forward_decode_ragged_matches_per_request_scalar(
             layer.compressed_kv[row] = buffers["compressed_kv"][0]
             layer.cmp_kv_state[row] = buffers["cmp_kv_state"][0]
             layer.cmp_score_state[row] = buffers["cmp_score_state"][0]
+            if "indexer.compressed_kv" in buffers:
+                assert layer.indexer is not None
+                layer.indexer.compressed_kv[row] = buffers["indexer.compressed_kv"][0]
+                layer.indexer.cmp_kv_state[row] = buffers["indexer.cmp_kv_state"][0]
+                layer.indexer.cmp_score_state[row] = buffers["indexer.cmp_score_state"][0]
 
     positions = torch.tensor(positions0, dtype=torch.long)
     nxt_batched = torch.tensor(first_tokens, dtype=torch.long).unsqueeze(1)  # (B, 1)
