@@ -20,6 +20,7 @@ from torch.nn.functional import cosine_similarity
 from mini_infer.cache.state_cache import StateCache, StateLayerSpec
 from mini_infer.models.blocks import HCAAttention
 from mini_infer.models.blocks.rope import RotaryEmbedding
+from mini_infer.models.blocks.swa import SWAAttention
 
 _HIDDEN = 64
 _KV_HEAD_DIM = 32
@@ -149,3 +150,86 @@ def test_hca_forward_decode_ragged_matches_scalar_per_request() -> None:
             f"request {row} (pos {warmup}): cos={cosine:.7f}, max={max_diff:.2e}"
         )
         torch.testing.assert_close(ours, theirs, rtol=1e-4, atol=1e-5)
+
+
+def _make_swa_cache(batch_size: int) -> StateCache:
+    spec = StateLayerSpec(
+        kv_head_dim=_KV_HEAD_DIM,
+        compression_ratio=0,  # pure SWA: window only, no compressor / compressed history
+        n_win=_N_WIN,
+        max_n_compressed=1,
+    )
+    return StateCache([spec], batch_size=batch_size)
+
+
+def test_swa_forward_decode_ragged_matches_scalar_per_request() -> None:
+    """Ragged SWA decode (window-only) equals per-request scalar decode.
+
+    SWA has no compressor, so the only ragged state is each row's circular
+    window written at `pos[b] % n_win`. Positions mix a partial window, the
+    just-wrapped boundary, and a full window.
+    """
+    torch.manual_seed(1)
+    block = SWAAttention(
+        hidden_size=_HIDDEN,
+        num_heads=4,
+        q_lora_rank=32,
+        kv_head_dim=_KV_HEAD_DIM,
+        rope_head_dim=_ROPE_HEAD_DIM,
+        num_groups=2,
+        o_lora_rank=32,
+        window_size=_N_WIN,
+        rms_norm_eps=1e-6,
+    ).eval()
+    rotary = RotaryEmbedding(head_dim=_ROPE_HEAD_DIM, base=10000.0)
+    warmups = [2, 7, 15]
+    batch_size = len(warmups)
+
+    swa_snapshots: list[torch.Tensor] = []
+    test_hiddens: list[torch.Tensor] = []
+    scalar_outs: list[torch.Tensor] = []
+
+    for warmup in warmups:
+        cache = _make_swa_cache(1)
+        for position in range(warmup):
+            with torch.no_grad():
+                block.forward_decode(
+                    torch.randn(1, 1, _HIDDEN),
+                    start_pos=position,
+                    state_cache=cache,
+                    layer_idx=0,
+                    token_position_embeddings=_token_pe(rotary, [position]),
+                )
+        swa_snapshots.append(cache.layer(0).swa_kv.clone())
+        hidden_test = torch.randn(1, 1, _HIDDEN)
+        test_hiddens.append(hidden_test)
+        with torch.no_grad():
+            scalar_outs.append(
+                block.forward_decode(
+                    hidden_test,
+                    start_pos=warmup,
+                    state_cache=cache,
+                    layer_idx=0,
+                    token_position_embeddings=_token_pe(rotary, [warmup]),
+                )
+            )
+
+    batched = _make_swa_cache(batch_size)
+    for row, swa_kv in enumerate(swa_snapshots):
+        batched.layer(0).swa_kv[row] = swa_kv[0]
+
+    positions = torch.tensor(warmups, dtype=torch.long)
+    with torch.no_grad():
+        ragged_out = block.forward_decode_ragged(
+            torch.cat(test_hiddens, dim=0),
+            positions=positions,
+            state_cache=batched,
+            layer_idx=0,
+            token_position_embeddings=_token_pe(rotary, warmups),
+        )
+
+    assert ragged_out.shape == (batch_size, 1, _HIDDEN)
+    for row in range(batch_size):
+        torch.testing.assert_close(
+            ragged_out[row : row + 1], scalar_outs[row], rtol=1e-4, atol=1e-5
+        )

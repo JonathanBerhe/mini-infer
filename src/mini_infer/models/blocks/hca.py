@@ -166,6 +166,31 @@ def _build_hca_decode_topk_idxs(
     return torch.cat([window_idxs, compressed_idxs]).to(torch.int64)
 
 
+def _build_window_decode_topk_idxs_ragged(
+    *,
+    window_size: int,
+    positions: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-request circular sliding-window gather indices, `(B, window_size)` int64.
+
+    Vectorized counterpart of `_build_window_decode_topk_idxs`; shared by ragged
+    SWA and ragged HCA/CSA decode. Row `b` is at position `positions[b]`:
+      - full buffer (`pos >= window_size - 1`): slot `j` is `(pos % win + 1 + j) % win`
+        (the circular wrap, all valid);
+      - partial (`pos < window_size - 1`): slot `j` is `j` if `j <= pos` else `-1`.
+    """
+    positions = positions.to(torch.int64)
+    pos_col = positions.unsqueeze(1)  # (B, 1)
+    neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
+    window_j = torch.arange(window_size, device=device, dtype=torch.int64).unsqueeze(0)  # (1, win)
+    pos_mod = (positions % window_size).unsqueeze(1)  # (B, 1)
+    full = pos_col >= (window_size - 1)  # (B, 1)
+    full_idx = (pos_mod + 1 + window_j) % window_size  # (B, win)
+    partial_idx = torch.where(window_j <= pos_col, window_j, neg_one)  # (B, win)
+    return torch.where(full, full_idx, partial_idx)  # (B, win)
+
+
 def _build_hca_decode_topk_idxs_ragged(
     *,
     window_size: int,
@@ -179,26 +204,16 @@ def _build_hca_decode_topk_idxs_ragged(
 
     Vectorized counterpart of `_build_hca_decode_topk_idxs`: returns
     `(B, window_size + n_compressed_max)` int64 where row `b` is at position
-    `positions[b]`. The window section is that row's circular-buffer order; the
-    compressed section is `arange(0, (positions[b] + 1) // m) + compressed_offset`,
-    `-1`-padded to `n_compressed_max` so every row shares one tensor width.
-
-    Window order, per row, matches `_build_window_decode_topk_idxs`:
-      - full buffer (`pos >= window_size - 1`): slot `j` is `(pos % win + 1 + j) % win`
-        (the circular wrap, all valid);
-      - partial (`pos < window_size - 1`): slot `j` is `j` if `j <= pos` else `-1`.
+    `positions[b]`. The window section is that row's circular-buffer order (via
+    `_build_window_decode_topk_idxs_ragged`); the compressed section is
+    `arange(0, (positions[b] + 1) // m) + compressed_offset`, `-1`-padded to
+    `n_compressed_max` so every row shares one tensor width.
     """
     positions = positions.to(torch.int64)
-    pos_col = positions.unsqueeze(1)  # (B, 1)
     neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
-
-    window_j = torch.arange(window_size, device=device, dtype=torch.int64).unsqueeze(0)  # (1, win)
-    pos_mod = (positions % window_size).unsqueeze(1)  # (B, 1)
-    full = pos_col >= (window_size - 1)  # (B, 1)
-    full_idx = (pos_mod + 1 + window_j) % window_size  # (B, win)
-    partial_idx = torch.where(window_j <= pos_col, window_j, neg_one)  # (B, win)
-    window_idxs = torch.where(full, full_idx, partial_idx)  # (B, win)
-
+    window_idxs = _build_window_decode_topk_idxs_ragged(
+        window_size=window_size, positions=positions, device=device
+    )
     n_valid = (positions + 1) // compression_ratio  # (B,)
     cmp_k = torch.arange(n_compressed_max, device=device, dtype=torch.int64).unsqueeze(0)
     cmp_idxs = torch.where(cmp_k < n_valid.unsqueeze(1), cmp_k + compressed_offset, neg_one)
