@@ -53,6 +53,7 @@ from mini_infer.cache.hca_attention import hca_mqa_with_sink
 from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.hca import (
     _build_window_decode_topk_idxs,
+    _build_window_decode_topk_idxs_ragged,
     _build_window_topk_idxs,
 )
 from mini_infer.models.blocks.rmsnorm import RMSNorm
@@ -351,6 +352,123 @@ class CSAAttention(nn.Module):
         if rope_dim > 0:
             attn_out = apply_partial_rope_last_n_dims(
                 attn_out, cos_for_tokens, sin_for_tokens, rope_dim, inverse=True
+            )
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
+    def forward_decode_ragged(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        n_compressed_max: int | None = None,
+    ) -> torch.Tensor:
+        """One ragged CSA decode step: B requests, each at its own `positions[b]`.
+
+        Per-request counterpart of `forward_decode`: HCA-style SWA scatter + main
+        overlap-compressor ragged step, plus the LightningIndexer's per-row masked
+        top-k pick over the compressed history. `n_compressed_max`
+        (= `max_b (positions[b] + 1) // m`) is the shared width of the valid
+        compressed prefix; the indexer masks each row's not-yet-valid blocks.
+        Returns `(B, 1, hidden_size)`; advances no counter.
+        """
+        batch_size, seqlen_in, _ = hidden_state.shape
+        if seqlen_in != 1:
+            raise ValueError(f"forward_decode_ragged expects seqlen=1, got {seqlen_in}")
+        if positions.shape != (batch_size,):
+            raise ValueError(f"positions shape {tuple(positions.shape)} != (B={batch_size},)")
+        num_heads_local = self.num_heads_local
+        kv_head_dim = self.kv_head_dim
+        rope_dim = self.rope_head_dim
+        window_size = self.window_size
+        m = self.compression_ratio
+
+        layer_state = state_cache.layer(layer_idx)
+        if layer_state.indexer is None:
+            raise ValueError(
+                f"layer {layer_idx}: state_cache must be allocated with an indexer "
+                "(IndexerStateSpec) for CSA decode"
+            )
+        positions = positions.to(torch.int64)
+        rows = torch.arange(batch_size, device=hidden_state.device)
+
+        # ---- Q low-rank latent (shared with the indexer), full Q, q-norm, RoPE ----
+        q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
+        q = self.q_b_proj(q_lora_latent).view(batch_size, 1, num_heads_local, kv_head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_for_token, sin_for_token = token_position_embeddings
+        if rope_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, rope_dim)
+
+        # ---- New SWA KV: scatter each row to pos % n_win ----
+        new_swa_kv = self.kv_norm(self.swa_kv_proj(hidden_state))
+        if rope_dim > 0:
+            new_swa_kv = apply_partial_rope_last_n_dims(
+                new_swa_kv, cos_for_token, sin_for_token, rope_dim
+            )
+        layer_state.swa_kv[rows, positions % window_size] = new_swa_kv.squeeze(1).to(
+            layer_state.swa_kv.dtype
+        )
+
+        # ---- Main compressor ragged step (overlap); write flushed blocks per row ----
+        flushed_main, flush_mask = self.compressor.forward_decode_step_ragged(
+            hidden_state,
+            positions=positions,
+            cmp_kv_state=layer_state.cmp_kv_state,
+            cmp_score_state=layer_state.cmp_score_state,
+            block_position_embeddings=block_position_embeddings,
+        )
+        if bool(flush_mask.any()):
+            write_slots = positions[flush_mask] // m
+            if int(write_slots.max()) >= layer_state.compressed_kv.shape[1]:
+                raise RuntimeError(
+                    f"layer {layer_idx}: main compressed history overflow at block "
+                    f"{int(write_slots.max())}; raise max_n_compressed"
+                )
+            layer_state.compressed_kv[rows[flush_mask], write_slots] = (
+                flushed_main[flush_mask].squeeze(1).to(layer_state.compressed_kv.dtype)
+            )
+
+        if n_compressed_max is None:
+            n_compressed_max = int(((positions + 1) // m).max())
+
+        # ---- Indexer ragged step: per-row masked top-k into the compressed history ----
+        indexer_topk_idxs = self.indexer.forward_decode_step_ragged(
+            hidden_state,
+            q_lora_latent,
+            positions=positions,
+            indexer_state=layer_state.indexer,
+            token_position_embeddings=token_position_embeddings,
+            block_position_embeddings=block_position_embeddings,
+            compressed_offset=window_size,
+            n_compressed_max=n_compressed_max,
+        )  # (B, 1, actual_top_k)
+
+        # ---- full_kv + per-row window indices, then one batched MQA-with-sink ----
+        full_kv = torch.cat(
+            [layer_state.swa_kv, layer_state.compressed_kv[:, :n_compressed_max]], dim=1
+        )
+        window_topk_idxs = _build_window_decode_topk_idxs_ragged(
+            window_size=window_size, positions=positions, device=hidden_state.device
+        ).unsqueeze(1)  # (B, 1, n_win)
+        topk_idxs = torch.cat([window_topk_idxs, indexer_topk_idxs], dim=-1).contiguous()
+
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=full_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+        if rope_dim > 0:
+            attn_out = apply_partial_rope_last_n_dims(
+                attn_out, cos_for_token, sin_for_token, rope_dim, inverse=True
             )
         out: torch.Tensor = self.grouped_output(attn_out)
         return out

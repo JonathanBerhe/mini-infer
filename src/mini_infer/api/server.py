@@ -44,7 +44,7 @@ from mini_infer.scheduler import (
     ContinuousScheduler,
     Request,
     RequestHandle,
-    StateCacheScheduler,
+    StateCacheCohortScheduler,
 )
 from mini_infer.workers import PDScheduler
 
@@ -102,13 +102,14 @@ async def _verify_auth(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_name = os.environ.get("MINI_INFER_MODEL", DEFAULT_MODEL)
-    scheduler: ContinuousScheduler | PDScheduler | StateCacheScheduler
+    scheduler: ContinuousScheduler | PDScheduler | StateCacheCohortScheduler
     if architecture_uses_state_cache(model_name):
-        # StateCache models (DeepSeek-V4) don't use PagedKVCache; serve them
-        # one request at a time via the StateCacheScheduler. PD / continuous
+        # StateCache models (DeepSeek-V4) don't use PagedKVCache; serve them via
+        # the StateCacheCohortScheduler, which batches equal-length / same-sampling
+        # requests through one lockstep forward. PD / packed-varlen continuous
         # batching don't apply to the per-request StateCache path.
-        logger.info("Backing /v1/completions with StateCacheScheduler for %s", model_name)
-        scheduler = StateCacheScheduler(StateCacheGenerator.from_pretrained(model_name))
+        logger.info("Backing /v1/completions with StateCacheCohortScheduler for %s", model_name)
+        scheduler = StateCacheCohortScheduler(StateCacheGenerator.from_pretrained(model_name))
     else:
         runner = ModelRunner.from_pretrained(model_name)
         if _USE_PD:
@@ -151,7 +152,7 @@ async def completions(
     fastapi_req: FastAPIRequest,
     _auth: None = Depends(_verify_auth),
 ) -> StreamingResponse | CompletionResponse:
-    scheduler: ContinuousScheduler | PDScheduler | StateCacheScheduler = (
+    scheduler: ContinuousScheduler | PDScheduler | StateCacheCohortScheduler = (
         fastapi_req.app.state.scheduler
     )
     internal = Request(

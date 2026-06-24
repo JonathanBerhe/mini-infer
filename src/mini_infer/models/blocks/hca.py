@@ -166,6 +166,60 @@ def _build_hca_decode_topk_idxs(
     return torch.cat([window_idxs, compressed_idxs]).to(torch.int64)
 
 
+def _build_window_decode_topk_idxs_ragged(
+    *,
+    window_size: int,
+    positions: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-request circular sliding-window gather indices, `(B, window_size)` int64.
+
+    Vectorized counterpart of `_build_window_decode_topk_idxs`; shared by ragged
+    SWA and ragged HCA/CSA decode. Row `b` is at position `positions[b]`:
+      - full buffer (`pos >= window_size - 1`): slot `j` is `(pos % win + 1 + j) % win`
+        (the circular wrap, all valid);
+      - partial (`pos < window_size - 1`): slot `j` is `j` if `j <= pos` else `-1`.
+    """
+    positions = positions.to(torch.int64)
+    pos_col = positions.unsqueeze(1)  # (B, 1)
+    neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
+    window_j = torch.arange(window_size, device=device, dtype=torch.int64).unsqueeze(0)  # (1, win)
+    pos_mod = (positions % window_size).unsqueeze(1)  # (B, 1)
+    full = pos_col >= (window_size - 1)  # (B, 1)
+    full_idx = (pos_mod + 1 + window_j) % window_size  # (B, win)
+    partial_idx = torch.where(window_j <= pos_col, window_j, neg_one)  # (B, win)
+    return torch.where(full, full_idx, partial_idx)  # (B, win)
+
+
+def _build_hca_decode_topk_idxs_ragged(
+    *,
+    window_size: int,
+    compression_ratio: int,
+    positions: torch.Tensor,
+    n_compressed_max: int,
+    compressed_offset: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-request gather indices for one ragged HCA decode step.
+
+    Vectorized counterpart of `_build_hca_decode_topk_idxs`: returns
+    `(B, window_size + n_compressed_max)` int64 where row `b` is at position
+    `positions[b]`. The window section is that row's circular-buffer order (via
+    `_build_window_decode_topk_idxs_ragged`); the compressed section is
+    `arange(0, (positions[b] + 1) // m) + compressed_offset`, `-1`-padded to
+    `n_compressed_max` so every row shares one tensor width.
+    """
+    positions = positions.to(torch.int64)
+    neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
+    window_idxs = _build_window_decode_topk_idxs_ragged(
+        window_size=window_size, positions=positions, device=device
+    )
+    n_valid = (positions + 1) // compression_ratio  # (B,)
+    cmp_k = torch.arange(n_compressed_max, device=device, dtype=torch.int64).unsqueeze(0)
+    cmp_idxs = torch.where(cmp_k < n_valid.unsqueeze(1), cmp_k + compressed_offset, neg_one)
+    return torch.cat([window_idxs, cmp_idxs], dim=1).to(torch.int64)
+
+
 def _build_hca_topk_idxs(
     *,
     seqlen: int,
@@ -624,5 +678,115 @@ class HCAAttention(nn.Module):
             attn_out = apply_partial_rope_last_n_dims(attn_out, cos_t, sin_t, rd, inverse=True)
 
         # ---- Grouped output projection ----
+        out: torch.Tensor = self.grouped_output(attn_out)
+        return out
+
+    def forward_decode_ragged(
+        self,
+        hidden_state: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        state_cache: StateCache,
+        layer_idx: int,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        n_compressed_max: int | None = None,
+    ) -> torch.Tensor:
+        """One ragged decode step: B requests, each at its own `positions[b]`.
+
+        The per-request counterpart of `forward_decode`. Reads and writes each
+        row's own SWA slot (`positions[b] % n_win`), runs the ragged compressor
+        (which flushes only the rows that close a block this step), and builds
+        per-row gather indices so one batched MQA-with-sink serves the whole
+        cohort even though the rows sit at different positions.
+
+        Args mirror `forward_decode`, except `start_pos: int` becomes
+        `positions: (B,) int64` and the RoPE tensors are genuinely per-row:
+            token_position_embeddings: `(cos, sin)`, each `(B, 1, rope_head_dim)`
+                for each row's own position.
+            block_position_embeddings: `(cos, sin)`, each `(B, 1, rope_head_dim)`
+                for each row's block position `(positions // m) * m`. Required
+                iff `rope_head_dim > 0`; non-flushing rows ignore their entry.
+            n_compressed_max: optional precomputed `max_b((positions[b] + 1) // m)`.
+                The scheduler tracks positions on the host and passes it to avoid
+                a device sync; omitted (e.g. in tests) it is derived with `.max()`.
+
+        Returns `(B, 1, hidden_size)`. Does NOT advance any counter; the caller
+        owns `positions`.
+        """
+        bsz, seqlen_in, _ = hidden_state.shape
+        if seqlen_in != 1:
+            raise ValueError(f"forward_decode_ragged expects seqlen=1, got {seqlen_in}")
+        if positions.shape != (bsz,):
+            raise ValueError(f"positions shape {tuple(positions.shape)} != (B={bsz},)")
+        n_h_local = self.num_heads_local
+        c = self.kv_head_dim
+        rd = self.rope_head_dim
+        n_win = self.window_size
+        m = self.compression_ratio
+
+        state = state_cache.layer(layer_idx)
+        positions = positions.to(torch.int64)
+        rows = torch.arange(bsz, device=hidden_state.device)
+
+        # ---- Q (identical to scalar decode; cos/sin are already per-row) ----
+        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
+        q = self.q_b_proj(q_latent).view(bsz, 1, n_h_local, c)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
+            q.dtype
+        )
+        cos_t, sin_t = token_position_embeddings
+        if rd > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rd)
+
+        # ---- New SWA KV: project + norm + RoPE; scatter each row to pos % n_win ----
+        new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))
+        if rd > 0:
+            new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rd)
+        state.swa_kv[rows, positions % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
+
+        # ---- Ragged compressor step: flushes only the rows that close a block ----
+        compressed, flush_mask = self.compressor.forward_decode_step_ragged(
+            hidden_state,
+            positions=positions,
+            cmp_kv_state=state.cmp_kv_state,
+            cmp_score_state=state.cmp_score_state,
+            block_position_embeddings=block_position_embeddings,
+        )
+        if bool(flush_mask.any()):
+            write_slots = positions[flush_mask] // m
+            if int(write_slots.max()) >= state.compressed_kv.shape[1]:
+                raise RuntimeError(
+                    f"layer {layer_idx}: compressed history overflow at block "
+                    f"{int(write_slots.max())}; raise max_n_compressed"
+                )
+            state.compressed_kv[rows[flush_mask], write_slots] = (
+                compressed[flush_mask].squeeze(1).to(state.compressed_kv.dtype)
+            )
+
+        # ---- full_kv: SWA window ; compressed history to the widest valid prefix ----
+        if n_compressed_max is None:
+            n_compressed_max = int(((positions + 1) // m).max())
+        full_kv = torch.cat([state.swa_kv, state.compressed_kv[:, :n_compressed_max]], dim=1)
+
+        # ---- Per-row gather indices, then one batched MQA-with-sink ----
+        topk_idxs = _build_hca_decode_topk_idxs_ragged(
+            window_size=n_win,
+            compression_ratio=m,
+            positions=positions,
+            n_compressed_max=n_compressed_max,
+            compressed_offset=n_win,
+            device=hidden_state.device,
+        ).unsqueeze(1)  # (B, 1, n_win + n_compressed_max)
+
+        attn_out = hca_mqa_with_sink(
+            q=q,
+            kv=full_kv,
+            sink_logits=self.sink.sink_logits,
+            topk_idxs=topk_idxs,
+            softmax_scale=self.softmax_scale,
+        )
+        if rd > 0:
+            attn_out = apply_partial_rope_last_n_dims(attn_out, cos_t, sin_t, rd, inverse=True)
         out: torch.Tensor = self.grouped_output(attn_out)
         return out
