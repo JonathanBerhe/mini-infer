@@ -1,7 +1,7 @@
 # ADR-019: Continuous batching for DeepSeek-V4 via a paged state pool
 
 Date: 2026-06-23
-Status: Proposed; Phase 0 implemented 2026-06-23 (Phases 1-3 not started)
+Status: Accepted. Lockstep cohort + full ragged continuous batching implemented and GPU-benchmarked 2026-06-24 (Phase 3 kernel/prefix-sharing optimizations not done).
 
 ## Context
 
@@ -173,14 +173,40 @@ GPU is only for throughput numbers.
   on gloo/CPU (batched output == each request run alone, token-for-token); the
   batched attention math itself is already reference-anchored at B=2 by the
   existing decode-parity tests.
-- **Phase 1 (about 1-2 weeks):** paged V4 streams + per-request positions +
-  ragged decode for **HCA only** (no indexer), validated vs the single-stream
-  oracle.
-- **Phase 2 (about 1-2 weeks):** **CSA** ragged (the indexer top-k masking is
-  the risk) + scheduler wiring into `ContinuousScheduler` + chunked-prefill
-  admission.
-- **Phase 3 (optional):** fast kernel backend (a) behind interface (b); V4
-  prefix sharing via `PrefixCache` on the compressed stream.
+- **Phases 1-2 (DONE 2026-06-24): ragged continuous batching, all modes.**
+  Built differently from the sketch above, and more simply: it turned out the
+  paged `BlockPool` streams were NOT needed. The per-request `StateCache` already
+  carries a batch dim, and every counter (`n_compressed_blocks`, `swa_count`,
+  write slots) derives from position, so ragged decode needed only per-request
+  `positions` plus per-row scatter/gather and a per-row masked indexer top-k, not
+  a cache rewrite. Shipped: `forward_decode_ragged` on SWA / HCA / CSA, ragged
+  `forward_decode_step` on the compressor + LightningIndexer, threaded through
+  `DeepseekV4ForCausalLM.forward_decode_with_cache_ragged`; a new
+  `StateCacheContinuousScheduler` (single-process dynamic admit/evict, NOT a reuse
+  of the packed-varlen `ContinuousScheduler`) and `TensorParallelStateCacheContinuousServer`
+  (TP leader/follower). Parity self-validated token-for-token vs single-stream
+  scalar on CPU + gloo (the reference is lockstep-only, so no ragged anchor, as
+  predicted). Chunked-prefill admission was not needed (admit prefills a whole
+  prompt into a free slot).
+- **Phase 3 (not done):** the fast fused-kernel backend and cross-request prefix
+  sharing remain future. Prefix sharing is the one place the deferred paged
+  compressed-stream design would still pay off; revisit if it becomes a workload.
+
+## Benchmark (2026-06-24, real V4-Flash, 2x B200, TP)
+
+`scripts/modal_v4_flash_cb_bench.py`, 16 requests x 64 tokens, ragged continuous
+batching vs one-at-a-time, identical output:
+
+| path | wall | throughput |
+|---|---|---|
+| one-at-a-time | 298.5 s | 3.4 tok/s |
+| ragged continuous batching | 82.9 s | 12.3 tok/s |
+
+**3.60x throughput.** This is a readable (unfused) implementation, so absolute
+tok/s is low (a ~158 GB MoE on a PyTorch path); the relative speedup is the
+result, consistent with the project not competing on absolute throughput. A fused
+attention/MoE path (Phase 3) would shift the decode toward memory-bound and raise
+the speedup further.
 
 ## Alternatives Considered
 
