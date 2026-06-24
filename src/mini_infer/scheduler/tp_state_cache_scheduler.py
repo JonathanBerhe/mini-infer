@@ -1,7 +1,8 @@
 """Rank-0 scheduler for tensor-parallel StateCache serving (DeepSeek-V4-Flash).
 
 Runs only on the leader (rank 0). Same start / stop / submit / run / stream
-interface as `StateCacheScheduler`, so the HTTP endpoint is unchanged, but it
+interface as the other schedulers (`ContinuousScheduler`,
+`StateCacheContinuousScheduler`), so the HTTP endpoint is unchanged, but it
 drives a `TensorParallelStateCacheServer`: each request's generation runs in
 lockstep across all ranks (the leader broadcasts the prompt and each sampled
 token). Requests are served one at a time, since TP generation is inherently a

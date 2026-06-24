@@ -11,6 +11,7 @@ exercised under continuous batching.
 
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -18,6 +19,7 @@ import torch
 
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
+from mini_infer.models import architecture_uses_state_cache
 from mini_infer.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
 from mini_infer.scheduler import Request, StateCacheContinuousScheduler
 
@@ -145,3 +147,21 @@ def test_rejects_invalid_sizes() -> None:
         StateCacheContinuousScheduler(gen, max_batch_size=0)
     with pytest.raises(ValueError, match="max_seq_len"):
         StateCacheContinuousScheduler(gen, max_seq_len=0)
+
+
+# ---------- server routing detection (V4 -> StateCache path) ----------
+
+
+def test_architecture_uses_state_cache_detects_v4(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["DeepseekV4ForCausalLM"]}))
+    assert architecture_uses_state_cache(str(tmp_path)) is True
+
+
+def test_architecture_uses_state_cache_false_for_paged_model(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["Qwen2ForCausalLM"]}))
+    assert architecture_uses_state_cache(str(tmp_path)) is False
+
+
+def test_architecture_uses_state_cache_false_for_unknown_arch(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["MysteryForCausalLM"]}))
+    assert architecture_uses_state_cache(str(tmp_path)) is False
