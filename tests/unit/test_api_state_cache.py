@@ -3,7 +3,7 @@
 The HTTP layer (`/v1/completions`, SSE) is common to all of mini-infer and is
 already covered for the PagedKVCache path. What is V4-specific is the scheduler
 behind it. This drives the REAL `completions` endpoint and the REAL
-`StateCacheCohortScheduler` (the server's default for V4) end to end (HTTP ->
+`StateCacheContinuousScheduler` (the server's default for V4) end to end (HTTP ->
 endpoint -> scheduler -> `StateCacheGenerator` -> response) over a small
 synthetic V4, so no real model,
 no tokenizer download, and no GPU are needed. Serving a 2-GPU model (V4-Flash)
@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 from mini_infer.api.server import _unhandled_exception_handler, completions
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
 from mini_infer.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
-from mini_infer.scheduler import StateCacheCohortScheduler
+from mini_infer.scheduler import StateCacheContinuousScheduler
 
 
 def _make_config() -> DeepseekV4Config:
@@ -74,8 +74,10 @@ def v4_client() -> Iterator[TestClient]:
     cfg = _make_config()
     torch.manual_seed(0)
     model = DeepseekV4ForCausalLM(cfg).eval()
-    scheduler = StateCacheCohortScheduler(  # type: ignore[arg-type]
-        StateCacheGenerator(model, _FakeTokenizer(cfg.vocab_size))
+    scheduler = StateCacheContinuousScheduler(  # type: ignore[arg-type]
+        StateCacheGenerator(model, _FakeTokenizer(cfg.vocab_size)),
+        max_batch_size=4,
+        max_seq_len=64,
     )
     scheduler.start()
 

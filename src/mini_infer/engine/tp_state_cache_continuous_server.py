@@ -96,9 +96,10 @@ class TensorParallelStateCacheContinuousServer:
 
     # ---- shared per-rank forwards (run on leader AND followers) ----
 
-    def _run_prefill(self, prompt_ids: list[int], slot_idx: int) -> int | None:
+    def _run_prefill(self, prompt_ids: list[int], slot_idx: int) -> torch.Tensor | None:
         """Prefill `prompt_ids` in a temp one-row cache, copy that row into batched
-        row `slot_idx`. Returns the sampled first token on the leader, else None."""
+        row `slot_idx`. Returns the last-position logits on the leader (the caller
+        samples the first token, honoring per-request params), else None."""
         temp = StateCache(
             build_state_cache_layer_specs(self._model.cfg, max_seq_len=self.max_seq_len),
             batch_size=1,
@@ -110,7 +111,7 @@ class TensorParallelStateCacheContinuousServer:
             logits = self._model.forward_prefill_with_cache(input_ids, state_cache=temp)
         self._copy_row(temp, dst=slot_idx)
         if self.is_leader:
-            return sample(logits[0, -1, :], SamplingParams(temperature=0.0))
+            return logits[0, -1, :]
         return None
 
     def _copy_row(self, src_cache: StateCache, *, dst: int) -> None:
@@ -134,6 +135,27 @@ class TensorParallelStateCacheContinuousServer:
             return self._model.forward_decode_with_cache_ragged(
                 input_ids, positions=position_tensor, state_cache=self._cache
             )
+
+    # ---- leader-driven operations (broadcast, then run; followers mirror) ----
+
+    def prefill_into_slot(self, prompt_ids: list[int], slot_idx: int) -> torch.Tensor:
+        """Leader: prefill `prompt_ids` into batched-cache row `slot_idx`, return the
+        last-position logits (the caller samples the first token). Broadcasts so
+        followers mirror the prefill + row copy.
+
+        A scheduler drives this (and `decode_batch`) to run dynamic continuous
+        batching across ranks without owning the cache itself.
+        """
+        self._broadcast(("prefill", slot_idx, prompt_ids))
+        logits = self._run_prefill(prompt_ids, slot_idx)
+        assert logits is not None  # only None on followers, which never call this
+        return logits
+
+    def decode_batch(self, input_tokens: list[int], positions: list[int]) -> torch.Tensor:
+        """Leader: run one ragged decode step over the whole batch, return logits
+        `(max_batch_size, 1, vocab)`. Broadcasts so followers mirror it."""
+        self._broadcast(("decode", input_tokens, positions))
+        return self._run_decode(input_tokens, positions)
 
     # ---- leader-driven cohort generation ----
 
@@ -163,18 +185,16 @@ class TensorParallelStateCacheContinuousServer:
             raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
 
         cohort_size = len(prompts)
+        params = SamplingParams(temperature=0.0)
         positions = [0] * cohort_size
         next_tokens = [0] * cohort_size
         for slot_idx, prompt_ids in enumerate(prompts):
-            self._broadcast(("prefill", slot_idx, prompt_ids))
-            first_token = self._run_prefill(prompt_ids, slot_idx)
-            assert first_token is not None
-            next_tokens[slot_idx] = first_token
+            prefill_logits = self.prefill_into_slot(prompt_ids, slot_idx)
+            next_tokens[slot_idx] = sample(prefill_logits, params)
             positions[slot_idx] = len(prompt_ids)
 
         outputs: list[list[int]] = [[] for _ in range(cohort_size)]
         done = [False] * cohort_size
-        params = SamplingParams(temperature=0.0)
         while True:
             decode_slots: list[int] = []
             for slot_idx in range(cohort_size):
@@ -195,8 +215,7 @@ class TensorParallelStateCacheContinuousServer:
             for slot_idx in decode_slots:
                 input_tokens[slot_idx] = next_tokens[slot_idx]
                 decode_positions[slot_idx] = positions[slot_idx]
-            self._broadcast(("decode", input_tokens, decode_positions))
-            logits = self._run_decode(input_tokens, decode_positions)
+            logits = self.decode_batch(input_tokens, decode_positions)
             for slot_idx in decode_slots:
                 next_tokens[slot_idx] = sample(logits[slot_idx, -1, :], params)
                 positions[slot_idx] += 1

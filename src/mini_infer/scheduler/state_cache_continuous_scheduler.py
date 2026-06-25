@@ -8,11 +8,10 @@ running batch (`forward_decode_with_cache_ragged`), so requests of different
 lengths, at different points in their own generation, share the model weights
 and attention kernels.
 
-Contrast with the other StateCache schedulers:
-  - `StateCacheScheduler`: one request at a time.
-  - `StateCacheCohortScheduler`: lockstep cohorts (equal-length, no mid-flight
-    join / leave).
-  - this one: ragged, per-request positions, dynamic admit / evict.
+This is the StateCache (DeepSeek-V4) counterpart to the packed-varlen
+`ContinuousScheduler` that serves PagedKVCache models: same idea (a running batch
+with dynamic admit / evict), but each request sits at its own position and the
+batch steps through one ragged forward rather than appending to a paged KV cache.
 
 The decode runs over all `max_batch_size` rows of a single batched `StateCache`.
 Free rows compute throwaway output the engine ignores; a later admit overwrites
