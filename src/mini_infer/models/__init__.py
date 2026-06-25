@@ -102,8 +102,8 @@ def architecture_uses_state_cache(name: str) -> bool:
     Reads `config.json`'s `architectures[0]` directly (transformers drops
     V4-only fields when building a fallback config, but `architectures` is
     preserved) and checks the registered class's `USES_STATE_CACHE` marker.
-    The API server uses this to route V4 to the StateCacheScheduler. Returns
-    False (the PagedKVCache path) if the architecture is unregistered.
+    The API server uses this to route V4 to the StateCacheContinuousScheduler.
+    Returns False (the PagedKVCache path) if the architecture is unregistered.
     """
     import json
     from pathlib import Path
