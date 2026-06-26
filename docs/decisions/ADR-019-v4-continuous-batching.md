@@ -1,7 +1,7 @@
 # ADR-019: Continuous batching for DeepSeek-V4 via a paged state pool
 
 Date: 2026-06-23
-Status: Accepted. Lockstep cohort + full ragged continuous batching implemented and GPU-benchmarked 2026-06-24 (Phase 3 kernel/prefix-sharing optimizations not done).
+Status: Accepted. Lockstep cohort + full ragged continuous batching implemented and GPU-benchmarked 2026-06-24. Cross-request prefix sharing later shipped; a fused decode-attention kernel was prototyped and rejected. See ADR-020.
 
 ## Context
 
@@ -188,9 +188,12 @@ GPU is only for throughput numbers.
   scalar on CPU + gloo (the reference is lockstep-only, so no ragged anchor, as
   predicted). Chunked-prefill admission was not needed (admit prefills a whole
   prompt into a free slot).
-- **Phase 3 (not done):** the fast fused-kernel backend and cross-request prefix
-  sharing remain future. Prefix sharing is the one place the deferred paged
-  compressed-stream design would still pay off; revisit if it becomes a workload.
+- **Phase 3 (resolved, ADR-020):** cross-request prefix sharing is implemented
+  and wired into serving (bit-exact). A fused decode-attention kernel was
+  prototyped but rejected: it gave ~0% end-to-end on V4-Flash (the MoE dominates
+  decode, attention is a thin slice) and diverged token-for-token from the
+  bit-parity path. The deferred paged compressed-stream design is still the
+  eventual target for prefix sharing; v1 copies snapshots.
 
 ## Benchmark (2026-06-24, real V4-Flash, 2x B200, TP)
 
