@@ -38,6 +38,7 @@ from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import MLAAttention, RMSNorm, RotaryEmbedding, SwiGLU
 from mini_infer.models.blocks.glm_dsa_indexer import GlmDsaIndexer
 from mini_infer.models.blocks.glm_moe_gate import GlmMoeFFN
+from mini_infer.quant.nvfp4 import dequantize_block_fp8_to_bf16_partial
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -73,6 +74,9 @@ class GlmMoeDsaConfig:
     # Per-layer markers: "dense"/"sparse" FFN and "full"/"shared" indexer.
     mlp_layer_types: tuple[str, ...]
     indexer_types: tuple[str, ...]
+    # "bf16" dequantizes an FP8 checkpoint fully; "fp8" keeps routed experts
+    # e4m3-resident (dequant per-call) so the 753B checkpoint fits one node.
+    expert_dtype: str = "bf16"
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> GlmMoeDsaConfig:
@@ -84,6 +88,15 @@ class GlmMoeDsaConfig:
         # HF's config always populates these (defaults derived in __post_init__).
         mlp_types = tuple(getattr(hf_config, "mlp_layer_types", None) or ["sparse"] * num_layers)
         idx_types = tuple(getattr(hf_config, "indexer_types", None) or ["full"] * num_layers)
+        # Native-FP8 checkpoints carry a quantization_config; keep their routed
+        # experts e4m3-resident so the full model fits a single node.
+        quant = getattr(hf_config, "quantization_config", None)
+        quant_method = (
+            quant.get("quant_method")
+            if isinstance(quant, dict)
+            else getattr(quant, "quant_method", None)
+        )
+        expert_dtype = "fp8" if quant_method == "fp8" else "bf16"
         return cls(
             vocab_size=hf_config.vocab_size,
             hidden_size=hf_config.hidden_size,
@@ -112,6 +125,7 @@ class GlmMoeDsaConfig:
             index_n_heads=hf_config.index_n_heads,
             mlp_layer_types=mlp_types,
             indexer_types=idx_types,
+            expert_dtype=expert_dtype,
         )
 
     @property
@@ -171,6 +185,7 @@ class _GlmMoeDsaDecoderLayer(nn.Module):
                 topk_group=cfg.topk_group,
                 norm_topk_prob=cfg.norm_topk_prob,
                 routed_scaling_factor=cfg.routed_scaling_factor,
+                expert_dtype=cfg.expert_dtype,
             )
         else:
             self.mlp = SwiGLU(cfg.hidden_size, cfg.intermediate_size)
@@ -240,22 +255,10 @@ _EXPERT_DOWN_RE = re.compile(r"^(model\.layers\.\d+)\.mlp\.experts\.down_proj$")
 _PER_EXPERT_RE = re.compile(
     r"^(model\.layers\.\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
 )
+_PER_EXPERT_SCALE_RE = re.compile(
+    r"^(model\.layers\.\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight_scale_inv$"
+)
 _PER_EXPERT_W = {"gate": "w1", "up": "w3", "down": "w2"}
-
-
-def _dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
-    """Dequantize a block-FP8 (e4m3) weight to BF16, handling partial blocks.
-
-    The published checkpoint quantizes 2-D weights in `block x block` tiles with
-    a per-tile scale; some weights (e.g. `kv_a_proj_with_mqa`, 576 rows) are not a
-    multiple of `block`, so the scale grid is `ceil(M/block) x ceil(N/block)` with
-    partial last tiles. Expand the scale by `block` along each axis, then crop to
-    the weight shape. (mini_infer.quant.dequantize_block_fp8_to_bf16 assumes exact
-    divisibility, so this ceil-aware variant lives here.)
-    """
-    rows, cols = weight.shape
-    expanded = scale.float().repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
-    return (weight.float() * expanded[:rows, :cols]).to(torch.bfloat16)
 
 
 @register_model
@@ -347,17 +350,27 @@ class GlmMoeDsaForCausalLM(BaseCausalLM):
         local_start = get_rank() * per_rank
         local_end = local_start + per_rank
 
-        # Pass 1: block-FP8 dequant. The published checkpoint ships e4m3 weights
-        # paired with a `.weight_scale_inv` per-block scale; dequantize to BF16
-        # and drop the scale companion. Synthetic / HF in-memory state_dicts are
-        # BF16 with no scales, so this is a pass-through for them.
+        keep_fp8 = cfg.expert_dtype == "fp8"
+
+        # Pass 1: block-FP8 dequant. e4m3 weights pair with a `.weight_scale_inv`
+        # per-block scale. Non-expert weights (attention/dense/shared/indexer)
+        # dequantize to BF16 and drop the scale. When expert_dtype="fp8", routed
+        # experts stay e4m3-resident: keep the weight AND propagate its scale so
+        # Pass 2 routes both onto the Fp8Expert buffers. Synthetic / HF in-memory
+        # state_dicts are BF16 with no scales, so this is a pass-through there.
         dequantized: dict[str, torch.Tensor] = {}
         for key, tensor in hf_state_dict.items():
             if key.endswith(".weight_scale_inv"):
-                continue  # consumed by its paired weight
+                paired = key[: -len("_scale_inv")]  # X.weight_scale_inv -> X.weight
+                if keep_fp8 and _PER_EXPERT_RE.match(paired):
+                    dequantized[key] = tensor  # propagate routed-expert scale
+                continue  # else consumed by the paired weight's dequant
             scale = hf_state_dict.get(key + "_scale_inv") if key.endswith(".weight") else None
             if scale is not None and tensor.dtype == torch.float8_e4m3fn:
-                dequantized[key] = _dequant_block_fp8(tensor, scale)
+                if keep_fp8 and _PER_EXPERT_RE.match(key):
+                    dequantized[key] = tensor  # keep routed expert e4m3-resident
+                else:
+                    dequantized[key] = dequantize_block_fp8_to_bf16_partial(tensor, scale)
             else:
                 dequantized[key] = tensor
 
@@ -402,7 +415,23 @@ class GlmMoeDsaForCausalLM(BaseCausalLM):
                     continue  # off-rank expert (expert-parallel)
                 local_j = global_j - local_start
                 w_name = _PER_EXPERT_W[per_expert.group(3)]
-                remapped[f"{prefix}.mlp.experts.{local_j}.{w_name}.weight"] = tensor
+                if keep_fp8:
+                    # e4m3-resident -> Fp8Expert buffer `w{n}` (no `.weight`).
+                    remapped[f"{prefix}.mlp.experts.{local_j}.{w_name}"] = tensor
+                else:
+                    remapped[f"{prefix}.mlp.experts.{local_j}.{w_name}.weight"] = tensor
+                continue
+            per_expert_scale = _PER_EXPERT_SCALE_RE.match(key)
+            if per_expert_scale is not None:
+                # Routed-expert block scale (propagated only when expert_dtype="fp8")
+                # -> Fp8Expert buffer `w{n}_scale`.
+                prefix = per_expert_scale.group(1)
+                global_j = int(per_expert_scale.group(2))
+                if not (local_start <= global_j < local_end):
+                    continue
+                local_j = global_j - local_start
+                w_name = _PER_EXPERT_W[per_expert_scale.group(3)]
+                remapped[f"{prefix}.mlp.experts.{local_j}.{w_name}_scale"] = tensor
                 continue
             new_key = key
             for pattern, replacement in _SHARED_EXPERT_RENAME:

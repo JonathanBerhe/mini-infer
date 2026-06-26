@@ -30,6 +30,7 @@ from torch.nn import functional
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.fp8_expert import Fp8Expert
 from mini_infer.models.blocks.mixtral_moe import MixtralExpert
 
 
@@ -124,6 +125,7 @@ class GlmMoeFFN(nn.Module):
         topk_group: int = 1,
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 1.0,
+        expert_dtype: str = "bf16",
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -143,9 +145,13 @@ class GlmMoeFFN(nn.Module):
             norm_topk_prob=norm_topk_prob,
             routed_scaling_factor=routed_scaling_factor,
         )
-        # Local routed experts only (this rank's contiguous slice).
+        # Local routed experts only (this rank's contiguous slice). "fp8" keeps
+        # them e4m3-resident (dequant per-call); "bf16" is the dequantized path.
+        if expert_dtype not in ("bf16", "fp8"):
+            raise ValueError(f"expert_dtype must be 'bf16' or 'fp8'; got {expert_dtype!r}")
+        expert_cls = Fp8Expert if expert_dtype == "fp8" else MixtralExpert
         self.experts = nn.ModuleList(
-            [MixtralExpert(hidden_size, moe_intermediate_size) for _ in range(num_experts_per_rank)]
+            [expert_cls(hidden_size, moe_intermediate_size) for _ in range(num_experts_per_rank)]
         )
         # Shared expert fires on every token. DeepSeek collapses N shared
         # experts into one MLP of width `N * moe_intermediate_size`; replicated.

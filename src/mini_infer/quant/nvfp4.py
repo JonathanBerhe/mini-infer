@@ -171,3 +171,35 @@ def dequantize_block_fp8_to_bf16(
     # Expand scale to per-element via repeat_interleave along both dims.
     scale_expanded = scale_fp32.repeat_interleave(block_m, dim=0).repeat_interleave(block_n, dim=1)
     return (weight_fp32 * scale_expanded).to(torch.bfloat16)
+
+
+def dequantize_block_fp8_to_bf16_partial(
+    fp8_weight: torch.Tensor,
+    fp8_scale: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+) -> torch.Tensor:
+    """Dequantize a block-FP8 e4m3 weight to BF16, allowing PARTIAL last blocks.
+
+    Like `dequantize_block_fp8_to_bf16`, but the scale grid is
+    `(ceil(M / block_M), ceil(N / block_N))` so weights whose dims are not a
+    multiple of the block size work (e.g. GLM-5.2's `kv_a_proj_with_mqa` is 576
+    rows = 4*128 + 64). The scale is expanded by `block` along each axis then
+    cropped to `(M, N)`. For exactly-divisible shapes this matches the strict
+    variant; it just does not raise on the partial case.
+    """
+    if fp8_weight.ndim != 2 or fp8_scale.ndim != 2:
+        raise ValueError(
+            f"expected 2-D weight and scale; got {tuple(fp8_weight.shape)}, "
+            f"{tuple(fp8_scale.shape)}"
+        )
+    rows, cols = fp8_weight.shape
+    block_m, block_n = block_size
+    expected = ((rows + block_m - 1) // block_m, (cols + block_n - 1) // block_n)
+    if fp8_scale.shape != expected:
+        raise ValueError(
+            f"fp8_scale shape {tuple(fp8_scale.shape)} != expected {expected} "
+            f"(block_size={block_size}, weight_shape={(rows, cols)})"
+        )
+    expanded = fp8_scale.float().repeat_interleave(block_m, dim=0).repeat_interleave(block_n, dim=1)
+    return (fp8_weight.float() * expanded[:rows, :cols]).to(torch.bfloat16)

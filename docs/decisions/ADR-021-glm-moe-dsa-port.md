@@ -79,6 +79,14 @@ What shipped:
    expert-parallel remap so each rank loads only its expert slice under TP,
    renames the shared expert, and drops the MTP layer.
 
+6. **FP8-resident experts** (`blocks/fp8_expert.py` + `GlmMoeFFN(expert_dtype=...)`):
+   `Fp8Expert` stores each routed expert's `w1/w2/w3` as e4m3 + a ceil-block scale
+   and dequantizes per matmul, so the FP8 checkpoint fits 8xH200 without the
+   ~1.5 TB BF16 blow-up. `from_hf` sets `expert_dtype="fp8"` from the checkpoint's
+   `quantization_config`; attention / dense / shared / indexer still dequantize to
+   BF16. The ceil-aware block-FP8 dequant lives in `quant/nvfp4.py`, shared by the
+   loader and `Fp8Expert`.
+
 ## Alternatives Considered
 
 **StateCache (V4-style) instead of PagedKVCache.** V4's `StateCache` is built
@@ -136,14 +144,15 @@ GLM is in scope.
   GPU-vs-CPU fp32 gap (index_add_ / scaled matmuls), so TP correctness must be
   judged against a same-device reference, not CPU.
 - The published checkpoint is **per-expert block-FP8** (~755 GB; confirmed via
-  the index with `scripts/inspect_glm_safetensors.py`). `load_weights` now
-  ingests it (ceil-aware dequant + per-expert + EP remap, validated on a
-  synthetic FP8 round-trip), and `scripts/modal_glm_stage_weights.py` stages it
-  to a Volume on a CPU-only function. But mini-infer's GLM has no FP8-resident
-  linear, so dequant-to-BF16 doubles it to ~1.5 TB, exceeding a single 8-GPU
-  node. Single-node serving therefore needs an FP8-resident path (like V4's
-  `FP4Expert`); otherwise it's multi-node BF16. So the loader is ready to
-  *ingest* the checkpoint, but a funded run still needs that further slice.
+  the index with `scripts/inspect_glm_safetensors.py`) and `load_weights`
+  ingests it (ceil-aware dequant + per-expert + EP remap). To fit a single node,
+  `expert_dtype="fp8"` keeps the routed experts (~96% of the weights)
+  e4m3-resident via `Fp8Expert` (dequant per-matmul, like V4's `FP4Expert`) while
+  attention / dense / shared / indexer dequantize to BF16, landing ~785 GB on
+  8xH200; `from_hf` selects this automatically from the checkpoint's
+  `quantization_config`. `scripts/modal_glm_stage_weights.py` stages the weights
+  on a CPU-only function. The only thing left between here and generated text is
+  the funded multi-GPU run itself (~$36/hr on 8xH200, beyond the current budget).
 
 **Trade-offs:**
 
@@ -175,6 +184,7 @@ All tests gate on the in-venv HF `glm_moe_dsa` reference via
 | TP model (CPU gloo, ws=2) | `test_glm_moe_tp_parity` | full MoE model: ranks identical, matches ws=1 (expert-parallel load) |
 | Real GPU TP (2x L4, NCCL) | `scripts/modal_glm_tp_smoke.py` | MoE config: ranks identical (diff 0); exact vs ws=1 GPU ref (cos 1.0) |
 | Block-FP8 + per-expert load | `test_glm_fp8_load` | ceil-aware dequant on partial blocks; per-expert BF16 load exact; FP8 round-trip recovers (cos > 0.97) |
+| FP8-resident experts | `test_glm_fp8_load` | Fp8Expert == dequantized MixtralExpert; fp8-resident model logits == bf16-dequant (experts stay e4m3) |
 
 ## References
 

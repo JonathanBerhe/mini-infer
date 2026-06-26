@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 
 import torch
 
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
-from mini_infer.models.glm_moe_dsa import GlmMoeDsaConfig, GlmMoeDsaForCausalLM, _dequant_block_fp8
+from mini_infer.models.blocks.fp8_expert import Fp8Expert
+from mini_infer.models.blocks.mixtral_moe import MixtralExpert
+from mini_infer.models.glm_moe_dsa import GlmMoeDsaConfig, GlmMoeDsaForCausalLM
+from mini_infer.quant.nvfp4 import dequantize_block_fp8_to_bf16_partial
 
 PROMPT = [3, 1, 4, 1, 5, 9]
 # Weights the real checkpoint FP8-quantizes (everything else stays BF16).
@@ -143,7 +147,7 @@ def test_dequant_block_fp8_handles_partial_blocks() -> None:
     w = torch.randn(192, 128)
     q, scale = _quant_block_fp8(w)
     assert scale.shape == (2, 1)  # ceil(192/128)=2, ceil(128/128)=1
-    recovered = _dequant_block_fp8(q, scale)
+    recovered = dequantize_block_fp8_to_bf16_partial(q, scale)
     assert recovered.shape == (192, 128)
     cs = torch.nn.functional.cosine_similarity(recovered.flatten().float(), w.flatten(), dim=0)
     assert float(cs) > 0.99  # e4m3 is lossy but should track closely
@@ -177,3 +181,43 @@ def test_per_expert_fp8_load_recovers_model() -> None:
         torch.nn.functional.cosine_similarity(ref_logits.flatten(), fp8_logits.flatten(), dim=0)
     )
     assert cs > 0.97, f"FP8-loaded logits drifted too far from BF16: cos={cs:.4f}"
+
+
+def test_fp8_expert_matches_dequantized_mixtral() -> None:
+    """Fp8Expert (dequant-per-call) equals a MixtralExpert holding the same
+    dequantized weights, the parity contract for the FP8-resident path."""
+    torch.manual_seed(0)
+    hidden, inter = 128, 256
+    mix = MixtralExpert(hidden, inter)
+    fp8 = Fp8Expert(hidden, inter)
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            q, scale = _quant_block_fp8(getattr(mix, name).weight.data.clone())
+            getattr(fp8, name).copy_(q)
+            getattr(fp8, f"{name}_scale").copy_(scale)
+            # MixtralExpert holds the dequantized weight so the contract is exact.
+            getattr(mix, name).weight.copy_(dequantize_block_fp8_to_bf16_partial(q, scale).float())
+    x = torch.randn(3, hidden)
+    assert torch.allclose(fp8(x), mix(x), atol=1e-5)
+
+
+def test_fp8_resident_matches_bf16_dequant() -> None:
+    """Loading the SAME per-expert FP8 checkpoint into an expert_dtype='fp8'
+    model (routed experts stay e4m3) yields logits identical to the bf16-dequant
+    path; the routed experts are verified to stay e4m3-resident."""
+    torch.manual_seed(0)
+    ckpt = _to_hf_state_dict(GlmMoeDsaForCausalLM(_make_cfg()).eval(), fp8=True)
+
+    bf16_model = GlmMoeDsaForCausalLM(_make_cfg()).eval()  # dequant-on-load (default)
+    GlmMoeDsaForCausalLM.load_weights(bf16_model, ckpt)
+
+    # expert_dtype='fp8' -> routed experts kept e4m3-resident. Do NOT .to(): that
+    # would cast the e4m3 buffers and defeat residency.
+    fp8_model = GlmMoeDsaForCausalLM(replace(_make_cfg(), expert_dtype="fp8")).eval()
+    GlmMoeDsaForCausalLM.load_weights(fp8_model, ckpt)
+
+    sparse_moe = fp8_model.model.layers[3].mlp
+    assert isinstance(sparse_moe.experts[0], Fp8Expert)
+    assert sparse_moe.experts[0].w1.dtype == torch.float8_e4m3fn  # stayed resident
+
+    assert torch.allclose(_prefill_logits(bf16_model), _prefill_logits(fp8_model), atol=1e-4)
