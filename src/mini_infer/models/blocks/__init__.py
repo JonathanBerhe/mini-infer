@@ -7,6 +7,8 @@ from mini_infer.models.blocks.geglu import GeGLU
 from mini_infer.models.blocks.gemma4_decoder_layer import Gemma4DecoderLayer
 from mini_infer.models.blocks.gemma_decoder_layer import GemmaDecoderLayer
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
+from mini_infer.models.blocks.glm_dsa_indexer import GlmDsaIndexer
+from mini_infer.models.blocks.glm_moe_gate import GlmMoeFFN, GlmNoAuxTcGate
 from mini_infer.models.blocks.gqa import GroupedQueryAttention
 from mini_infer.models.blocks.hash_routed_gate import HashRoutedGate
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
@@ -34,6 +36,9 @@ __all__ = [
     "Gemma4DecoderLayer",
     "GemmaDecoderLayer",
     "GemmaRMSNorm",
+    "GlmDsaIndexer",
+    "GlmMoeFFN",
+    "GlmNoAuxTcGate",
     "GroupedOutputProjection",
     "GroupedQueryAttention",
     "HCAAttention",
