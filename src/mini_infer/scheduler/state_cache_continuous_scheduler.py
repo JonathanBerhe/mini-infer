@@ -19,6 +19,12 @@ the row. At steady state (a full batch) there is no waste. Per-request output
 equals running that request alone through `StateCacheGenerator` (the ragged
 decode is bit-parity self-consistent with the scalar path).
 
+Pass a `StatePrefixCache` to enable cross-request prefix sharing: a request whose
+prompt extends a previously prefilled one restores that snapshot and replays only
+the new suffix, skipping the shared prefill. This touches only per-slot prefill
+(both paths leave the same row state); the decode loop is unchanged and output is
+identical.
+
 Same start / stop / submit / run / stream interface as the other schedulers.
 """
 
@@ -34,8 +40,12 @@ from collections.abc import Iterator
 import torch
 
 from mini_infer.cache.state_cache import StateCache
+from mini_infer.cache.state_prefix_cache import StatePrefixCache
 from mini_infer.engine.sampler import sample
-from mini_infer.engine.state_cache_generator import StateCacheGenerator
+from mini_infer.engine.state_cache_generator import (
+    StateCacheGenerator,
+    prefill_with_prefix_cache,
+)
 from mini_infer.models.deepseek_v4 import build_state_cache_layer_specs
 from mini_infer.scheduler.request_state import (
     FinishReason,
@@ -70,6 +80,7 @@ class StateCacheContinuousScheduler:
         *,
         max_batch_size: int = 8,
         max_seq_len: int = 2048,
+        prefix_cache: StatePrefixCache | None = None,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
@@ -81,6 +92,12 @@ class StateCacheContinuousScheduler:
         self._dtype = generator.dtype
         self._max_batch_size = max_batch_size
         self._max_seq_len = max_seq_len
+        # Opt-in cross-request prefix sharing. When set, a prompt that extends a
+        # previously prefilled one restores that snapshot and replays only the
+        # suffix, skipping the shared prefill; output is unchanged either way.
+        # Off by default: snapshotting every prefill costs memory the caller
+        # should choose to spend. Accessed only from the single engine thread.
+        self._prefix_cache = prefix_cache
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -177,10 +194,23 @@ class StateCacheContinuousScheduler:
             device=self._device,
             dtype=self._dtype,
         )
-        input_ids = torch.tensor([prompt_ids], device=self._device, dtype=torch.long)
-        with torch.inference_mode():
-            logits = self._model.forward_prefill_with_cache(input_ids, state_cache=temp)
-            first_token = sample(logits[0, -1, :], running.request.sampling_params)
+        params = running.request.sampling_params
+        if self._prefix_cache is not None:
+            # Reuse a cached prompt prefix: restore + replay only the suffix into
+            # `temp` instead of re-prefilling the shared prefix. Same end state.
+            next_logits = prefill_with_prefix_cache(
+                self._model,
+                prompt_ids,
+                state_cache=temp,
+                prefix_cache=self._prefix_cache,
+                device=self._device,
+            )
+            first_token = sample(next_logits, params)
+        else:
+            input_ids = torch.tensor([prompt_ids], device=self._device, dtype=torch.long)
+            with torch.inference_mode():
+                logits = self._model.forward_prefill_with_cache(input_ids, state_cache=temp)
+                first_token = sample(logits[0, -1, :], params)
         self._copy_row(temp, src=0, dst=slot_idx)
         self._slots[slot_idx] = _Slot(
             request=running, position=len(prompt_ids), next_token=first_token

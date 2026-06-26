@@ -17,6 +17,7 @@ import threading
 import pytest
 import torch
 
+from mini_infer.cache.state_prefix_cache import StatePrefixCache
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
 from mini_infer.models import architecture_uses_state_cache
@@ -79,6 +80,36 @@ def _greedy(prompt: str, max_tokens: int) -> Request:
     )
 
 
+class _CharTokenizer:
+    """prompt -> per-char ids, so an extended prompt shares a token-id prefix.
+
+    Unlike `_VarLenTokenizer` (whose ids depend on the whole string), this makes
+    "hello" a true token-id prefix of "hello world", which is what exercises the
+    prefix-sharing hit path.
+    """
+
+    def __init__(self, vocab_size: int, eos_token_id: int | None = None) -> None:
+        self._vocab_size = vocab_size
+        self._eos_token_id = eos_token_id
+
+    def encode(self, text: str) -> list[int]:
+        return [ord(c) % self._vocab_size for c in text]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return " ".join(str(int(t)) for t in token_ids)
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return self._eos_token_id
+
+
+def _make_char_generator() -> StateCacheGenerator:
+    cfg = _make_config()
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(cfg).eval()
+    return StateCacheGenerator(model, _CharTokenizer(cfg.vocab_size))  # type: ignore[arg-type]
+
+
 def test_continuous_matches_per_request_scalar() -> None:
     """6 requests, varied lengths + max_tokens, batch of 3 (so admit / evict)."""
     gen = _make_generator()
@@ -133,6 +164,78 @@ def test_continuous_respects_eos() -> None:
     assert eos not in result.tokens
     if len(expected) < 6:
         assert result.finish_reason == "stop"
+
+
+def test_continuous_with_prefix_sharing_matches_scalar() -> None:
+    """Prefix sharing on, shared-prefix prompts: batched output still equals
+    per-request scalar, and the snapshot cache gets populated."""
+    gen = _make_char_generator()
+    # Distinct strings, several sharing a token-id prefix ("hello" / "hi"), plus a
+    # miss ("hi"). Char tokenizer makes the shared prefixes real.
+    specs = [
+        ("hello", 4),
+        ("hello world", 5),
+        ("hello there", 4),
+        ("hi", 3),
+        ("hello world wide", 6),
+    ]
+    expected = {
+        prompt: gen.generate_ids(gen.tokenizer.encode(prompt), max_new_tokens=mt)
+        for prompt, mt in specs
+    }
+
+    prefix_cache = StatePrefixCache()
+    scheduler = StateCacheContinuousScheduler(
+        gen, max_batch_size=2, max_seq_len=64, prefix_cache=prefix_cache
+    )
+    scheduler.start()
+    results: dict[str, list[int]] = {}
+    lock = threading.Lock()
+
+    def worker(prompt: str, max_tokens: int) -> None:
+        out = scheduler.run(_greedy(prompt, max_tokens))
+        with lock:
+            results[prompt] = out.tokens
+
+    threads = [threading.Thread(target=worker, args=(p, mt)) for p, mt in specs]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+    finally:
+        scheduler.stop()
+
+    for prompt, _ in specs:
+        assert results[prompt] == expected[prompt], (
+            f"{prompt}: {results[prompt]} != {expected[prompt]}"
+        )
+    assert len(prefix_cache) > 0  # prefills inserted snapshots for reuse
+
+
+def test_prefix_sharing_serves_a_prefix_hit() -> None:
+    """Warm a prompt, then a prompt that extends it is served via restore + suffix
+    replay (not a fresh prefill), producing the same tokens as scalar."""
+    gen = _make_char_generator()
+    base, extended = "hello", "hello world"
+    expected = gen.generate_ids(gen.tokenizer.encode(extended), max_new_tokens=5)
+
+    prefix_cache = StatePrefixCache()
+    scheduler = StateCacheContinuousScheduler(
+        gen, max_batch_size=1, max_seq_len=64, prefix_cache=prefix_cache
+    )
+    scheduler.start()
+    try:
+        scheduler.run(_greedy(base, 3))  # warm: prefill of "hello" caches its snapshot
+        # "hello" is now a usable prefix of "hello world": the next prefill will hit.
+        assert prefix_cache.match(gen.tokenizer.encode(extended))[0] == len(
+            gen.tokenizer.encode(base)
+        )
+        out = scheduler.run(_greedy(extended, 5))  # served via the prefix-hit path
+    finally:
+        scheduler.stop()
+
+    assert out.tokens == expected
 
 
 def test_submit_before_start_raises() -> None:

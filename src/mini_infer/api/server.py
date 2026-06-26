@@ -36,6 +36,7 @@ from mini_infer.api.schemas import (
     CompletionResponse,
     CompletionUsage,
 )
+from mini_infer.cache.state_prefix_cache import StatePrefixCache
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
@@ -63,6 +64,13 @@ _USE_PD = os.environ.get("MINI_INFER_USE_PD", "").lower() in {"1", "true", "yes"
 _PD_MODE = os.environ.get("MINI_INFER_PD_MODE", "parallel").lower()
 if _PD_MODE not in {"serial", "parallel"}:
     raise ValueError(f"MINI_INFER_PD_MODE must be 'serial' or 'parallel'; got {_PD_MODE!r}")
+# Cross-request prefix sharing for the StateCache (DeepSeek-V4) path: snapshot
+# each prompt's post-prefill state so a later prompt that extends it replays only
+# the new suffix instead of re-prefilling the shared prefix. Output is unchanged;
+# it trades a bounded (FIFO-capped) snapshot pool for skipped re-prefills. On by
+# default for that path; set MINI_INFER_PREFIX_SHARING=0 to disable under memory
+# pressure. No effect on the PagedKVCache path (which has its own prefix cache).
+_PREFIX_SHARING = os.environ.get("MINI_INFER_PREFIX_SHARING", "1").lower() in {"1", "true", "yes"}
 
 # Default bind is loopback; set MINI_INFER_HOST=0.0.0.0 (or a specific
 # interface) to expose. Pairing with MINI_INFER_API_KEY for any non-loopback
@@ -109,8 +117,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # requests at their own positions through one ragged forward per step
         # (dynamic admit / evict). PD / packed-varlen continuous batching don't
         # apply to the per-request StateCache path.
-        logger.info("Backing /v1/completions with StateCacheContinuousScheduler for %s", model_name)
-        scheduler = StateCacheContinuousScheduler(StateCacheGenerator.from_pretrained(model_name))
+        logger.info(
+            "Backing /v1/completions with StateCacheContinuousScheduler for %s (prefix_sharing=%s)",
+            model_name,
+            _PREFIX_SHARING,
+        )
+        scheduler = StateCacheContinuousScheduler(
+            StateCacheGenerator.from_pretrained(model_name),
+            prefix_cache=StatePrefixCache() if _PREFIX_SHARING else None,
+        )
     else:
         runner = ModelRunner.from_pretrained(model_name)
         if _USE_PD:
