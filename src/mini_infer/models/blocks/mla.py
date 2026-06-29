@@ -51,7 +51,7 @@ reduce to plain `nn.Linear`.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -59,7 +59,10 @@ from torch import nn
 from mini_infer.cache.mla_attention import mla_packed_attention_forward
 from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mini_infer.models.blocks.rmsnorm import RMSNorm
-from mini_infer.models.blocks.rope import apply_interleaved_rotary_pos_emb
+from mini_infer.models.blocks.rope import (
+    apply_interleaved_rotary_pos_emb,
+    apply_rotary_pos_emb,
+)
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -81,6 +84,8 @@ class MLAAttention(nn.Module):
         rms_norm_eps: float,
         attention_bias: bool,
         layer_idx: int,
+        use_interleaved_rope: bool = True,
+        indexer: nn.Module | None = None,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_world_size
@@ -102,6 +107,16 @@ class MLAAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.layer_idx = layer_idx
+        # RoPE convention: interleaved (DeepSeek-V2/V3/Kimi, the default) vs
+        # non-interleaved NeoX/Llama split-half (GLM-MoE-DSA). See forward().
+        self.use_interleaved_rope = use_interleaved_rope
+        # Optional DSA top-k selector (GLM-MoE-DSA). When set, each query is
+        # masked to the indexer's selected keys (plus causal) in the SDPA. The
+        # indexer scores from the shared q_lora latent, so it requires the
+        # low-rank Q path. None for V2/V3/Kimi (dense MLA).
+        if indexer is not None and q_lora_rank is None:
+            raise ValueError("DSA indexer requires the low-rank Q path (q_lora_rank set)")
+        self.indexer = indexer
         # Q path: direct projection (V2-Lite, q_lora_rank=None) or
         # low-rank decomposition (V2 / V3, q_lora_rank=1536).
         # When sharded under TP: `q_a_proj` (input -> q_lora_rank latent) is
@@ -141,12 +156,44 @@ class MLAAttention(nn.Module):
         # Softmax scale: 1/sqrt(qk_head_dim) per HF source line 335.
         self._softmax_scale = 1.0 / math.sqrt(self.qk_head_dim)
 
+    def compute_dsa_topk(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Run the DSA indexer to pick per-request top-k keys (cache-aware).
+
+        Exposed so a GLM-MoE-DSA decoder layer can compute the selection at a
+        "full" indexer layer and thread it into the following "shared" layers
+        (IndexShare). The indexer caches its per-token keys in `past_key_values`
+        (an `index_k` stream), so a decode step scores against the full history.
+        Requires the low-rank Q path and an attached indexer.
+        """
+        if self.indexer is None:
+            raise RuntimeError("compute_dsa_topk requires an attached DSA indexer")
+        assert self.q_a_proj is not None and self.q_a_layernorm is not None
+        q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        # The indexer is duck-typed (GlmDsaIndexer); MLAAttention stays generic.
+        indexer: Any = self.indexer
+        result: list[torch.Tensor] = indexer.forward_cached(
+            hidden_states,
+            q_latent,
+            position_embeddings,
+            past_key_values,
+            cu_seqlens_q,
+            self.layer_idx,
+        )
+        return result
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         past_key_values: PagedKVCache,
         cu_seqlens_q: torch.Tensor,
+        dsa_topk: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # hidden_states: (1, total_q, hidden_size). Engine packs the batch
         # along dim 1; per-request boundaries live in cu_seqlens_q.
@@ -154,6 +201,7 @@ class MLAAttention(nn.Module):
         assert bsz == 1, "MLAAttention expects packed-batch convention (B=1)"
 
         # --- Q path ---
+        q_latent: torch.Tensor | None = None
         if self.q_lora_rank is None:
             assert self.q_proj is not None
             q = self.q_proj(hidden_states)
@@ -161,7 +209,10 @@ class MLAAttention(nn.Module):
             assert self.q_a_proj is not None
             assert self.q_a_layernorm is not None
             assert self.q_b_proj is not None
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            # Keep the shared low-rank latent: the DSA indexer (if any) scores
+            # from it, matching HF where the indexer reuses `q_resid`.
+            q_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            q = self.q_b_proj(q_latent)
         # q: (1, total_q, num_heads_local * qk_head_dim)
         # → (1, num_heads_local, total_q, qk_head_dim). Under TP each rank
         # only computed its slice of heads; the reshape uses the *local*
@@ -178,15 +229,19 @@ class MLAAttention(nn.Module):
         # kv_latent: (1, total_q, kv_lora_rank) — shared across heads
         # k_rope:    (1, total_q, qk_rope_head_dim) — shared across heads
 
-        # Apply RoPE: q_pe shape is (1, num_heads, total_q, qk_rope_head_dim);
-        # k_rope reshaped to (1, 1, total_q, qk_rope_head_dim) so the same
-        # call rotates both. Uses INTERLEAVED RoPE (DeepSeek convention)
-        # — pairs (x[2i], x[2i+1]) rotate together. HF's `apply_rotary_emb`
-        # uses the same complex-number formulation; we stay in real
-        # arithmetic but the math matches bit-for-bit.
+        # Apply RoPE to q_pe (1, num_heads, total_q, qk_rope_head_dim) and the
+        # shared k_rope (reshaped to (1, 1, total_q, qk_rope_head_dim)) in one
+        # call. Convention depends on the model: DeepSeek-V2/V3/Kimi use
+        # INTERLEAVED RoPE (pairs (x[2i], x[2i+1]) rotate together, matching
+        # HF's complex `apply_rotary_emb`). GLM-MoE-DSA uses non-interleaved
+        # NeoX/Llama RoPE (split-half), matching HF GlmMoeDsa's
+        # `apply_rotary_pos_emb`. Each is bit-parity against its own reference.
         cos, sin = position_embeddings  # both (1, total_q, qk_rope_head_dim)
         k_rope_for_rope = k_rope.view(1, total_q, 1, self.qk_rope_head_dim).transpose(1, 2)
-        q_pe, k_rope_rotated = apply_interleaved_rotary_pos_emb(q_pe, k_rope_for_rope, cos, sin)
+        if self.use_interleaved_rope:
+            q_pe, k_rope_rotated = apply_interleaved_rotary_pos_emb(q_pe, k_rope_for_rope, cos, sin)
+        else:
+            q_pe, k_rope_rotated = apply_rotary_pos_emb(q_pe, k_rope_for_rope, cos, sin)
         # k_rope_rotated: (1, 1, total_q, qk_rope_head_dim) — still shared across heads
 
         # --- Append per-stream to cache (packed shape: (total_q, num_kv_heads_s, head_dim_s)) ---
@@ -235,7 +290,15 @@ class MLAAttention(nn.Module):
             .contiguous()
         )
 
-        # --- Asymmetric SDPA ---
+        # --- DSA top-k selection (GLM-MoE-DSA) ---
+        # A caller may pass precomputed/reused indices (IndexShare: "shared"
+        # layers receive the prior "full" layer's selection). Otherwise the
+        # attached indexer (if any) selects here from the shared q_lora latent.
+        if dsa_topk is None and self.indexer is not None:
+            assert q_latent is not None  # guaranteed by the q_lora_rank check in __init__
+            dsa_topk = self.indexer(hidden_states, q_latent, position_embeddings, cu_seqlens_q)
+
+        # --- Asymmetric SDPA (with optional DSA sparse mask) ---
         attn_out = mla_packed_attention_forward(
             q_packed,
             k_full,
@@ -243,6 +306,7 @@ class MLAAttention(nn.Module):
             cu_seqlens_q,
             cu_seqlens_k,
             self._softmax_scale,
+            dsa_topk=dsa_topk,
         )
         # attn_out: (total_q, num_heads_local, v_head_dim)
 

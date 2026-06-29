@@ -25,6 +25,7 @@ def mla_packed_attention_forward(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
+    dsa_topk: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Per-request causal SDPA with asymmetric V head_dim.
 
@@ -40,6 +41,13 @@ def mla_packed_attention_forward(
     intra-request position `i` (where the request has `q_len` queries
     and `k_len` cached keys, `q_len <= k_len`) attends to keys
     `0..(k_len - q_len + i)`.
+
+    DeepSeek Sparse Attention (GLM-MoE-DSA): when `dsa_topk` is given, it is a
+    per-request list of `(q_len, topk)` int64 key indices (request-local, into
+    `[0, k_len)`) from the Lightning Indexer. Each query then attends only to
+    its selected keys: positions outside the top-k get `-inf` before the causal
+    mask, exactly mirroring HF's `index_mask + causal_mask`. `None` keeps the
+    dense per-request causal behavior (V2/V3/Kimi).
     """
     if q.shape[1] != k.shape[1] or q.shape[1] != v.shape[1]:
         raise ValueError(
@@ -75,6 +83,15 @@ def mla_packed_attention_forward(
         v_b = v[k_start:k_end]
         # fp32 attention math for numerical stability.
         scores = torch.einsum("qhd,khd->qhk", q_b.float(), k_b.float()) * softmax_scale
+        # DSA sparse mask: keep only the indexer-selected keys per query
+        # (-inf elsewhere), broadcast over heads, before the causal mask.
+        if dsa_topk is not None:
+            topk_r = dsa_topk[batch_idx]
+            index_mask = torch.full(
+                (q_len, k_len), -float("inf"), dtype=scores.dtype, device=q.device
+            )
+            index_mask.scatter_(1, topk_r, 0.0)
+            scores = scores + index_mask[:, None, :]
         # Causal mask: intra-request position i attends to keys 0..(k_len - q_len + i).
         q_offset = k_len - q_len
         q_abs_positions = torch.arange(q_len, device=q.device) + q_offset
