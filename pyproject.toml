@@ -38,6 +38,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "modal>=1.4.2",
+    # Bit-parity reference for MiniMax-M3: the minimax_m3_vl modeling code first
+    # ships in transformers 5.12. Constrains the (single) resolved transformers
+    # for the whole repo to 5.12.x; the golden suite is re-run to confirm the
+    # existing families still match under the bump.
+    "transformers>=5.12,<5.13",
 ]
 
 [tool.ruff]
