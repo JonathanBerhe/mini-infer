@@ -14,6 +14,25 @@ Layer routing auto-derived in `__post_init__` from the `[0,0,0,1,...]` freqs:
 `layer_types` -> layers 0-2 `full_attention`, 3-59 `minimax_m3_sparse`;
 `mlp_layer_types` -> layers 0-2 `dense`, 3-59 `sparse` (MoE).
 
+## Corrections (verified against HF `minimax_m3_vl` source during Phase 2)
+
+Two Phase-0 synthesis claims were wrong; the HF source is authoritative:
+
+1. **Block selection is GLOBAL, not per-GQA-group.** `build_block_mask`'s input
+   comes from `block_scores = scores.view(...).amax(-1).amax(1)` which max-pools
+   over the block tokens AND the index heads, giving one selected-block set per
+   `(batch, query)`, shared across ALL main attention heads. The additive mask is
+   `[B, 1, S, k_len]` (broadcast over heads). Ignore the earlier "4 independent
+   per-group selections / repeat_interleave 16" language in §1b/§1c/§1e-item-9.
+2. **RoPE is the first-`rotary_dim`-dims split** (HF `apply_rotary_pos_emb` slices
+   to `cos.shape[-1]=64`, rotates the leading 64 dims with the half-rotation,
+   passes the trailing 64). mini-infer's `RotaryEmbedding(partial_rotary_factor)`
+   uses a DIFFERENT convention (zero-padded width-128 table pairing dim i with
+   i+64), so it does NOT match. Use `RotaryEmbedding(head_dim=rotary_dim=64,
+   base=5e6)` (width-64 table) + the new `apply_rotary_pos_emb_partial`. Resolves
+   open-question #1. The block mask also REPLACES the causal mask (folds causal
+   in), it is not added on top of a separate causal mask.
+
 ## 1. MSA attention
 
 Same module class for dense and sparse layers (`MiniMaxM3VLAttention`); sparse
