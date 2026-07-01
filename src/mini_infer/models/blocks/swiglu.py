@@ -15,23 +15,32 @@ all-reduce per FFN. At `world_size=1` it reduces to plain `nn.Linear`.
 
 import torch
 from torch import nn
-from torch.nn import functional
 
 from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
+from mini_infer.models.blocks.activations import GateUpActivation, swiglu
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        activation: GateUpActivation = swiglu,
+    ) -> None:
         super().__init__()
         # Column-parallel: each rank holds `intermediate_size // world_size`
-        # output features. SiLU + elementwise mul operate per-feature so they
-        # work on the sharded activation as-is.
+        # output features. The gate-up activation + elementwise mul operate
+        # per-feature so they work on the sharded activation as-is.
         self.gate_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=False)
         self.up_proj = ColumnParallelLinear(hidden_size, intermediate_size, bias=False)
         # Row-parallel: input is the sharded gated activation, output is the
         # all-reduced full hidden state. One all-reduce per FFN.
         self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False)
+        # Gate-up combiner. Default `swiglu` (silu(gate)*up) keeps Llama/Qwen/
+        # Mistral numerically identical; M3's dense MLP passes `swigluoai`.
+        self._activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out: torch.Tensor = self.down_proj(functional.silu(self.gate_proj(x)) * self.up_proj(x))
+        out: torch.Tensor = self.down_proj(self._activation(self.gate_proj(x), self.up_proj(x)))
         return out

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from mini_infer.models.blocks.activations import GateUpActivation, swiglu
 from mini_infer.quant.nvfp4 import dequantize_block_fp8_to_bf16_partial
 
 _FP8_BLOCK = 128
@@ -37,12 +38,19 @@ class Fp8Expert(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, intermediate_size: int, *, block: int = _FP8_BLOCK
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        block: int = _FP8_BLOCK,
+        activation: GateUpActivation = swiglu,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.block = block
+        # Default `swiglu` matches MixtralExpert; M3's fp8 experts pass `swigluoai`.
+        self._activation = activation
         self._register("w1", intermediate_size, hidden_size)  # gate
         self._register("w3", intermediate_size, hidden_size)  # up
         self._register("w2", hidden_size, intermediate_size)  # down
@@ -73,7 +81,6 @@ class Fp8Expert(nn.Module):
         w1 = self._dequant("w1", x.dtype)
         w3 = self._dequant("w3", x.dtype)
         w2 = self._dequant("w2", x.dtype)
-        out: torch.Tensor = functional.linear(
-            functional.silu(functional.linear(x, w1)) * functional.linear(x, w3), w2
-        )
+        gated = self._activation(functional.linear(x, w1), functional.linear(x, w3))
+        out: torch.Tensor = functional.linear(gated, w2)
         return out

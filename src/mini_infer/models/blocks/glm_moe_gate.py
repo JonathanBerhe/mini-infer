@@ -30,6 +30,7 @@ from torch.nn import functional
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.activations import GateUpActivation, swiglu
 from mini_infer.models.blocks.fp8_expert import Fp8Expert
 from mini_infer.models.blocks.mixtral_moe import MixtralExpert
 
@@ -126,6 +127,7 @@ class GlmMoeFFN(nn.Module):
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 1.0,
         expert_dtype: str = "bf16",
+        activation: GateUpActivation = swiglu,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -151,13 +153,18 @@ class GlmMoeFFN(nn.Module):
             raise ValueError(f"expert_dtype must be 'bf16' or 'fp8'; got {expert_dtype!r}")
         expert_cls = Fp8Expert if expert_dtype == "fp8" else MixtralExpert
         self.experts = nn.ModuleList(
-            [expert_cls(hidden_size, moe_intermediate_size) for _ in range(num_experts_per_rank)]
+            [
+                expert_cls(hidden_size, moe_intermediate_size, activation=activation)
+                for _ in range(num_experts_per_rank)
+            ]
         )
         # Shared expert fires on every token. DeepSeek collapses N shared
         # experts into one MLP of width `N * moe_intermediate_size`; replicated.
         self.n_shared_experts = n_shared_experts
         self.shared_experts: MixtralExpert | None = (
-            MixtralExpert(hidden_size, moe_intermediate_size * n_shared_experts)
+            MixtralExpert(
+                hidden_size, moe_intermediate_size * n_shared_experts, activation=activation
+            )
             if n_shared_experts > 0
             else None
         )
