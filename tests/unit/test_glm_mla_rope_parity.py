@@ -1,16 +1,18 @@
 """GLM-MoE-DSA main-attention RoPE parity vs HF `GlmMoeDsaAttention`.
 
-GLM-5.2's MLA uses non-interleaved (NeoX/Llama) RoPE, unlike DeepSeek-V2/V3
-which use interleaved. This test pins that down: with synced MLA weights and
-an all-pass DSA mask (`index_topk >= seq_len`, so the indexer selects every
-token and the sparse mask degenerates to plain causal), our
-`MLAAttention(use_interleaved_rope=False)` must match `GlmMoeDsaAttention`
-to cosine-sim > 0.999. The indexer weights stay random because the all-pass
-mask makes them irrelevant to the output, which isolates the RoPE convention
-and the shared MLA math (low-rank Q, kv_b decompression, asymmetric SDPA).
+GLM-5.2's main MLA attention uses INTERLEAVED RoPE like DeepSeek-V2/V3 (HF
+`apply_rotary_pos_emb_interleave`, transformers >= 5.12; earlier versions
+applied split-half rope here, contradicting their own docs). This test pins
+that down: with synced MLA weights and an all-pass DSA mask
+(`index_topk >= seq_len`, so the indexer selects every token and the sparse
+mask degenerates to plain causal), our `MLAAttention` must match
+`GlmMoeDsaAttention` to cosine-sim > 0.999. The indexer weights stay random
+because the all-pass mask makes them irrelevant to the output, which isolates
+the RoPE convention and the shared MLA math (low-rank Q, kv_b decompression,
+asymmetric SDPA).
 
-A regression guard also confirms the default `use_interleaved_rope=True`
-still matches the DeepSeek-V2 reference, so V2/V3/Kimi are untouched.
+A regression guard also confirms the same interleaved path still matches the
+DeepSeek-V2 reference, so V2/V3/Kimi are untouched.
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ def _make_paged_cache() -> PagedKVCache:
     return cache
 
 
-def _make_ours(use_interleaved_rope: bool) -> MLAAttention:
+def _make_ours() -> MLAAttention:
     return MLAAttention(
         hidden_size=HIDDEN,
         num_heads=NUM_HEADS,
@@ -78,7 +80,6 @@ def _make_ours(use_interleaved_rope: bool) -> MLAAttention:
         rms_norm_eps=RMS_EPS,
         attention_bias=False,
         layer_idx=0,
-        use_interleaved_rope=use_interleaved_rope,
     ).eval()
 
 
@@ -96,7 +97,7 @@ def _sync_mla_weights(ours: MLAAttention, hf_attn: torch.nn.Module) -> None:
 
 
 def test_glm_mla_matches_hf_with_allpass_dsa() -> None:
-    """Non-interleaved RoPE: our MLA matches `GlmMoeDsaAttention` (all-pass DSA)."""
+    """Interleaved RoPE: our MLA matches `GlmMoeDsaAttention` (all-pass DSA)."""
     pytest.importorskip("transformers.models.glm_moe_dsa.modeling_glm_moe_dsa")
     from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
         GlmMoeDsaConfig,
@@ -133,7 +134,7 @@ def test_glm_mla_matches_hf_with_allpass_dsa() -> None:
     cfg._attn_implementation = "eager"
 
     hf_attn = GlmMoeDsaAttention(cfg, layer_idx=0).eval()
-    ours = _make_ours(use_interleaved_rope=False)
+    ours = _make_ours()
     _sync_mla_weights(ours, hf_attn)
 
     hidden_states = torch.randn(1, TOTAL_Q, HIDDEN, dtype=torch.float32)
@@ -172,11 +173,8 @@ def test_glm_mla_matches_hf_with_allpass_dsa() -> None:
 
 
 def test_interleaved_rope_default_unchanged_vs_deepseek_v2() -> None:
-    """Regression: default `use_interleaved_rope=True` still matches DeepSeek-V2.
-
-    Guards that adding the GLM non-interleaved branch did not perturb the
-    interleaved path that V2/V3/Kimi rely on.
-    """
+    """Regression: the interleaved rope path still matches DeepSeek-V2, so
+    V2/V3/Kimi are unperturbed by GLM sharing it."""
     pytest.importorskip("transformers.models.deepseek_v2.modeling_deepseek_v2")
     from transformers.models.deepseek_v2.configuration_deepseek_v2 import (
         DeepseekV2Config,
@@ -218,7 +216,7 @@ def test_interleaved_rope_default_unchanged_vs_deepseek_v2() -> None:
         rms_norm_eps=1e-6,
         attention_bias=False,
         layer_idx=0,
-    ).eval()  # use_interleaved_rope defaults True
+    ).eval()
 
     with torch.no_grad():
         ours.q_proj.weight.copy_(hf_attn.q_proj.weight)

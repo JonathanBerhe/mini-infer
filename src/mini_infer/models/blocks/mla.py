@@ -85,6 +85,7 @@ class MLAAttention(nn.Module):
         attention_bias: bool,
         layer_idx: int,
         use_interleaved_rope: bool = True,
+        softmax_scale: float | None = None,
         indexer: nn.Module | None = None,
     ) -> None:
         super().__init__()
@@ -107,8 +108,8 @@ class MLAAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.layer_idx = layer_idx
-        # RoPE convention: interleaved (DeepSeek-V2/V3/Kimi, the default) vs
-        # non-interleaved NeoX/Llama split-half (GLM-MoE-DSA). See forward().
+        # RoPE convention: interleaved (DeepSeek-V2/V3/Kimi and GLM-MoE-DSA,
+        # the default) vs non-interleaved NeoX/Llama split-half. See forward().
         self.use_interleaved_rope = use_interleaved_rope
         # Optional DSA top-k selector (GLM-MoE-DSA). When set, each query is
         # masked to the indexer's selected keys (plus causal) in the SDPA. The
@@ -153,8 +154,13 @@ class MLAAttention(nn.Module):
         # Row-parallel output: input is the per-head-sharded attention output
         # (already split along the head axis). One all-reduce per block.
         self.o_proj = RowParallelLinear(num_heads * v_head_dim, hidden_size, bias=attention_bias)
-        # Softmax scale: 1/sqrt(qk_head_dim) per HF source line 335.
-        self._softmax_scale = 1.0 / math.sqrt(self.qk_head_dim)
+        # Softmax scale: 1/sqrt(qk_head_dim) unless the model overrides it.
+        # GLM-MoE-DSA with yarn rope scaling folds yarn_get_mscale(factor,
+        # mscale_all_dim)**2 into the scale (HF `GlmMoeDsaAttention.scaling`);
+        # see `GlmMoeDsaConfig.attention_softmax_scale`.
+        self._softmax_scale = (
+            softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(self.qk_head_dim)
+        )
 
     def compute_dsa_topk(
         self,
@@ -231,11 +237,11 @@ class MLAAttention(nn.Module):
 
         # Apply RoPE to q_pe (1, num_heads, total_q, qk_rope_head_dim) and the
         # shared k_rope (reshaped to (1, 1, total_q, qk_rope_head_dim)) in one
-        # call. Convention depends on the model: DeepSeek-V2/V3/Kimi use
-        # INTERLEAVED RoPE (pairs (x[2i], x[2i+1]) rotate together, matching
-        # HF's complex `apply_rotary_emb`). GLM-MoE-DSA uses non-interleaved
-        # NeoX/Llama RoPE (split-half), matching HF GlmMoeDsa's
-        # `apply_rotary_pos_emb`. Each is bit-parity against its own reference.
+        # call. Convention depends on the model: DeepSeek-V2/V3/Kimi and
+        # GLM-MoE-DSA use INTERLEAVED RoPE (pairs (x[2i], x[2i+1]) rotate
+        # together, matching HF's `apply_rotary_pos_emb_interleave`). The
+        # non-interleaved NeoX/Llama split-half remains available for models
+        # that need it. Each is bit-parity against its own reference.
         cos, sin = position_embeddings  # both (1, total_q, qk_rope_head_dim)
         k_rope_for_rope = k_rope.view(1, total_q, 1, self.qk_rope_head_dim).transpose(1, 2)
         if self.use_interleaved_rope:

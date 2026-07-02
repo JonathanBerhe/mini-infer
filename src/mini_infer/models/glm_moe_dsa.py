@@ -14,8 +14,10 @@ machinery with three deltas:
   - **`noaux_tc` MoE**: DeepSeek-V3-style sigmoid gate with an aux-loss-free
     selection bias and grouped top-k (`GlmMoeFFN`), vs Mixtral's softmax gate.
 
-GLM also uses **non-interleaved (NeoX) RoPE** for both the main attention and
-the indexer (`MLAAttention(use_interleaved_rope=False)`), unlike DeepSeek-V2/V3.
+GLM's main MLA uses **interleaved (DeepSeek-style) RoPE** like V2/V3; only the
+indexer uses the non-interleaved NeoX split-half. (transformers < 5.7 applied
+the split-half in the main attention too, a bug fixed upstream in PR #46372;
+the parity reference here is transformers 5.12.)
 Layers `< first_k_dense_replace` are dense `SwiGLU`; the rest are MoE. The MTP
 draft layer (`num_nextn_predict_layers`) is a speculative-decoding accelerator
 and is not modeled (its checkpoint keys are dropped at load).
@@ -38,6 +40,7 @@ from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import MLAAttention, RMSNorm, RotaryEmbedding, SwiGLU
 from mini_infer.models.blocks.glm_dsa_indexer import GlmDsaIndexer
 from mini_infer.models.blocks.glm_moe_gate import GlmMoeFFN
+from mini_infer.models.blocks.rope import yarn_get_mscale
 from mini_infer.quant.nvfp4 import dequantize_block_fp8_to_bf16_partial
 
 if TYPE_CHECKING:
@@ -77,6 +80,13 @@ class GlmMoeDsaConfig:
     # "bf16" dequantizes an FP8 checkpoint fully; "fp8" keeps routed experts
     # e4m3-resident (dequant per-call) so the 753B checkpoint fits one node.
     expert_dtype: str = "bf16"
+    # Rope-scaling parameters (HF `rope_parameters`). A non-"default" rope_type
+    # with `mscale_all_dim` set folds a yarn mscale correction into the
+    # attention softmax scale (see `attention_softmax_scale`). GLM-5.2's
+    # published config is rope_type="default", where these stay no-ops.
+    rope_type: str = "default"
+    rope_factor: float = 1.0
+    rope_mscale_all_dim: float = 0.0
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> GlmMoeDsaConfig:
@@ -126,11 +136,29 @@ class GlmMoeDsaConfig:
             mlp_layer_types=mlp_types,
             indexer_types=idx_types,
             expert_dtype=expert_dtype,
+            rope_type=str(rope_params.get("rope_type", "default")),
+            rope_factor=float(rope_params.get("factor", 1.0)),
+            rope_mscale_all_dim=float(rope_params.get("mscale_all_dim", 0) or 0.0),
         )
 
     @property
     def qk_head_dim(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    def attention_softmax_scale(self) -> float:
+        """Softmax scale for the main attention, matching HF `GlmMoeDsaAttention`.
+
+        Plain `1/sqrt(qk_head_dim)`, multiplied by `yarn_get_mscale(factor,
+        mscale_all_dim)**2` when the checkpoint enables rope scaling (any
+        non-"default" rope_type) with `mscale_all_dim` set, per transformers
+        5.12. GLM-5.2's published config uses rope_type="default", where this
+        reduces to the plain scale.
+        """
+        scale: float = self.qk_head_dim**-0.5
+        if self.rope_type != "default" and self.rope_mscale_all_dim:
+            mscale = yarn_get_mscale(self.rope_factor, self.rope_mscale_all_dim)
+            scale *= mscale * mscale
+        return scale
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         return self.mlp_layer_types[layer_idx] == "sparse"
@@ -151,13 +179,20 @@ class _GlmMoeDsaDecoderLayer(nn.Module):
     def __init__(self, cfg: GlmMoeDsaConfig, layer_idx: int) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
-        indexer = GlmDsaIndexer(
-            hidden_size=cfg.hidden_size,
-            q_lora_rank=cfg.q_lora_rank,
-            num_heads=cfg.index_n_heads,
-            head_dim=cfg.index_head_dim,
-            qk_rope_head_dim=cfg.qk_rope_head_dim,
-            index_topk=cfg.index_topk,
+        # "shared" layers carry no indexer parameters at all (HF sets
+        # `indexer = None` on them); they reuse the previous full layer's
+        # selection. Instantiating one anyway would break weight loading.
+        indexer = (
+            None
+            if cfg.indexer_is_shared(layer_idx)
+            else GlmDsaIndexer(
+                hidden_size=cfg.hidden_size,
+                q_lora_rank=cfg.q_lora_rank,
+                num_heads=cfg.index_n_heads,
+                head_dim=cfg.index_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                index_topk=cfg.index_topk,
+            )
         )
         self.self_attn = MLAAttention(
             hidden_size=cfg.hidden_size,
@@ -170,7 +205,8 @@ class _GlmMoeDsaDecoderLayer(nn.Module):
             rms_norm_eps=cfg.rms_norm_eps,
             attention_bias=cfg.attention_bias,
             layer_idx=layer_idx,
-            use_interleaved_rope=False,  # GLM uses NeoX/Llama RoPE
+            use_interleaved_rope=True,  # interleaved in the main MLA (HF PR #46372)
+            softmax_scale=cfg.attention_softmax_scale(),
             indexer=indexer,
         )
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
@@ -206,8 +242,13 @@ class _GlmMoeDsaDecoderLayer(nn.Module):
         residual = hidden_states
         x = self.input_layernorm(hidden_states)
         # DSA selection: a "shared" layer reuses the prior "full" layer's
-        # top-k; otherwise compute it here (matches HF's `not skip or prev is None`).
-        if self.skip_topk and prev_topk is not None:
+        # top-k (it has no indexer of its own); a "full" layer computes it here.
+        if self.skip_topk:
+            if prev_topk is None:
+                raise ValueError(
+                    "shared DSA layer needs top-k indices from a previous full "
+                    "indexer layer; check indexer_types (layer 0 must be 'full')"
+                )
             topk = prev_topk
         else:
             topk = self.self_attn.compute_dsa_topk(
@@ -270,7 +311,10 @@ class GlmMoeDsaForCausalLM(BaseCausalLM):
         super().__init__()
         self.cfg = cfg
         self.model = _GlmMoeDsaInnerModel(cfg)
-        # GLM-5.2 uses plain RoPE (theta 8e6, no YaRN) on the qk_rope slice.
+        # GLM-5.2 uses plain RoPE (theta 8e6, no YaRN) on the qk_rope slice:
+        # the cos/sin tables here are non-yarn. Yarn configs are reflected only
+        # in the attention softmax scale (`attention_softmax_scale`), matching
+        # the mscale correction HF applies inside `GlmMoeDsaAttention`.
         self.rotary_emb = RotaryEmbedding(cfg.qk_rope_head_dim, base=cfg.rope_theta)
         self.lm_head = ColumnParallelLinear(
             cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True

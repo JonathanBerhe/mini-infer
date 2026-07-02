@@ -2,9 +2,10 @@
 
 The 753B real checkpoint is far out of reach for CPU CI, so these tests use a
 synthetic mini-config exercising the structurally distinctive bits: MLA streams,
-the DSA indexer per layer, heterogeneous dense/MoE FFN, IndexShare top-k reuse
-across "shared" layers, and the stacked-3D expert weight load. Full-model
-bit-parity vs HF runs on the same tiny config (no checkpoint download).
+the DSA indexer on "full" layers, heterogeneous dense/MoE FFN, IndexShare top-k
+reuse across "shared" layers (which carry no indexer weights), and the
+stacked-3D expert weight load. Full-model bit-parity vs HF runs on the same
+tiny config (no checkpoint download).
 """
 
 from __future__ import annotations

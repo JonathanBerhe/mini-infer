@@ -112,7 +112,6 @@ def test_glm_mla_dsa_attention_matches_hf() -> None:
         rms_norm_eps=RMS_EPS,
         attention_bias=False,
         layer_idx=0,
-        use_interleaved_rope=False,
         indexer=indexer,
     ).eval()
 

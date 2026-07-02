@@ -87,7 +87,7 @@ def _run_parity(index_topk: int) -> None:
         torch.full((SEQ_LEN, SEQ_LEN), float("-inf"), dtype=torch.float32), diagonal=1
     ).unsqueeze(0)
     with torch.no_grad():
-        hf_topk = hf_indexer(hidden_states, q_resid, (cos, sin), causal3d, use_cache=False)
+        hf_topk = hf_indexer(hidden_states, q_resid, (cos, sin), causal3d, position_ids)
     assert hf_topk.shape == (1, SEQ_LEN, min(index_topk, SEQ_LEN))
 
     cu_seqlens_q = torch.tensor([0, SEQ_LEN], dtype=torch.int32)

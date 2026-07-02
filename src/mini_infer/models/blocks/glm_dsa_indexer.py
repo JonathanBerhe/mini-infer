@@ -42,7 +42,35 @@ from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.rope import apply_rotary_pos_emb
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from mini_infer.cache.paged_kv_cache import PagedKVCache
+
+
+class _Fp32ColumnParallelLinear(ColumnParallelLinear):
+    """A `ColumnParallelLinear` whose parameters stay fp32 through dtype casts.
+
+    Mirrors HF's `_keep_in_fp32_modules = ["indexer.weights_proj"]`: a
+    whole-model `.to(dtype=torch.bfloat16)` (the `load_model` path) converts
+    every other weight but leaves this one fp32-resident, and the subsequent
+    weight load upcasts the checkpoint tensor into it (`load_full_weight`
+    casts the source to the existing param dtype). Device moves still apply;
+    only the dtype is pinned, with the original fp32 bits preserved.
+    """
+
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> _Fp32ColumnParallelLinear:
+        frozen = {name: param.data for name, param in self.named_parameters(recurse=False)}
+        super()._apply(fn, recurse)  # type: ignore[no-untyped-call]
+        for name, param in self.named_parameters(recurse=False):
+            original = frozen[name]
+            if not param.is_floating_point() or original.is_meta or param.data.is_meta:
+                continue
+            # Re-derive from the pre-cast bits so a dtype round-trip
+            # (fp32 -> bf16 -> fp32) never erodes the resident value.
+            param.data = original.to(device=param.data.device, dtype=torch.float32)
+        return self
 
 
 class GlmDsaIndexer(nn.Module):
@@ -83,7 +111,9 @@ class GlmDsaIndexer(nn.Module):
         self.wk = nn.Linear(hidden_size, head_dim, bias=False)
         self.k_norm = nn.LayerNorm(head_dim, eps=layernorm_eps)
         # Per-token, per-head weighting scalar. Column-parallel by head.
-        self.weights_proj = ColumnParallelLinear(hidden_size, num_heads, bias=False)
+        # fp32-resident (survives whole-model bf16 casts), mirroring HF's
+        # `_keep_in_fp32_modules = ["indexer.weights_proj"]`.
+        self.weights_proj = _Fp32ColumnParallelLinear(hidden_size, num_heads, bias=False)
         self.softmax_scale = head_dim**-0.5
 
     def _project(
@@ -115,8 +145,13 @@ class GlmDsaIndexer(nn.Module):
         q_pe, k_pe_rot = apply_rotary_pos_emb(q_pe, k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe_rot.squeeze(2), k_nope], dim=-1)
-        # Head weights use the FULL head count for the 1/sqrt(n_heads) factor.
-        weights = self.weights_proj(hidden_states).float() * (self.num_heads**-0.5)
+        # Head weights: an fp32 matmul over upcast hidden states, matching HF
+        # 5.12's `weights_proj(hidden_states.to(weights_proj.weight.dtype))`
+        # with the fp32-resident weight. The 1/sqrt(n_heads) factor uses the
+        # FULL head count.
+        weights = self.weights_proj(hidden_states.to(self.weights_proj.weight.dtype)).float() * (
+            self.num_heads**-0.5
+        )
         return q, k, weights
 
     def _causal_topk(
