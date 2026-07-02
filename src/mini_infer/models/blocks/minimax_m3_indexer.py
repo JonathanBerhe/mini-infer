@@ -10,7 +10,7 @@ All comments are the load-bearing details:
     # per-head Gemma RMSNorm pre-RoPE; k is one shared head:
     idx_q = q_norm(q_proj(x).view(B, S, n_idx_heads, d)).transpose(1, 2)
     idx_k = k_norm(k_proj(x).view(B, S, 1, d)).transpose(1, 2)
-    idx_q, idx_k = partial_rope(idx_q, idx_k, cos, sin)      # first rotary_dim dims only
+    idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)  # full RoPE over head_dim
     scores = idx_q.float() @ idx_k.float().mT               # [B, heads, S, k_len]; NO /sqrt(d)
     scores = scores.masked_fill(k_pos > q_pos, -inf)        # causal, TOKEN granularity, BEFORE pool
     scores = pad(scores, last block up to block_size, -inf)
@@ -41,11 +41,16 @@ serving phases.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
-from mini_infer.models.blocks.rope import apply_rotary_pos_emb_partial
+from mini_infer.models.blocks.rope import apply_rotary_pos_emb
+
+if TYPE_CHECKING:
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
 
 
 class MiniMaxM3Indexer(nn.Module):
@@ -96,7 +101,7 @@ class MiniMaxM3Indexer(nn.Module):
 
         Args:
             hidden_states: `(B, S, hidden_size)`.
-            cos, sin: partial-RoPE tables, width `rotary_dim`, shape `(B, S, rotary_dim)`.
+            cos, sin: RoPE tables, full width `head_dim`, shape `(B, S, head_dim)`.
             position_ids: `(B, S)` absolute positions.
 
         Returns:
@@ -108,37 +113,44 @@ class MiniMaxM3Indexer(nn.Module):
 
         idx_q = self.q_norm(self.q_proj(hidden_states).view(bsz, seqlen, h, d)).transpose(1, 2)
         idx_k = self.k_norm(self.k_proj(hidden_states).view(bsz, seqlen, 1, d)).transpose(1, 2)
-        idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)
-
-        k_len = idx_k.shape[2]
-        num_blocks = -(-k_len // self.block_size)  # ceil
-        pad = num_blocks * self.block_size - k_len
+        idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
 
         # [B, h, S, k_len], raw fp32 dot (NO 1/sqrt(d)). idx_k's single head
         # broadcasts across the h index heads.
         scores = torch.matmul(idx_q.float(), idx_k.float().transpose(-1, -2))
-        k_positions = torch.arange(k_len, device=hidden_states.device)
+        return self._select_blocks(scores, position_ids, idx_k.shape[2])
+
+    def _select_blocks(
+        self, scores: torch.Tensor, position_ids: torch.Tensor, k_len: int
+    ) -> torch.Tensor:
+        """Raw `(B, h, q, k_len)` scores -> `(B, q, topk)` block ids (-1 padded).
+
+        Applies token-granularity causal masking, pads the last block, max-pools
+        over the block's tokens AND the index heads (one selection per query,
+        shared across all main heads), force-includes the local block(s), and
+        takes the top-k. Shared by `forward` (batched prefill) and
+        `forward_cached` (packed-varlen decode/prefill over the cache).
+        """
+        bsz, h, q, _ = scores.shape
+        device = scores.device
+        num_blocks = -(-k_len // self.block_size)  # ceil
+        pad = num_blocks * self.block_size - k_len
+
+        k_positions = torch.arange(k_len, device=device)
         token_future = k_positions[None, None, None, :] > position_ids[:, None, :, None]
         scores = scores.masked_fill(token_future, float("-inf"))
         if pad:
             scores = torch.nn.functional.pad(scores, (0, pad), value=float("-inf"))
+        block_scores = scores.view(bsz, h, q, num_blocks, self.block_size).amax(-1).amax(1)
 
-        # Pool over the block's tokens (dim -1) AND the index heads (dim 1): one
-        # score per (batch, query, block), shared across all main attention heads.
-        block_scores = scores.view(bsz, h, seqlen, num_blocks, self.block_size).amax(-1).amax(1)
-
-        # Force-include the query's own block(s): the local window is always
-        # attended (guarantees a non-empty causal selection).
         if self.local_blocks > 0:
             q_block = position_ids // self.block_size
-            local = torch.arange(self.local_blocks, device=hidden_states.device)
+            local = torch.arange(self.local_blocks, device=device)
             local_idx = (q_block[..., None] - local.view(1, 1, -1)).clamp(min=0)
             block_scores.scatter_(-1, local_idx, float("inf"))
 
         topk = min(self.topk_blocks, num_blocks)
         top_scores, top_idx = block_scores.topk(topk, dim=-1)
-        # A selected slot that scored -inf is a not-really-available block (fewer
-        # valid blocks than topk); mark it -1 so the mask ignores it.
         return top_idx.masked_fill(top_scores == float("-inf"), -1)
 
     def build_block_mask(
@@ -177,3 +189,59 @@ class MiniMaxM3Indexer(nn.Module):
         keep = block_keep & ~token_future
         min_dtype = torch.finfo(dtype).min
         return torch.zeros(keep.shape, dtype=dtype, device=device).masked_fill(~keep, min_dtype)
+
+    def forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+        layer_idx: int,
+        *,
+        dtype: torch.dtype,
+        stream_name: str = "index_k",
+    ) -> list[torch.Tensor]:
+        """Packed-varlen, cache-aware selection -> one additive block mask per request.
+
+        Appends this step's index-K to `stream_name`, reads back each request's
+        full index-K history, scores its queries against that history, selects the
+        top-k blocks, and builds the `(q_len_r, 1, k_len_r)` additive mask
+        (`packed_attention`'s `block_mask` format). Prefill (`q_len == k_len`) and
+        decode (`q_len == 1`, `k_len == context`) run the same code; they differ
+        only in the materialized per-request `k_len`. Absolute query positions are
+        derived from the cache lengths (`[k_len - q_len, k_len)`), matching
+        `GlmDsaIndexer.forward_cached` and the packed-varlen convention.
+        """
+        _, total_q, _ = hidden_states.shape
+        h, d = self.num_heads, self.head_dim
+        device = hidden_states.device
+
+        idx_q = self.q_norm(self.q_proj(hidden_states).view(1, total_q, h, d)).transpose(1, 2)
+        idx_k = self.k_norm(self.k_proj(hidden_states).view(1, total_q, 1, d)).transpose(1, 2)
+        idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
+
+        # Append this step's index-K (packed (total_q, 1, d)); read back full history.
+        idx_k_packed = idx_k[0].transpose(0, 1).contiguous()  # (total_q, 1, d)
+        past_key_values.append_stream_packed(idx_k_packed, cu_seqlens_q, layer_idx, stream_name)
+        idx_k_full, cu_seqlens_k, _ = past_key_values.materialize_packed_stream(
+            layer_idx, stream_name
+        )  # (total_k, 1, d)
+
+        masks: list[torch.Tensor] = []
+        for r in range(cu_seqlens_q.shape[0] - 1):
+            q_s, q_e = int(cu_seqlens_q[r]), int(cu_seqlens_q[r + 1])
+            k_s, k_e = int(cu_seqlens_k[r]), int(cu_seqlens_k[r + 1])
+            q_len_r, k_len_r = q_e - q_s, k_e - k_s
+            if q_len_r == 0:
+                masks.append(idx_q.new_zeros(0, 1, k_len_r, dtype=dtype))
+                continue
+            q_r = idx_q[0, :, q_s:q_e, :]  # (h, q_len, d)
+            k_r = idx_k_full[k_s:k_e, 0, :]  # (k_len, d)
+            # queries occupy absolute positions [k_len - q_len, k_len).
+            pos_r = (torch.arange(q_len_r, device=device) + (k_len_r - q_len_r)).unsqueeze(0)
+            scores = torch.einsum("hqd,kd->hqk", q_r.float(), k_r.float()).unsqueeze(0)
+            block_indices = self._select_blocks(scores, pos_r, k_len_r)  # (1, q_len, topk)
+            mask_full = self.build_block_mask(block_indices, k_len_r, pos_r, dtype=dtype)
+            masks.append(mask_full[0, 0].unsqueeze(1))  # (q_len, 1, k_len)
+        return masks

@@ -30,8 +30,9 @@ Port M3 as `MiniMaxM3ForCausalLM` on the **standard PagedKVCache path**
 with a small set of new pieces. The design:
 
 - **Attention:** GQA (64q/4kv, head_dim 128) with per-head Gemma QK-norm and
-  partial RoPE (dim 64, theta 5e6). Layers 0-2 are dense full attention; layers
-  3-59 add the MSA indexer.
+  full RoPE over head_dim (theta 5e6; the config's `rotary_dim` field is not
+  wired into the HF rope, settled by the parity harness). Layers 0-2 are dense
+  full attention; layers 3-59 add the MSA indexer.
 - **MSA indexer (new, the heaviest piece):** 4 index heads (one per GQA group) +
   one shared index key head, dim 128. Score tokens (fp32, no `1/sqrt(d)`),
   causal-mask at token granularity, **max-pool into 128-blocks**, top-16 +
