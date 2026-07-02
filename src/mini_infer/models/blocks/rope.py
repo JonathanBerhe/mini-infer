@@ -22,6 +22,19 @@ import torch
 from torch import nn
 
 
+def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
+    """YaRN attention-magnitude correction factor ("mscale", Peng et al. 2023).
+
+    Matches HF's `yarn_get_mscale`: `1.0` when there is no context extension
+    (`scale <= 1`), otherwise `0.1 * mscale * ln(scale) + 1.0`. DeepSeek-shape
+    models (GLM-MoE-DSA included) fold the SQUARE of this factor into the
+    attention softmax scale when the rope parameters set `mscale_all_dim`.
+    """
+    if scale <= 1.0:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
 def _yarn_correction_dim(
     num_rotations: float, head_dim: int, base: float, max_seq_len: int
 ) -> float:
