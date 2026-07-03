@@ -1,7 +1,7 @@
 """MiniMax-M3 family: owned text-model implementation (MSA, arXiv 2606.13392).
 
 Text-only port (M3 is multimodal; vision is out of scope). Architecturally this
-is a standard GQA transformer with per-head Gemma QK-norm and partial RoPE, an
+is a standard GQA transformer with per-head Gemma QK-norm and full RoPE, an
 MoE that reuses GLM's `noaux_tc` sigmoid gate, and MiniMax Sparse Attention:
 
   - **MSA**: on the sparse layers a `MiniMaxM3Indexer` scores 128-token KV blocks
@@ -15,9 +15,9 @@ MoE that reuses GLM's `noaux_tc` sigmoid gate, and MiniMax Sparse Attention:
   - **swigluoai**: the clamped GLU used by the dense MLP and every expert.
 
 Layers `[0, first_dense_layers)` are dense full-attention + dense SwiGLU; the rest
-are MSA + MoE. RoPE is NeoX/non-interleaved on the first `rotary_dim` dims
-(`apply_rotary_pos_emb_partial`). Multi-token-prediction (MTP) draft weights are
-dropped at load.
+are MSA + MoE. RoPE is NeoX/non-interleaved and FULL over head_dim (theta 5e6);
+the config's `rotary_dim` field is not wired into the HF rope, so neither is it
+here. Multi-token-prediction (MTP) draft weights are dropped at load.
 """
 
 from __future__ import annotations
@@ -140,7 +140,7 @@ class MiniMaxM3Config:
 
 
 class _MiniMaxM3Attention(nn.Module):
-    """GQA with per-head Gemma QK-norm + partial RoPE; MSA block mask on sparse layers."""
+    """GQA with per-head Gemma QK-norm + full RoPE; MSA block mask on sparse layers."""
 
     def __init__(self, cfg: MiniMaxM3Config, layer_idx: int, *, sparse: bool) -> None:
         super().__init__()
@@ -283,13 +283,15 @@ class _MiniMaxM3InnerModel(nn.Module):
         self.norm = GemmaRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
 
-# FFN weights arrive fused (HF in-memory `state_dict()`): the dense MLP and the
-# shared expert stack gate+up into one `gate_up_proj` (out dim 2*I; gate = first
-# half, up = second, matching swigluoai's `chunk(2, -1)`), and the routed experts
-# stack all E into 3D `experts.gate_up_proj` (E, 2*I, H) / `experts.down_proj`
-# (E, H, I). Split into our SwiGLU (`gate_proj/up_proj/down_proj`) and MixtralExpert
-# (`w1`=gate, `w3`=up, `w2`=down) params. A separate-projection checkpoint passes
-# through (dense) or renames (shared / per-expert).
+# FFN weights arrive in two layouts. HF in-memory `state_dict()`: the dense MLP
+# and the shared expert stack gate+up into one `gate_up_proj` (out dim 2*I; gate
+# = first half, up = second, matching swigluoai's `chunk(2, -1)`), and the routed
+# experts stack all E into 3D `experts.gate_up_proj` (E, 2*I, H) /
+# `experts.down_proj` (E, H, I). The on-disk 428B checkpoint instead ships the
+# MoE under `block_sparse_moe.` with per-expert `experts.E.{w1,w3,w2}` (already
+# split; w1=gate, w3=up, w2=down) and the router bias at the block level
+# (`block_sparse_moe.e_score_correction_bias`). Both map onto our SwiGLU
+# (`gate_proj/up_proj/down_proj`) and MixtralExpert (`w1/w3/w2`) params.
 _DENSE_GATE_UP_RE = re.compile(r"^(model\.layers\.\d+)\.mlp\.gate_up_proj\.weight$")
 _EXPERT_GATE_UP_RE = re.compile(r"^(model\.layers\.\d+)\.mlp\.experts\.gate_up_proj$")
 _EXPERT_DOWN_RE = re.compile(r"^(model\.layers\.\d+)\.mlp\.experts\.down_proj$")
@@ -297,6 +299,9 @@ _PER_EXPERT_RE = re.compile(
     r"^(model\.layers\.\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
 )
 _PER_EXPERT_W = {"gate": "w1", "up": "w3", "down": "w2"}
+# Disk layout: per-expert weights already in our w1/w3/w2 names; only the
+# expert-parallel global->local index remap is needed.
+_PER_EXPERT_W_RE = re.compile(r"^(model\.layers\.\d+)\.mlp\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
 _SHARED_GATE_UP_RE = re.compile(
     r"^(model\.layers\.\d+)\.mlp\.shared_experts\.gate_up_proj\.weight$"
 )
@@ -406,6 +411,14 @@ class MiniMaxM3ForCausalLM(BaseCausalLM):
                 key = key[len("language_model.") :]
             if _DROP_RE.search(raw_key) or _DROP_RE.search(key):
                 continue
+            # Disk layout: the MoE block lives under `block_sparse_moe.` with the
+            # router bias at the block level; normalize to the in-memory `mlp.`
+            # names so one mapping path serves both layouts.
+            if ".block_sparse_moe." in key:
+                key = key.replace(".block_sparse_moe.", ".mlp.")
+                key = key.replace(
+                    ".mlp.e_score_correction_bias", ".mlp.gate.e_score_correction_bias"
+                )
 
             dense = _DENSE_GATE_UP_RE.match(key)
             if dense is not None:  # dense MLP fused gate+up -> gate_proj / up_proj
@@ -444,6 +457,14 @@ class MiniMaxM3ForCausalLM(BaseCausalLM):
                     continue
                 w_name = _PER_EXPERT_W[per_expert.group(3)]
                 remapped[f"{prefix}.mlp.experts.{global_j - local_start}.{w_name}.weight"] = tensor
+                continue
+            per_expert_w = _PER_EXPERT_W_RE.match(key)
+            if per_expert_w is not None:  # disk layout: our names, EP remap only
+                prefix, global_j = per_expert_w.group(1), int(per_expert_w.group(2))
+                if not _keep(global_j):
+                    continue
+                local_j = global_j - local_start
+                remapped[f"{prefix}.mlp.experts.{local_j}.{per_expert_w.group(3)}.weight"] = tensor
                 continue
             shared_gate_up = _SHARED_GATE_UP_RE.match(key)
             if shared_gate_up is not None:  # shared expert fused gate+up -> w1 / w3
