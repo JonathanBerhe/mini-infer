@@ -226,11 +226,13 @@ than the architecture).
 
 ## What's still open
 
-- The real-428B coherence gate + the end-to-end kernel A/B on it (the
-  staging + generate scripts exist; results land in `docs/benchmarks/`).
-- The decode kernel's default-on decision (gated on that A/B, ADR-022).
+- The real-428B gate PASSED (coherent reasoning output, 4-rank TP/EP
+  consistency, block-FP8-resident experts on 4x H200; see
+  [2026-07-03-minimax-m3-428b-gate.md](../benchmarks/2026-07-03-minimax-m3-428b-gate.md)),
+  and the kernel A/B on it came back 0.98x token-identical at 16K, settling
+  the decode kernel as off by default (ADR-022).
 - A block-sparse PREFILL kernel (the reference's CSR KV-outer path); the
   materialized torch path is the only prefill today.
 - The index branch stays O(context) per decode step (full re-score); an
-  incremental scoring scheme is the next lever if the real-model profile
+  incremental scoring scheme is the next lever if a long-context profile
   shows it dominating.

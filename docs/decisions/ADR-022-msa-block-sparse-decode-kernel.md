@@ -76,10 +76,15 @@ kernel output bit-identical.
   docs/benchmarks/2026-07-03-msa-decode-kernel.md).
 - End-to-end on a 114M-param synthetic M3-shaped model at 32K context the
   kernel arm is 0.95x (a slight LOSS): per-step host overhead and the
-  indexer's O(context) re-scoring dominate at toy scale. This is exactly why
-  the flag stays off: the ship decision belongs to the end-to-end A/B on the
-  real 428B checkpoint, where 57 sparse layers of 64-head attention at long
-  context are a materially larger share of each step.
+  indexer's O(context) re-scoring dominate at toy scale.
+- **The real-model A/B (the ship gate) ran on the 428B checkpoint, 4x H200,
+  16K context: 0.98x with token identity PASS** (see
+  docs/benchmarks/2026-07-03-minimax-m3-428b-gate.md). MoE weight traffic
+  (~13 GB/step) dwarfs the K/V materialization the kernel eliminates
+  (~2 GB/step at 16K), so the kernel cannot move the end-to-end number at
+  practical contexts. **Decision: stays off by default**, same verdict shape
+  as ADR-020; unlike V4's kernel the arms are token-identical, so the flag
+  remains a safe opt-in for long-context experiments.
 - The remaining O(context) decode term is the index branch (re-scores the full
   cached index-K history every step); a future incremental-scoring or fused
   selection kernel is the next lever if the real-model A/B shows the indexer
