@@ -190,7 +190,7 @@ class MiniMaxM3Indexer(nn.Module):
         min_dtype = torch.finfo(dtype).min
         return torch.zeros(keep.shape, dtype=dtype, device=device).masked_fill(~keep, min_dtype)
 
-    def forward_cached(
+    def select_cached(
         self,
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
@@ -199,19 +199,22 @@ class MiniMaxM3Indexer(nn.Module):
         cu_seqlens_q: torch.Tensor,
         layer_idx: int,
         *,
-        dtype: torch.dtype,
         stream_name: str = "index_k",
-    ) -> list[torch.Tensor]:
-        """Packed-varlen, cache-aware selection -> one additive block mask per request.
+    ) -> list[tuple[torch.Tensor, int]]:
+        """Packed-varlen, cache-aware selection -> per-request selected block ids.
 
         Appends this step's index-K to `stream_name`, reads back each request's
-        full index-K history, scores its queries against that history, selects the
-        top-k blocks, and builds the `(q_len_r, 1, k_len_r)` additive mask
-        (`packed_attention`'s `block_mask` format). Prefill (`q_len == k_len`) and
+        full index-K history, scores its queries against that history, and selects
+        the top-k blocks. Returns one `((q_len_r, topk) int64 ids, k_len_r)` pair
+        per request; `-1` marks a padding slot. Prefill (`q_len == k_len`) and
         decode (`q_len == 1`, `k_len == context`) run the same code; they differ
         only in the materialized per-request `k_len`. Absolute query positions are
         derived from the cache lengths (`[k_len - q_len, k_len)`), matching
         `GlmDsaIndexer.forward_cached` and the packed-varlen convention.
+
+        Single source of truth for cache-aware selection: `forward_cached` builds
+        dense masks from these ids (the torch oracle path) and the block-sparse
+        decode kernel consumes them directly, so both paths share one selection.
         """
         _, total_q, _ = hidden_states.shape
         h, d = self.num_heads, self.head_dim
@@ -228,13 +231,17 @@ class MiniMaxM3Indexer(nn.Module):
             layer_idx, stream_name
         )  # (total_k, 1, d)
 
-        masks: list[torch.Tensor] = []
-        for r in range(cu_seqlens_q.shape[0] - 1):
-            q_s, q_e = int(cu_seqlens_q[r]), int(cu_seqlens_q[r + 1])
-            k_s, k_e = int(cu_seqlens_k[r]), int(cu_seqlens_k[r + 1])
+        # One host sync each (vs per-request int() casts in the loop; the
+        # cu tensors live on the pool device during decode).
+        cu_q = cu_seqlens_q.tolist()
+        cu_k = cu_seqlens_k.tolist()
+        selections: list[tuple[torch.Tensor, int]] = []
+        for r in range(len(cu_q) - 1):
+            q_s, q_e = cu_q[r], cu_q[r + 1]
+            k_s, k_e = cu_k[r], cu_k[r + 1]
             q_len_r, k_len_r = q_e - q_s, k_e - k_s
             if q_len_r == 0:
-                masks.append(idx_q.new_zeros(0, 1, k_len_r, dtype=dtype))
+                selections.append((torch.empty(0, 0, dtype=torch.int64, device=device), k_len_r))
                 continue
             q_r = idx_q[0, :, q_s:q_e, :]  # (h, q_len, d)
             k_r = idx_k_full[k_s:k_e, 0, :]  # (k_len, d)
@@ -242,6 +249,45 @@ class MiniMaxM3Indexer(nn.Module):
             pos_r = (torch.arange(q_len_r, device=device) + (k_len_r - q_len_r)).unsqueeze(0)
             scores = torch.einsum("hqd,kd->hqk", q_r.float(), k_r.float()).unsqueeze(0)
             block_indices = self._select_blocks(scores, pos_r, k_len_r)  # (1, q_len, topk)
-            mask_full = self.build_block_mask(block_indices, k_len_r, pos_r, dtype=dtype)
+            selections.append((block_indices[0], k_len_r))
+        return selections
+
+    def forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+        layer_idx: int,
+        *,
+        dtype: torch.dtype,
+        stream_name: str = "index_k",
+    ) -> list[torch.Tensor]:
+        """Cache-aware selection -> one additive block mask per request.
+
+        `select_cached` picks the blocks; this expands each request's selection
+        into the `(q_len_r, 1, k_len_r)` additive mask (`packed_attention`'s
+        `block_mask` format). The torch-oracle path of the main attention.
+        """
+        device = hidden_states.device
+        masks: list[torch.Tensor] = []
+        for block_indices, k_len_r in self.select_cached(
+            hidden_states,
+            cos,
+            sin,
+            past_key_values,
+            cu_seqlens_q,
+            layer_idx,
+            stream_name=stream_name,
+        ):
+            q_len_r = block_indices.shape[0]
+            if q_len_r == 0:
+                masks.append(torch.zeros(0, 1, k_len_r, dtype=dtype, device=device))
+                continue
+            pos_r = (torch.arange(q_len_r, device=device) + (k_len_r - q_len_r)).unsqueeze(0)
+            mask_full = self.build_block_mask(
+                block_indices.unsqueeze(0), k_len_r, pos_r, dtype=dtype
+            )
             masks.append(mask_full[0, 0].unsqueeze(1))  # (q_len, 1, k_len)
         return masks

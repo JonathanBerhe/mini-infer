@@ -246,6 +246,68 @@ def test_greedy_decode_parity_vs_hf() -> None:
     assert my_tokens == hf_tokens, f"HF {hf_tokens} vs ours {my_tokens}"
 
 
+def test_greedy_decode_kernel_path_matches_hf() -> None:
+    """Greedy decode with the paged decode path enabled matches HF tokens.
+
+    On CPU the dispatcher runs the pure-torch block-sparse reference, so this
+    pins the model wiring end to end: prefill takes the materialized oracle,
+    every decode step takes `select_cached` + paged reads of only the selected
+    blocks (plus the dense layers' full-history paged path). Tokens must equal
+    HF exactly, same as the oracle path.
+    """
+    pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    torch.manual_seed(0)
+    hf_model, my_model = _build_hf_and_mine()
+    my_model.set_decode_kernel(True)
+
+    prompt = [3, 1, 4, 1, 5]
+    n_new = 8
+
+    hf_tokens = _hf_greedy(hf_model, prompt, n_new)
+
+    my_tokens = list(prompt)
+    cache = _make_cache(my_model)
+    plen = len(prompt)
+    with torch.inference_mode():
+        logits = my_model(
+            input_ids=torch.tensor([prompt], dtype=torch.long),
+            position_ids=torch.arange(plen, dtype=torch.long).unsqueeze(0),
+            past_key_values=cache,
+            cu_seqlens_q=torch.tensor([0, plen], dtype=torch.int32),
+        )
+        nxt = int(logits[0, -1].argmax())
+        my_tokens.append(nxt)
+        cache_len = plen
+        for _ in range(n_new - 1):
+            logits = my_model(
+                input_ids=torch.tensor([[nxt]], dtype=torch.long),
+                position_ids=torch.tensor([[cache_len]], dtype=torch.long),
+                past_key_values=cache,
+                cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            )
+            cache_len += 1
+            nxt = int(logits[0, -1].argmax())
+            my_tokens.append(nxt)
+
+    assert my_tokens == hf_tokens, f"HF {hf_tokens} vs ours {my_tokens}"
+
+
+def test_batched_decode_kernel_path_matches_hf() -> None:
+    """Batched ragged decode with the paged decode path on matches HF per request."""
+    pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    torch.manual_seed(0)
+    hf_model, my_model = _build_hf_and_mine()
+    my_model.set_decode_kernel(True)
+
+    prompts = [[3, 1, 4, 1, 5], [2, 7, 1, 8]]
+    n_new = 6
+
+    hf_gen = [_hf_greedy(hf_model, p, n_new) for p in prompts]
+    my_gen = _mine_batched_generate(my_model, prompts, n_new)
+
+    assert my_gen == hf_gen, f"HF {hf_gen} vs ours {my_gen}"
+
+
 def test_batched_decode_matches_hf() -> None:
     """Continuous-batching shape: two ragged-length prompts decoded together.
 
@@ -344,6 +406,128 @@ def test_disk_layout_load_matches_in_memory_load() -> None:
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=_make_cache(disk_model),
+            cu_seqlens_q=cu,
+        )
+    assert torch.equal(ref, got)
+
+
+def _quant_block_fp8(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-FP8 e4m3 quantization (ceil blocks), the staged-checkpoint format.
+
+    Mirrors the GLM fixture generator; exact inverse of
+    `dequantize_block_fp8_to_bf16_partial` up to e4m3 rounding.
+    """
+    import math
+
+    out, inn = w.shape
+    scale = torch.zeros(math.ceil(out / block), math.ceil(inn / block), dtype=torch.float32)
+    q = torch.zeros_like(w, dtype=torch.float8_e4m3fn)
+    for bi in range(scale.shape[0]):
+        for bj in range(scale.shape[1]):
+            blk = w[bi * block : (bi + 1) * block, bj * block : (bj + 1) * block]
+            amax = float(blk.abs().max())
+            s = amax / 448.0 if amax > 0 else 1.0
+            scale[bi, bj] = s
+            q[bi * block : (bi + 1) * block, bj * block : (bj + 1) * block] = (blk / s).to(
+                torch.float8_e4m3fn
+            )
+    return q, scale
+
+
+def _fp8_disk_layout(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Disk layout with routed experts pre-quantized to block-FP8 (staging format)."""
+    disk = _to_disk_layout(hf_state_dict)
+    out: dict[str, torch.Tensor] = {}
+    expert_re = __import__("re").compile(r"\.block_sparse_moe\.experts\.\d+\.(w1|w2|w3)\.weight$")
+    for key, tensor in disk.items():
+        if expert_re.search(key):
+            q, scale = _quant_block_fp8(tensor.float())
+            out[key] = q
+            out[key + "_scale_inv"] = scale
+        else:
+            out[key] = tensor
+    return out
+
+
+def test_fp8_resident_load_recovers_model() -> None:
+    """The pre-quantized staged layout + expert_dtype='fp8' recovers the model.
+
+    Routed experts stay e4m3-resident (`Fp8Expert` buffers); logits must track
+    the bf16 reference within FP8 quantization error.
+    """
+    pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    torch.manual_seed(0)
+    hf_model, ref_model = _build_hf_and_mine()
+
+    hf_cfg = _tiny_hf_config()
+    hf_cfg.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    fp8_cfg = MiniMaxM3Config.from_hf(hf_cfg)
+    assert fp8_cfg.expert_dtype == "fp8"
+    fp8_model = MiniMaxM3ForCausalLM(fp8_cfg).to(torch.float32).eval()
+    MiniMaxM3ForCausalLM.load_weights(fp8_model, _fp8_disk_layout(hf_model.state_dict()))
+
+    total_q = 12
+    input_ids = torch.randint(0, fp8_cfg.vocab_size, (1, total_q), dtype=torch.long)
+    position_ids = torch.arange(total_q, dtype=torch.long).unsqueeze(0)
+    cu = torch.tensor([0, total_q], dtype=torch.int32)
+    with torch.inference_mode():
+        ref = ref_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=_make_cache(ref_model),
+            cu_seqlens_q=cu,
+        )
+        got = fp8_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=_make_cache(fp8_model),
+            cu_seqlens_q=cu,
+        )
+    assert torch.all(torch.isfinite(got))
+    cs = float(torch.nn.functional.cosine_similarity(ref.flatten(), got.flatten(), dim=0))
+    assert cs > 0.97, f"FP8-resident logits drifted too far from bf16: cos={cs:.4f}"
+
+
+def test_streaming_load_matches_full_load(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Shard-by-shard streaming load equals the one-shot full-dict load exactly."""
+    pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    import json
+
+    from safetensors.torch import save_file
+
+    torch.manual_seed(0)
+    hf_model, ref_model = _build_hf_and_mine()
+    disk = {k: v.contiguous() for k, v in _to_disk_layout(hf_model.state_dict()).items()}
+
+    # Write the disk layout as 3 shards + manifest (keys round-robin over shards).
+    keys = sorted(disk.keys())
+    shard_names = [f"model-{i + 1:05d}-of-00003.safetensors" for i in range(3)]
+    weight_map = {k: shard_names[i % 3] for i, k in enumerate(keys)}
+    for shard in shard_names:
+        save_file({k: disk[k] for k in keys if weight_map[k] == shard}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+    streamed = MiniMaxM3ForCausalLM(MiniMaxM3Config.from_hf(_tiny_hf_config()))
+    streamed = streamed.to(torch.float32).eval()
+    MiniMaxM3ForCausalLM.load_weights_streaming(
+        streamed, str(tmp_path), device="cpu", dtype=torch.float32
+    )
+
+    total_q = 10
+    input_ids = torch.randint(0, ref_model.cfg.vocab_size, (1, total_q), dtype=torch.long)
+    position_ids = torch.arange(total_q, dtype=torch.long).unsqueeze(0)
+    cu = torch.tensor([0, total_q], dtype=torch.int32)
+    with torch.inference_mode():
+        ref = ref_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=_make_cache(ref_model),
+            cu_seqlens_q=cu,
+        )
+        got = streamed(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=_make_cache(streamed),
             cu_seqlens_q=cu,
         )
     assert torch.equal(ref, got)
