@@ -1,7 +1,7 @@
 """MiniMax-M3 family: owned text-model implementation (MSA, arXiv 2606.13392).
 
 Text-only port (M3 is multimodal; vision is out of scope). Architecturally this
-is a standard GQA transformer with per-head Gemma QK-norm and full RoPE, an
+is a standard GQA transformer with per-head Gemma QK-norm and partial RoPE, an
 MoE that reuses GLM's `noaux_tc` sigmoid gate, and MiniMax Sparse Attention:
 
   - **MSA**: on the sparse layers a `MiniMaxM3Indexer` scores 128-token KV blocks
@@ -15,9 +15,11 @@ MoE that reuses GLM's `noaux_tc` sigmoid gate, and MiniMax Sparse Attention:
   - **swigluoai**: the clamped GLU used by the dense MLP and every expert.
 
 Layers `[0, first_dense_layers)` are dense full-attention + dense SwiGLU; the rest
-are MSA + MoE. RoPE is NeoX/non-interleaved and FULL over head_dim (theta 5e6);
-the config's `rotary_dim` field is not wired into the HF rope, so neither is it
-here. Multi-token-prediction (MTP) draft weights are dropped at load.
+are MSA + MoE. RoPE is NeoX/non-interleaved and PARTIAL: width-`rotary_dim`
+tables (64 of 128 real) rotate the leading dims and pass the tail, matching
+HF's slice-to-cos-width apply under the deployment config's
+`partial_rotary_factor`. Multi-token-prediction (MTP) draft weights are
+dropped at load.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from mini_infer.models.blocks.activations import swigluoai
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
 from mini_infer.models.blocks.glm_moe_gate import GlmMoeFFN
 from mini_infer.models.blocks.minimax_m3_indexer import MiniMaxM3Indexer
-from mini_infer.models.blocks.rope import apply_rotary_pos_emb
+from mini_infer.models.blocks.rope import apply_rotary_pos_emb_partial
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -91,10 +93,17 @@ class MiniMaxM3Config:
         head_dim = int(
             getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads
         )
-        rotary_dim = int(
-            getattr(text, "rotary_dim", None)
-            or round(getattr(text, "partial_rotary_factor", 0.5) * head_dim)
+        # Partial RoPE width. HF's rope init reads `partial_rotary_factor` out
+        # of the (standardized) rope_parameters; the deployment config ships it
+        # as a flat field (0.5) alongside `rotary_dim` (64). Follow HF's
+        # precedence: rope_parameters first, then the flat fields, then full.
+        partial_factor = rope_params.get("partial_rotary_factor") or getattr(
+            text, "partial_rotary_factor", None
         )
+        if partial_factor:
+            rotary_dim = int(head_dim * float(partial_factor))
+        else:
+            rotary_dim = int(getattr(text, "rotary_dim", None) or head_dim)
         # Dense/sparse split: HF encodes it via first_k_dense_replace or the
         # sparse/moe frequency arrays; layer i is dense iff i < first_dense.
         first_dense = getattr(text, "first_k_dense_replace", None)
@@ -150,7 +159,7 @@ class MiniMaxM3Config:
 
 
 class _MiniMaxM3Attention(nn.Module):
-    """GQA with per-head Gemma QK-norm + full RoPE; MSA block mask on sparse layers."""
+    """GQA with per-head Gemma QK-norm + partial RoPE; MSA block mask on sparse layers."""
 
     def __init__(self, cfg: MiniMaxM3Config, layer_idx: int, *, sparse: bool) -> None:
         super().__init__()
@@ -204,7 +213,10 @@ class _MiniMaxM3Attention(nn.Module):
         v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # Partial RoPE: cos/sin are width `rotary_dim`; the helper rotates the
+        # leading dims and passes the tail through, matching HF's slice-to-cos
+        # width apply. (rotary_dim == head_dim degenerates to full rope.)
+        q, k = apply_rotary_pos_emb_partial(q, k, cos, sin)
 
         keys_packed = k.transpose(1, 2).squeeze(0).contiguous()
         values_packed = v.transpose(1, 2).squeeze(0).contiguous()
@@ -428,11 +440,14 @@ class MiniMaxM3ForCausalLM(BaseCausalLM):
         super().__init__()
         self.cfg = cfg
         self.model = _MiniMaxM3InnerModel(cfg)
-        # Full RoPE over the whole head_dim (theta 5e6). The transformers M3
-        # reference uses a full head_dim rope table under rope_type="default"
-        # (inv_freq has head_dim/2 non-zero freqs); the config's rotary_dim /
-        # partial_rotary_factor are not wired into it, so this matches HF exactly.
-        self.rotary_emb = RotaryEmbedding(cfg.head_dim, base=cfg.rope_theta)
+        # Partial RoPE (theta 5e6): a width-`rotary_dim` table (64 of 128 for
+        # the real model). HF standardizes the deployment config's flat
+        # `partial_rotary_factor` into rope_parameters and builds inv_freq of
+        # length rotary_dim/2; its apply then rotates only the first
+        # rotary_dim head dims. A harness config that omits the factor makes
+        # HF degenerate to full rope, which is why parity configs must carry
+        # it (the real checkpoint is trained partial).
+        self.rotary_emb = RotaryEmbedding(cfg.rotary_dim, base=cfg.rope_theta)
         self.lm_head = ColumnParallelLinear(
             cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
         )

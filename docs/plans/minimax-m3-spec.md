@@ -24,15 +24,20 @@ Two Phase-0 synthesis claims were wrong; the HF source is authoritative:
    `(batch, query)`, shared across ALL main attention heads. The additive mask is
    `[B, 1, S, k_len]` (broadcast over heads). Ignore the earlier "4 independent
    per-group selections / repeat_interleave 16" language in §1b/§1c/§1e-item-9.
-2. **RoPE is FULL over head_dim, not partial** (resolved by the Phase-3
-   model-level parity harness, superseding the earlier partial-RoPE reading).
-   The HF config carries a `rotary_dim` field but it is NOT wired into the rope:
-   under `rope_type="default"` HF builds `inv_freq` of length `head_dim/2` (all
-   non-zero) and `apply_rotary_pos_emb` rotates the whole 128-dim head. Use
-   `RotaryEmbedding(head_dim=128, base=5e6)` (width-128 table) + the standard
-   `apply_rotary_pos_emb`, for the main branch AND the indexer. Resolves
-   open-question #1. The block mask also REPLACES the causal mask (folds causal
-   in), it is not added on top of a separate causal mask.
+2. **RoPE is PARTIAL: first `rotary_dim` (64) of 128 dims** (the original
+   reading; re-confirmed by the real-model gate after a detour). The deployment
+   config ships FLAT `partial_rotary_factor: 0.5` + `rope_theta`;
+   `standardize_rope_params` folds the factor into rope_parameters, `inv_freq`
+   gets length rotary_dim/2, and HF's apply slices to the cos width (rotates
+   the first 64, passes the rest). CAUTION (the detour): a harness config that
+   passes an explicit `rope_parameters` dict WITHOUT the factor makes HF
+   silently degenerate to full rope; an interim "full RoPE, rotary_dim inert"
+   correction here was that artifact, caught only when the real 428B generated
+   fluent-but-degenerate text. Parity configs must be deployment-shaped (flat
+   fields). Use `RotaryEmbedding(head_dim=rotary_dim, base=5e6)` +
+   `apply_rotary_pos_emb_partial` for the main branch AND the indexer. The
+   block mask also REPLACES the causal mask (folds causal in), it is not added
+   on top of a separate causal mask.
 
 ## 1. MSA attention
 
@@ -45,7 +50,7 @@ layers additionally build an indexer. GQA 64q/4kv (G=16), head_dim 128,
 q = q_proj(x).view(B,S,64,128); k = k_proj(x).view(B,S,4,128); v = v_proj(x).view(B,S,4,128)
 q = q_norm(q); k = k_norm(k)            # per-head Gemma RMSNorm(128), pre-RoPE, pre-transpose; V NOT normed
 q,k = transpose(1,2)
-q,k = apply_rotary_pos_emb(q,k,cos,sin) # full RoPE over all 128 dims (rotary_dim is not wired)
+q,k = apply_rotary_pos_emb(q,k,cos,sin) # PARTIAL: cos width 64 -> rotate first 64 of 128
 k,v = kv_cache.update(k,v)              # full KV, no pruning
 # sparse layers: block_indices = indexer(...); attention_mask += build_block_mask(block_indices)
 k,v = repeat_kv(k,v,16)                 # 4 -> 64
@@ -62,7 +67,7 @@ o = p @ v ; out = o_proj(o)
 ```
 idx_q = q_norm(q_proj(x).view(B,S,4,128)).transpose(1,2)   # norm BEFORE transpose/RoPE
 idx_k = k_norm(k_proj(x).view(B,S,1,128)).transpose(1,2)
-idx_q,idx_k = apply_rotary_pos_emb(idx_q,idx_k,cos,sin)     # full RoPE, same tables as main branch
+idx_q,idx_k = apply_rotary_pos_emb(idx_q,idx_k,cos,sin)     # partial RoPE, same width-64 tables
 idx_k = cache.update_index(idx_k)                          # full idx_k history cached separately
 scores = idx_q.float() @ idx_k.float().transpose(-1,-2)    # FP32, RAW dot, NO /sqrt(d)
 scores = scores.masked_fill(arange(k_len) > position_ids[...,None], -inf)  # causal, TOKEN granularity, BEFORE pool
@@ -91,7 +96,7 @@ Savings are in the main branch (<=16 blocks attended), not the index branch
 
 ### 1e. Bit-parity-critical details (do not deviate)
 1. Index score has NO `/sqrt(d_idx)` scale `[PAPER-CONTRADICTION]` (raw fp32 dot).
-2. Indexer applies full RoPE AND per-head qk-norm BEFORE RoPE `[PAPER-CONTRADICTION]`.
+2. Indexer applies partial RoPE AND per-head qk-norm BEFORE RoPE `[PAPER-CONTRADICTION]`.
 3. RMSNorm = `out*(1.0+weight)`, fp32, cast back AFTER multiply (Gemma order).
 4. Index scores fp32; main softmax fp32 then cast bf16; matmuls bf16 at scale `128**-0.5`.
 5. Causal mask at TOKEN granularity BEFORE block max-pool (`k_pos > q_pos`, strict).
@@ -144,9 +149,9 @@ All seven sites: `input_layernorm`, `post_attention_layernorm`, `model.norm` (di
 `q_norm`, `k_norm`, `index_q_norm`, `index_k_norm` (dim 128, per-head, applied on `[B,S,H,128]` BEFORE transpose/RoPE).
 
 ### 2e. RoPE / embeddings / LM head
-- Full RoPE: `dim=head_dim=128`; `inv_freq=1/(5e6**(arange(0,128,2)/128))`; cos/sin width 128.
-  The config's `rotary_dim` field is inert under `rope_type="default"` (verified: HF inv_freq
-  spans head_dim/2 non-zero freqs; full-width rotation matches bit-for-bit, first-64 partial diverges).
+- Partial RoPE: `dim=rotary_dim=64`; `inv_freq=1/(5e6**(arange(0,64,2)/64))`; cos/sin width 64.
+  Driven by the flat `partial_rotary_factor: 0.5` (standardized into rope_parameters); an explicit
+  rope_parameters dict without the factor silently forces full rope in HF (harness trap, see Corrections #2).
   `rotate_half(x)=cat([-x[...,d/2:], x[...,:d/2]])` = NeoX/non-interleaved (NOT DeepSeek interleaved). cos/sin fp32 -> bf16.
 - Embeddings: `nn.Embedding(200064, 6144)`, no embed scaling (unlike Gemma).
 - Final `model.norm(6144)` -> `lm_head Linear(6144, 200064, bias=False)`, UNTIED (load `lm_head.weight` separately). No logit softcap.
@@ -192,7 +197,7 @@ path (1c), not the kernel. Kernel study informs an optional later Triton port
 | GQA q/k/v/o + qk-norm hooks | reuse | `models/blocks/gqa.py:37` (norm hooks :82-86,:118-122) | 64q/4kv/128 are config |
 | Paged KV cache (full KV) | reuse | `cache/paged_kv_cache.py:14`, `cache/block_pool.py:83` | PagedKVCache, NOT StateCache |
 | Packed varlen attention | extend | `cache/packed_attention.py:190` `_torch` | inject block-sparse mask; mirror `cache/mla_attention.py:86-94` `dsa_topk` |
-| Full RoPE (128, theta 5e6) | reuse | `models/blocks/rope.py` `RotaryEmbedding` + `apply_rotary_pos_emb` | verified by parity: NeoX pairing, `rotary_dim` inert |
+| Partial RoPE (64/128, theta 5e6) | reuse | `models/blocks/rope.py` `RotaryEmbedding(rotary_dim)` + `apply_rotary_pos_emb_partial` | NeoX pairing; harness configs must ship the flat partial factor |
 | Per-head qk-norm (q AND k) | reuse | `models/blocks/transformer_block.py:42-43`; `models/qwen3.py:96` | must be Gemma `(1+w)` norm |
 | Gemma RMSNorm `(1+w)` | reuse | `models/blocks/gemma_rmsnorm.py:12` | for ALL norms incl. 4 per-head qk/index norms |
 | SwiGLU FFN shape | extend | `models/blocks/swiglu.py:23` | shape reusable, activation differs |
@@ -221,11 +226,11 @@ take an arbitrary per-query mask).
 - Pin `transformers==5.12.1` as a TEST-ONLY dep (`transformers>=5.12,<5.13`); do not perturb the engine runtime pin. (Docs anchor v5.12.0; re-verify the `minimax_m3_vl` file diff 5.12.0 vs 5.12.1 and pin whichever you validate against.)
 - Pure-PyTorch eager reference EXISTS (kernel not mandatory). Use `attn_implementation="eager"` + fp32 on CPU. The whole text forward runs on CPU.
 - Tiny-random text-only CPU instantiation works (`MiniMaxM3VLForCausalLM` text path takes only input_ids/attention/positions/past). Build a small config (3 dense + 2 MoE/MSA layers, tiny `index_block_size` so a short seq spans >topk+local blocks), export its `state_dict`, load identical weights into the from-scratch model (isolates math from loading), compare per-layer top-down.
-- Per-layer parity test (first divergence = root cause): embedding -> input norm -> q/k/v + qk-norm -> full RoPE -> indexer block-scores + indices (EXACT int) + bias -> attn out -> swigluoai MLP -> MoE (router weights/indices EXACT int + experts + shared + combined) -> residual + final norm + logits (argmax). Gate `allclose(rtol=1e-4, atol=1e-5)` fp32; exact-int for router/indexer selections.
+- Per-layer parity test (first divergence = root cause): embedding -> input norm -> q/k/v + qk-norm -> partial RoPE -> indexer block-scores + indices (EXACT int) + bias -> attn out -> swigluoai MLP -> MoE (router weights/indices EXACT int + experts + shared + combined) -> residual + final norm + logits (argmax). Gate `allclose(rtol=1e-4, atol=1e-5)` fp32; exact-int for router/indexer selections.
 - Real-weights golden (428B, multi-GPU, temp 0 vs `MiniMaxM3SparseForConditionalGeneration`) is the deferred GPU gate; the tiny-random per-layer harness is the CI gate.
 
 ## 6. Open questions (resolve during implementation)
-1. RESOLVED (Phase 3): RoPE is full-width over head_dim with NeoX half-rotation; `rope.py` `RotaryEmbedding` + `apply_rotary_pos_emb` match HF bit-for-bit (model parity harness green).
+1. RESOLVED (twice): RoPE is PARTIAL, first rotary_dim=64 dims, NeoX half-rotation; width-64 tables + `apply_rotary_pos_emb_partial` match HF bit-for-bit ON A DEPLOYMENT-SHAPED CONFIG (flat partial_rotary_factor). An interim full-rope resolution was an artifact of a harness config that bypassed the factor.
 2. transformers 5.12.0 vs 5.12.1 `minimax_m3_vl` file diff — pin whichever you validate against.
 3. Verbatim-code drift — diff the spec's code blocks against a local `pip install transformers==5.12.1` checkout before freezing fixtures.
 4. Indexer per-head norm — confirm `MiniMaxM3VLIndexer.__init__` uses `MiniMaxM3VLRMSNorm` (Gemma 1+w), not LayerNorm; cover index_q_norm/index_k_norm in the harness.

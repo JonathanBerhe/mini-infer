@@ -43,6 +43,7 @@ image = (
 )
 
 _PROMPT = "The capital of France is"
+_PROMPT_QUESTION = "What is the capital of France? Name two famous landmarks there."
 
 # Long-context filler for the kernel A/B: a real prose paragraph (not a
 # synthetic token pattern) repeated to the target length after tokenization.
@@ -59,9 +60,21 @@ _AB_DOC = (
 )
 
 
-def _greedy_decode(model, cache, tokenizer, prompt_ids, max_new_tokens, device):  # type: ignore[no-untyped-def]
-    """Chunked prefill + greedy decode; returns generated token ids."""
+def _greedy_decode(model, cache, tokenizer, prompt_ids, max_new_tokens, device, sampling=None):  # type: ignore[no-untyped-def]
+    """Chunked prefill + decode; greedy unless `sampling` (SamplingParams) is set.
+
+    Sampled decode seeds the RNG identically on every rank, so the draws (and
+    therefore the tokens) stay rank-comparable: TP-consistent logits + the same
+    seeded generator give the same trajectory on all ranks.
+    """
     import torch
+
+    from mini_infer.engine.sampler import sample
+
+    def _next(logits_row):  # type: ignore[no-untyped-def]
+        if sampling is None:
+            return int(logits_row.argmax())
+        return sample(logits_row.float(), sampling)
 
     chunk = 1024
     plen = len(prompt_ids)
@@ -78,7 +91,10 @@ def _greedy_decode(model, cache, tokenizer, prompt_ids, max_new_tokens, device):
                 cu_seqlens_q=torch.tensor([0, n], dtype=torch.int32),
             )
             done += n
-        nxt = int(logits[0, -1].argmax())
+        if sampling is not None:
+            torch.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
+        nxt = _next(logits[0, -1])
         out = [nxt]
         cache_len = plen
         for _ in range(max_new_tokens - 1):
@@ -89,7 +105,7 @@ def _greedy_decode(model, cache, tokenizer, prompt_ids, max_new_tokens, device):
                 cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
             )
             cache_len += 1
-            nxt = int(logits[0, -1].argmax())
+            nxt = _next(logits[0, -1])
             out.append(nxt)
     return out
 
@@ -198,25 +214,49 @@ def _run_rank(
         tokenizer = AutoTokenizer.from_pretrained(_CKPT_DIR)
         _cfg, model = _build_and_load(_CKPT_DIR, device)
 
-        # 1. Coherence gate.
-        prompt_ids = tokenizer.encode(_PROMPT)
+        # 1. Coherence gate. The model ships sampling-first generation defaults
+        # and an RL-tuned chat format; raw greedy completion is off-spec (it
+        # answers correctly then loops). Apply the chat template so greedy
+        # decoding is in-distribution and stays rank-comparable.
+        try:
+            # tokenize=False then encode: apply_chat_template's tokenized
+            # return type varies by transformers version (list vs Encoding).
+            prompt_text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": _PROMPT_QUESTION}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            prompt_ids = list(tokenizer.encode(prompt_text, add_special_tokens=False))
+        except Exception:  # no template shipped: fall back to raw completion
+            prompt_ids = list(tokenizer.encode(_PROMPT))
+        if prompt_ids and not isinstance(prompt_ids[0], int):
+            raise TypeError(f"prompt_ids not ints: {type(prompt_ids[0])}")
+        # The model's own generation defaults (do_sample, temp 1.0, top_p 0.95);
+        # greedy is off-spec for this family and loops.
+        from mini_infer.engine.sampler import SamplingParams
+
+        sampling = SamplingParams(temperature=1.0, top_p=0.95)
         cache = _make_cache(model, device, len(prompt_ids) + max_new_tokens + 8)
-        out_ids = _greedy_decode(model, cache, tokenizer, prompt_ids, max_new_tokens, device)
+        out_ids = _greedy_decode(
+            model, cache, tokenizer, prompt_ids, max_new_tokens, device, sampling=sampling
+        )
         text = tokenizer.decode(out_ids)
         del cache
 
-        # 2. Kernel A/B at long context: same prefill state per arm.
-        ab_doc_ids = tokenizer.encode(_AB_DOC)
-        long_ids = (ab_doc_ids * (ab_context // len(ab_doc_ids) + 1))[:ab_context]
+        # 2. Kernel A/B at long context (skip with ab_steps=0): same prefill
+        # state per arm.
         results = {}
-        for arm in ("torch", "kernel"):
-            model.set_decode_kernel(arm == "kernel")
-            cache = _make_cache(model, device, ab_context + ab_steps + 8)
-            _greedy_decode(model, cache, tokenizer, long_ids, 1, device)
-            tokens, tps = _timed_decode(model, cache, ab_context, ab_steps, device)
-            results[arm] = {"tokens": tokens, "tok_s": tps}
-            del cache
-        model.set_decode_kernel(False)
+        if ab_steps > 0:
+            ab_doc_ids = tokenizer.encode(_AB_DOC)
+            long_ids = (ab_doc_ids * (ab_context // len(ab_doc_ids) + 1))[:ab_context]
+            for arm in ("torch", "kernel"):
+                model.set_decode_kernel(arm == "kernel")
+                cache = _make_cache(model, device, ab_context + ab_steps + 8)
+                _greedy_decode(model, cache, tokenizer, long_ids, 1, device)
+                tokens, tps = _timed_decode(model, cache, ab_context, ab_steps, device)
+                results[arm] = {"tokens": tokens, "tok_s": tps}
+                del cache
+            model.set_decode_kernel(False)
         return {
             "rank": rank,
             "text": text,
@@ -277,15 +317,18 @@ def generate(max_new_tokens: int = 48, ab_context: int = 16384, ab_steps: int = 
     same_text = all(results[r]["text"] == r0["text"] for r in results)
     lines.append(f"rank consistency: {'PASS' if same_text else 'FAIL'}")
     ab = r0["ab"]
-    same_tokens = ab["torch"]["tokens"] == ab["kernel"]["tokens"]
-    speedup = ab["kernel"]["tok_s"] / ab["torch"]["tok_s"]
-    lines.append(
-        f"kernel A/B @ ctx={16384}: torch {ab['torch']['tok_s']:.2f} tok/s, "
-        f"kernel {ab['kernel']['tok_s']:.2f} tok/s, speedup {speedup:.2f}x, "
-        f"token identity {'PASS' if same_tokens else 'FAIL'}"
-    )
+    if ab:
+        same_tokens = ab["torch"]["tokens"] == ab["kernel"]["tokens"]
+        speedup = ab["kernel"]["tok_s"] / ab["torch"]["tok_s"]
+        lines.append(
+            f"kernel A/B @ ctx={ab_context}: torch {ab['torch']['tok_s']:.2f} tok/s, "
+            f"kernel {ab['kernel']['tok_s']:.2f} tok/s, speedup {speedup:.2f}x, "
+            f"token identity {'PASS' if same_tokens else 'FAIL'}"
+        )
     lines.append(f"peak GPU mem rank0: {r0['mem_gb']:.1f} GB")
-    return "\n".join(lines)
+    report = "\n".join(lines)
+    print(report, flush=True)  # also lands in app logs for detached runs
+    return report
 
 
 @app.local_entrypoint()

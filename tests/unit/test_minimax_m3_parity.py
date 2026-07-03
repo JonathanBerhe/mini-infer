@@ -71,7 +71,14 @@ def _tiny_hf_config():
         num_experts_per_tok=4,
         routed_scaling_factor=2.0,
         rms_norm_eps=1e-6,
-        rope_parameters={"rope_type": "default", "rope_theta": 5_000_000.0},
+        # Deployment-shaped rope config: FLAT rope_theta + partial_rotary_factor
+        # (no explicit rope_parameters), exactly like the real config.json. HF
+        # standardizes the flat factor into rope_parameters and runs PARTIAL
+        # rope over the first rotary_dim dims; an explicit rope_parameters dict
+        # without the factor silently degenerates HF to full rope and masks the
+        # divergence (which is how the real-model gate caught it).
+        rope_theta=5_000_000.0,
+        partial_rotary_factor=0.5,
         rotary_dim=8,
         hidden_act="swigluoai",
         tie_word_embeddings=False,

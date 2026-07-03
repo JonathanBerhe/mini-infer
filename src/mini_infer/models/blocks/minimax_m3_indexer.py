@@ -10,7 +10,7 @@ All comments are the load-bearing details:
     # per-head Gemma RMSNorm pre-RoPE; k is one shared head:
     idx_q = q_norm(q_proj(x).view(B, S, n_idx_heads, d)).transpose(1, 2)
     idx_k = k_norm(k_proj(x).view(B, S, 1, d)).transpose(1, 2)
-    idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)  # full RoPE over head_dim
+    idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)  # first rotary_dim dims
     scores = idx_q.float() @ idx_k.float().mT               # [B, heads, S, k_len]; NO /sqrt(d)
     scores = scores.masked_fill(k_pos > q_pos, -inf)        # causal, TOKEN granularity, BEFORE pool
     scores = pad(scores, last block up to block_size, -inf)
@@ -47,7 +47,7 @@ import torch
 from torch import nn
 
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
-from mini_infer.models.blocks.rope import apply_rotary_pos_emb
+from mini_infer.models.blocks.rope import apply_rotary_pos_emb_partial
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -101,7 +101,8 @@ class MiniMaxM3Indexer(nn.Module):
 
         Args:
             hidden_states: `(B, S, hidden_size)`.
-            cos, sin: RoPE tables, full width `head_dim`, shape `(B, S, head_dim)`.
+            cos, sin: partial-RoPE tables (width `rotary_dim`, shared with the
+                main branch), shape `(B, S, rotary_dim)`.
             position_ids: `(B, S)` absolute positions.
 
         Returns:
@@ -113,7 +114,7 @@ class MiniMaxM3Indexer(nn.Module):
 
         idx_q = self.q_norm(self.q_proj(hidden_states).view(bsz, seqlen, h, d)).transpose(1, 2)
         idx_k = self.k_norm(self.k_proj(hidden_states).view(bsz, seqlen, 1, d)).transpose(1, 2)
-        idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
+        idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)
 
         # [B, h, S, k_len], raw fp32 dot (NO 1/sqrt(d)). idx_k's single head
         # broadcasts across the h index heads.
@@ -222,7 +223,7 @@ class MiniMaxM3Indexer(nn.Module):
 
         idx_q = self.q_norm(self.q_proj(hidden_states).view(1, total_q, h, d)).transpose(1, 2)
         idx_k = self.k_norm(self.k_proj(hidden_states).view(1, total_q, 1, d)).transpose(1, 2)
-        idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
+        idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)
 
         # Append this step's index-K (packed (total_q, 1, d)); read back full history.
         idx_k_packed = idx_k[0].transpose(0, 1).contiguous()  # (total_q, 1, d)

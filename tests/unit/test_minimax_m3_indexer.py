@@ -1,8 +1,8 @@
-"""MiniMax-M3 MSA: the block indexer and the block mask.
+"""MiniMax-M3 MSA: partial RoPE, the block indexer, and the block mask.
 
-The indexer runs full RoPE over `head_dim` (matching HF); the standalone
-`apply_rotary_pos_emb_partial` helper is exercised here too as a general
-first-N-dims primitive, but MSA itself does not use the partial form.
+The indexer applies partial RoPE (width `rotary_dim` tables shared with the
+main branch; the first dims rotate, the tail passes through), matching HF's
+slice-to-cos-width apply under the deployment config's partial_rotary_factor.
 
 Validated against independent loop-based references (so a vectorization bug in
 the module doesn't hide behind the same vectorization in the check), plus the
@@ -19,7 +19,6 @@ from torch.nn import functional
 from mini_infer.models.blocks.minimax_m3_indexer import MiniMaxM3Indexer
 from mini_infer.models.blocks.rope import (
     RotaryEmbedding,
-    apply_rotary_pos_emb,
     apply_rotary_pos_emb_partial,
 )
 
@@ -91,7 +90,7 @@ def _reference_selection(idxer: MiniMaxM3Indexer, hidden: torch.Tensor, cos, sin
     h, d, bs = idxer.num_heads, idxer.head_dim, idxer.block_size
     idx_q = idxer.q_norm(idxer.q_proj(hidden).view(bsz, seqlen, h, d)).transpose(1, 2)
     idx_k = idxer.k_norm(idxer.k_proj(hidden).view(bsz, seqlen, 1, d)).transpose(1, 2)
-    idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
+    idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)
     idx_q, idx_k = idx_q.detach().float(), idx_k.detach().float()
     num_blocks = -(-seqlen // bs)
     sets: list[set[int]] = []
@@ -119,7 +118,7 @@ def test_indexer_selection_matches_loop_reference() -> None:
     seqlen = 10
     hidden = torch.randn(1, seqlen, 16)
     position_ids = torch.arange(seqlen).unsqueeze(0)
-    cos, sin = _rope_tables(8, seqlen)
+    cos, sin = _rope_tables(4, seqlen)
 
     block_indices = idxer(hidden, cos, sin, position_ids)
     assert block_indices.shape == (1, seqlen, 2)
@@ -139,7 +138,7 @@ def test_build_block_mask_matches_reference() -> None:
     seqlen = 10
     hidden = torch.randn(1, seqlen, 16)
     position_ids = torch.arange(seqlen).unsqueeze(0)
-    cos, sin = _rope_tables(8, seqlen)
+    cos, sin = _rope_tables(4, seqlen)
 
     block_indices = idxer(hidden, cos, sin, position_ids)
     mask = idxer.build_block_mask(block_indices, seqlen, position_ids, dtype=torch.float32)
@@ -168,7 +167,7 @@ def test_msa_collapses_to_causal_when_all_blocks_selected() -> None:
     ).eval()
     hidden = torch.randn(1, seqlen, 16)
     position_ids = torch.arange(seqlen).unsqueeze(0)
-    cos, sin = _rope_tables(8, seqlen)
+    cos, sin = _rope_tables(4, seqlen)
 
     block_indices = idxer(hidden, cos, sin, position_ids)
     mask = idxer.build_block_mask(block_indices, seqlen, position_ids, dtype=torch.float32)
@@ -197,7 +196,7 @@ def test_topk_smaller_than_blocks_actually_prunes() -> None:
     seqlen = 12  # 3 blocks, topk=2
     hidden = torch.randn(1, seqlen, 16)
     position_ids = torch.arange(seqlen).unsqueeze(0)
-    cos, sin = _rope_tables(8, seqlen)
+    cos, sin = _rope_tables(4, seqlen)
 
     block_indices = idxer(hidden, cos, sin, position_ids)
     mask = idxer.build_block_mask(block_indices, seqlen, position_ids, dtype=torch.float32)

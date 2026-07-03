@@ -37,10 +37,14 @@ down, because the paper or a first reading suggests otherwise:
 - **Selection is GLOBAL per query, not per GQA group.** The block scores
   max-pool over the block's tokens AND the index heads, so every main head of
   a query shares one selected-block set. The mask is `[B, 1, S, k_len]`.
-- **RoPE is FULL over head_dim.** The config ships a `rotary_dim` field but
-  it is not wired into the HF rope under `rope_type="default"`; the rope
-  table spans all 128 dims. Proved by the model-level parity harness (the
-  first-64 partial variant diverges; full-width matches bit-for-bit).
+- **RoPE is PARTIAL: the first `rotary_dim` (64) of 128 dims.** The
+  deployment config ships a FLAT `partial_rotary_factor: 0.5` that HF's
+  `standardize_rope_params` folds into rope_parameters; the apply slices to
+  the cos width. Trap for parity harnesses: passing an explicit
+  `rope_parameters` dict without the factor silently degenerates HF to full
+  rope, which briefly convinced us the field was inert; the real 428B gate
+  (fluent-but-degenerate output) exposed it. Harness configs must mirror the
+  deployment config's flat fields.
 - **Index scores carry NO `1/sqrt(d)` scale.** Raw fp32 dot products.
 
 Full-model logits match the HF reference bit-for-bit on the tiny-random CPU
@@ -72,13 +76,13 @@ collapsed to `first_dense_layers` in our config).
 
 The scoring branch is a miniature attention: 4 index heads (`q_proj`
 6144->512), one shared index key head (`k_proj` 6144->128), per-head Gemma
-RMSNorm on both, applied BEFORE the transpose and BEFORE RoPE, then full RoPE
-with the same tables as the main branch.
+RMSNorm on both, applied BEFORE the transpose and BEFORE RoPE, then partial
+RoPE with the same width-64 tables as the main branch.
 
 ```python
 idx_q = q_norm(q_proj(x).view(B, S, 4, 128)).transpose(1, 2)
 idx_k = k_norm(k_proj(x).view(B, S, 1, 128)).transpose(1, 2)
-idx_q, idx_k = apply_rotary_pos_emb(idx_q, idx_k, cos, sin)
+idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)
 scores = idx_q.float() @ idx_k.float().mT        # RAW fp32 dot, NO 1/sqrt(d)
 ```
 
@@ -124,13 +128,13 @@ an arbitrary per-query additive mask.
 
 Standard GQA (64 q heads / 4 kv heads / head_dim 128, scale `128**-0.5`) with
 per-head Gemma QK-norm applied on the `(B, S, H, 128)` view before transpose
-and RoPE (V is not normed), then full RoPE over all 128 dims (NeoX split-half
-pairing, theta 5e6):
+and RoPE (V is not normed), then partial RoPE over the first 64 dims (NeoX
+split-half pairing, theta 5e6, width-64 cos/sin tables):
 
 ```python
 q = q_norm(q_proj(x).view(B, S, 64, 128)).transpose(1, 2)
 k = k_norm(k_proj(x).view(B, S, 4, 128)).transpose(1, 2)
-q, k = apply_rotary_pos_emb(q, k, cos, sin)   # full width; rotary_dim is inert
+q, k = apply_rotary_pos_emb_partial(q, k, cos, sin)  # rotate [:64], pass [64:]
 ```
 
 On sparse layers the indexer's mask replaces the causal mask; softmax runs in
@@ -210,8 +214,9 @@ than the architecture).
    extension of the packed torch attention.
 3. Full-model bit-parity vs HF on a tiny-random config (3 dense + 2 MSA/MoE
    layers), identical weights loaded through `load_weights`: cos > 0.999,
-   argmax-equal, allclose 1e-3. This harness is what falsified the
-   partial-RoPE reading.
+   argmax-equal, allclose 1e-3. The config must be DEPLOYMENT-shaped (flat
+   partial_rotary_factor, no hand-built rope_parameters); a hand-built dict
+   once masked the partial-rope path until the real-model gate exposed it.
 4. Serving parity: greedy / batched / TP / prefix-cache / disk-layout, plus
    the kernel-path variants (the CPU dispatcher runs the pure-torch
    block-sparse reference, so the wiring is exercised without a GPU).
