@@ -9,13 +9,13 @@ Reproducer:
 
 ```
 # A10 + Qwen-0.5B
-MINI_INFER_BENCH_GPU=A10 modal run scripts/modal_openloop_bench.py \
+MINI_INFER_BENCH_GPU=A10 uv run modal run scripts/modal_openloop_bench.py \
     --model Qwen/Qwen2.5-0.5B-Instruct \
     --rates 0.1,0.2,0.4,0.6,1.0 --duration 30 --warmup 1 \
     --max-tokens 128 --num-blocks 4096
 
 # H100 + Qwen-7B
-MINI_INFER_BENCH_GPU=H100 modal run scripts/modal_openloop_bench.py \
+MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/modal_openloop_bench.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --rates 0.5,1,2,4 --duration 30 --warmup 1 \
     --max-tokens 128 --num-blocks 4096
@@ -87,7 +87,8 @@ Sustained capacity: ~**0.40 RPS**.
 
 Sustained capacity: ~**0.47 RPS**.
 
-Errors: zero. 182 successful streamed completions across the two configs.
+Errors: zero. 303 successful streamed completions across the two configs
+(74 on A10, 229 on H100).
 
 ## Reading the data
 
@@ -156,13 +157,17 @@ preserved), finish it with `cancelled`, reap its blocks, and continue
 the loop. The cancelled client sees `finish_reason="cancelled"` rather
 than a 503 across the board.
 
-All 10 existing scheduler unit tests still pass. The new OOM-preemption
-path did not trigger during the calibrated sweeps above (errs=0) because
-`num_blocks=4096` keeps the pool comfortably ahead of offered load.
+All 10 existing scheduler unit tests still pass, plus a dedicated test for
+the preemption path itself
+([tests/unit/test_scheduler_oom.py](../../tests/unit/test_scheduler_oom.py)):
+it forces a mid-step `OutOfMemoryError` and asserts the engine thread
+survives, cancels the youngest prefiller, and the retried step succeeds.
+The path did not trigger during the calibrated sweeps above (errs=0)
+because `num_blocks=4096` keeps the pool comfortably ahead of offered load.
 
 ## What this validates
 
-- The open-loop harness measures TTFT and ITL correctly via SSE; 182
+- The open-loop harness measures TTFT and ITL correctly via SSE; 303
   successful completions across two configs with deterministic
   per-request numbers and zero protocol errors.
 - mini-infer's continuous-batching scheduler degrades gracefully under
@@ -186,6 +191,6 @@ path did not trigger during the calibrated sweeps above (errs=0) because
 - Speculative decoding, INT8 weights, TurboQuant KV, or any other
   optimization path. These are orthogonal axes that should each get
   their own calibrated sweep.
-- The OOM-preemption path under live overload (the fix is defensive and
-  unit-tested; a deliberately oversubscribed Modal run would exercise it
-  end-to-end).
+- The OOM-preemption path under live overload. The mechanism is
+  unit-tested (`tests/unit/test_scheduler_oom.py`), but a deliberately
+  oversubscribed Modal run would exercise it end-to-end on real GPU memory.

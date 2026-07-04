@@ -229,7 +229,6 @@ def _percentile(values: list[float], q: float) -> float | None:
 @dataclass
 class RateSummary:
     target_rate: float
-    n_total: int
     n_ok: int
     n_err: int
     achieved_rps: float
@@ -259,7 +258,6 @@ def _summarize(target_rate: float, results: list[RequestResult]) -> RateSummary:
 
     return RateSummary(
         target_rate=target_rate,
-        n_total=len(results),
         n_ok=len(ok),
         n_err=n_err,
         achieved_rps=achieved,

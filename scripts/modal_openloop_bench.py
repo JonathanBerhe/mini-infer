@@ -123,6 +123,7 @@ def run_openloop(
     warmup: int,
     max_tokens: int,
     num_blocks: int,
+    block_size: int,
 ) -> str:
     """Boot the server, then drive it with the open-loop bench. All in one container."""
     import torch
@@ -136,8 +137,11 @@ def run_openloop(
     env["MINI_INFER_PORT"] = "8000"
     # Size the KV block pool to fit the offered load. Default 1024 blocks of
     # 16 tokens each = 16K slots, which OOMs under a rate sweep that puts
-    # dozens of long-prompt requests in flight at once.
+    # dozens of long-prompt requests in flight at once. block_size trades
+    # per-block granularity (less internal fragmentation at small sizes)
+    # against FlashAttention's paged-varlen fast path (needs block_size % 256).
     env["MINI_INFER_NUM_BLOCKS"] = str(num_blocks)
+    env["MINI_INFER_BLOCK_SIZE"] = str(block_size)
     env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     # Server logs are best-effort; if the run hangs they help diagnose,
     # otherwise they just clutter the Modal log stream. Inherit stderr/stdout.
@@ -190,6 +194,7 @@ def main(
     warmup: int = 3,
     max_tokens: int = 128,
     num_blocks: int = 4096,
+    block_size: int = 16,
 ) -> None:
     print(
         run_openloop.remote(
@@ -199,5 +204,6 @@ def main(
             warmup=warmup,
             max_tokens=max_tokens,
             num_blocks=num_blocks,
+            block_size=block_size,
         )
     )
