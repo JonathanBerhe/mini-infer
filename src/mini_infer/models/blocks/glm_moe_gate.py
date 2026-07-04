@@ -24,6 +24,8 @@ expert is replicated and added after the reduce).
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional
@@ -67,7 +69,14 @@ class GlmNoAuxTcGate(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         # Gate is replicated (every rank routes identically). Named/shaped to
         # match HF `mlp.gate.weight` so weight loading is a direct copy.
+        # A real checkpoint always overwrites this via load_weights, but an
+        # un-loaded model (tests that run a freshly-constructed reference
+        # model directly) must not depend on whatever garbage `torch.empty`
+        # happens to return: init it the same way `nn.Linear`'s default
+        # `reset_parameters` would, so a fresh instance is a well-defined,
+        # finite router rather than uninitialized memory.
         self.weight = nn.Parameter(torch.empty(n_routed_experts, hidden_size))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         # Aux-loss-free selection bias (HF `mlp.gate.e_score_correction_bias`).
         self.register_buffer(
             "e_score_correction_bias", torch.zeros(n_routed_experts, dtype=torch.float32)
