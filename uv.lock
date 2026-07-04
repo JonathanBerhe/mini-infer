@@ -1033,6 +1033,7 @@ cuda = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "modal" },
     { name = "mypy" },
     { name = "pytest" },
@@ -1055,6 +1056,7 @@ provides-extras = ["cuda"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "modal", specifier = ">=1.4.2" },
     { name = "mypy", specifier = ">=1.10" },
     { name = "pytest", specifier = ">=8.0" },

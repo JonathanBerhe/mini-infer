@@ -127,7 +127,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             prefix_cache=StatePrefixCache() if _PREFIX_SHARING else None,
         )
     else:
-        runner = ModelRunner.from_pretrained(model_name)
+        # MINI_INFER_NUM_BLOCKS / MINI_INFER_BLOCK_SIZE let benchmarks size
+        # the KV pool to fit the offered load. The runner defaults
+        # (DEFAULT_NUM_BLOCKS=1024, DEFAULT_BLOCK_SIZE=16) hold ~16K token
+        # slots, which is fine for small-concurrency dev but OOMs under a
+        # rate sweep that puts dozens of long-prompt requests in flight.
+        runner_kwargs: dict[str, int] = {}
+        env_num_blocks = os.environ.get("MINI_INFER_NUM_BLOCKS")
+        env_block_size = os.environ.get("MINI_INFER_BLOCK_SIZE")
+        if env_num_blocks:
+            runner_kwargs["num_blocks"] = int(env_num_blocks)
+        if env_block_size:
+            runner_kwargs["block_size"] = int(env_block_size)
+        runner = ModelRunner.from_pretrained(model_name, **runner_kwargs)
         if _USE_PD:
             logger.info(
                 "Backing /v1/completions with PDScheduler (mode=%s; MINI_INFER_USE_PD set)",
