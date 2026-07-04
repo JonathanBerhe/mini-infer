@@ -38,6 +38,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "modal>=1.4.2",
+    # Bit-parity reference for MiniMax-M3: the minimax_m3_vl modeling code first
+    # ships in transformers 5.12. Constrains the (single) resolved transformers
+    # for the whole repo to 5.12.x; the golden suite is re-run to confirm the
+    # existing families still match under the bump.
+    "transformers>=5.12,<5.13",
 ]
 
 [tool.ruff]
@@ -51,6 +56,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 # Triton kernels conventionally use uppercase pointer args (Q_ptr) and constexpr
 # constants (HEAD_DIM, BLOCK_SIZE). Allow it in the kernel modules.
 "src/mini_infer/cache/paged_attention.py" = ["N803"]
+"src/mini_infer/cache/msa_paged_attention.py" = ["N803"]
 "src/mini_infer/cache/turbo_kernel.py" = ["N803"]
 "src/mini_infer/quant/int8_kernel.py" = ["N803"]
 "src/mini_infer/models/blocks/hc_sinkhorn_kernel.py" = ["N803"]

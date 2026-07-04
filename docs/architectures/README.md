@@ -10,6 +10,7 @@ The direct realization of mini-infer's research-paper-engine niche
 
 | Family | Paper | Reference | Our walkthrough |
 |---|---|---|---|
+| MiniMax-M3 (MSA) | MSA report (arXiv 2606.13392) | HF transformers `modeling_minimax_m3_vl.py` (text path) | [minimax-m3.md](minimax-m3.md) |
 | DeepSeek-V4 | DeepSeek-V4 technical report | [DeepSeek-V4-Pro/inference](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main/inference) | [deepseek-v4.md](deepseek-v4.md) |
 | DeepSeek-V2 / V3 / Kimi-K2 (MLA) | DeepSeek-V2 technical report | HF transformers `modeling_deepseek_v2.py` | [deepseek-v2-mla.md](deepseek-v2-mla.md) |
 | Gemma 4 (text-only) | Gemma 4 release notes | HF transformers `modeling_gemma3.py` (text path) | [gemma-4.md](gemma-4.md) |
@@ -22,9 +23,13 @@ The direct realization of mini-infer's research-paper-engine niche
 
 ## Pending walkthroughs
 
-All currently-registered architectures have walkthroughs. Future
-additions trigger when a new paper architecture is implemented per
-the [roadmap-2026 §Paper-watch-list](../plans/roadmap-2026.md).
+- **GLM-5.2 (GlmMoeDsa)**: ported and merged (ADR-021, the GLM one);
+  walkthrough not yet written. Until then the ADR plus the DeepSeek-V2
+  MLA walkthrough cover most of it (GLM = V3.2-shape MLA + DSA indexer
+  + IndexShare).
+
+Future additions trigger when a new paper architecture is implemented
+per the [roadmap-2026 §Paper-watch-list](../plans/roadmap-2026.md).
 
 Reading order suggestion if you're new to the codebase:
 

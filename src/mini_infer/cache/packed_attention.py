@@ -56,6 +56,7 @@ def packed_attention_forward(
     layer_idx: int,
     cu_seqlens_q: torch.Tensor,
     softmax_scale: float | None = None,
+    block_mask: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Varlen attention over packed-q with K/V read from a `PagedKVCache`.
 
@@ -85,6 +86,12 @@ def packed_attention_forward(
         cu_seqlens_q: `(B+1,)` int cumulative q boundaries; `cu_seqlens_q[-1]`
             equals `total_q`.
         softmax_scale: defaults to `1/sqrt(head_dim)`.
+        block_mask: optional per-request additive attention bias, one
+            `(q_len_r, 1, k_len_r)` tensor per request (0 where a key is kept,
+            `finfo.min` where masked). Used by MiniMax-M3 MSA: the bias folds the
+            block selection AND causality together, so it REPLACES the built-in
+            causal fill. Only the `torch` backend can consume it (the CUDA fast
+            paths take no per-query mask); passing it with another backend raises.
 
     Returns:
         `(total_q, num_q_heads, head_dim)` attention output. GQA is handled by
@@ -92,6 +99,11 @@ def packed_attention_forward(
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    if block_mask is not None and cache._pool.attention_backend != "torch":
+        raise ValueError(
+            "block_mask (MSA block-sparse bias) requires the 'torch' attention "
+            f"backend; got {cache._pool.attention_backend!r}"
+        )
 
     # Per-layer attention pattern. `None` window = full causal (every
     # current model except Gemma family); positive int = sliding window
@@ -119,6 +131,7 @@ def packed_attention_forward(
             cu_seqlens_k,
             softmax_scale,
             window=window,
+            block_mask=block_mask,
         )
 
     # FlashInfer paged-attention backend (opt-in via the pool's
@@ -195,6 +208,7 @@ def packed_attention_torch(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
     window: int | None = None,
+    block_mask: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Pure PyTorch reference: per-request SDPA over the packed sequences.
 
@@ -224,6 +238,15 @@ def packed_attention_torch(
             f"cu_seqlens_q has {batch_size + 1} entries but cu_seqlens_k has "
             f"{cu_seqlens_k.shape[0]} entries"
         )
+    if block_mask is not None and len(block_mask) != batch_size:
+        raise ValueError(
+            f"block_mask has {len(block_mask)} entries but there are {batch_size} requests"
+        )
+    if block_mask is not None and window is not None:
+        # The MSA bias REPLACES the causal fill, so a sliding window would be
+        # silently dropped. No current model combines them; refuse loudly so a
+        # future SWA + block-sparse model fails here instead of mis-masking.
+        raise ValueError("block_mask and window are mutually exclusive")
 
     for batch_idx in range(batch_size):
         q_start = int(cu_seqlens_q[batch_idx])
@@ -250,17 +273,24 @@ def packed_attention_torch(
         # Compute attention in fp32 for numerical stability.
         scores = torch.einsum("qhd,khd->qhk", q_b.float(), k_b.float()) * softmax_scale
 
-        # Causal mask: query at intra-request position i = (k_len - q_len + i)
-        # in absolute K terms. It attends to K positions [0, k_len - q_len + i].
-        q_offset = k_len - q_len
-        q_abs_positions = torch.arange(q_len, device=q.device) + q_offset
-        k_positions = torch.arange(k_len, device=q.device)
-        invalid = k_positions[None, :] > q_abs_positions[:, None]  # (q_len, k_len)
-        if window is not None:
-            # Sliding window: also forbid keys older than `q - window + 1`.
-            too_old = k_positions[None, :] < (q_abs_positions[:, None] - window + 1)
-            invalid = invalid | too_old
-        scores = scores.masked_fill(invalid[:, None, :], -float("inf"))
+        if block_mask is not None:
+            # MiniMax-M3 MSA: the per-request additive bias already folds block
+            # selection AND causality together (build_block_mask re-applies the
+            # token-level causal mask), so it REPLACES the built-in causal fill.
+            # Shape (q_len, 1, k_len) broadcasts over the query heads.
+            scores = scores + block_mask[batch_idx].to(scores.dtype)
+        else:
+            # Causal mask: query at intra-request position i = (k_len - q_len + i)
+            # in absolute K terms. It attends to K positions [0, k_len - q_len + i].
+            q_offset = k_len - q_len
+            q_abs_positions = torch.arange(q_len, device=q.device) + q_offset
+            k_positions = torch.arange(k_len, device=q.device)
+            invalid = k_positions[None, :] > q_abs_positions[:, None]  # (q_len, k_len)
+            if window is not None:
+                # Sliding window: also forbid keys older than `q - window + 1`.
+                too_old = k_positions[None, :] < (q_abs_positions[:, None] - window + 1)
+                invalid = invalid | too_old
+            scores = scores.masked_fill(invalid[:, None, :], -float("inf"))
 
         weights = torch.softmax(scores, dim=-1)
         out[q_start:q_end] = torch.einsum("qhk,khd->qhd", weights, v_b.float()).to(q.dtype)

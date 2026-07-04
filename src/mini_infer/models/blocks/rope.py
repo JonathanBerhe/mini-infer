@@ -279,6 +279,34 @@ def apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
+def apply_rotary_pos_emb_partial(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partial RoPE, first-`rotary_dim`-dims split (HF standard partial; Phi,
+    MiniMax-M3). `cos`/`sin` have last dim `rotary_dim < head_dim`; the leading
+    `rotary_dim` dims of q/k are rotated with the half-rotation and the trailing
+    `head_dim - rotary_dim` dims pass through unchanged.
+
+    Distinct from `apply_rotary_pos_emb` (rotates the full head_dim, so a
+    zero-padded width-head_dim table pairs dim i with i + head_dim/2) and from
+    `apply_partial_rope_last_n_dims` (rotates the TRAILING dims, DeepSeek layout).
+    Here dim i pairs with dim i + rotary_dim/2 within the leading block, matching
+    HF's `apply_rotary_pos_emb` which slices to `cos.shape[-1]` before rotating.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = torch.cat([(q_rot * cos) + (rotate_half(q_rot) * sin), q_pass], dim=-1)
+    k_embed = torch.cat([(k_rot * cos) + (rotate_half(k_rot) * sin), k_pass], dim=-1)
+    return q_embed, k_embed
+
+
 def apply_interleaved_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -253,6 +253,22 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             )
         return self._pool.storage_for_layer(layer_idx)
 
+    def pool_storage_for_stream(self, layer_idx: int, stream_name: str) -> torch.Tensor:
+        """Return one named stream's pool storage for a layer, shape
+        `(num_blocks, block_size, num_heads_s, head_dim_s)`.
+
+        The named-stream counterpart of `pool_storage_for_layer`, for kernels
+        that read a non-legacy layout (e.g. MiniMax-M3's `k`/`v`/`index_k`
+        streams) directly from blocks via the block table.
+        """
+        if self._pool.kv_quant is not None:
+            raise RuntimeError(
+                "pool_storage_for_stream is uncompressed-only; "
+                f"got kv_quant={self._pool.kv_quant!r}. Kernel paged paths "
+                "don't support compressed K/V; use the materialized path."
+            )
+        return self._pool.storage_for_stream(layer_idx, stream_name)
+
     def materialize_packed_kv(
         self, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
