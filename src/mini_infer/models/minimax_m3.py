@@ -103,7 +103,19 @@ class MiniMaxM3Config:
         if partial_factor:
             rotary_dim = int(head_dim * float(partial_factor))
         else:
-            rotary_dim = int(getattr(text, "rotary_dim", None) or head_dim)
+            # A bare `rotary_dim` without the factor is ambiguous: HF's rope
+            # does not read `rotary_dim`, so it would run FULL rope while
+            # honoring the field here would run partial, a silent parity break.
+            # Refuse instead of guessing.
+            explicit_rotary = getattr(text, "rotary_dim", None)
+            if explicit_rotary and int(explicit_rotary) != head_dim:
+                raise ValueError(
+                    f"config ships rotary_dim={explicit_rotary} without "
+                    "partial_rotary_factor; HF ignores bare rotary_dim (full rope), "
+                    "so honoring it would diverge from the reference. Ship "
+                    "partial_rotary_factor to request partial rope."
+                )
+            rotary_dim = head_dim
         # Dense/sparse split: HF encodes it via first_k_dense_replace or the
         # sparse/moe frequency arrays; layer i is dense iff i < first_dense.
         first_dense = getattr(text, "first_k_dense_replace", None)
@@ -227,7 +239,9 @@ class _MiniMaxM3Attention(nn.Module):
         past_key_values.append_stream_packed(keys_packed, cu_seqlens_q, self.layer_idx, "k")
         past_key_values.append_stream_packed(values_packed, cu_seqlens_q, self.layer_idx, "v")
 
-        if self.use_decode_kernel and self._decode_kernel_applicable(past_key_values, cu_seqlens_q):
+        if self.use_decode_kernel and self._decode_kernel_applicable(
+            past_key_values, cu_seqlens_q, paged_ctx
+        ):
             attn_packed = self._forward_decode_paged(
                 hidden_states, cos, sin, past_key_values, cu_seqlens_q, queries_packed, paged_ctx
             )
@@ -262,16 +276,30 @@ class _MiniMaxM3Attention(nn.Module):
         return out
 
     def _decode_kernel_applicable(
-        self, past_key_values: PagedKVCache, cu_seqlens_q: torch.Tensor
+        self,
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+        paged_ctx: dict[str, Any] | None = None,
     ) -> bool:
         """Paged decode path applies to pure decode steps only (every request
         contributes exactly one token), single rank, with the index block a
-        multiple of the pool block. Everything else takes the torch path."""
+        multiple of the pool block. Everything else takes the torch path.
+
+        The pure-decode test reads a device tensor (one host sync); the model
+        forward hoists it into `paged_ctx` once per step so the check does not
+        sync once per layer.
+        """
         from mini_infer.distributed.group import get_world_size
 
         if get_world_size() != 1:
             return False
-        if not bool((cu_seqlens_q[1:] - cu_seqlens_q[:-1] == 1).all()):
+        if paged_ctx is not None and "pure_decode" in paged_ctx:
+            pure_decode = bool(paged_ctx["pure_decode"])
+        else:
+            pure_decode = bool((cu_seqlens_q[1:] - cu_seqlens_q[:-1] == 1).all())
+            if paged_ctx is not None:
+                paged_ctx["pure_decode"] = pure_decode
+        if not pure_decode:
             return False
         if self.indexer is not None:
             pool_block_size = past_key_values.pool_storage_for_stream(self.layer_idx, "k").shape[1]
@@ -638,6 +666,16 @@ def _remap_m3_state(
             continue  # otherwise consumed by the paired weight's dequant below
 
         scale = normalized.get(key + "_scale_inv") if key.endswith(".weight") else None
+        if tensor.dtype == torch.float8_e4m3fn and scale is None:
+            # A scale-free e4m3 tensor cannot be loaded: without its
+            # weight_scale_inv it would be copied (or cast) as garbage. Pairs
+            # must be co-located in one shard (the staging script guarantees
+            # this; a re-sharded checkpoint might not).
+            raise ValueError(
+                f"FP8 weight {key!r} has no weight_scale_inv in the same shard; "
+                "re-shard the checkpoint so each e4m3 weight and its scale are "
+                "co-located"
+            )
         if scale is not None and tensor.dtype == torch.float8_e4m3fn:
             fp8_expert = _PER_EXPERT_W_RE.match(key)
             if keep_fp8 and fp8_expert is not None:

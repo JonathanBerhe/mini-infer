@@ -96,3 +96,14 @@ def test_block_mask_wrong_length_raises() -> None:
 
     with pytest.raises(ValueError, match="block_mask has"):
         packed_attention_torch(q, k, v, cu_q, cu_k, d**-0.5, block_mask=[_causal_bias(3, 3)])
+
+
+def test_block_mask_with_window_raises() -> None:
+    """The bias replaces the causal fill, so a sliding window would be silently
+    dropped; the combination must refuse instead of mis-masking."""
+    q, k, v, cu_q, cu_k, _, d = _setup()
+    import pytest
+
+    block_mask = [_causal_bias(3, 3), _causal_bias(1, 5)]
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        packed_attention_torch(q, k, v, cu_q, cu_k, d**-0.5, window=4, block_mask=block_mask)

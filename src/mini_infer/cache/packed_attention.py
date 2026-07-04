@@ -242,6 +242,11 @@ def packed_attention_torch(
         raise ValueError(
             f"block_mask has {len(block_mask)} entries but there are {batch_size} requests"
         )
+    if block_mask is not None and window is not None:
+        # The MSA bias REPLACES the causal fill, so a sliding window would be
+        # silently dropped. No current model combines them; refuse loudly so a
+        # future SWA + block-sparse model fails here instead of mis-masking.
+        raise ValueError("block_mask and window are mutually exclusive")
 
     for batch_idx in range(batch_size):
         q_start = int(cu_seqlens_q[batch_idx])

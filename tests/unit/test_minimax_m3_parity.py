@@ -602,3 +602,32 @@ def test_prefix_hit_matches_full_prefill() -> None:
         f"prefix-hit last-token logits diverged: max_abs_diff="
         f"{(last_a - last_b).abs().max().item():.6f}"
     )
+
+
+def test_from_hf_rejects_bare_rotary_dim() -> None:
+    """rotary_dim without partial_rotary_factor is ambiguous (HF would run full
+    rope, honoring the field would run partial); from_hf must refuse."""
+    pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    hf_cfg = _tiny_hf_config()
+    # Strip the factor everywhere HF may carry it, leaving only rotary_dim.
+    hf_cfg.partial_rotary_factor = None
+    if isinstance(getattr(hf_cfg, "rope_parameters", None), dict):
+        hf_cfg.rope_parameters.pop("partial_rotary_factor", None)
+    hf_cfg.rotary_dim = 8  # != head_dim 16
+
+    with pytest.raises(ValueError, match="rotary_dim"):
+        MiniMaxM3Config.from_hf(hf_cfg)
+
+
+def test_remap_rejects_scaleless_fp8_weight() -> None:
+    """An e4m3 weight with no co-located weight_scale_inv must fail loudly,
+    not be copied scale-free into a bf16 param."""
+    pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    from mini_infer.models.minimax_m3 import _remap_m3_state
+
+    cfg = MiniMaxM3Config.from_hf(_tiny_hf_config())
+    orphan = {
+        "model.layers.3.mlp.experts.0.w1.weight": torch.zeros(8, 16, dtype=torch.float8_e4m3fn)
+    }
+    with pytest.raises(ValueError, match="weight_scale_inv"):
+        _remap_m3_state(cfg, orphan)
