@@ -34,6 +34,7 @@ from collections.abc import Iterator
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample
+from mini_infer.exceptions import OutOfMemoryError
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -155,16 +156,52 @@ class ContinuousScheduler:
         yield from self.submit(request).steps()
 
     def _engine_loop(self) -> None:
-        """Engine-thread main loop; runs `_step()` until `stop()` is signaled."""
-        try:
-            while not self._stop_event.is_set():
+        """Engine-thread main loop; runs `_step()` until `stop()` is signaled.
+
+        Mid-step OOM is recoverable: the pool can hand out blocks during a
+        forward (decode growth, partial prefill chunk needing a new block)
+        and may run out even after admission accepted everyone. Killing the
+        engine thread on that would take down every in-flight request and
+        every future one. Instead we preempt the youngest still-prefilling
+        request and let the loop retry; the cancelled request returns
+        `finish_reason="cancelled"` to its client. Other exceptions still
+        crash the thread loudly, because they signal real bugs.
+        """
+        while not self._stop_event.is_set():
+            try:
                 self._step()
-                # When fully idle, wait briefly so we don't spin the CPU.
-                if not self._running and self._waiting.empty():
-                    self._stop_event.wait(timeout=self.IDLE_SLEEP_SECONDS)
-        except Exception:
-            logger.exception("engine thread crashed")
-            raise
+            except OutOfMemoryError:
+                logger.warning("engine OOM during step; preempting youngest in-flight request")
+                self._preempt_on_oom()
+            except Exception:
+                logger.exception("engine thread crashed")
+                raise
+            # When fully idle, wait briefly so we don't spin the CPU.
+            if not self._running and self._waiting.empty():
+                self._stop_event.wait(timeout=self.IDLE_SLEEP_SECONDS)
+
+    def _preempt_on_oom(self) -> None:
+        """Cancel the youngest in-flight request and reap so the loop can retry.
+
+        Picks a prefiller over a decoder when possible: prefillers haven't
+        emitted any user-visible output yet, so the user-facing damage is
+        smaller. Among prefillers we cancel the most recently admitted one
+        (FILO), matching the intuition that the most recent admission is
+        what pushed us past the watermark.
+        """
+        candidates = [
+            r
+            for r in self._running
+            if r.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING)
+        ]
+        if not candidates:
+            candidates = [r for r in self._running if r.state == RequestState.DECODING]
+        if not candidates:
+            return
+        # `_running` preserves admission order; youngest is at the back.
+        victim = candidates[-1]
+        self._finish(victim, "cancelled")
+        self._reap_done()
 
     def _step(self) -> None:
         """One scheduler iteration: admit, sample decoders, reap, packed forward."""
