@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Inference Engine Architecture</title>
+<style>
+  :root {
+    color-scheme: light;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #111827;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+  }
+  .wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+  }
+  header.page {
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 24px;
+    margin-bottom: 32px;
+  }
+  header.page h1 {
+    margin: 0 0 8px;
+    font-size: 28px;
+    letter-spacing: -0.01em;
+  }
+  header.page p {
+    margin: 0;
+    color: #4b5563;
+    font-size: 16px;
+  }
+  section.panel {
+    margin: 56px 0;
+  }
+  section.panel h2 {
+    margin: 0 0 8px;
+    font-size: 20px;
+    letter-spacing: -0.005em;
+  }
+  section.panel h2 .num {
+    display: inline-block;
+    min-width: 22px;
+    color: #9ca3af;
+    font-variant-numeric: tabular-nums;
+    margin-right: 6px;
+  }
+  section.panel p.intro {
+    margin: 0 0 20px;
+    color: #374151;
+    max-width: 72ch;
+  }
+  figure {
+    margin: 0;
+    padding: 20px;
+    background: #fafafa;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+  }
+  figure svg {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  figcaption {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px dashed #e5e7eb;
+    color: #4b5563;
+    font-size: 14px;
+  }
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 0.92em;
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin: 12px 0 0;
+    font-size: 13px;
+    color: #4b5563;
+  }
+  .legend .sw {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .legend .chip {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1.5px solid;
+  }
+  .chip.engine { background: #dbeafe; border-color: #2563eb; }
+  .chip.model  { background: #fed7aa; border-color: #ea580c; }
+  .chip.ext    { background: #f3f4f6; border-color: #9ca3af; }
+  .chip.bridge { background: #ccfbf1; border-color: #0d9488; }
+  section.anchor {
+    margin-top: 64px;
+    padding: 24px 28px;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+  }
+  section.anchor h2 {
+    margin-top: 0;
+  }
+  section.anchor ul {
+    margin: 0;
+    padding-left: 20px;
+  }
+  section.anchor li {
+    margin: 6px 0;
+    color: #374151;
+  }
+  section.anchor a {
+    color: #1d4ed8;
+    text-decoration: none;
+  }
+  section.anchor a:hover {
+    text-decoration: underline;
+  }
+  footer.page {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid #e5e7eb;
+    color: #6b7280;
+    font-size: 13px;
+  }
+  @media print {
+    figure { break-inside: avoid; background: #ffffff; }
+    section.panel { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <h1>Inference engine architecture</h1>
+  <p>How an LLM inference engine is wired, what is generic across models, and what the engine actually has to follow when the architecture changes.</p>
+  <div class="legend" aria-label="Color legend">
+    <span class="sw"><span class="chip engine"></span>engine-generic (reused across models)</span>
+    <span class="sw"><span class="chip model"></span>model-specific (paper-faithful)</span>
+    <span class="sw"><span class="chip ext"></span>external (HF, GPU, network)</span>
+    <span class="sw"><span class="chip bridge"></span>interface contract</span>
+  </div>
+</header>
+
+<!-- ===================== PANEL 1 ===================== -->
+<section class="panel" id="p1">
+  <h2><span class="num">1.</span>Request flow</h2>
+  <p class="intro">
+    A request enters as HTTP and leaves as a stream of tokens. Between those two
+    points, four kinds of components do real work: the API layer turns bytes into
+    a request, the scheduler decides when this request runs alongside others, the
+    model runner executes prefill and decode steps, and the KV cache manager owns
+    the GPU memory that grows token by token. Everything else hangs off these.
+  </p>
+
+  <figure>
+  <svg viewBox="0 0 900 660" xmlns="http://www.w3.org/2000/svg"
+       font-family="system-ui, -apple-system, sans-serif" font-size="13">
+    <defs>
+      <marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+      </marker>
+      <marker id="ar1s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+      </marker>
+      <marker id="ar1back" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M10,0 L0,5 L10,10 z" fill="#374151"/>
+      </marker>
+    </defs>
+
+    <!-- HTTP Request -->
+    <g>
+      <rect x="140" y="30" width="240" height="50" rx="8" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+      <text x="260" y="52" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="600" fill="#374151">HTTP request</text>
+      <text x="260" y="69" text-anchor="middle" font-size="11" fill="#6b7280">POST /v1/completions</text>
+    </g>
+
+    <!-- arrow HTTP -> API -->
+    <line x1="260" y1="80" x2="260" y2="115" stroke="#374151" stroke-width="1.6" marker-end="url(#ar1)"/>
+
+    <!-- API Server -->
+    <g>
+      <rect x="140" y="118" width="240" height="72" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="260" y="142" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">API Server</text>
+      <text x="260" y="161" text-anchor="middle" font-size="11" fill="#1e40af">FastAPI · streaming SSE</text>
+      <text x="260" y="178" text-anchor="middle" font-size="11" fill="#1e40af">tokenize, validate, route</text>
+    </g>
+
+    <!-- arrow API -> Scheduler -->
+    <line x1="260" y1="190" x2="260" y2="225" stroke="#374151" stroke-width="1.6" marker-end="url(#ar1)"/>
+
+    <!-- Scheduler -->
+    <g>
+      <rect x="140" y="228" width="240" height="118" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="260" y="252" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">Scheduler</text>
+      <text x="260" y="270" text-anchor="middle" font-size="11" fill="#1e40af">continuous batching</text>
+      <line x1="160" y1="280" x2="360" y2="280" stroke="#93c5fd" stroke-width="1" stroke-dasharray="3 3"/>
+      <text x="260" y="299" text-anchor="middle" font-size="11" fill="#1e40af">waiting queue (admission)</text>
+      <text x="260" y="316" text-anchor="middle" font-size="11" fill="#1e40af">running batch (step loop)</text>
+      <text x="260" y="334" text-anchor="middle" font-size="11" fill="#1e40af">prefill ⇄ decode interleave</text>
+    </g>
+
+    <!-- arrow Scheduler -> Model Runner -->
+    <line x1="260" y1="346" x2="260" y2="385" stroke="#374151" stroke-width="1.6" marker-end="url(#ar1)"/>
+
+    <!-- Model Runner -->
+    <g>
+      <rect x="140" y="388" width="240" height="120" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="260" y="412" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">Model Runner</text>
+      <text x="260" y="428" text-anchor="middle" font-size="11" fill="#1e40af">torch forward, calls model code</text>
+      <!-- three orange chips for the actual model-specific steps -->
+      <g>
+        <rect x="156" y="442" width="68" height="50" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.4"/>
+        <text x="190" y="463" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="600" fill="#7c2d12" font-size="11">prefill</text>
+        <text x="190" y="478" text-anchor="middle" font-size="10" fill="#9a3412">full prompt</text>
+
+        <rect x="226" y="442" width="68" height="50" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.4"/>
+        <text x="260" y="463" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="600" fill="#7c2d12" font-size="11">decode</text>
+        <text x="260" y="478" text-anchor="middle" font-size="10" fill="#9a3412">one token</text>
+
+        <rect x="296" y="442" width="68" height="50" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.4"/>
+        <text x="330" y="463" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="600" fill="#7c2d12" font-size="11">sample</text>
+        <text x="330" y="478" text-anchor="middle" font-size="10" fill="#9a3412">pick next</text>
+      </g>
+    </g>
+
+    <!-- arrow Model Runner -> GPU -->
+    <line x1="260" y1="508" x2="260" y2="545" stroke="#374151" stroke-width="1.6" marker-end="url(#ar1)"/>
+
+    <!-- GPU -->
+    <g>
+      <rect x="140" y="548" width="240" height="72" rx="8" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+      <text x="260" y="573" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#374151">GPU</text>
+      <text x="260" y="591" text-anchor="middle" font-size="11" fill="#6b7280">model weights resident in VRAM</text>
+      <text x="260" y="608" text-anchor="middle" font-size="11" fill="#6b7280">KV memory pool (paged blocks)</text>
+    </g>
+
+    <!-- ============= sidecars ============= -->
+
+    <!-- Prefix Cache -->
+    <g>
+      <rect x="540" y="228" width="240" height="56" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="660" y="252" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">Prefix Cache</text>
+      <text x="660" y="270" text-anchor="middle" font-size="11" fill="#1e40af">radix tree of token prefixes</text>
+    </g>
+    <!-- double arrow Scheduler <-> Prefix Cache -->
+    <line x1="380" y1="252" x2="540" y2="252" stroke="#374151" stroke-width="1.5"
+          marker-end="url(#ar1s)" marker-start="url(#ar1back)"/>
+    <text x="460" y="246" text-anchor="middle" font-size="10" fill="#6b7280">cache lookup</text>
+
+    <!-- KV Cache Manager -->
+    <g>
+      <rect x="540" y="310" width="240" height="180" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="660" y="334" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">KV Cache Manager</text>
+      <text x="660" y="352" text-anchor="middle" font-size="11" fill="#1e40af">paged allocation, block table</text>
+      <line x1="560" y1="364" x2="760" y2="364" stroke="#93c5fd" stroke-width="1" stroke-dasharray="3 3"/>
+      <text x="660" y="383" text-anchor="middle" font-size="11" fill="#1e40af">BlockPool (fixed-size blocks)</text>
+      <text x="660" y="400" text-anchor="middle" font-size="11" fill="#1e40af">per-request block table</text>
+      <text x="660" y="417" text-anchor="middle" font-size="11" fill="#1e40af">free-list, ref counts</text>
+      <text x="660" y="434" text-anchor="middle" font-size="11" fill="#1e40af">copy-on-write at branch</text>
+      <text x="660" y="451" text-anchor="middle" font-size="11" fill="#1e40af">eviction policy</text>
+      <text x="660" y="475" text-anchor="middle" font-size="10" fill="#6b7280">owns the GPU memory that grows per token</text>
+    </g>
+    <!-- arrow Scheduler -> KV Cache Manager (admission check) -->
+    <path d="M 380 320 Q 460 320 540 340" fill="none" stroke="#374151" stroke-width="1.5" marker-end="url(#ar1s)"/>
+    <text x="455" y="312" text-anchor="middle" font-size="10" fill="#6b7280">can we admit?</text>
+
+    <!-- double arrow Model Runner <-> KV Cache Manager -->
+    <line x1="380" y1="448" x2="540" y2="448" stroke="#374151" stroke-width="1.5"
+          marker-end="url(#ar1s)" marker-start="url(#ar1back)"/>
+    <text x="460" y="442" text-anchor="middle" font-size="10" fill="#6b7280">read / write KV</text>
+
+    <!-- streaming output arrow on the left -->
+    <g>
+      <path d="M 140 580 Q 60 580 60 152 Q 60 70 140 60" fill="none" stroke="#0d9488" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ar1s)"/>
+      <text x="32" y="350" text-anchor="middle" font-size="11" fill="#0f766e" transform="rotate(-90 32 350)">streamed tokens out</text>
+    </g>
+
+  </svg>
+  <figcaption>
+    Each request flows top to bottom through the engine-generic pipeline (blue),
+    touching the model-specific code (orange) only inside the Model Runner.
+    The KV cache manager is drawn off to the side because both the scheduler
+    (for admission) and the runner (for read / write) talk to it. Generated
+    tokens stream back up the dashed teal path to the client.
+  </figcaption>
+  </figure>
+</section>
+
+<!-- ===================== PANEL 2 ===================== -->
+<section class="panel" id="p2">
+  <h2><span class="num">2.</span>Two layers, one interface</h2>
+  <p class="intro">
+    An inference engine cleanly stacks into two layers, and the engine and the
+    model are <em>not peers</em>. The engine sits on top and runs unchanged
+    across an entire <em>class</em> of models: autoregressive transformer LLMs
+    with attention over a growing KV state. Every frontier LLM from 2018 to
+    2026 (Llama, Qwen, Mistral, Gemma, Mixtral, DeepSeek) fits inside that
+    class, which is why the same scheduler, KV cache manager, prefix cache,
+    sampler, tokenizer, batcher and router run unchanged for all of them.
+    Outside the class (Mamba, diffusion, encoder-decoder) most of these
+    services do not apply and the engine has to grow parallel paths. The two
+    layers meet at a deliberately small interface:
+    <code>prefill(input_ids, cache) -&gt; logits</code> and
+    <code>decode(token, cache) -&gt; logits</code>. The engine <em>calls</em>
+    that interface; each model <em>implements</em> it. Stay inside the class
+    and a new model drops in with no engine changes; break the contract (a
+    model whose state isn't a growing KV cache, for example) and the engine
+    has to grow.
+  </p>
+
+  <figure>
+  <svg viewBox="0 0 900 632" xmlns="http://www.w3.org/2000/svg"
+       font-family="system-ui, sans-serif" font-size="13">
+    <defs>
+      <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+      </marker>
+    </defs>
+
+    <!-- ========== TOP LAYER: engine services (caller) ========== -->
+    <rect x="40" y="20" width="820" height="200" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="1.8"/>
+    <text x="450" y="44" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a" font-size="13">
+      ENGINE SERVICES · one implementation, every autoregressive transformer LLM uses these
+    </text>
+
+    <g font-family="ui-monospace, Menlo, monospace" font-size="12" fill="#1e3a8a">
+      <!-- row 1 -->
+      <g transform="translate(56,68)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Scheduler</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">continuous batching</text>
+      </g>
+      <g transform="translate(256,68)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">KV Cache Mgr</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">paged KV blocks</text>
+      </g>
+      <g transform="translate(456,68)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Prefix Cache</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">radix tree, sharing</text>
+      </g>
+      <g transform="translate(656,68)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Sampler</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">greedy / top-k / top-p</text>
+      </g>
+      <!-- row 2 -->
+      <g transform="translate(56,140)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Tokenizer</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">HF encode / decode</text>
+      </g>
+      <g transform="translate(256,140)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Batcher</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">padding-free packing</text>
+      </g>
+      <g transform="translate(456,140)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Router</text>
+        <text x="14" y="44" font-size="11" fill="#3b82f6">multi-replica</text>
+      </g>
+    </g>
+
+    <!-- ========== arrow: engine -> contract ========== -->
+    <line x1="450" y1="226" x2="450" y2="258" stroke="#374151" stroke-width="2" marker-end="url(#ar2)"/>
+    <text x="462" y="248" fill="#4b5563" font-size="11" font-style="italic">calls</text>
+
+    <!-- ========== MIDDLE: interface contract (the boundary) ========== -->
+    <rect x="40" y="266" width="820" height="100" rx="10" fill="#ccfbf1" stroke="#0d9488" stroke-width="2"/>
+    <text x="450" y="288" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#134e4a" font-size="13">
+      INTERFACE CONTRACT
+    </text>
+    <text x="450" y="314" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" fill="#115e59" font-size="13">
+      prefill(input_ids, cache) -&gt; logits
+    </text>
+    <text x="450" y="334" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" fill="#115e59" font-size="13">
+      decode(token, cache)      -&gt; logits
+    </text>
+    <text x="450" y="356" text-anchor="middle" fill="#0f766e" font-size="11" font-style="italic">
+      domain assumption: autoregressive decoding over a growing KV state
+    </text>
+
+    <!-- ========== arrow: contract -> model ========== -->
+    <line x1="450" y1="372" x2="450" y2="404" stroke="#374151" stroke-width="2" marker-end="url(#ar2)"/>
+    <text x="462" y="394" fill="#4b5563" font-size="11" font-style="italic">implemented by</text>
+
+    <!-- ========== BOTTOM LAYER: model definitions (implementer) ========== -->
+    <rect x="40" y="412" width="820" height="200" rx="12" fill="#fff7ed" stroke="#ea580c" stroke-width="1.8"/>
+    <text x="450" y="436" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#7c2d12" font-size="13">
+      MODEL DEFINITIONS · one per architecture, bit-parity to paper
+    </text>
+
+    <g font-family="ui-monospace, Menlo, monospace" font-size="12" fill="#7c2d12">
+      <!-- row 1 -->
+      <g transform="translate(56,460)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Llama</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">GQA · RoPE · SwiGLU</text>
+      </g>
+      <g transform="translate(256,460)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Qwen</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">GQA · RoPE</text>
+      </g>
+      <g transform="translate(456,460)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Mistral</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">GQA · sliding window</text>
+      </g>
+      <g transform="translate(656,460)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Gemma</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">GQA · RMSNorm</text>
+      </g>
+      <!-- row 2 -->
+      <g transform="translate(56,532)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">Mixtral</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">MoE · top-k routing</text>
+      </g>
+      <g transform="translate(256,532)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">DeepSeek-V2</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">MLA (low-rank KV)</text>
+      </g>
+      <g transform="translate(456,532)">
+        <rect width="188" height="58" rx="6" fill="#ffffff" stroke="#fdba74" stroke-width="1.2"/>
+        <text x="14" y="24" font-weight="700">DeepSeek-V4</text>
+        <text x="14" y="44" font-size="11" fill="#c2410c">hybrid sparse + MoE</text>
+      </g>
+    </g>
+
+  </svg>
+  <figcaption>
+    Reads top to bottom: the engine on top <em>calls</em> the contract; each
+    model underneath <em>implements</em> it. "One implementation, every model"
+    means "every model in the class" named at the bottom of the contract band:
+    autoregressive transformer LLMs with KV attention. That class happens to
+    cover every frontier LLM in 2026, which is why every production engine
+    (vLLM, SGLang, TGI, TensorRT-LLM) makes the same architectural bet.
+    mini-infer's bit-parity tests are the assertion that a model implements
+    this contract correctly, number for number, against its upstream reference.
+  </figcaption>
+  </figure>
+</section>
+
+<!-- ===================== PANEL 3 ===================== -->
+<section class="panel" id="p3">
+  <h2><span class="num">3.</span>State abstractions: the real coupling</h2>
+  <p class="intro">
+    The single biggest thing that ties an engine to a model family is the shape
+    of the state. For a standard transformer the state is a KV cache that grows
+    linearly with sequence length, so the entire engine is built around paging,
+    sharing, quantizing, and attending over that. Change the state, and the
+    engine grows a parallel cache abstraction. mini-infer already carries two,
+    and an SSM would force a third.
+  </p>
+
+  <figure>
+  <svg viewBox="0 0 900 520" xmlns="http://www.w3.org/2000/svg"
+       font-family="system-ui, sans-serif" font-size="13">
+    <defs>
+      <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#374151"/>
+      </marker>
+      <marker id="ar3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#9ca3af"/>
+      </marker>
+    </defs>
+
+    <!-- ROW 1: Standard transformer -->
+    <g>
+      <rect x="40" y="30" width="280" height="110" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-width="1.6"/>
+      <text x="180" y="56" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#7c2d12">Standard transformer</text>
+      <text x="180" y="78" text-anchor="middle" font-size="11" fill="#9a3412">Llama · Qwen · Mistral · Gemma</text>
+      <text x="180" y="95" text-anchor="middle" font-size="11" fill="#9a3412">Mixtral · DeepSeek-V2 (MLA)</text>
+      <text x="180" y="120" text-anchor="middle" font-size="11" fill="#9a3412" font-style="italic">attention with per-token K, V</text>
+    </g>
+    <line x1="320" y1="85" x2="370" y2="85" stroke="#374151" stroke-width="1.8" marker-end="url(#ar3)"/>
+    <g>
+      <rect x="380" y="30" width="480" height="110" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="620" y="54" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">PagedKVCache + BlockPool</text>
+      <!-- block grid -->
+      <g transform="translate(412,68)">
+        <rect width="34" height="26" rx="3" fill="#dbeafe" stroke="#60a5fa" stroke-width="1"/>
+        <text x="17" y="18" text-anchor="middle" font-size="10" fill="#1e3a8a">B0</text>
+        <rect x="40" width="34" height="26" rx="3" fill="#dbeafe" stroke="#60a5fa" stroke-width="1"/>
+        <text x="57" y="18" text-anchor="middle" font-size="10" fill="#1e3a8a">B1</text>
+        <rect x="80" width="34" height="26" rx="3" fill="#dbeafe" stroke="#60a5fa" stroke-width="1"/>
+        <text x="97" y="18" text-anchor="middle" font-size="10" fill="#1e3a8a">B2</text>
+        <rect x="120" width="34" height="26" rx="3" fill="#dbeafe" stroke="#60a5fa" stroke-width="1"/>
+        <text x="137" y="18" text-anchor="middle" font-size="10" fill="#1e3a8a">B3</text>
+        <rect x="160" width="34" height="26" rx="3" fill="#dbeafe" stroke="#60a5fa" stroke-width="1"/>
+        <text x="177" y="18" text-anchor="middle" font-size="10" fill="#1e3a8a">B4</text>
+        <rect x="200" width="34" height="26" rx="3" fill="#bfdbfe" stroke="#60a5fa" stroke-width="1" stroke-dasharray="2 2"/>
+        <text x="217" y="18" text-anchor="middle" font-size="10" fill="#1e3a8a">B5</text>
+        <text x="248" y="18" font-size="14" fill="#1e3a8a">…</text>
+        <line x1="280" y1="13" x2="420" y2="13" stroke="#60a5fa" stroke-width="1.4" marker-end="url(#ar3)"/>
+        <text x="350" y="8" text-anchor="middle" font-size="10" fill="#1e40af">grows token by token</text>
+      </g>
+      <text x="620" y="120" text-anchor="middle" font-size="11" fill="#1e40af" font-style="italic">cost: linear in sequence length</text>
+    </g>
+
+    <!-- ROW 2: DSV4 hybrid -->
+    <g>
+      <rect x="40" y="170" width="280" height="110" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-width="1.6"/>
+      <text x="180" y="196" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#7c2d12">DeepSeek-V4 hybrid</text>
+      <text x="180" y="218" text-anchor="middle" font-size="11" fill="#9a3412">CSA · SWA · HCA · LightningIndexer</text>
+      <text x="180" y="237" text-anchor="middle" font-size="11" fill="#9a3412">hash-routed MoE</text>
+      <text x="180" y="260" text-anchor="middle" font-size="11" fill="#9a3412" font-style="italic">paged KV does not fit</text>
+    </g>
+    <line x1="320" y1="225" x2="370" y2="225" stroke="#374151" stroke-width="1.8" marker-end="url(#ar3)"/>
+    <g>
+      <rect x="380" y="170" width="480" height="110" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="620" y="194" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">StateCache (parallel abstraction)</text>
+      <!-- three sub-components -->
+      <g transform="translate(404,210)">
+        <rect width="140" height="48" rx="6" fill="#dbeafe" stroke="#60a5fa" stroke-width="1.2"/>
+        <text x="70" y="20" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="600" fill="#1e3a8a">compressed history</text>
+        <text x="70" y="36" text-anchor="middle" font-size="10" fill="#1e40af">HCA</text>
+      </g>
+      <g transform="translate(556,210)">
+        <rect width="140" height="48" rx="6" fill="#dbeafe" stroke="#60a5fa" stroke-width="1.2"/>
+        <text x="70" y="20" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="600" fill="#1e3a8a">sliding window</text>
+        <text x="70" y="36" text-anchor="middle" font-size="10" fill="#1e40af">SWA</text>
+      </g>
+      <g transform="translate(708,210)">
+        <rect width="140" height="48" rx="6" fill="#dbeafe" stroke="#60a5fa" stroke-width="1.2"/>
+        <text x="70" y="20" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="600" fill="#1e3a8a">lightning indexer</text>
+        <text x="70" y="36" text-anchor="middle" font-size="10" fill="#1e40af">CSA helper</text>
+      </g>
+      <text x="620" y="270" text-anchor="middle" font-size="11" fill="#1e40af" font-style="italic">cost: hybrid; several caches in parallel</text>
+    </g>
+
+    <!-- ROW 3: SSM (greyed) -->
+    <g opacity="0.75">
+      <rect x="40" y="310" width="280" height="110" rx="10" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.6" stroke-dasharray="6 4"/>
+      <text x="180" y="336" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#6b7280">SSM / Mamba</text>
+      <text x="180" y="358" text-anchor="middle" font-size="11" fill="#6b7280">selective state, recurrent</text>
+      <text x="180" y="376" text-anchor="middle" font-size="11" fill="#6b7280">no attention, no KV</text>
+      <text x="180" y="400" text-anchor="middle" font-size="11" fill="#9ca3af" font-style="italic">not yet supported</text>
+    </g>
+    <line x1="320" y1="365" x2="370" y2="365" stroke="#9ca3af" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#ar3d)"/>
+    <g opacity="0.75">
+      <rect x="380" y="310" width="480" height="110" rx="10" fill="#f9fafb" stroke="#d1d5db" stroke-width="1.6" stroke-dasharray="6 4"/>
+      <text x="620" y="336" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#6b7280">Recurrent state (fixed size)</text>
+      <g transform="translate(556,352)">
+        <rect width="128" height="42" rx="6" fill="#f3f4f6" stroke="#d1d5db" stroke-width="1.2"/>
+        <text x="64" y="18" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-size="11" font-weight="600" fill="#6b7280">h_t</text>
+        <text x="64" y="34" text-anchor="middle" font-size="10" fill="#9ca3af">constant in seq len</text>
+      </g>
+      <text x="620" y="410" text-anchor="middle" font-size="11" fill="#9ca3af" font-style="italic">cost: O(1) in sequence length</text>
+    </g>
+
+    <!-- footer caption inside the figure SVG -->
+    <g>
+      <rect x="40" y="450" width="820" height="46" rx="8" fill="#ccfbf1" stroke="#0d9488" stroke-width="1.6"/>
+      <text x="450" y="479" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="600" fill="#134e4a">
+        Cache shape is the real coupling between engine and architecture. Everything else is reused.
+      </text>
+    </g>
+  </svg>
+  <figcaption>
+    mini-infer's standard models all use <code>PagedKVCache</code> + <code>BlockPool</code>.
+    DeepSeek-V4 did not fit that shape (compressed history plus sliding window plus
+    an indexer is not "a list of KV blocks"), so the engine grew a second cache
+    type, <code>StateCache</code>. An SSM would force a third. Same engine
+    services above, different cache below.
+  </figcaption>
+  </figure>
+</section>
+
+<!-- ===================== PANEL 4 ===================== -->
+<section class="panel" id="p4">
+  <h2><span class="num">4.</span>Three axes an engine actually follows</h2>
+  <p class="intro">
+    Saying "an inference engine follows the architecture" is too coarse. It
+    follows the architecture along three specific axes. If a new model is the
+    same along all three, every existing path works for free. If it differs on
+    any of them, that axis dictates what the engine has to grow.
+  </p>
+
+  <figure>
+  <svg viewBox="0 0 900 420" xmlns="http://www.w3.org/2000/svg"
+       font-family="system-ui, sans-serif" font-size="13">
+
+    <!-- Axis 1 -->
+    <g>
+      <rect x="40" y="30" width="220" height="100" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="150" y="60" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">State / memory shape</text>
+      <text x="150" y="82" text-anchor="middle" font-size="11" fill="#1e40af">the big one</text>
+      <text x="150" y="104" text-anchor="middle" font-size="11" fill="#1e40af" font-style="italic">defines the cache type</text>
+    </g>
+    <g font-family="ui-monospace, Menlo, monospace" font-size="11" fill="#7c2d12">
+      <g transform="translate(280,46)">
+        <rect width="138" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="69" y="22" text-anchor="middle">paged KV</text>
+      </g>
+      <g transform="translate(428,46)">
+        <rect width="170" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="85" y="22" text-anchor="middle">MLA (low-rank KV)</text>
+      </g>
+      <g transform="translate(608,46)">
+        <rect width="138" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="69" y="22" text-anchor="middle">SSM state</text>
+      </g>
+      <g transform="translate(280,90)">
+        <rect width="200" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="100" y="22" text-anchor="middle">cross-attention cache</text>
+      </g>
+      <g transform="translate(490,90)">
+        <rect width="230" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="115" y="22" text-anchor="middle">DSV4 hybrid (CSA+SWA+HCA)</text>
+      </g>
+    </g>
+
+    <!-- Axis 2 -->
+    <g>
+      <rect x="40" y="150" width="220" height="100" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="150" y="180" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">Control flow</text>
+      <text x="150" y="202" text-anchor="middle" font-size="11" fill="#1e40af">layer loop &amp; dispatch</text>
+      <text x="150" y="224" text-anchor="middle" font-size="11" fill="#1e40af" font-style="italic">defines step shape</text>
+    </g>
+    <g font-family="ui-monospace, Menlo, monospace" font-size="11" fill="#7c2d12">
+      <g transform="translate(280,166)">
+        <rect width="180" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="90" y="22" text-anchor="middle">static depth (Llama)</text>
+      </g>
+      <g transform="translate(470,166)">
+        <rect width="180" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="90" y="22" text-anchor="middle">dynamic depth (looped)</text>
+      </g>
+      <g transform="translate(660,166)">
+        <rect width="200" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="100" y="22" text-anchor="middle">MoE sparse dispatch</text>
+      </g>
+      <g transform="translate(280,210)">
+        <rect width="220" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="110" y="22" text-anchor="middle">diffusion iterations</text>
+      </g>
+      <g transform="translate(510,210)">
+        <rect width="240" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="120" y="22" text-anchor="middle">speculative decoding (multi-token)</text>
+      </g>
+    </g>
+
+    <!-- Axis 3 -->
+    <g>
+      <rect x="40" y="270" width="220" height="100" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="1.6"/>
+      <text x="150" y="300" text-anchor="middle" font-family="ui-monospace, Menlo, monospace" font-weight="700" fill="#1e3a8a">Attention specifics</text>
+      <text x="150" y="322" text-anchor="middle" font-size="11" fill="#1e40af">KV layout, kernel choice</text>
+      <text x="150" y="344" text-anchor="middle" font-size="11" fill="#1e40af" font-style="italic">defines which kernel runs</text>
+    </g>
+    <g font-family="ui-monospace, Menlo, monospace" font-size="11" fill="#7c2d12">
+      <g transform="translate(280,286)">
+        <rect width="80" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="40" y="22" text-anchor="middle">MHA</text>
+      </g>
+      <g transform="translate(370,286)">
+        <rect width="80" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="40" y="22" text-anchor="middle">GQA</text>
+      </g>
+      <g transform="translate(460,286)">
+        <rect width="80" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="40" y="22" text-anchor="middle">MLA</text>
+      </g>
+      <g transform="translate(550,286)">
+        <rect width="160" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="80" y="22" text-anchor="middle">sliding window</text>
+      </g>
+      <g transform="translate(720,286)">
+        <rect width="140" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="70" y="22" text-anchor="middle">hybrid (DSV4)</text>
+      </g>
+      <g transform="translate(280,330)">
+        <rect width="160" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="80" y="22" text-anchor="middle">RoPE / ALiBi</text>
+      </g>
+      <g transform="translate(450,330)">
+        <rect width="160" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="80" y="22" text-anchor="middle">FlashAttention 2</text>
+      </g>
+      <g transform="translate(620,330)">
+        <rect width="170" height="34" rx="6" fill="#fed7aa" stroke="#ea580c" stroke-width="1.2"/>
+        <text x="85" y="22" text-anchor="middle">FlashInfer FP8</text>
+      </g>
+    </g>
+
+  </svg>
+  <figcaption>
+    The blue boxes on the left are the engine's three axes of variation; the
+    orange chips on the right are the values an architecture can pick. A new
+    model that lands on (paged KV, static depth, GQA) drops in for free. A model
+    that lands on (DSV4 hybrid, MoE dispatch, hybrid attention) forces the
+    engine to add a parallel state cache, a routing pass, and a different
+    attention kernel.
+  </figcaption>
+  </figure>
+</section>
+
+<!-- ===================== ANCHOR ===================== -->
+<section class="anchor">
+  <h2>Where this lives in mini-infer</h2>
+  <p style="margin-top:0;color:#4b5563;">
+    The diagram above is engine-agnostic. Here are the concrete files in this
+    repo that implement each piece, in case you want to read the code next to it.
+  </p>
+  <ul>
+    <li><strong>API server:</strong> <a href="../../src/mini_infer/api/server.py"><code>src/mini_infer/api/server.py</code></a> (FastAPI, streaming)</li>
+    <li><strong>Scheduler:</strong> <a href="../../src/mini_infer/scheduler/continuous_scheduler.py"><code>src/mini_infer/scheduler/continuous_scheduler.py</code></a>, request state in <a href="../../src/mini_infer/scheduler/request_state.py"><code>request_state.py</code></a></li>
+    <li><strong>Model Runner:</strong> <a href="../../src/mini_infer/engine/model_runner.py"><code>src/mini_infer/engine/model_runner.py</code></a></li>
+    <li><strong>Sampler:</strong> <a href="../../src/mini_infer/engine/sampler.py"><code>src/mini_infer/engine/sampler.py</code></a></li>
+    <li><strong>Speculative decoding:</strong> <a href="../../src/mini_infer/engine/speculative.py"><code>src/mini_infer/engine/speculative.py</code></a></li>
+    <li><strong>Paged KV cache + block pool:</strong> <a href="../../src/mini_infer/cache/paged_kv_cache.py"><code>src/mini_infer/cache/paged_kv_cache.py</code></a>, <a href="../../src/mini_infer/cache/block_pool.py"><code>block_pool.py</code></a></li>
+    <li><strong>Paged attention kernel:</strong> <a href="../../src/mini_infer/cache/paged_attention.py"><code>src/mini_infer/cache/paged_attention.py</code></a>, packed variant in <a href="../../src/mini_infer/cache/packed_attention.py"><code>packed_attention.py</code></a></li>
+    <li><strong>MLA attention (DSV2):</strong> <a href="../../src/mini_infer/cache/mla_attention.py"><code>src/mini_infer/cache/mla_attention.py</code></a></li>
+    <li><strong>Prefix cache:</strong> <a href="../../src/mini_infer/cache/prefix_cache.py"><code>src/mini_infer/cache/prefix_cache.py</code></a></li>
+    <li><strong>DSV4 alternative state path:</strong> <a href="../../src/mini_infer/cache/state_cache.py"><code>src/mini_infer/cache/state_cache.py</code></a>, hybrid attention in <a href="../../src/mini_infer/cache/hca_attention.py"><code>hca_attention.py</code></a>, model defs in <a href="../../src/mini_infer/models/deepseek_v4.py"><code>models/deepseek_v4.py</code></a> with blocks in <a href="../../src/mini_infer/models/blocks/"><code>models/blocks/</code></a> (<code>hca.py</code>, <code>csa.py</code>, <code>deepseek_v4_decoder_layer.py</code>)</li>
+    <li><strong>Quantization (W8A16, TurboQuant KV):</strong> <a href="../../src/mini_infer/quant/"><code>src/mini_infer/quant/</code></a>, plus <a href="../../src/mini_infer/cache/turbo_quant.py"><code>cache/turbo_quant.py</code></a>, <a href="../../src/mini_infer/cache/turbo_kernel.py"><code>cache/turbo_kernel.py</code></a></li>
+    <li><strong>Tensor parallelism:</strong> <a href="../../src/mini_infer/distributed/"><code>src/mini_infer/distributed/</code></a></li>
+    <li><strong>Disaggregated workers:</strong> <a href="../../src/mini_infer/workers/"><code>src/mini_infer/workers/</code></a></li>
+    <li><strong>Device-type helper (the one central check):</strong> <a href="../../src/mini_infer/device.py"><code>src/mini_infer/device.py</code></a></li>
+  </ul>
+</section>
+
+<footer class="page">
+  Teaching artifact. Engine-agnostic diagram, mini-infer-specific anchor.
+  Open in any browser, no JS, no network.
+</footer>
+
+</div>
+</body>
+</html>
