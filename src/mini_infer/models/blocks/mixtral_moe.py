@@ -41,6 +41,7 @@ from torch.nn import functional
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.activations import GateUpActivation, swiglu
 
 
 class MixtralExpert(nn.Module):
@@ -51,14 +52,23 @@ class MixtralExpert(nn.Module):
     sharding), so the per-rank expert acts as a normal `SwiGLU`-shape FFN.
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        activation: GateUpActivation = swiglu,
+    ) -> None:
         super().__init__()
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)  # gate
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)  # down
         self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)  # up
+        # Default `swiglu` keeps Mixtral/DeepSeek/GLM experts identical; M3
+        # passes `swigluoai`.
+        self._activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out: torch.Tensor = self.w2(functional.silu(self.w1(x)) * self.w3(x))
+        out: torch.Tensor = self.w2(self._activation(self.w1(x), self.w3(x)))
         return out
 
 

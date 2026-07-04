@@ -3,6 +3,14 @@
 Date: 2026-06-19
 Status: Accepted
 
+> Amendment (2026-07-02): the "non-interleaved RoPE in the main attention"
+> statements below reflected a bug in transformers <= 5.6 that PR
+> huggingface/transformers#46372 fixed. GLM's main MLA uses INTERLEAVED
+> (DeepSeek-style) RoPE; only the indexer is non-interleaved. The port now
+> passes `use_interleaved_rope=True` and is parity-validated against
+> transformers 5.12. HF also stopped instantiating indexer weights on
+> "shared" IndexShare layers; the port mirrors that.
+
 ## Context
 
 GLM-5.2 (z.ai, released June 2026) ships as `GlmMoeDsaForCausalLM`

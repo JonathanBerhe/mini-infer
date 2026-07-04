@@ -24,12 +24,15 @@ expert is replicated and added after the reduce).
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.activations import GateUpActivation, swiglu
 from mini_infer.models.blocks.fp8_expert import Fp8Expert
 from mini_infer.models.blocks.mixtral_moe import MixtralExpert
 
@@ -66,7 +69,14 @@ class GlmNoAuxTcGate(nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         # Gate is replicated (every rank routes identically). Named/shaped to
         # match HF `mlp.gate.weight` so weight loading is a direct copy.
+        # A real checkpoint always overwrites this via load_weights, but an
+        # un-loaded model (tests that run a freshly-constructed reference
+        # model directly) must not depend on whatever garbage `torch.empty`
+        # happens to return: init it the same way `nn.Linear`'s default
+        # `reset_parameters` would, so a fresh instance is a well-defined,
+        # finite router rather than uninitialized memory.
         self.weight = nn.Parameter(torch.empty(n_routed_experts, hidden_size))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         # Aux-loss-free selection bias (HF `mlp.gate.e_score_correction_bias`).
         self.register_buffer(
             "e_score_correction_bias", torch.zeros(n_routed_experts, dtype=torch.float32)
@@ -126,6 +136,7 @@ class GlmMoeFFN(nn.Module):
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 1.0,
         expert_dtype: str = "bf16",
+        activation: GateUpActivation = swiglu,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -151,13 +162,18 @@ class GlmMoeFFN(nn.Module):
             raise ValueError(f"expert_dtype must be 'bf16' or 'fp8'; got {expert_dtype!r}")
         expert_cls = Fp8Expert if expert_dtype == "fp8" else MixtralExpert
         self.experts = nn.ModuleList(
-            [expert_cls(hidden_size, moe_intermediate_size) for _ in range(num_experts_per_rank)]
+            [
+                expert_cls(hidden_size, moe_intermediate_size, activation=activation)
+                for _ in range(num_experts_per_rank)
+            ]
         )
         # Shared expert fires on every token. DeepSeek collapses N shared
         # experts into one MLP of width `N * moe_intermediate_size`; replicated.
         self.n_shared_experts = n_shared_experts
         self.shared_experts: MixtralExpert | None = (
-            MixtralExpert(hidden_size, moe_intermediate_size * n_shared_experts)
+            MixtralExpert(
+                hidden_size, moe_intermediate_size * n_shared_experts, activation=activation
+            )
             if n_shared_experts > 0
             else None
         )

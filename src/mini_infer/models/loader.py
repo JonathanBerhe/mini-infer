@@ -3,13 +3,20 @@
 Resolves the checkpoint via `huggingface_hub.snapshot_download` (already
 a transitive dependency through `transformers`), then reads either
 `model.safetensors` (single-file) or the sharded `model.safetensors.index.json`
-manifest. Returns a flat `dict[str, Tensor]` ready for
-`model.load_state_dict(state_dict, strict=True)`.
+manifest. Two entry points:
+
+- `load_safetensors_state_dict`: the whole checkpoint as one flat dict. Fine
+  up to checkpoints that fit host RAM.
+- `iter_safetensors_shards`: one shard-sized dict at a time, for streaming
+  loads of checkpoints that do NOT fit host RAM (e.g. MiniMax-M3's 854 GB);
+  the consumer copies each shard's tensors into (possibly TP-sliced) module
+  params and lets the shard free before the next one loads.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import torch
@@ -37,7 +44,6 @@ def load_safetensors_state_dict(
     the resulting state_dict's dtype contract unambiguous.
     """
     local_dir = _resolve_local_dir(name_or_path)
-    index_path = local_dir / "model.safetensors.index.json"
     target_device = torch.device(device)
     # `safetensors.load_file(device=...)` accepts `cuda` / `cpu` strings and
     # `cuda:0` etc.; pass through the canonical form.
@@ -61,13 +67,7 @@ def load_safetensors_state_dict(
     # BF16 here both defeats that detection AND leaves the tensor at its
     # packed half-width shape, so the un-dequantized `(out, in // 2)` weight
     # loads silently and only blows up at the first forward matmul.
-    quantized_dtypes = {torch.float8_e4m3fn, torch.int8, torch.uint8}
-    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0_dtype is not None:
-        quantized_dtypes.add(e8m0_dtype)
-    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    if fp4_dtype is not None:
-        quantized_dtypes.add(fp4_dtype)
+    quantized_dtypes = _quantized_dtypes()
 
     def _maybe_cast(t: torch.Tensor) -> torch.Tensor:
         # Skip quantized dtypes (they need a pre-block dequant to be
@@ -88,6 +88,62 @@ def load_safetensors_state_dict(
         return t.to(dtype=dtype) if t.dtype != dtype else t
 
     state_dict: dict[str, torch.Tensor] = {}
+    for shard_dict in _iter_shard_dicts(local_dir, safetensors_device, _maybe_cast):
+        state_dict.update(shard_dict)
+    return state_dict
+
+
+def iter_safetensors_shards(
+    name_or_path: str,
+    *,
+    device: str | torch.device,
+    dtype: torch.dtype,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Yield the checkpoint one shard-dict at a time (streaming counterpart of
+    `load_safetensors_state_dict`, same device/dtype/quantized-dtype rules).
+
+    Peak host memory is one shard (plus whatever the consumer retains), so
+    checkpoints far larger than RAM can be loaded incrementally. Shards are
+    yielded in sorted filename order; key->shard assignment follows the
+    checkpoint's own manifest, so co-located tensors (e.g. an FP8 weight and
+    its `weight_scale_inv` scale) arrive together when the writer put them in
+    the same shard.
+    """
+    local_dir = _resolve_local_dir(name_or_path)
+    target_device = torch.device(device)
+    safetensors_device = (
+        f"{target_device.type}:{target_device.index}"
+        if target_device.index is not None
+        else target_device.type
+    )
+    quantized_dtypes = _quantized_dtypes()
+
+    def _maybe_cast(t: torch.Tensor) -> torch.Tensor:
+        if t.dtype in quantized_dtypes or t.dtype == torch.float32:
+            return t
+        return t.to(dtype=dtype) if t.dtype != dtype else t
+
+    yield from _iter_shard_dicts(local_dir, safetensors_device, _maybe_cast)
+
+
+def _quantized_dtypes() -> set[torch.dtype]:
+    """Dtypes that must never be blanket-cast (block-quantized storage)."""
+    quantized = {torch.float8_e4m3fn, torch.int8, torch.uint8}
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None:
+        quantized.add(e8m0_dtype)
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None:
+        quantized.add(fp4_dtype)
+    return quantized
+
+
+def _iter_shard_dicts(
+    local_dir: Path,
+    safetensors_device: str,
+    maybe_cast: Callable[[torch.Tensor], torch.Tensor],
+) -> Iterator[dict[str, torch.Tensor]]:
+    index_path = local_dir / "model.safetensors.index.json"
     if index_path.exists():
         with index_path.open() as f:
             manifest = json.load(f)
@@ -95,8 +151,7 @@ def load_safetensors_state_dict(
         shards = sorted(set(weight_map.values()))
         for shard in shards:
             shard_dict = load_file(str(local_dir / shard), device=safetensors_device)
-            for k, v in shard_dict.items():
-                state_dict[k] = _maybe_cast(v)
+            yield {k: maybe_cast(v) for k, v in shard_dict.items()}
     else:
         single_file = local_dir / "model.safetensors"
         if not single_file.exists():
@@ -104,9 +159,7 @@ def load_safetensors_state_dict(
                 f"no model.safetensors or model.safetensors.index.json under {local_dir}"
             )
         loaded = load_file(str(single_file), device=safetensors_device)
-        for k, v in loaded.items():
-            state_dict[k] = _maybe_cast(v)
-    return state_dict
+        yield {k: maybe_cast(v) for k, v in loaded.items()}
 
 
 def _resolve_local_dir(name_or_path: str) -> Path:
