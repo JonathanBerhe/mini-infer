@@ -68,6 +68,7 @@ image = (
         "huggingface_hub>=0.20",
         "hf-transfer>=0.1.6",  # parallel, fast LFS downloads
         "safetensors>=0.4",
+        "numpy",  # safetensors save_file serializes via numpy
     )
 )
 
