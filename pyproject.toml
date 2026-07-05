@@ -27,6 +27,15 @@ cuda = [
     # FlashInfer paged-attention kernels; CUDA-only, import-guarded.
     "flashinfer-python>=0.6.10rc1",
 ]
+# TPU-only extra for the JAX/Pallas backend (src/mini_infer/backends/tpu).
+# Plain `jax`, NOT `jax[tpu]`: plain JAX runs Pallas kernels in interpret mode
+# on CPU (pallas_call(..., interpret=True)), which is enough to develop and
+# parity-test the kernels with no TPU hardware. Imports of `jax` in the codebase
+# are try/except guarded so the base (non-TPU) install still imports. Real TPU
+# execution needs `jax[tpu]` installed separately on a TPU host.
+tpu = [
+    "jax>=0.4",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mini_infer"]
@@ -83,6 +92,15 @@ follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 module = ["flash_attn", "flash_attn.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# JAX/Pallas is the optional TPU backend SDK (the `tpu` extra). Treated like
+# triton/flash_attn: an import-guarded accelerator dependency whose kernel DSL
+# (jax.experimental.pallas) we do not type-check against. Skipping it also lets
+# the `jax = None` fallback bindings type-check on non-JAX installs.
+[[tool.mypy.overrides]]
+module = ["jax", "jax.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
