@@ -309,6 +309,214 @@ if _JAX_AVAILABLE:
             interpret=interpret,
         )
 
+    def _paged_prefill_launch(
+        q: Array,
+        k_pages: Array,
+        v_pages: Array,
+        block_tables: Array,
+        lengths: Array,
+        *,
+        scale: float,
+        interpret: bool,
+    ) -> Array:
+        """Launch paged prefill / multi-query attention.
+
+        Like the decode launch but each sequence has q_len query tokens
+        (q shape (num_seqs, q_len, num_heads, head_dim)), placed at the last
+        q_len absolute positions of the context, attending causally.
+        """
+        num_seqs, q_len, num_heads, head_dim = q.shape
+        page_size = k_pages.shape[1]
+        num_kv_heads = k_pages.shape[2]
+        max_pages = block_tables.shape[1]
+        q_per_kv = num_heads // num_kv_heads
+
+        grid = (num_seqs, num_heads, max_pages)
+
+        def kernel(
+            block_tables_ref: Any,
+            lengths_ref: Any,
+            q_ref: Any,
+            k_ref: Any,
+            v_ref: Any,
+            out_ref: Any,
+            m_scratch: Any,
+            l_scratch: Any,
+            acc_scratch: Any,
+        ) -> None:
+            del block_tables_ref  # used only by the index_maps
+            seq_index = pl.program_id(0)
+            page_index = pl.program_id(2)
+            num_page_steps = pl.num_programs(2)
+
+            @pl.when(page_index == 0)  # type: ignore[untyped-decorator]
+            def _init() -> None:
+                m_scratch[...] = jnp.full_like(m_scratch, _MASK_NEG)
+                l_scratch[...] = jnp.zeros_like(l_scratch)
+                acc_scratch[...] = jnp.zeros_like(acc_scratch)
+
+            length = lengths_ref[seq_index]
+            q_mat = q_ref[...].reshape(q_len, head_dim)  # (q_len, head_dim)
+            k = k_ref[...].reshape(page_size, head_dim)  # (page_size, head_dim)
+            v = v_ref[...].reshape(page_size, head_dim)  # (page_size, head_dim)
+
+            scores = jax.lax.dot_general(
+                q_mat,
+                k,
+                (((1,), (1,)), ((), ())),  # contract head_dim
+                preferred_element_type=jnp.float32,
+            )
+            scores = scores * scale  # (q_len, page_size)
+
+            # Causal-by-absolute-position mask. Query row t sits at absolute
+            # position (length - q_len + t) and may attend to key j only if
+            # j <= that position. This subsumes the ragged length mask (keys past
+            # the context sit beyond every query) and reduces to the decode mask
+            # when q_len == 1.
+            q_pos = (length - q_len) + jax.lax.broadcasted_iota(jnp.int32, (q_len, page_size), 0)
+            k_pos = page_index * page_size + jax.lax.broadcasted_iota(
+                jnp.int32, (q_len, page_size), 1
+            )
+            scores = jnp.where(k_pos <= q_pos, scores, _MASK_NEG)
+
+            m_prev = m_scratch[...]  # (q_len, 1)
+            l_prev = l_scratch[...]  # (q_len, 1)
+            acc_prev = acc_scratch[...]  # (q_len, head_dim)
+
+            m_cur = jnp.max(scores, axis=-1, keepdims=True)
+            m_new = jnp.maximum(m_prev, m_cur)
+            p = jnp.exp(scores - m_new)
+            correction = jnp.exp(m_prev - m_new)
+            l_new = correction * l_prev + jnp.sum(p, axis=-1, keepdims=True)
+            acc_new = correction * acc_prev + jax.lax.dot_general(
+                p,
+                v,
+                (((1,), (0,)), ((), ())),  # contract page_size
+                preferred_element_type=jnp.float32,
+            )
+
+            m_scratch[...] = m_new
+            l_scratch[...] = l_new
+            acc_scratch[...] = acc_new
+
+            @pl.when(page_index == num_page_steps - 1)  # type: ignore[untyped-decorator]
+            def _finalize() -> None:
+                out_ref[...] = (
+                    (acc_scratch[...] / l_scratch[...]).reshape(out_ref.shape).astype(out_ref.dtype)
+                )
+
+        q_spec = pl.BlockSpec((1, q_len, 1, head_dim), lambda s, h, p, bt, ln: (s, 0, h, 0))
+        out_spec = pl.BlockSpec((1, q_len, 1, head_dim), lambda s, h, p, bt, ln: (s, 0, h, 0))
+        kv_block = (1, page_size, 1, head_dim)
+        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
+        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
+
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=grid,
+            in_specs=[q_spec, k_spec, v_spec],
+            out_specs=out_spec,
+            scratch_shapes=[
+                pltpu.VMEM((q_len, 1), jnp.float32),
+                pltpu.VMEM((q_len, 1), jnp.float32),
+                pltpu.VMEM((q_len, head_dim), jnp.float32),
+            ],
+        )
+
+        result: Array = pl.pallas_call(
+            kernel,
+            grid_spec=grid_spec,
+            out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+            interpret=interpret,
+        )(block_tables, lengths, q, k_pages, v_pages)
+        return result
+
+    def pallas_paged_prefill_attention(
+        q: Array,
+        k_pages: Array,
+        v_pages: Array,
+        block_tables: Array,
+        lengths: Array,
+        *,
+        scale: float | None = None,
+        interpret: bool = False,
+    ) -> Array:
+        """Paged prefill / multi-query attention via a Pallas TPU kernel.
+
+        Generalises the decode kernel to q_len >= 1 query tokens per sequence:
+        the case for prefill (a chunk of new tokens) and speculative decode (a
+        small candidate window). Each sequence's q_len queries occupy the last
+        q_len absolute positions of its context and attend causally: query token
+        t attends to keys at positions j <= (length - q_len + t). Separate from
+        decode, matching RPA's specialized-per-workload compilation.
+
+        Args:
+            q: queries, `(num_seqs, q_len, num_heads, head_dim)`.
+            k_pages: key cache pool, `(num_pages, page_size, num_kv_heads, head_dim)`.
+            v_pages: value cache pool, same shape as `k_pages`.
+            block_tables: `(num_seqs, max_pages)` int page table (see the decode kernel).
+            lengths: `(num_seqs,)` int total context length per sequence,
+                including the q_len query tokens themselves.
+            scale: softmax scale. Defaults to `1/sqrt(head_dim)`.
+            interpret: run in Pallas interpret mode on CPU (no TPU needed).
+
+        Returns:
+            Attention output, `(num_seqs, q_len, num_heads, head_dim)`, dtype of q.
+
+        Raises:
+            RuntimeError: if JAX is not installed.
+            ValueError: on rank/shape mismatch or an unclean head grouping.
+        """
+        if not _JAX_AVAILABLE:
+            raise RuntimeError(
+                "JAX is not available; install the 'tpu' extra "
+                "(uv sync --extra tpu) to use the Pallas paged attention kernel"
+            )
+        if q.ndim != 4:
+            raise ValueError(
+                f"q must be (num_seqs, q_len, num_heads, head_dim) for prefill; got rank {q.ndim}"
+            )
+        if k_pages.ndim != 4 or v_pages.shape != k_pages.shape:
+            raise ValueError(
+                "k_pages and v_pages must be (num_pages, page_size, num_kv_heads, "
+                f"head_dim) and identical; got {k_pages.shape} and {v_pages.shape}"
+            )
+        num_seqs = q.shape[0]
+        if block_tables.ndim != 2 or block_tables.shape[0] != num_seqs:
+            raise ValueError(
+                "block_tables must be (num_seqs, max_pages) matching q's num_seqs; "
+                f"got {block_tables.shape} for num_seqs={num_seqs}"
+            )
+        if lengths.ndim != 1 or lengths.shape[0] != num_seqs:
+            raise ValueError(
+                f"lengths must be (num_seqs,); got {lengths.shape} for num_seqs={num_seqs}"
+            )
+
+        num_heads, head_dim = q.shape[2], q.shape[3]
+        num_kv_heads = k_pages.shape[2]
+        if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
+            raise ValueError(
+                "num_heads must be a positive multiple of num_kv_heads for "
+                f"grouped-query attention; got {num_heads} query heads and "
+                f"{num_kv_heads} kv heads"
+            )
+        if k_pages.shape[3] != head_dim:
+            raise ValueError(f"head_dim mismatch: q has {head_dim}, k_pages has {k_pages.shape[3]}")
+
+        effective_scale = scale if scale is not None else 1.0 / (head_dim**0.5)
+        block_tables = block_tables.astype(jnp.int32)
+        lengths = lengths.astype(jnp.int32)
+
+        return _paged_prefill_launch(
+            q,
+            k_pages,
+            v_pages,
+            block_tables,
+            lengths,
+            scale=effective_scale,
+            interpret=interpret,
+        )
+
 else:
 
     def pallas_paged_attention(
@@ -326,6 +534,22 @@ else:
         Keeps the import working without JAX; callers should gate on
         `supports_pallas_paged_attention()` first.
         """
+        raise RuntimeError(
+            "JAX is not available; install the 'tpu' extra "
+            "(uv sync --extra tpu) to use the Pallas paged attention kernel"
+        )
+
+    def pallas_paged_prefill_attention(
+        q: Any,
+        k_pages: Any,
+        v_pages: Any,
+        block_tables: Any,
+        lengths: Any,
+        *,
+        scale: float | None = None,
+        interpret: bool = False,
+    ) -> Any:
+        """Fallback when JAX is absent; gate on `supports_pallas_paged_attention()`."""
         raise RuntimeError(
             "JAX is not available; install the 'tpu' extra "
             "(uv sync --extra tpu) to use the Pallas paged attention kernel"

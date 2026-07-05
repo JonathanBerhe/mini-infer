@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from .pallas_attention import pallas_attention, supports_pallas_attention
 from .pallas_paged_attention import (
     pallas_paged_attention,
+    pallas_paged_prefill_attention,
     supports_pallas_paged_attention,
 )
 
@@ -77,9 +78,11 @@ def dispatch_attention(
 ) -> Array:
     """Route an attention call to the paged or dense Pallas TPU kernel.
 
-    If ``block_tables`` is given, the paged decode kernel is used: ``k`` and
-    ``v`` are the page pools ``(num_pages, page_size, num_kv_heads, head_dim)``
-    and ``block_tables`` / ``lengths`` select each sequence's pages and context
+    If ``block_tables`` is given, a paged kernel is used: prefill / multi-query
+    when ``q`` is rank-4 ``(num_seqs, q_len, num_heads, head_dim)``, single-token
+    decode when rank-3 ``(num_seqs, num_heads, head_dim)``. ``k`` and ``v`` are
+    the page pools ``(num_pages, page_size, num_kv_heads, head_dim)`` and
+    ``block_tables`` / ``lengths`` select each sequence's pages and context
     length. Otherwise the dense kernel is used: ``k`` and ``v`` are contiguous
     ``(heads, seq, head_dim)`` (or 4D with a batch axis).
 
@@ -96,6 +99,12 @@ def dispatch_attention(
     if block_tables is not None:
         if lengths is None:
             raise ValueError("paged attention requires both block_tables and lengths")
+        # Rank-4 q (num_seqs, q_len, num_heads, head_dim) is prefill / multi-query;
+        # rank-3 q (num_seqs, num_heads, head_dim) is single-token decode.
+        if q.ndim == 4:
+            return pallas_paged_prefill_attention(
+                q, k, v, block_tables, lengths, scale=scale, interpret=interpret
+            )
         return pallas_paged_attention(
             q, k, v, block_tables, lengths, scale=scale, interpret=interpret
         )
