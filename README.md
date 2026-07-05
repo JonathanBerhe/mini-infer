@@ -152,8 +152,8 @@ FastAPI (api/server.py) ──► ContinuousScheduler.submit(Request)
                                          BlockPool (shared)
                                                 │
                                                 ▼
-                                Triton kernel  /  PyTorch reference
-                                  (CUDA)           (CPU/MPS)
+                            Backend kernels       /  PyTorch reference
+                   (CUDA/Triton, TPU/Pallas, Trainium/NKI)  (CPU/MPS)
 ```
 
 * **`engine/`** loads the model and owns prefill and decode.
@@ -182,7 +182,7 @@ By design:
 
 * **No multimodal** (text-only). Gemma 3/4 vision/audio towers and Phi-Vision are skipped; we implement the text decoder.
 * **No training or fine-tuning** (inference only).
-* **No reimplemented attention kernels.** flash-attn for varlen on CUDA, FlashInfer for FP8/NVFP4 paged paths, PyTorch SDPA on CPU/MPS. We own Triton kernels only for INT8 GEMM, TurboQuant KV dequant, and the Hyper-Connections Sinkhorn port.
+* **No reimplemented attention kernels beyond what a vendor library lacks.** flash-attn for varlen on CUDA, FlashInfer for FP8/NVFP4 paged paths, PyTorch SDPA on CPU/MPS, XLA/Pallas primitives on TPU. We own hand-written kernels (Triton on GPU, Pallas on TPU, NKI on Trainium) only where the math isn't in a vendor library: INT8 GEMM, TurboQuant KV dequant, the Hyper-Connections Sinkhorn port, and paged attention on TPU.
 
 Planned work (DeepSeek-V3/Kimi-K2 large-checkpoint runs, V4-Flash multi-GPU forward, the funded GLM-5.2 753B run) is tracked in [docs/plans/roadmap-2026.md](docs/plans/roadmap-2026.md).
 
