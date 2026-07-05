@@ -86,6 +86,50 @@ def _make_paged(num_seqs, num_heads, num_kv_heads, head_dim, page_size, max_page
     return q, k_pages, v_pages, block_tables, lengths
 
 
+def _prefill_reference(q, k_pages, v_pages, block_tables, lengths, scale):
+    num_seqs, q_len, num_heads, _ = q.shape
+    num_kv_heads = k_pages.shape[2]
+    q_per_kv = num_heads // num_kv_heads
+    max_pages = block_tables.shape[1]
+    out = np.zeros_like(q)
+    for s in range(num_seqs):
+        length = int(lengths[s])
+        k_full = np.concatenate([k_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
+        v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
+        k_ids = np.arange(k_full.shape[0])
+        for h in range(num_heads):
+            kv = h // q_per_kv
+            for t in range(q_len):
+                q_pos = length - q_len + t
+                scores = (k_full[:, kv, :] @ q[s, t, h]) * scale
+                scores = np.where(k_ids <= q_pos, scores, -1e30)
+                scores = scores - scores.max()
+                weights = np.exp(scores)
+                weights /= weights.sum()
+                out[s, t, h] = weights @ v_full[:, kv, :]
+    return out
+
+
+def _make_prefill(num_seqs, q_len, num_heads, num_kv_heads, head_dim, page_size, max_pages, seed):
+    rng = np.random.default_rng(seed)
+    num_pages = num_seqs * max_pages + 2
+    q = rng.standard_normal((num_seqs, q_len, num_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
+    lengths = np.zeros((num_seqs,), dtype=np.int32)
+    cursor = 0
+    for s in range(num_seqs):
+        length = int(rng.integers(q_len, max_pages * page_size + 1))
+        lengths[s] = length
+        n_used = (length + page_size - 1) // page_size
+        for pi in range(max_pages):
+            block_tables[s, pi] = cursor if pi < n_used else 0
+            if pi < n_used:
+                cursor += 1
+    return q, k_pages, v_pages, block_tables, lengths
+
+
 def _timed(jax, fn, iters=20):
     out = fn()
     jax.block_until_ready(out)  # trigger compile / first run
@@ -110,7 +154,10 @@ def main() -> int:
     import jax.numpy as jnp
 
     from mini_infer.backends.tpu.pallas_attention import pallas_attention
-    from mini_infer.backends.tpu.pallas_paged_attention import pallas_paged_attention
+    from mini_infer.backends.tpu.pallas_paged_attention import (
+        pallas_paged_attention,
+        pallas_paged_prefill_attention,
+    )
 
     print("jax", jax.__version__)
     try:
@@ -159,6 +206,29 @@ def main() -> int:
         ms, out = _timed(jax, lambda args=args: pallas_paged_attention(*args, interpret=interpret))
         ref = _paged_reference(q2, kp, vp, bt, ln, 1.0 / (128**0.5))
         all_ok &= _report(f"paged {label}", out, ref, ms)
+
+    # Paged prefill / multi-query attention (q_len > 1).
+    print("Paged prefill attention:")
+    for label, (nh, nkv, ql) in {
+        "MHA q_len=8": (8, 8, 8),
+        "GQA q_len=8 (8q/2kv)": (8, 2, 8),
+    }.items():
+        q3, kp, vp, bt, ln = _make_prefill(
+            num_seqs=8,
+            q_len=ql,
+            num_heads=nh,
+            num_kv_heads=nkv,
+            head_dim=128,
+            page_size=16,
+            max_pages=8,
+            seed=2,
+        )
+        args = (jnp.asarray(q3), jnp.asarray(kp), jnp.asarray(vp), jnp.asarray(bt), jnp.asarray(ln))
+        ms, out = _timed(
+            jax, lambda args=args: pallas_paged_prefill_attention(*args, interpret=interpret)
+        )
+        ref = _prefill_reference(q3, kp, vp, bt, ln, 1.0 / (128**0.5))
+        all_ok &= _report(f"prefill {label}", out, ref, ms)
 
     print("ALL PASS" if all_ok else "SOME FAILED")
     return 0 if all_ok else 1
