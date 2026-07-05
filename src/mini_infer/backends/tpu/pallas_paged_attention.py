@@ -38,9 +38,9 @@ sequence's real pages contribute nothing. Slots past a sequence's pages still
 gather some in-bounds dummy page (the caller sets them to a valid index); masking
 makes their contribution zero, so the result is independent of the dummy.
 
-Scope: this M2 kernel is multi-head attention (num_kv_heads == num_heads) in
-interpret mode. Grouped-query attention, on-TPU execution, and a dispatch/golden
-wiring are follow-ups (see the module TODO in the tests and ADR-023).
+Scope: this kernel supports grouped-query attention (num_kv_heads divides
+num_heads; query head h reads kv head h // (num_heads // num_kv_heads)) and runs
+in interpret mode. On-TPU execution is a follow-up (see ADR-023).
 
 JAX is optional and import-guarded exactly as in pallas_softmax.py /
 pallas_attention.py. With plain `jax` (no `jax[tpu]`), pass `interpret=True` to
@@ -110,7 +110,11 @@ if _JAX_AVAILABLE:
         """
         num_seqs, num_heads, head_dim = q.shape
         page_size = k_pages.shape[1]
+        num_kv_heads = k_pages.shape[2]
         max_pages = block_tables.shape[1]
+        # Grouped-query attention: each block of q_per_kv query heads shares one
+        # kv head. q_per_kv == 1 is plain multi-head attention.
+        q_per_kv = num_heads // num_kv_heads
 
         # Grid outer -> inner: (sequence, head, page). The page axis is INNER so
         # successive sequential grid steps are successive online-softmax
@@ -194,8 +198,9 @@ if _JAX_AVAILABLE:
         q_spec = pl.BlockSpec((1, 1, head_dim), lambda s, h, p, bt, ln: (s, h, 0))
         out_spec = pl.BlockSpec((1, 1, head_dim), lambda s, h, p, bt, ln: (s, h, 0))
         kv_block = (1, page_size, 1, head_dim)
-        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h, 0))
-        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h, 0))
+        # The kv head for query head h is h // q_per_kv (grouped-query mapping).
+        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
+        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,  # block_tables, lengths
@@ -234,7 +239,8 @@ if _JAX_AVAILABLE:
 
         Args:
             q: queries, `(num_seqs, num_heads, head_dim)` (one token per seq).
-            k_pages: key cache pool, `(num_pages, page_size, num_heads, head_dim)`.
+            k_pages: key cache pool, `(num_pages, page_size, num_kv_heads, head_dim)`
+                (num_kv_heads may be < num_heads for grouped-query attention).
             v_pages: value cache pool, same shape as `k_pages`.
             block_tables: `(num_seqs, max_pages)` int array; `block_tables[s, p]`
                 is the physical page index in the pool for sequence `s`'s logical
@@ -250,8 +256,8 @@ if _JAX_AVAILABLE:
 
         Raises:
             RuntimeError: if JAX is not installed.
-            ValueError: on rank/shape mismatch, or grouped-query heads
-                (num_kv_heads != num_heads), which this M2 kernel does not do yet.
+            ValueError: on rank/shape mismatch, or if num_heads is not a multiple
+                of num_kv_heads (grouped-query requires a clean head grouping).
         """
         if not _JAX_AVAILABLE:
             raise RuntimeError(
@@ -279,11 +285,11 @@ if _JAX_AVAILABLE:
 
         num_heads, head_dim = q.shape[1], q.shape[2]
         num_kv_heads = k_pages.shape[2]
-        if num_kv_heads != num_heads:
+        if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
             raise ValueError(
-                "this M2 kernel is multi-head only (num_kv_heads == num_heads); "
-                f"got {num_kv_heads} kv heads and {num_heads} query heads. "
-                "Grouped-query attention is a follow-up."
+                "num_heads must be a positive multiple of num_kv_heads for "
+                f"grouped-query attention; got {num_heads} query heads and "
+                f"{num_kv_heads} kv heads"
             )
         if k_pages.shape[3] != head_dim:
             raise ValueError(f"head_dim mismatch: q has {head_dim}, k_pages has {k_pages.shape[3]}")

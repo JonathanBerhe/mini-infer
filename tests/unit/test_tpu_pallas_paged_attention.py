@@ -37,6 +37,8 @@ def _reference(
     """Materialise each sequence's KV from its pages and do masked attention."""
     num_seqs, num_heads = q.shape[:2]
     page_size = k_pages.shape[1]
+    num_kv_heads = k_pages.shape[2]
+    q_per_kv = num_heads // num_kv_heads
     max_pages = block_tables.shape[1]
     out = np.zeros_like(q)
     for s in range(num_seqs):
@@ -47,12 +49,13 @@ def _reference(
         v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
         valid = np.arange(max_pages * page_size) < length
         for h in range(num_heads):
-            scores = (k_full[:, h, :] @ q[s, h]) * scale
+            kv = h // q_per_kv  # grouped-query: query head h reads kv head kv
+            scores = (k_full[:, kv, :] @ q[s, h]) * scale
             scores = np.where(valid, scores, -1e30)
             scores = scores - scores.max()
             weights = np.exp(scores)
             weights = weights / weights.sum()
-            out[s, h] = weights @ v_full[:, h, :]
+            out[s, h] = weights @ v_full[:, kv, :]
     return out
 
 
@@ -64,14 +67,17 @@ def _make_case(
     max_pages: int = 4,
     seed: int = 0,
     shuffle_pages: bool = False,
+    num_kv_heads: int | None = None,
 ):
     """Build a ragged paged-attention case with distinct pages per sequence."""
+    if num_kv_heads is None:
+        num_kv_heads = num_heads
     rng = np.random.default_rng(seed)
     # Enough pages for every sequence to use up to max_pages distinct ones.
     num_pages = num_seqs * max_pages + 2
     q = rng.standard_normal((num_seqs, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
 
     physical = list(range(num_pages))
     if shuffle_pages:
@@ -169,12 +175,19 @@ def test_stable_on_large_logits():
     assert _cosine(got, ref) > 0.99
 
 
-def test_rejects_grouped_query_heads():
-    # num_kv_heads != num_heads is not supported by this M2 kernel.
-    q = jnp.zeros((2, 4, 16), dtype=jnp.float32)
-    k_pages = jnp.zeros((4, 8, 2, 16), dtype=jnp.float32)  # 2 kv heads vs 4 q heads
+def test_grouped_query_attention():
+    # 8 query heads share 2 kv heads (4:1 grouping).
+    got, ref = _run(_make_case(num_heads=8, num_kv_heads=2, seed=9))
+    assert _cosine(got, ref) > 0.99
+    np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_rejects_indivisible_head_grouping():
+    # num_heads must be a multiple of num_kv_heads; 3 is not a multiple of 2.
+    q = jnp.zeros((2, 3, 16), dtype=jnp.float32)  # 3 query heads
+    k_pages = jnp.zeros((4, 8, 2, 16), dtype=jnp.float32)  # 2 kv heads
     v_pages = jnp.zeros((4, 8, 2, 16), dtype=jnp.float32)
     block_tables = jnp.zeros((2, 3), dtype=jnp.int32)
     lengths = jnp.ones((2,), dtype=jnp.int32)
-    with pytest.raises(ValueError, match="multi-head only"):
+    with pytest.raises(ValueError, match="multiple of num_kv_heads"):
         pallas_paged_attention(q, k_pages, v_pages, block_tables, lengths, interpret=True)
