@@ -40,10 +40,14 @@ green run genuinely means it ran on the TPU.
 
 ## Caveats
 
-- **TPU via metadata can be flaky.** `enable_tpu` in `kernel-metadata.json` is
-  newer and less reliable than `enable_gpu`. If a pushed kernel reports no TPU,
-  open it once in the Kaggle notebook UI, set the accelerator to TPU, and re-push
-  the same slug.
+- **TPU via metadata often falls back to CPU.** `enable_tpu: true` is a valid
+  field (it is in `kaggle kernels init`), but a CLI push commonly still gets a
+  CPU worker (observed here: `jax devices: [CpuDevice]`). When that happens the
+  kernel logs `ERROR: no TPU device visible` and exits non-zero by design, so an
+  ERROR with that message means provisioning fell back, not that the kernels are
+  wrong. The reliable fix is the UI: open the kernel, set the accelerator to
+  "TPU VM v3-8", and Save & Run All. The account must be phone-verified with TPU
+  quota. `machine_shape` in the metadata is the other lever if you script it.
 - **Internet must stay enabled** (`enable_internet: true`) so the kernel can
   clone the branch.
 - **JAX is preinstalled** on Kaggle's TPU image; the script deliberately does not

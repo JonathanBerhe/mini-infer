@@ -1,5 +1,5 @@
 {
-  "id": "YOUR_KAGGLE_USERNAME/mini-infer-tpu-pallas",
+  "id": "JonathanBerhe/mini-infer-tpu-pallas-kernels",
   "title": "mini-infer TPU Pallas kernels",
   "code_file": "run_kaggle_tpu.py",
   "language": "python",
