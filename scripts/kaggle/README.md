@@ -1,5 +1,11 @@
 # Run the TPU Pallas kernels on a real TPU (Kaggle)
 
+> Note: Kaggle now gates accelerator use behind image-based identity
+> verification (Persona). If you would rather not do that, use the Colab path in
+> `scripts/colab/` instead (Google account only, no verification), or GCP Cloud
+> TPU / TPU Research Cloud. This Kaggle bundle is kept for anyone fine with the
+> verification.
+
 Everything in the TPU backend (ADR-023, ADR-024) is validated in Pallas
 interpret mode on CPU. This bundle runs the same kernels on an actual TPU, which
 is the one thing interpret mode cannot confirm (real Mosaic lowering, tiling, and
