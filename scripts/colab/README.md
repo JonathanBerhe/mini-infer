@@ -21,9 +21,15 @@ checking each against a NumPy reference. A real TPU run prints
 `devices: [TpuDevice(...)]` and ends with `ALL PASS`, and it refuses to fall back
 to CPU, so a green run genuinely ran on the TPU.
 
-Note: Colab free-tier TPU availability is dynamic; if none is free, retry later
-or use Colab Pro. Colab's free TPU is typically TPU v2, which is plenty for this
-correctness confirmation.
+Note: on the first run the cell aligns Colab's `libtpu` with its `jaxlib` and
+restarts the runtime once, then you run the cell again. Colab's preinstalled
+`libtpu` can be older than `jaxlib` and reject the compiled kernel with
+"Unsupported version: expected <= 7 but got 8". That is an environment version
+skew, not a kernel bug: the kernel compiles to valid Mosaic; the runtime just
+cannot load what this jaxlib emitted. Colab free-tier TPU availability is also
+dynamic (typically TPU v2); retry later if none is free. If Colab keeps refusing
+to align, use the GCP Cloud TPU path below: a fresh VM installs a matched
+`jax[tpu]` and avoids the skew entirely.
 
 ## Scriptable alternative: Google Cloud TPU (paid, gcloud, closest to `modal run`)
 
