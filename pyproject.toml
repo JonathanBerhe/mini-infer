@@ -104,6 +104,14 @@ module = ["jax", "jax.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+# The TPU backend type-checks in two worlds: with jax installed (the tpu extra,
+# dev boxes) and without (CPU-only CI). Fallback bindings like `jnp = None` need
+# a type: ignore only in the first world and get flagged unused in the second,
+# so no single ignore state satisfies both; silence unused-ignore there only.
+[[tool.mypy.overrides]]
+module = ["mini_infer.backends.tpu.*"]
+warn_unused_ignores = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
