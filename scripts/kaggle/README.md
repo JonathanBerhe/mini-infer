@@ -28,14 +28,14 @@ fetch the log. That is the closest Kaggle has to `modal run`.
    `kaggle.json` API token at `~/.kaggle/kaggle.json` (chmod 600). The Kaggle
    account must be phone-verified to use accelerators.
 3. **Set your username** in `kernel-metadata.json`: change `id` to
-   `"<your-username>/mini-infer-tpu-pallas"`.
+   `"<your-username>/mini-infer-tpu-pallas-kernels"`.
 
 ## Run
 
 ```bash
 kaggle kernels push   -p scripts/kaggle
-kaggle kernels status  <your-username>/mini-infer-tpu-pallas          # poll until "complete"
-kaggle kernels output  <your-username>/mini-infer-tpu-pallas -p out/  # fetch the log
+kaggle kernels status  <your-username>/mini-infer-tpu-pallas-kernels          # poll until "complete"
+kaggle kernels output  <your-username>/mini-infer-tpu-pallas-kernels -p out/  # fetch the log
 ```
 
 The log should end with `ALL PASS` and, per kernel, a line like

@@ -381,6 +381,17 @@ if _JAX_AVAILABLE:
             )
         if k.shape[1] != v.shape[1]:
             raise ValueError(f"k and v must share seq length; got {k.shape[1]} and {v.shape[1]}")
+        if k.shape[0] != q.shape[0] or v.shape[0] != q.shape[0]:
+            # Without this guard a head-count mismatch (e.g. unexpanded GQA K/V,
+            # which the PAGED kernels accept) would not error: Pallas dynamic-slice
+            # clamping maps the excess query heads onto the last kv head and
+            # returns finite but wrong attention output.
+            raise ValueError(
+                "q, k, v must share the heads axis for dense attention; got "
+                f"{q.shape[0]}, {k.shape[0]}, {v.shape[0]}. Grouped-query K/V "
+                "(num_kv_heads < num_heads) is supported by the paged kernels, "
+                "not the dense kernel."
+            )
 
         seq_q = q.shape[1]
         seq_k = k.shape[1]

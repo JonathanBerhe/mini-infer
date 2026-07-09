@@ -180,3 +180,17 @@ def test_dispatch_requires_lengths_for_paged():
             block_tables=jnp.asarray(block_tables),
             interpret=True,
         )
+
+
+def test_dispatch_rejects_lengths_without_block_tables():
+    # The mirror misuse: lengths with no block table would silently route to the
+    # dense kernel and attend over padded positions (no ragged masking there).
+    q, k, v = _dense_inputs(seed=8)
+    with pytest.raises(ValueError, match="lengths requires block_tables"):
+        dispatch_attention(
+            jnp.asarray(q),
+            jnp.asarray(k),
+            jnp.asarray(v),
+            lengths=jnp.array([4, 8, 2, 1], dtype=jnp.int32),
+            interpret=True,
+        )

@@ -5,10 +5,10 @@ is the closest Kaggle offers to `modal run`: push it from a terminal, it runs on
 a Kaggle TPU VM, and you poll for status and pull the log.
 
     pip install kaggle                       # once; API token at ~/.kaggle/kaggle.json
-    # edit kernel-metadata.json: set "id" to "<your-username>/mini-infer-tpu-pallas"
+    # edit kernel-metadata.json: set "id" to "<your-username>/mini-infer-tpu-pallas-kernels"
     kaggle kernels push   -p scripts/kaggle
-    kaggle kernels status  <your-username>/mini-infer-tpu-pallas    # poll to complete
-    kaggle kernels output  <your-username>/mini-infer-tpu-pallas -p out/   # fetch log
+    kaggle kernels status  <your-username>/mini-infer-tpu-pallas-kernels    # poll to complete
+    kaggle kernels output  <your-username>/mini-infer-tpu-pallas-kernels -p out/   # fetch log
 
 Prerequisites (see README.md): the tpu-pallas-backend branch pushed to GitHub,
 and TPU + internet enabled (kernel-metadata.json sets enable_tpu / enable_internet).

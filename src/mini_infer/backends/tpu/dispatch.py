@@ -92,10 +92,18 @@ def dispatch_attention(
 
     Raises:
         RuntimeError: if the TPU backend is unavailable (JAX not installed).
-        ValueError: if ``block_tables`` is given without ``lengths``.
+        ValueError: if ``block_tables`` is given without ``lengths``, or
+            ``lengths`` without ``block_tables``.
     """
     if not tpu_backend_available():
         raise RuntimeError("TPU backend unavailable; install the 'tpu' extra (uv sync --extra tpu)")
+    if block_tables is None and lengths is not None:
+        # Silently dropping lengths would attend over padded positions past each
+        # sequence's real length; the dense kernel has no ragged masking.
+        raise ValueError(
+            "lengths requires block_tables (ragged masking exists only in the "
+            "paged kernels); for dense attention pass neither"
+        )
     if block_tables is not None:
         if lengths is None:
             raise ValueError("paged attention requires both block_tables and lengths")

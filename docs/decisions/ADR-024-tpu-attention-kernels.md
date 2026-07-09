@@ -25,8 +25,8 @@ will write:
   to the same parity bar as the CUDA path?
 
 The kernels built under this ADR: M0 row-wise softmax (scaffold), M1 dense
-flash-attention, M2 paged + ragged decode attention, plus grouped-query support
-and a backend dispatcher.
+flash-attention, M2 paged + ragged decode attention, a paged prefill /
+multi-query kernel, plus grouped-query support and a backend dispatcher.
 
 ## Decision
 
@@ -108,9 +108,9 @@ Costs and risks:
   on-TPU execution is a real, still-open confirmation step (run the script).
 - These are correctness-first reference kernels, not performance-tuned; block
   sizes are conservative and there is no DMA pipelining.
-- The paged kernel is decode-oriented (one query per sequence). Prefill and
-  mixed prefill/decode batches (variable query length, RPA's distribution-aware
-  case) are a planned extension.
+- Mixed prefill/decode batches (variable query length in one batch, RPA's
+  distribution-aware case) are a planned extension; decode and single-batch
+  paged prefill / multi-query are shipped.
 - Nothing is wired into the PyTorch runner yet. A JAX execution path in the
   runner is a larger cross-framework effort, intentionally out of scope here to
   respect ADR-023's backend-isolation rule; the dispatcher is the seam it will

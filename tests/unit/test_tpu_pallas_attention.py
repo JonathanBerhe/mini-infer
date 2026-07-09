@@ -239,3 +239,17 @@ def test_pallas_attention_rejects_head_dim_mismatch() -> None:
     v = jnp.ones((1, 128, 32), dtype=jnp.float32)
     with pytest.raises(ValueError, match="head_dim"):
         pallas_attention(q, k, v, interpret=True)
+
+
+def test_pallas_attention_rejects_head_count_mismatch() -> None:
+    """Unexpanded GQA K/V (fewer kv heads than query heads) must raise.
+
+    Without the guard, Pallas dynamic-slice clamping maps the excess query
+    heads onto the last kv head and returns finite but WRONG output. The dense
+    kernel has no GQA support; that belongs to the paged kernels.
+    """
+    q = jnp.ones((8, 128, 64), dtype=jnp.float32)
+    k = jnp.ones((4, 128, 64), dtype=jnp.float32)  # 4 kv heads for 8 query heads
+    v = jnp.ones((4, 128, 64), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="heads axis"):
+        pallas_attention(q, k, v, interpret=True)
