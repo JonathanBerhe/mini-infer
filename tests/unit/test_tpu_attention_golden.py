@@ -60,25 +60,29 @@ def _torch_paged_reference(
 ) -> np.ndarray:
     """Paged, ragged, grouped-query decode attention in PyTorch."""
     num_seqs, num_heads, _ = q.shape
-    num_kv_heads = k_pages.shape[2]
+    num_kv_heads = k_pages.shape[0]
     q_per_kv = num_heads // num_kv_heads
     max_pages = block_tables.shape[1]
     out = np.zeros_like(q)
     for s in range(num_seqs):
         length = int(lengths[s])
-        k_full = np.concatenate([k_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        kt = torch.from_numpy(k_full).to(torch.float32)  # (T, KVH, D)
+        k_full = np.concatenate(
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        kt = torch.from_numpy(k_full).to(torch.float32)  # (KVH, T, D)
         vt = torch.from_numpy(v_full).to(torch.float32)
-        total = kt.shape[0]
+        total = kt.shape[1]
         valid = torch.arange(total) < length
         for h in range(num_heads):
             kv = h // q_per_kv
             qh = torch.from_numpy(q[s, h]).to(torch.float32)  # (D,)
-            scores = (kt[:, kv, :] @ qh) * scale  # (T,)
+            scores = (kt[kv] @ qh) * scale  # (T,)
             scores = scores.masked_fill(~valid, float("-inf"))
             weights = torch.softmax(scores, dim=-1)
-            out[s, h] = (weights @ vt[:, kv, :]).numpy()
+            out[s, h] = (weights @ vt[kv]).numpy()
     return out
 
 
@@ -96,8 +100,8 @@ def _paged_inputs(
     rng = np.random.default_rng(seed)
     num_pages = num_seqs * max_pages + 2
     q = rng.standard_normal((num_seqs, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
     block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
     lengths = np.zeros((num_seqs,), dtype=np.int32)
     cursor = 0

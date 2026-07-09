@@ -46,23 +46,27 @@ def _dense_reference(q, k, v, scale, causal):
 
 def _paged_reference(q, k_pages, v_pages, block_tables, lengths, scale):
     num_seqs, num_heads, _ = q.shape
-    num_kv_heads = k_pages.shape[2]
+    num_kv_heads = k_pages.shape[0]
     q_per_kv = num_heads // num_kv_heads
     max_pages = block_tables.shape[1]
     out = np.zeros_like(q)
     for s in range(num_seqs):
         length = int(lengths[s])
-        k_full = np.concatenate([k_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        valid = np.arange(max_pages * k_pages.shape[1]) < length
+        k_full = np.concatenate(
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        valid = np.arange(max_pages * k_pages.shape[2]) < length
         for h in range(num_heads):
             kv = h // q_per_kv
-            scores = (k_full[:, kv, :] @ q[s, h]) * scale
+            scores = (k_full[kv] @ q[s, h]) * scale
             scores = np.where(valid, scores, -1e30)
             scores = scores - scores.max()
             weights = np.exp(scores)
             weights /= weights.sum()
-            out[s, h] = weights @ v_full[:, kv, :]
+            out[s, h] = weights @ v_full[kv]
     return out
 
 
@@ -70,8 +74,8 @@ def _make_paged(num_seqs, num_heads, num_kv_heads, head_dim, page_size, max_page
     rng = np.random.default_rng(seed)
     num_pages = num_seqs * max_pages + 2
     q = rng.standard_normal((num_seqs, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
     block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
     lengths = np.zeros((num_seqs,), dtype=np.int32)
     cursor = 0
@@ -88,25 +92,29 @@ def _make_paged(num_seqs, num_heads, num_kv_heads, head_dim, page_size, max_page
 
 def _prefill_reference(q, k_pages, v_pages, block_tables, lengths, scale):
     num_seqs, q_len, num_heads, _ = q.shape
-    num_kv_heads = k_pages.shape[2]
+    num_kv_heads = k_pages.shape[0]
     q_per_kv = num_heads // num_kv_heads
     max_pages = block_tables.shape[1]
     out = np.zeros_like(q)
     for s in range(num_seqs):
         length = int(lengths[s])
-        k_full = np.concatenate([k_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        k_ids = np.arange(k_full.shape[0])
+        k_full = np.concatenate(
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        k_ids = np.arange(k_full.shape[1])
         for h in range(num_heads):
             kv = h // q_per_kv
             for t in range(q_len):
                 q_pos = length - q_len + t
-                scores = (k_full[:, kv, :] @ q[s, t, h]) * scale
+                scores = (k_full[kv] @ q[s, t, h]) * scale
                 scores = np.where(k_ids <= q_pos, scores, -1e30)
                 scores = scores - scores.max()
                 weights = np.exp(scores)
                 weights /= weights.sum()
-                out[s, t, h] = weights @ v_full[:, kv, :]
+                out[s, t, h] = weights @ v_full[kv]
     return out
 
 
@@ -114,8 +122,8 @@ def _make_prefill(num_seqs, q_len, num_heads, num_kv_heads, head_dim, page_size,
     rng = np.random.default_rng(seed)
     num_pages = num_seqs * max_pages + 2
     q = rng.standard_normal((num_seqs, q_len, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
     block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
     lengths = np.zeros((num_seqs,), dtype=np.int32)
     cursor = 0

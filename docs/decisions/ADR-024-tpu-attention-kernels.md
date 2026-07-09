@@ -115,3 +115,28 @@ Costs and risks:
   runner is a larger cross-framework effort, intentionally out of scope here to
   respect ADR-023's backend-isolation rule; the dispatcher is the seam it will
   plug into.
+
+## Amendment (2026-07-09): first real-TPU run
+
+The interpret-mode risk called out above materialized exactly as predicted, and
+the first run on real hardware (Colab TPU v5e) taught two things:
+
+1. **Dense kernels PASS on hardware.** `dense causal=False` cosine 0.9999949,
+   `causal=True` cosine 0.9999963 vs the fp32 NumPy reference (the ~1e-3 max
+   abs error is the TPU's default matmul precision, not a logic difference).
+   This is the first on-hardware validation of the backend.
+2. **The paged kernels hit the Mosaic block-shape rule** that interpret mode
+   does not check: a block's last two dims must be divisible by (8, 128) or
+   equal the array dims. Blocks like `(1, page_size, 1, head_dim)` put a 1 in
+   the sublane slot over a >1 heads axis and are rejected at lowering.
+
+Resolution: the page pools are now **heads-first**,
+`(num_kv_heads, num_pages, page_size, head_dim)`, so every KV block's last two
+dims are exactly `(page_size, head_dim)`, equal to the array dims and legal for
+any page size. Decode queries gain an internal singleton axis and prefill
+queries are carried transposed as `(num_seqs, num_heads, q_len, head_dim)` for
+the same reason. JAX's production `paged_attention` kernel uses the same
+heads-first layout; the hardware constraint independently forced the same
+design. Also fixed en route: Colab's preinstalled libtpu can lag jaxlib and
+reject valid Mosaic ("expected <= 7 but got 8"); the Colab notebook installs a
+matched `jax[tpu]` and restarts once.

@@ -103,14 +103,20 @@ if _JAX_AVAILABLE:
 
         Shapes:
             q            (num_seqs, num_heads, head_dim)   one query per sequence
-            k_pages      (num_pages, page_size, num_heads, head_dim)
+            k_pages      (num_kv_heads, num_pages, page_size, head_dim)
             v_pages      same as k_pages
             block_tables (num_seqs, max_pages) int32       physical page per slot
             lengths      (num_seqs,) int32                 context length per seq
+
+        The pools are HEADS-FIRST. Real-TPU lowering requires each block's last
+        two dims to be divisible by (8, 128) or equal the array dims (a rule
+        interpret mode does not check; we hit it on hardware). Heads-first makes
+        every KV block exactly (page_size, head_dim) == the array's last two
+        dims, legal for any page size; JAX's production paged kernel makes the
+        same choice. q gains a singleton axis for the same reason.
         """
         num_seqs, num_heads, head_dim = q.shape
-        page_size = k_pages.shape[1]
-        num_kv_heads = k_pages.shape[2]
+        num_kv_heads, _num_pages, page_size, _ = k_pages.shape
         max_pages = block_tables.shape[1]
         # Grouped-query attention: each block of q_per_kv query heads shares one
         # kv head. q_per_kv == 1 is plain multi-head attention.
@@ -195,12 +201,14 @@ if _JAX_AVAILABLE:
         # index_maps receive the grid indices followed by the scalar-prefetch
         # arrays (block table, lengths). The KV specs read block_tables to fetch
         # the physical page for this (sequence, page): this is the paged gather.
-        q_spec = pl.BlockSpec((1, 1, head_dim), lambda s, h, p, bt, ln: (s, h, 0))
-        out_spec = pl.BlockSpec((1, 1, head_dim), lambda s, h, p, bt, ln: (s, h, 0))
-        kv_block = (1, page_size, 1, head_dim)
+        # q carries a singleton third axis so its block's last two dims equal
+        # the array's (the TPU tiling rule above).
+        q_spec = pl.BlockSpec((1, 1, 1, head_dim), lambda s, h, p, bt, ln: (s, h, 0, 0))
+        out_spec = pl.BlockSpec((1, 1, 1, head_dim), lambda s, h, p, bt, ln: (s, h, 0, 0))
+        kv_block = (1, 1, page_size, head_dim)
         # The kv head for query head h is h // q_per_kv (grouped-query mapping).
-        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
-        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
+        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (h // q_per_kv, bt[s, p], 0, 0))
+        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (h // q_per_kv, bt[s, p], 0, 0))
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,  # block_tables, lengths
@@ -214,13 +222,14 @@ if _JAX_AVAILABLE:
             ],
         )
 
+        q4 = q[:, :, None, :]  # singleton axis so the block equals the array's last two dims
         result: Array = pl.pallas_call(
             kernel,
             grid_spec=grid_spec,
-            out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+            out_shape=jax.ShapeDtypeStruct(q4.shape, q.dtype),
             interpret=interpret,
-        )(block_tables, lengths, q, k_pages, v_pages)
-        return result
+        )(block_tables, lengths, q4, k_pages, v_pages)
+        return result[:, :, 0, :]
 
     def pallas_paged_attention(
         q: Array,
@@ -239,8 +248,10 @@ if _JAX_AVAILABLE:
 
         Args:
             q: queries, `(num_seqs, num_heads, head_dim)` (one token per seq).
-            k_pages: key cache pool, `(num_pages, page_size, num_kv_heads, head_dim)`
-                (num_kv_heads may be < num_heads for grouped-query attention).
+            k_pages: key cache pool, heads-first
+                `(num_kv_heads, num_pages, page_size, head_dim)` (num_kv_heads may
+                be < num_heads for grouped-query attention; heads-first keeps the
+                TPU blocks tile-legal, see `_paged_decode_launch`).
             v_pages: value cache pool, same shape as `k_pages`.
             block_tables: `(num_seqs, max_pages)` int array; `block_tables[s, p]`
                 is the physical page index in the pool for sequence `s`'s logical
@@ -270,8 +281,8 @@ if _JAX_AVAILABLE:
             )
         if k_pages.ndim != 4 or v_pages.shape != k_pages.shape:
             raise ValueError(
-                "k_pages and v_pages must be (num_pages, page_size, num_heads, "
-                f"head_dim) and identical; got {k_pages.shape} and {v_pages.shape}"
+                "k_pages and v_pages must be heads-first (num_kv_heads, num_pages, "
+                f"page_size, head_dim) and identical; got {k_pages.shape} and {v_pages.shape}"
             )
         if block_tables.ndim != 2 or block_tables.shape[0] != q.shape[0]:
             raise ValueError(
@@ -284,7 +295,7 @@ if _JAX_AVAILABLE:
             )
 
         num_heads, head_dim = q.shape[1], q.shape[2]
-        num_kv_heads = k_pages.shape[2]
+        num_kv_heads = k_pages.shape[0]
         if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
             raise ValueError(
                 "num_heads must be a positive multiple of num_kv_heads for "
@@ -326,8 +337,7 @@ if _JAX_AVAILABLE:
         q_len absolute positions of the context, attending causally.
         """
         num_seqs, q_len, num_heads, head_dim = q.shape
-        page_size = k_pages.shape[1]
-        num_kv_heads = k_pages.shape[2]
+        num_kv_heads, _num_pages, page_size, _ = k_pages.shape
         max_pages = block_tables.shape[1]
         q_per_kv = num_heads // num_kv_heads
 
@@ -405,11 +415,14 @@ if _JAX_AVAILABLE:
                     (acc_scratch[...] / l_scratch[...]).reshape(out_ref.shape).astype(out_ref.dtype)
                 )
 
-        q_spec = pl.BlockSpec((1, q_len, 1, head_dim), lambda s, h, p, bt, ln: (s, 0, h, 0))
-        out_spec = pl.BlockSpec((1, q_len, 1, head_dim), lambda s, h, p, bt, ln: (s, 0, h, 0))
-        kv_block = (1, page_size, 1, head_dim)
-        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
-        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (bt[s, p], 0, h // q_per_kv, 0))
+        # q is carried transposed as (num_seqs, num_heads, q_len, head_dim) so the
+        # block's last two dims (q_len, head_dim) equal the array's; the pools are
+        # heads-first for the same TPU tiling rule (see the decode launch).
+        q_spec = pl.BlockSpec((1, 1, q_len, head_dim), lambda s, h, p, bt, ln: (s, h, 0, 0))
+        out_spec = pl.BlockSpec((1, 1, q_len, head_dim), lambda s, h, p, bt, ln: (s, h, 0, 0))
+        kv_block = (1, 1, page_size, head_dim)
+        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (h // q_per_kv, bt[s, p], 0, 0))
+        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln: (h // q_per_kv, bt[s, p], 0, 0))
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -423,13 +436,14 @@ if _JAX_AVAILABLE:
             ],
         )
 
+        qt = jnp.swapaxes(q, 1, 2)  # (num_seqs, num_heads, q_len, head_dim)
         result: Array = pl.pallas_call(
             kernel,
             grid_spec=grid_spec,
-            out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+            out_shape=jax.ShapeDtypeStruct(qt.shape, q.dtype),
             interpret=interpret,
-        )(block_tables, lengths, q, k_pages, v_pages)
-        return result
+        )(block_tables, lengths, qt, k_pages, v_pages)
+        return jnp.swapaxes(result, 1, 2)
 
     def pallas_paged_prefill_attention(
         q: Array,
@@ -452,7 +466,8 @@ if _JAX_AVAILABLE:
 
         Args:
             q: queries, `(num_seqs, q_len, num_heads, head_dim)`.
-            k_pages: key cache pool, `(num_pages, page_size, num_kv_heads, head_dim)`.
+            k_pages: key cache pool, heads-first
+                `(num_kv_heads, num_pages, page_size, head_dim)`.
             v_pages: value cache pool, same shape as `k_pages`.
             block_tables: `(num_seqs, max_pages)` int page table (see the decode kernel).
             lengths: `(num_seqs,)` int total context length per sequence,
@@ -478,8 +493,8 @@ if _JAX_AVAILABLE:
             )
         if k_pages.ndim != 4 or v_pages.shape != k_pages.shape:
             raise ValueError(
-                "k_pages and v_pages must be (num_pages, page_size, num_kv_heads, "
-                f"head_dim) and identical; got {k_pages.shape} and {v_pages.shape}"
+                "k_pages and v_pages must be heads-first (num_kv_heads, num_pages, "
+                f"page_size, head_dim) and identical; got {k_pages.shape} and {v_pages.shape}"
             )
         num_seqs = q.shape[0]
         if block_tables.ndim != 2 or block_tables.shape[0] != num_seqs:
@@ -493,7 +508,7 @@ if _JAX_AVAILABLE:
             )
 
         num_heads, head_dim = q.shape[2], q.shape[3]
-        num_kv_heads = k_pages.shape[2]
+        num_kv_heads = k_pages.shape[0]
         if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
             raise ValueError(
                 "num_heads must be a positive multiple of num_kv_heads for "

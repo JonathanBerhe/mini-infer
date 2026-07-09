@@ -36,26 +36,27 @@ def _reference(
 ) -> np.ndarray:
     """Materialise each sequence's KV from its pages and do masked attention."""
     num_seqs, num_heads = q.shape[:2]
-    page_size = k_pages.shape[1]
-    num_kv_heads = k_pages.shape[2]
+    num_kv_heads, _, page_size, _ = k_pages.shape
     q_per_kv = num_heads // num_kv_heads
     max_pages = block_tables.shape[1]
     out = np.zeros_like(q)
     for s in range(num_seqs):
         length = int(lengths[s])
         k_full = np.concatenate(
-            [k_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0
-        )  # (max_pages * page_size, num_heads, head_dim)
-        v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )  # (num_kv_heads, max_pages * page_size, head_dim)
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
         valid = np.arange(max_pages * page_size) < length
         for h in range(num_heads):
             kv = h // q_per_kv  # grouped-query: query head h reads kv head kv
-            scores = (k_full[:, kv, :] @ q[s, h]) * scale
+            scores = (k_full[kv] @ q[s, h]) * scale
             scores = np.where(valid, scores, -1e30)
             scores = scores - scores.max()
             weights = np.exp(scores)
             weights = weights / weights.sum()
-            out[s, h] = weights @ v_full[:, kv, :]
+            out[s, h] = weights @ v_full[kv]
     return out
 
 
@@ -76,8 +77,8 @@ def _make_case(
     # Enough pages for every sequence to use up to max_pages distinct ones.
     num_pages = num_seqs * max_pages + 2
     q = rng.standard_normal((num_seqs, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
 
     physical = list(range(num_pages))
     if shuffle_pages:
@@ -158,13 +159,13 @@ def test_trailing_pages_are_masked_out():
     rng = np.random.default_rng(11)
     num_pages = 6
     q = rng.standard_normal((1, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_heads, num_pages, page_size, head_dim)).astype(np.float32)
     block_tables = np.array([[0, 3, 5, 2]], dtype=np.int32)  # arbitrary trailing pages
     lengths = np.array([1], dtype=np.int32)
     got, _ = _run((q, k_pages, v_pages, block_tables, lengths))
     # length 1 -> output is exactly value row 0 of the first page, per head.
-    expected = v_pages[0, 0, :, :]  # (num_heads, head_dim)
+    expected = v_pages[:, 0, 0, :]  # (num_heads, head_dim)
     np.testing.assert_allclose(got[0], expected, rtol=1e-4, atol=1e-4)
 
 
@@ -185,8 +186,8 @@ def test_grouped_query_attention():
 def test_rejects_indivisible_head_grouping():
     # num_heads must be a multiple of num_kv_heads; 3 is not a multiple of 2.
     q = jnp.zeros((2, 3, 16), dtype=jnp.float32)  # 3 query heads
-    k_pages = jnp.zeros((4, 8, 2, 16), dtype=jnp.float32)  # 2 kv heads
-    v_pages = jnp.zeros((4, 8, 2, 16), dtype=jnp.float32)
+    k_pages = jnp.zeros((2, 4, 8, 16), dtype=jnp.float32)  # 2 kv heads, heads-first
+    v_pages = jnp.zeros((2, 4, 8, 16), dtype=jnp.float32)
     block_tables = jnp.zeros((2, 3), dtype=jnp.int32)
     lengths = jnp.ones((2,), dtype=jnp.int32)
     with pytest.raises(ValueError, match="multiple of num_kv_heads"):

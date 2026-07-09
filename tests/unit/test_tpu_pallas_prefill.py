@@ -30,25 +30,29 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 def _prefill_reference(q, k_pages, v_pages, block_tables, lengths, scale):
     """Paged, ragged, grouped-query, causal multi-query attention in NumPy."""
     num_seqs, q_len, num_heads, _ = q.shape
-    num_kv_heads = k_pages.shape[2]
+    num_kv_heads = k_pages.shape[0]
     q_per_kv = num_heads // num_kv_heads
     max_pages = block_tables.shape[1]
     out = np.zeros_like(q)
     for s in range(num_seqs):
         length = int(lengths[s])
-        k_full = np.concatenate([k_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        v_full = np.concatenate([v_pages[block_tables[s, pi]] for pi in range(max_pages)], axis=0)
-        k_ids = np.arange(k_full.shape[0])
+        k_full = np.concatenate(
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        k_ids = np.arange(k_full.shape[1])
         for h in range(num_heads):
             kv = h // q_per_kv
             for t in range(q_len):
                 q_pos = length - q_len + t
-                scores = (k_full[:, kv, :] @ q[s, t, h]) * scale
+                scores = (k_full[kv] @ q[s, t, h]) * scale
                 scores = np.where(k_ids <= q_pos, scores, -1e30)
                 scores = scores - scores.max()
                 weights = np.exp(scores)
                 weights /= weights.sum()
-                out[s, t, h] = weights @ v_full[:, kv, :]
+                out[s, t, h] = weights @ v_full[kv]
     return out
 
 
@@ -58,8 +62,8 @@ def _make_prefill(
     rng = np.random.default_rng(seed)
     num_pages = num_seqs * max_pages + 2
     q = rng.standard_normal((num_seqs, q_len, num_heads, head_dim)).astype(np.float32)
-    k_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
-    v_pages = rng.standard_normal((num_pages, page_size, num_kv_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
     block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
     lengths = np.zeros((num_seqs,), dtype=np.int32)
     cursor = 0
@@ -139,10 +143,11 @@ def test_causal_masks_future():
 
     length = int(lengths[0])
     pos = length - 1  # query 1's own position (the future position for query 0)
-    phys = int(block_tables[0, pos // v_pages.shape[1]])
-    offset = pos % v_pages.shape[1]
+    page_size = v_pages.shape[2]
+    phys = int(block_tables[0, pos // page_size])
+    offset = pos % page_size
     v_perturbed = v_pages.copy()
-    v_perturbed[phys, offset, :, :] += 1000.0  # loud change at position length-1
+    v_perturbed[:, phys, offset, :] += 1000.0  # loud change at position length-1
     perturbed, _ = _run_prefill((q, k_pages, v_perturbed, block_tables, lengths))
 
     # Query 0 (position length-2) must be blind to position length-1.

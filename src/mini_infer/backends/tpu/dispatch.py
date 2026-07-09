@@ -81,7 +81,7 @@ def dispatch_attention(
     If ``block_tables`` is given, a paged kernel is used: prefill / multi-query
     when ``q`` is rank-4 ``(num_seqs, q_len, num_heads, head_dim)``, single-token
     decode when rank-3 ``(num_seqs, num_heads, head_dim)``. ``k`` and ``v`` are
-    the page pools ``(num_pages, page_size, num_kv_heads, head_dim)`` and
+    the page pools, heads-first ``(num_kv_heads, num_pages, page_size, head_dim)``, and
     ``block_tables`` / ``lengths`` select each sequence's pages and context
     length. Otherwise the dense kernel is used: ``k`` and ``v`` are contiguous
     ``(heads, seq, head_dim)`` (or 4D with a batch axis).
