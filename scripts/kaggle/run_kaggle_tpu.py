@@ -46,7 +46,12 @@ def main() -> int:
         )
         return 1
 
-    if not os.path.isdir(DEST):
+    if os.path.isdir(DEST):
+        # Reused workers keep the old checkout; always sync to the branch head
+        # so a re-run never silently executes stale code.
+        _sh("git", "-C", DEST, "fetch", "--depth", "1", "origin", BRANCH)
+        _sh("git", "-C", DEST, "reset", "--hard", "FETCH_HEAD")
+    else:
         _sh("git", "clone", "--depth", "1", "--branch", BRANCH, REPO_URL, DEST)
     # The tpu backend submodules import guard on jax only and mini_infer/__init__
     # is empty, so adding src to the path is all the runner needs (no pip install).
