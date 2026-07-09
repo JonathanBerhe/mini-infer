@@ -1,8 +1,10 @@
 """Selection and routing for the TPU attention backend (ADR-023).
 
 Two jobs: decide whether the Pallas TPU kernels should run on this host, and
-route an attention call to the dense (`pallas_attention`) or paged
-(`pallas_paged_attention`) kernel.
+route an attention call to the dense kernel (`pallas_attention`) or the right
+member of the paged family (`pallas_paged_attention` for decode,
+`pallas_paged_prefill_attention` for uniform prefill,
+`pallas_paged_mixed_attention` for mixed prefill/decode batches).
 
 This is the seam a future engine integration would call. Today mini-infer's
 runner is PyTorch on CUDA/CPU/MPS, so no real request is routed here yet: wiring
@@ -26,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 from .pallas_attention import pallas_attention, supports_pallas_attention
 from .pallas_paged_attention import (
     pallas_paged_attention,
+    pallas_paged_mixed_attention,
     pallas_paged_prefill_attention,
     supports_pallas_paged_attention,
 )
@@ -72,28 +75,35 @@ def dispatch_attention(
     *,
     block_tables: Any = None,
     lengths: Any = None,
+    q_lens: Any = None,
     scale: float | None = None,
     causal: bool = False,
     interpret: bool = False,
 ) -> Array:
     """Route an attention call to the paged or dense Pallas TPU kernel.
 
-    If ``block_tables`` is given, a paged kernel is used: prefill / multi-query
-    when ``q`` is rank-4 ``(num_seqs, q_len, num_heads, head_dim)``, single-token
-    decode when rank-3 ``(num_seqs, num_heads, head_dim)``. ``k`` and ``v`` are
-    the page pools, heads-first ``(num_kv_heads, num_pages, page_size, head_dim)``, and
-    ``block_tables`` / ``lengths`` select each sequence's pages and context
-    length. Otherwise the dense kernel is used: ``k`` and ``v`` are contiguous
+    If ``block_tables`` is given, a paged kernel is used: single-token decode
+    when ``q`` is rank-3 ``(num_seqs, num_heads, head_dim)``; with rank-4 q
+    ``(num_seqs, q_len, num_heads, head_dim)``, uniform prefill / multi-query
+    when ``q_lens`` is absent, or the mixed prefill/decode kernel when
+    ``q_lens`` gives each sequence its own query count (decode rows carry
+    q_lens[s] == 1, prefill rows q_lens[s] > 1, padded to a shared max_q_len).
+    ``k`` and ``v`` are the page pools, heads-first
+    ``(num_kv_heads, num_pages, page_size, head_dim)``, and ``block_tables`` /
+    ``lengths`` select each sequence's pages and context length. Otherwise the
+    dense kernel is used: ``k`` and ``v`` are contiguous
     ``(heads, seq, head_dim)`` (or 4D with a batch axis).
 
     ``causal`` applies only to the dense path; the paged decode path has a single
     query per sequence that attends over all of its cached (past) context, so it
-    is causal by construction and ``causal`` is ignored there.
+    is causal by construction and ``causal`` is ignored there. The paged prefill
+    and mixed paths are causal by position, also independent of ``causal``.
 
     Raises:
         RuntimeError: if the TPU backend is unavailable (JAX not installed).
-        ValueError: if ``block_tables`` is given without ``lengths``, or
-            ``lengths`` without ``block_tables``.
+        ValueError: if ``block_tables`` is given without ``lengths`` (or the
+            reverse), or ``q_lens`` is given anywhere it cannot apply (without
+            ``block_tables``, or with a rank-3 decode ``q``).
     """
     if not tpu_backend_available():
         raise RuntimeError("TPU backend unavailable; install the 'tpu' extra (uv sync --extra tpu)")
@@ -104,14 +114,31 @@ def dispatch_attention(
             "lengths requires block_tables (ragged masking exists only in the "
             "paged kernels); for dense attention pass neither"
         )
+    if block_tables is None and q_lens is not None:
+        # Same trap as lengths: the dense kernel would attend over padded query
+        # rows as if they were real tokens.
+        raise ValueError(
+            "q_lens requires block_tables (mixed prefill/decode batches exist "
+            "only in the paged path); for dense attention pass neither"
+        )
     if block_tables is not None:
         if lengths is None:
             raise ValueError("paged attention requires both block_tables and lengths")
-        # Rank-4 q (num_seqs, q_len, num_heads, head_dim) is prefill / multi-query;
-        # rank-3 q (num_seqs, num_heads, head_dim) is single-token decode.
+        # Rank-4 q (num_seqs, q_len, num_heads, head_dim) is prefill / multi-query
+        # (mixed when q_lens is given); rank-3 q (num_seqs, num_heads, head_dim)
+        # is single-token decode.
         if q.ndim == 4:
+            if q_lens is not None:
+                return pallas_paged_mixed_attention(
+                    q, k, v, block_tables, lengths, q_lens, scale=scale, interpret=interpret
+                )
             return pallas_paged_prefill_attention(
                 q, k, v, block_tables, lengths, scale=scale, interpret=interpret
+            )
+        if q_lens is not None:
+            raise ValueError(
+                "q_lens requires rank-4 q (num_seqs, max_q_len, num_heads, head_dim); "
+                "a mixed batch carries its decode rows as q_lens[s] == 1, not as rank-3 q"
             )
         return pallas_paged_attention(
             q, k, v, block_tables, lengths, scale=scale, interpret=interpret
