@@ -140,3 +140,10 @@ heads-first layout; the hardware constraint independently forced the same
 design. Also fixed en route: Colab's preinstalled libtpu can lag jaxlib and
 reject valid Mosaic ("expected <= 7 but got 8"); the Colab notebook installs a
 matched `jax[tpu]` and restarts once.
+
+**Closure (same day):** with the heads-first layout, the full suite passed on
+the TPU v5e: dense (causal and non-causal), paged decode (MHA and GQA), and
+paged prefill (MHA and GQA), all cosine >= 0.999995 vs the NumPy reference,
+exit 0 (commit 83321f8). The small (1, 1) and (q_len, 1) VMEM scratch shapes
+lowered without issue. The on-TPU confirmation step called out in Consequences
+is complete; results in docs/benchmarks/2026-07-09-tpu-v5e-pallas-kernels.md.
