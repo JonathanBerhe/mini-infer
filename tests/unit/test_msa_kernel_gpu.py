@@ -29,7 +29,11 @@ TOPK = 4
 def _random_pool_and_requests(
     seq_lens: list[int], device: torch.device, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
-    """A shared random pool plus per-request block tables and selections."""
+    """A shared random pool plus per-request block tables and selections.
+
+    Selections are per KV head (`(NUM_KV_HEADS, TOPK)`, transformers 5.14
+    semantics) and drawn independently per head so a program reading another
+    head's block list would fail the parity check."""
     total_blocks = sum(-(-s // POOL_BLOCK) for s in seq_lens) + 2
     k_pool = torch.randn(total_blocks, POOL_BLOCK, NUM_KV_HEADS, HEAD_DIM, device=device).to(dtype)
     v_pool = torch.randn(total_blocks, POOL_BLOCK, NUM_KV_HEADS, HEAD_DIM, device=device).to(dtype)
@@ -45,10 +49,13 @@ def _random_pool_and_requests(
         n_index = -(-s // INDEX_BLOCK)
         local = n_index - 1  # the query's own block, always selected
         others = [b for b in range(n_index) if b != local]
-        perm = torch.randperm(len(others))[: TOPK - 1].tolist()
-        sel = [local] + [others[i] for i in perm]
-        sel += [-1] * (TOPK - len(sel))  # pad like the indexer does
-        selections.append(torch.tensor(sel, device=device, dtype=torch.int64))
+        per_head = []
+        for _ in range(NUM_KV_HEADS):
+            perm = torch.randperm(len(others))[: TOPK - 1].tolist()
+            sel = [local] + [others[i] for i in perm]
+            sel += [-1] * (TOPK - len(sel))  # pad like the indexer does
+            per_head.append(sel)
+        selections.append(torch.tensor(per_head, device=device, dtype=torch.int64))
     return k_pool, v_pool, block_tables, selections
 
 
@@ -94,7 +101,7 @@ def test_msa_kernel_small_group_falls_back_to_torch() -> None:
     k_pool = torch.randn(4, POOL_BLOCK, 2, 32, device=device)
     v_pool = torch.randn(4, POOL_BLOCK, 2, 32, device=device)
     block_tables = [torch.arange(3, device=device, dtype=torch.int32)]
-    selections = [torch.tensor([0, -1], device=device, dtype=torch.int64)]
+    selections = [torch.tensor([[0, -1], [0, 1]], device=device, dtype=torch.int64)]
     q = torch.randn(1, 4, 32, device=device)
 
     ref = msa_paged_decode_torch(

@@ -75,7 +75,9 @@ def _gate_parity(n_group: int, topk_group: int) -> None:
 
     x = torch.randn(N_TOKENS, HIDDEN, dtype=torch.float32)
     with torch.no_grad():
-        hf_idx, hf_w = hf_moe.route_tokens_to_experts(hf_moe.gate(x))
+        # transformers 5.14 folded route_tokens_to_experts into the router's
+        # forward, which now returns (router_logits, topk_weights, topk_indices).
+        _, hf_w, hf_idx = hf_moe.gate(x)
         our_idx, our_w = ours(x)
 
     for t in range(N_TOKENS):
