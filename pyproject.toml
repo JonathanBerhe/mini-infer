@@ -47,11 +47,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "modal>=1.4.2",
-    # Bit-parity reference for MiniMax-M3: the minimax_m3_vl modeling code first
-    # ships in transformers 5.12. Constrains the (single) resolved transformers
-    # for the whole repo to 5.12.x; the golden suite is re-run to confirm the
-    # existing families still match under the bump.
-    "transformers>=5.12,<5.13",
+    # Bit-parity reference for the newest ported family: Inkling modeling code
+    # first ships in transformers 5.14 (MiniMax-M3 needed 5.12). Constrains the
+    # (single) resolved transformers for the whole repo to 5.14.x; the golden
+    # suite is re-run to confirm the existing families still match under the bump.
+    "transformers>=5.14,<5.15",
     # async HTTP client for the open-loop bench (scripts/http_openloop_bench.py).
     # Streaming + per-token timing via SSE; not used by the server itself.
     "httpx>=0.27",

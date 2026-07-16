@@ -14,18 +14,21 @@ All comments are the load-bearing details:
     scores = idx_q.float() @ idx_k.float().mT               # [B, heads, S, k_len]; NO /sqrt(d)
     scores = scores.masked_fill(k_pos > q_pos, -inf)        # causal, TOKEN granularity, BEFORE pool
     scores = pad(scores, last block up to block_size, -inf)
-    # pool over the block's tokens (-1) AND the index heads (1) -> one score/query/block:
-    block_scores = scores.view(B, n_idx_heads, S, n_blocks, block_size).amax(-1).amax(1)
+    # pool over the block's tokens only -> one score per (query, index head, block):
+    block_scores = scores.view(B, n_idx_heads, S, n_blocks, block_size).amax(-1)
     block_scores.scatter_(-1, local_blocks, +inf)           # force-include the query's own block(s)
     top_scores, top_idx = block_scores.topk(min(topk_blocks, n_blocks), -1)
-    block_indices = top_idx.masked_fill(top_scores == -inf, -1)   # [B, S, topk]; -1 = padding
+    block_indices = top_idx.masked_fill(top_scores == -inf, -1)  # [B, h, S, topk]; -1 = padding
 
 Two properties that took reading the source to pin down (the paper and an earlier
 spec draft had these wrong):
   - The index scores have NO `1/sqrt(d)` scale (raw fp32 dot).
-  - `block_scores` maxes over the block tokens AND the index heads, so the
-    selection is a SINGLE set per query, shared across every main attention head
-    (not one selection per GQA group). The mask is therefore `[B, 1, S, k_len]`.
+  - The selection is PER INDEX HEAD (`index_n_heads == num_key_value_heads`,
+    one independent block set per KV / GQA group), and the mask expands each
+    index head's selection across its group's query heads:
+    `[B, num_query_heads, S, k_len]`. (transformers 5.12 pooled the index
+    heads into one shared selection; 5.14 corrected this to per-head, and
+    this port follows the 5.14 reference.)
 
 `build_block_mask` turns the selection into the additive attention mask the main
 attention adds before softmax; it folds the causal mask in (it REPLACES, not
@@ -64,6 +67,7 @@ class MiniMaxM3Indexer(nn.Module):
         head_dim: int,
         block_size: int,
         topk_blocks: int,
+        num_query_heads: int,
         local_blocks: int = 1,
         rms_norm_eps: float = 1e-6,
     ) -> None:
@@ -76,7 +80,16 @@ class MiniMaxM3Indexer(nn.Module):
             raise ValueError(f"topk_blocks must be positive, got {topk_blocks}")
         if local_blocks < 0:
             raise ValueError(f"local_blocks must be non-negative, got {local_blocks}")
+        if num_query_heads % num_heads != 0:
+            raise ValueError(
+                f"num_query_heads={num_query_heads} must be a multiple of the "
+                f"index head count num_heads={num_heads} (one selection per GQA group)"
+            )
         self.num_heads = num_heads
+        # Main-attention query head count; each index head's selection is
+        # expanded across its `num_query_heads // num_heads` group when the
+        # dense mask is built.
+        self.num_query_heads = num_query_heads
         self.head_dim = head_dim
         self.block_size = block_size
         self.topk_blocks = topk_blocks
@@ -106,8 +119,9 @@ class MiniMaxM3Indexer(nn.Module):
             position_ids: `(B, S)` absolute positions.
 
         Returns:
-            `(B, S, topk)` int64 block ids; `-1` marks a padding slot (fewer valid
-            blocks than `topk`, i.e. an all-future / masked block).
+            `(B, num_heads, S, topk)` int64 block ids, one independent selection
+            per index head; `-1` marks a padding slot (fewer valid blocks than
+            `topk`, i.e. an all-future / masked block).
         """
         bsz, seqlen, _ = hidden_states.shape
         h, d = self.num_heads, self.head_dim
@@ -124,13 +138,13 @@ class MiniMaxM3Indexer(nn.Module):
     def _select_blocks(
         self, scores: torch.Tensor, position_ids: torch.Tensor, k_len: int
     ) -> torch.Tensor:
-        """Raw `(B, h, q, k_len)` scores -> `(B, q, topk)` block ids (-1 padded).
+        """Raw `(B, h, q, k_len)` scores -> `(B, h, q, topk)` block ids (-1 padded).
 
         Applies token-granularity causal masking, pads the last block, max-pools
-        over the block's tokens AND the index heads (one selection per query,
-        shared across all main heads), force-includes the local block(s), and
-        takes the top-k. Shared by `forward` (batched prefill) and
-        `forward_cached` (packed-varlen decode/prefill over the cache).
+        over the block's tokens (one selection PER INDEX HEAD, i.e. per GQA
+        group), force-includes the local block(s), and takes the top-k. Shared
+        by `forward` (batched prefill) and `forward_cached` (packed-varlen
+        decode/prefill over the cache).
         """
         bsz, h, q, _ = scores.shape
         device = scores.device
@@ -142,12 +156,13 @@ class MiniMaxM3Indexer(nn.Module):
         scores = scores.masked_fill(token_future, float("-inf"))
         if pad:
             scores = torch.nn.functional.pad(scores, (0, pad), value=float("-inf"))
-        block_scores = scores.view(bsz, h, q, num_blocks, self.block_size).amax(-1).amax(1)
+        block_scores = scores.view(bsz, h, q, num_blocks, self.block_size).amax(-1)
 
         if self.local_blocks > 0:
             q_block = position_ids // self.block_size
             local = torch.arange(self.local_blocks, device=device)
             local_idx = (q_block[..., None] - local.view(1, 1, -1)).clamp(min=0)
+            local_idx = local_idx.unsqueeze(1).expand(-1, h, -1, -1)
             block_scores.scatter_(-1, local_idx, float("inf"))
 
         topk = min(self.topk_blocks, num_blocks)
@@ -162,29 +177,33 @@ class MiniMaxM3Indexer(nn.Module):
         *,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Selected blocks -> additive attention bias `(B, 1, S, key_length)`.
+        """Selected blocks -> additive bias `(B, num_query_heads, S, key_length)`.
 
-        A key is kept (bias 0) iff its block was selected for the query AND it is
-        causally visible (`key_pos <= query_pos`); every other key gets
-        `finfo(dtype).min`. Folds the causal mask in (this REPLACES the causal
-        mask in the main attention). Head dim is 1 (broadcast over all heads,
-        since the selection is global per query).
+        A key is kept (bias 0) iff its block was selected by the query head's
+        GQA group's index head AND it is causally visible (`key_pos <=
+        query_pos`); every other key gets `finfo(dtype).min`. Folds the causal
+        mask in (this REPLACES the causal mask in the main attention). Each
+        index head's keep row is repeated `num_query_heads // num_heads` times
+        so query head `g` reads its own group's selection — the same
+        repeat-interleave layout `repeat_kv` uses for GQA broadcast.
         """
         device = block_indices.device
-        bsz, seqlen, _ = block_indices.shape
+        bsz, n_idx_heads, seqlen, _ = block_indices.shape
         num_key_blocks = -(-key_length // self.block_size)  # ceil
 
         # -1 slots -> a throwaway column at index num_key_blocks; scatter 0 at the
         # real selected blocks, then drop the throwaway column.
         safe = block_indices.masked_fill(block_indices < 0, num_key_blocks)
-        bias = block_indices.new_full((bsz, seqlen, num_key_blocks + 1), float("-inf"), dtype=dtype)
+        bias = block_indices.new_full(
+            (bsz, n_idx_heads, seqlen, num_key_blocks + 1), float("-inf"), dtype=dtype
+        )
         bias.scatter_(-1, safe, 0.0)
         bias = bias[..., :num_key_blocks]
 
-        # Expand each kept block to its block_size key slots; add the head axis.
-        block_keep = (
-            (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :key_length].unsqueeze(1)
-        )  # (B, 1, S, key_length) bool
+        # Expand each kept block to its block_size key slots, then each index
+        # head to its GQA group's query heads.
+        block_keep = (bias == 0.0).repeat_interleave(self.block_size, dim=-1)[..., :key_length]
+        block_keep = block_keep.repeat_interleave(self.num_query_heads // n_idx_heads, dim=1)
         k_positions = torch.arange(key_length, device=device)
         token_future = k_positions[None, None, None, :] > position_ids[:, None, :, None]
         keep = block_keep & ~token_future
@@ -206,8 +225,9 @@ class MiniMaxM3Indexer(nn.Module):
 
         Appends this step's index-K to `stream_name`, reads back each request's
         full index-K history, scores its queries against that history, and selects
-        the top-k blocks. Returns one `((q_len_r, topk) int64 ids, k_len_r)` pair
-        per request; `-1` marks a padding slot. Prefill (`q_len == k_len`) and
+        the top-k blocks. Returns one `((num_heads, q_len_r, topk) int64 ids,
+        k_len_r)` pair per request (one selection per index head / GQA group);
+        `-1` marks a padding slot. Prefill (`q_len == k_len`) and
         decode (`q_len == 1`, `k_len == context`) run the same code; they differ
         only in the materialized per-request `k_len`. Absolute query positions are
         derived from the cache lengths (`[k_len - q_len, k_len)`), matching
@@ -242,14 +262,16 @@ class MiniMaxM3Indexer(nn.Module):
             k_s, k_e = cu_k[r], cu_k[r + 1]
             q_len_r, k_len_r = q_e - q_s, k_e - k_s
             if q_len_r == 0:
-                selections.append((torch.empty(0, 0, dtype=torch.int64, device=device), k_len_r))
+                selections.append(
+                    (torch.empty(self.num_heads, 0, 0, dtype=torch.int64, device=device), k_len_r)
+                )
                 continue
             q_r = idx_q[0, :, q_s:q_e, :]  # (h, q_len, d)
             k_r = idx_k_full[k_s:k_e, 0, :]  # (k_len, d)
             # queries occupy absolute positions [k_len - q_len, k_len).
             pos_r = (torch.arange(q_len_r, device=device) + (k_len_r - q_len_r)).unsqueeze(0)
             scores = torch.einsum("hqd,kd->hqk", q_r.float(), k_r.float()).unsqueeze(0)
-            block_indices = self._select_blocks(scores, pos_r, k_len_r)  # (1, q_len, topk)
+            block_indices = self._select_blocks(scores, pos_r, k_len_r)  # (1, h, q_len, topk)
             selections.append((block_indices[0], k_len_r))
         return selections
 
@@ -268,8 +290,9 @@ class MiniMaxM3Indexer(nn.Module):
         """Cache-aware selection -> one additive block mask per request.
 
         `select_cached` picks the blocks; this expands each request's selection
-        into the `(q_len_r, 1, k_len_r)` additive mask (`packed_attention`'s
-        `block_mask` format). The torch-oracle path of the main attention.
+        into the `(q_len_r, num_query_heads, k_len_r)` additive mask
+        (`packed_attention`'s `block_mask` format, per-head). The torch-oracle
+        path of the main attention.
         """
         device = hidden_states.device
         masks: list[torch.Tensor] = []
@@ -282,13 +305,16 @@ class MiniMaxM3Indexer(nn.Module):
             layer_idx,
             stream_name=stream_name,
         ):
-            q_len_r = block_indices.shape[0]
+            q_len_r = block_indices.shape[1]
             if q_len_r == 0:
-                masks.append(torch.zeros(0, 1, k_len_r, dtype=dtype, device=device))
+                masks.append(
+                    torch.zeros(0, self.num_query_heads, k_len_r, dtype=dtype, device=device)
+                )
                 continue
             pos_r = (torch.arange(q_len_r, device=device) + (k_len_r - q_len_r)).unsqueeze(0)
             mask_full = self.build_block_mask(
                 block_indices.unsqueeze(0), k_len_r, pos_r, dtype=dtype
             )
-            masks.append(mask_full[0, 0].unsqueeze(1))  # (q_len, 1, k_len)
+            # (1, H, q_len, k_len) -> packed_attention's (q_len, H, k_len).
+            masks.append(mask_full[0].transpose(0, 1))
         return masks

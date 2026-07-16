@@ -106,16 +106,18 @@ def _parity_sweep() -> list[str]:
 
         q = torch.randn(len(seq_lens), num_q_heads, head_dim, device=device, dtype=torch.bfloat16)
         tables = cache.block_tables_per_request_tensor(device)
-        # Random selections incl. the local (last) block, -1 padded.
+        # Random selections incl. the local (last) block, -1 padded; one
+        # independent row per KV head (per-head selection, transformers 5.14).
         selections = []
         for n in seq_lens:
             nb = -(-n // index_block)
             last = nb - 1
-            others = torch.randperm(max(nb - 1, 1))[: max(min(topk, nb) - 1, 0)]
-            sel = torch.full((topk,), -1, dtype=torch.int64)
-            sel[0] = last
-            sel[1 : 1 + others.numel()] = others
-            selections.append(sel.to(device))
+            per_head = torch.full((num_kv_heads, topk), -1, dtype=torch.int64)
+            for kv_h in range(num_kv_heads):
+                others = torch.randperm(max(nb - 1, 1))[: max(min(topk, nb) - 1, 0)]
+                per_head[kv_h, 0] = last
+                per_head[kv_h, 1 : 1 + others.numel()] = others
+            selections.append(per_head.to(device))
 
         k_pool = pool.storage_for_stream(0, "k")
         v_pool = pool.storage_for_stream(0, "v")
@@ -141,7 +143,8 @@ def _parity_sweep() -> list[str]:
         for n in seq_lens:
             starts.append(starts[-1] + n)
         for r, n in enumerate(seq_lens):
-            for b in selections[r].tolist():
+            # A token is perturbable only if NO head selected its block.
+            for b in selections[r].flatten().tolist():
                 if b >= 0:
                     lo = starts[r] + b * index_block
                     hi = starts[r] + min((b + 1) * index_block, n)
@@ -206,6 +209,7 @@ def _op_microbench() -> list[str]:
             head_dim=head_dim,
             block_size=index_block,
             topk_blocks=topk,
+            num_query_heads=num_q_heads,
             local_blocks=1,
         )
         .to(device)
@@ -246,10 +250,11 @@ def _op_microbench() -> list[str]:
             nb = -(-ctx // index_block)
             sel = []
             for _ in range(batch):
-                s = torch.full((topk,), -1, dtype=torch.int64, device=device)
-                pick = torch.randperm(nb, device=device)[: min(topk, nb)]
-                pick[0] = nb - 1  # force local
-                s[: pick.numel()] = pick
+                s = torch.full((num_kv_heads, topk), -1, dtype=torch.int64, device=device)
+                for kv_h in range(num_kv_heads):
+                    pick = torch.randperm(nb, device=device)[: min(topk, nb)]
+                    pick[0] = nb - 1  # force local
+                    s[kv_h, : pick.numel()] = pick
                 sel.append(s)
 
             def kernel_arm(q=q, pool=pool, tables=tables, seq_lens=seq_lens, sel=sel):  # type: ignore[no-untyped-def]
@@ -272,9 +277,9 @@ def _op_microbench() -> list[str]:
                 for r in range(batch):
                     pos = torch.tensor([[ctx - 1]], device=device)
                     m = idxer.build_block_mask(
-                        sel[r].view(1, 1, -1), ctx, pos, dtype=torch.bfloat16
+                        sel[r].view(1, num_kv_heads, 1, -1), ctx, pos, dtype=torch.bfloat16
                     )
-                    masks.append(m[0, 0].unsqueeze(1))
+                    masks.append(m[0].transpose(0, 1))
                 return packed_attention_torch(
                     q, keys_full, vals_full, cu_dec, cu_k, head_dim**-0.5, block_mask=masks
                 )
