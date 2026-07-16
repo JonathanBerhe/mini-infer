@@ -16,10 +16,14 @@ Two implementations:
   Mirrors `paged_attention.py`'s decode kernel plus the selection indirection.
 
 Selection comes from `MiniMaxM3Indexer.select_cached` (the same routine that
-builds the oracle's dense mask, so both paths share one selection). At decode
-the query is the newest token (position `seq_len - 1`), so every cached
-position in a selected block is causally visible; the only masking needed is
-`position < seq_len` in the (possibly partial) last block.
+builds the oracle's dense mask, so both paths share one selection). The
+selection is PER INDEX HEAD — `index_n_heads == num_key_value_heads`, one
+independent block set per KV / GQA group (transformers 5.14 semantics) — so
+each request carries a `(num_kv_heads, topk)` id tensor and each KV head's
+program walks its own block list. At decode the query is the newest token
+(position `seq_len - 1`), so every cached position in a selected block is
+causally visible; the only masking needed is `position < seq_len` in the
+(possibly partial) last block.
 """
 
 from __future__ import annotations
@@ -109,8 +113,10 @@ def msa_paged_decode_torch(
       v_pool_layer    : same shape
       block_tables    : per request, 1D int tensor of pool block ids in order
       seq_lens        : per request, cached length INCLUDING the current token
-      selected_blocks : per request, 1D int64 selected index-block ids, -1 padded
-                        (the decode row of `MiniMaxM3Indexer.select_cached`)
+      selected_blocks : per request, (num_kv_heads, topk) int64 selected
+                        index-block ids, -1 padded — one row per KV / GQA
+                        group (the decode row of
+                        `MiniMaxM3Indexer.select_cached`)
 
     Returns: (B, num_q_heads, head_dim).
     """
@@ -128,26 +134,36 @@ def msa_paged_decode_torch(
         scale = 1.0 / math.sqrt(head_dim)
 
     outs = []
+    offs = torch.arange(pool_block_size, device=q.device, dtype=torch.int32)
     for r in range(batch):
-        pool_ids, base = _selected_pool_entries(
-            selected_blocks[r], block_tables[r], seq_lens[r], index_block_size, pool_block_size
-        )
-        # Expand entries to token positions; drop dead entries and the tail
-        # beyond seq_len (partial last block).
-        offs = torch.arange(pool_block_size, device=q.device, dtype=torch.int32)
-        positions = base[:, None] + offs[None, :]  # (entries, pool_block_size)
-        keep = (base[:, None] >= 0) & (positions < seq_lens[r])
-        entry_ids = pool_ids[:, None].expand_as(positions)[keep].long()
-        slot = (positions % pool_block_size)[keep].long()
-        k_sel = k_pool_layer[entry_ids, slot]  # (n_sel, num_kv_heads, head_dim)
-        v_sel = v_pool_layer[entry_ids, slot]
+        if selected_blocks[r].ndim != 2 or selected_blocks[r].shape[0] != num_kv_heads:
+            raise ValueError(
+                f"request {r}: selected_blocks must be (num_kv_heads={num_kv_heads}, topk); "
+                f"got {tuple(selected_blocks[r].shape)}"
+            )
+        head_outs = []
+        for kv_h in range(num_kv_heads):
+            pool_ids, base = _selected_pool_entries(
+                selected_blocks[r][kv_h],
+                block_tables[r],
+                seq_lens[r],
+                index_block_size,
+                pool_block_size,
+            )
+            # Expand entries to token positions; drop dead entries and the tail
+            # beyond seq_len (partial last block).
+            positions = base[:, None] + offs[None, :]  # (entries, pool_block_size)
+            keep = (base[:, None] >= 0) & (positions < seq_lens[r])
+            entry_ids = pool_ids[:, None].expand_as(positions)[keep].long()
+            slot = (positions % pool_block_size)[keep].long()
+            k_sel = k_pool_layer[entry_ids, slot, kv_h].float()  # (n_sel, d)
+            v_sel = v_pool_layer[entry_ids, slot, kv_h].float()
 
-        k_sel = k_sel.repeat_interleave(group_size, dim=1).float()  # (n_sel, H, d)
-        v_sel = v_sel.repeat_interleave(group_size, dim=1).float()
-        q_r = q[r].float()  # (H, d)
-        scores = torch.einsum("hd,shd->hs", q_r, k_sel) * scale
-        weights = torch.softmax(scores, dim=-1)
-        outs.append(torch.einsum("hs,shd->hd", weights, v_sel))
+            q_g = q[r, kv_h * group_size : (kv_h + 1) * group_size].float()  # (group, d)
+            scores = torch.einsum("gd,sd->gs", q_g, k_sel) * scale
+            weights = torch.softmax(scores, dim=-1)
+            head_outs.append(torch.einsum("gs,sd->gd", weights, v_sel))
+        outs.append(torch.cat(head_outs, dim=0))
     return torch.stack(outs, dim=0).to(q.dtype)
 
 
@@ -158,8 +174,8 @@ if _TRITON_AVAILABLE:
         Q_ptr,
         K_pool_ptr,
         V_pool_ptr,
-        pool_ids_ptr,  # (B, max_entries) int32 physical pool block ids
-        base_pos_ptr,  # (B, max_entries) int32 token base positions, -1 = dead
+        pool_ids_ptr,  # (B, num_kv_heads, max_entries) int32 physical pool block ids
+        base_pos_ptr,  # (B, num_kv_heads, max_entries) int32 token base positions, -1 = dead
         seq_lens_ptr,  # (B,) int32
         Out_ptr,
         max_entries,
@@ -181,11 +197,13 @@ if _TRITON_AVAILABLE:
         # One program per (request, KV head): a (GROUP, HEAD_DIM) output tile
         # covering the whole GQA group. Each selected K/V block is read ONCE
         # per group (vs once per q head in a per-head grid), and QK / PV are
-        # real tl.dot MMAs. The selection is one set per request shared across
-        # all heads (verified against HF), so the block walk is identical for
-        # every program of the request; dead entries carry base position -1.
+        # real tl.dot MMAs. The selection is one block set PER KV head
+        # (index_n_heads == num_kv_heads, transformers 5.14 semantics), so
+        # each program walks its own head's entry row; dead entries carry
+        # base position -1.
         req_idx = tl.program_id(0)
         kv_h = tl.program_id(1)
+        num_kv_heads = tl.num_programs(1)
 
         seq_len = tl.load(seq_lens_ptr + req_idx)
 
@@ -205,7 +223,7 @@ if _TRITON_AVAILABLE:
         acc = tl.zeros([GROUP, HEAD_DIM], dtype=tl.float32)
 
         pos_in_block = tl.arange(0, POOL_BLOCK_SIZE)
-        entry_offset = req_idx * max_entries
+        entry_offset = (req_idx * num_kv_heads + kv_h) * max_entries
 
         for entry in range(0, max_entries):
             base = tl.load(base_pos_ptr + entry_offset + entry)
@@ -303,18 +321,31 @@ def msa_paged_decode_triton(
             scale=scale,
         )
 
-    per_req = [
-        _selected_pool_entries(
-            selected_blocks[r], block_tables[r], seq_lens[r], index_block_size, pool_block_size
-        )
+    num_kv_heads_local = k_pool_layer.shape[2]
+    per_req_head = [
+        [
+            _selected_pool_entries(
+                selected_blocks[r][kv_h],
+                block_tables[r],
+                seq_lens[r],
+                index_block_size,
+                pool_block_size,
+            )
+            for kv_h in range(num_kv_heads_local)
+        ]
         for r in range(batch)
     ]
-    max_entries = max(ids.numel() for ids, _ in per_req)
-    pool_ids = torch.zeros((batch, max_entries), dtype=torch.int32, device=q.device)
-    base_pos = torch.full((batch, max_entries), -1, dtype=torch.int32, device=q.device)
-    for r, (ids, base) in enumerate(per_req):
-        pool_ids[r, : ids.numel()] = ids
-        base_pos[r, : base.numel()] = base
+    max_entries = max(ids.numel() for heads in per_req_head for ids, _ in heads)
+    pool_ids = torch.zeros(
+        (batch, num_kv_heads_local, max_entries), dtype=torch.int32, device=q.device
+    )
+    base_pos = torch.full(
+        (batch, num_kv_heads_local, max_entries), -1, dtype=torch.int32, device=q.device
+    )
+    for r, heads in enumerate(per_req_head):
+        for kv_h, (ids, base) in enumerate(heads):
+            pool_ids[r, kv_h, : ids.numel()] = ids
+            base_pos[r, kv_h, : base.numel()] = base
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
 
     q_c = q.contiguous()

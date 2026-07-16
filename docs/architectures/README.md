@@ -10,6 +10,7 @@ The direct realization of mini-infer's research-paper-engine niche
 
 | Family | Paper | Reference | Our walkthrough |
 |---|---|---|---|
+| Inkling / Inkling-Small | [Release post](https://thinkingmachines.ai/news/introducing-inkling/) | HF transformers `modeling_inkling.py` (text path) | [inkling.md](inkling.md) |
 | MiniMax-M3 (MSA) | MSA report (arXiv 2606.13392) | HF transformers `modeling_minimax_m3_vl.py` (text path) | [minimax-m3.md](minimax-m3.md) |
 | DeepSeek-V4 | DeepSeek-V4 technical report | [DeepSeek-V4-Pro/inference](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main/inference) | [deepseek-v4.md](deepseek-v4.md) |
 | DeepSeek-V2 / V3 / Kimi-K2 (MLA) | DeepSeek-V2 technical report | HF transformers `modeling_deepseek_v2.py` | [deepseek-v2-mla.md](deepseek-v2-mla.md) |

@@ -195,6 +195,7 @@ class _MiniMaxM3Attention(nn.Module):
                 head_dim=cfg.index_head_dim,
                 block_size=cfg.index_block_size,
                 topk_blocks=cfg.index_topk_blocks,
+                num_query_heads=cfg.num_attention_heads,
                 local_blocks=cfg.index_local_blocks,
                 rms_norm_eps=cfg.rms_norm_eps,
             )
@@ -257,6 +258,16 @@ class _MiniMaxM3Attention(nn.Module):
                     self.layer_idx,
                     dtype=queries_packed.dtype,
                 )
+                # The indexer is replicated, so its masks carry ALL query-head
+                # rows; under TP the main q/k/v are column-parallel, so slice
+                # to this rank's local head range. The KV heads shard the same
+                # way, so the local rows are exactly the local groups' rows.
+                from mini_infer.distributed.group import get_rank, get_world_size
+
+                if get_world_size() > 1:
+                    local_heads = queries_packed.shape[1]
+                    start = get_rank() * local_heads
+                    block_mask = [m[:, start : start + local_heads, :] for m in block_mask]
 
             keys_full, cu_seqlens_k, _ = past_key_values.materialize_packed_stream(
                 self.layer_idx, "k"
@@ -349,7 +360,8 @@ class _MiniMaxM3Attention(nn.Module):
         selections = self.indexer.select_cached(
             hidden_states, cos, sin, past_key_values, cu_seqlens_q, self.layer_idx
         )
-        selected = [ids[0] for ids, _ in selections]  # decode: one query row each
+        # Decode: one query row each; keep the per-index-head axis -> (h, topk).
+        selected = [ids[:, 0, :] for ids, _ in selections]
         return msa_paged_decode(
             queries_packed,
             k_pool,

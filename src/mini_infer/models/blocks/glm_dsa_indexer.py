@@ -9,9 +9,15 @@ attention softmax (see `mla_packed_attention_forward`'s DSA path).
 Math (one query at token `t`, scoring against keys `k_j`), matching HF
 `GlmMoeDsaIndexer`:
     q_t,h   = wq_b(q_resid_t)               # per-head, pe-first layout
-    rope(q_t,h[:rope_dim])                  # NON-interleaved (NeoX) RoPE
+    rope(q_t,h[:rope_dim])                  # INTERLEAVED (DeepSeek) RoPE
     k_j     = k_norm(wk(h_j))               # single shared key, pe-first
     rope(k_j[:rope_dim])
+
+The indexer's RoPE is interleaved, like the main MLA attention (transformers
+5.14 corrected this; 5.12 shipped it non-interleaved). Our helper writes the
+rotated pairs back interleaved while HF's `apply_rotary_pos_emb_interleave`
+writes them as concatenated halves; the two differ by a fixed permutation
+applied to BOTH q and k, so every q.k score is bit-identical.
     s_t,h,j = ReLU( (q_t,h . k_j) * d^-0.5 )
     w_t,h   = weights_proj(h_t) * n_heads^-0.5
     score_t,j = sum_h( s_t,h,j * w_t,h )
@@ -39,7 +45,7 @@ from torch.nn.functional import relu
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import ColumnParallelLinear
-from mini_infer.models.blocks.rope import apply_rotary_pos_emb
+from mini_infer.models.blocks.rope import apply_interleaved_rotary_pos_emb
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -130,19 +136,22 @@ class GlmDsaIndexer(nn.Module):
         bsz, total_q, _ = hidden_states.shape
         cos, sin = position_embeddings
 
-        # Queries: pe-first split (rope dims lead), NeoX RoPE on the pe slice.
+        # Queries: pe-first split (rope dims lead), interleaved RoPE on the
+        # pe slice (same convention as the main MLA attention).
         q = self.wq_b(q_resid).view(bsz, total_q, self.num_heads_local, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
         )
-        # Key: single shared head, pe-first split, same NeoX RoPE.
+        # Key: single shared head, pe-first split, same interleaved RoPE.
         k = self.k_norm(self.wk(hidden_states))  # (1, T, head_dim)
         k_pe, k_nope = torch.split(
             k, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
         )
         # Rotate q_pe (1, T, H, rope_D) and k_pe (1, T, 1, rope_D) together;
         # unsqueeze_dim=2 broadcasts cos/sin over the head axis.
-        q_pe, k_pe_rot = apply_rotary_pos_emb(q_pe, k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
+        q_pe, k_pe_rot = apply_interleaved_rotary_pos_emb(
+            q_pe, k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2
+        )
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe_rot.squeeze(2), k_nope], dim=-1)
         # Head weights: an fp32 matmul over upcast hidden states, matching HF

@@ -66,25 +66,33 @@ def _make_indexer(seed: int = 0) -> MiniMaxM3Indexer:
         head_dim=8,
         block_size=4,
         topk_blocks=2,
+        num_query_heads=4,
         local_blocks=1,
     ).eval()
 
 
-def _selected_sets(block_indices: torch.Tensor) -> list[set[int]]:
-    """Per-query set of selected real blocks (drop the -1 padding)."""
-    out = []
-    for i in range(block_indices.shape[1]):
-        out.append({int(b) for b in block_indices[0, i].tolist() if b >= 0})
+def _selected_sets(block_indices: torch.Tensor) -> list[list[set[int]]]:
+    """Per (index head, query) set of selected real blocks (drop the -1 padding)."""
+    out: list[list[set[int]]] = []
+    for head in range(block_indices.shape[1]):
+        out.append(
+            [
+                {int(b) for b in block_indices[0, head, i].tolist() if b >= 0}
+                for i in range(block_indices.shape[2])
+            ]
+        )
     return out
 
 
 def _reference_selection(idxer: MiniMaxM3Indexer, hidden: torch.Tensor, cos, sin, position_ids):
-    """Loop-based reference for the indexer's per-query selected-block SET.
+    """Loop-based reference for the indexer's per-(head, query) selected-block SET.
 
-    Scores each (query, block) as the max over index heads and over causally-valid
-    tokens in the block of the raw idx_q.idx_k dot (no scale), forces the local
-    block(s), takes the top-k, and drops padding. Set-valued so it is robust to
-    top-k tie-breaks among equal / -inf scores (only the mask-relevant set matters).
+    Scores each (head, query, block) as the max over causally-valid tokens in
+    the block of the raw idx_q.idx_k dot (no scale), forces the local block(s),
+    takes the top-k per head (transformers 5.14 semantics: one selection per
+    index head, no head pooling), and drops padding. Set-valued so it is robust
+    to top-k tie-breaks among equal / -inf scores (only the mask-relevant set
+    matters).
     """
     bsz, seqlen, _ = hidden.shape
     h, d, bs = idxer.num_heads, idxer.head_dim, idxer.block_size
@@ -93,22 +101,24 @@ def _reference_selection(idxer: MiniMaxM3Indexer, hidden: torch.Tensor, cos, sin
     idx_q, idx_k = apply_rotary_pos_emb_partial(idx_q, idx_k, cos, sin)
     idx_q, idx_k = idx_q.detach().float(), idx_k.detach().float()
     num_blocks = -(-seqlen // bs)
-    sets: list[set[int]] = []
-    for i in range(seqlen):
-        qpos = int(position_ids[0, i])
-        bscore = [float("-inf")] * num_blocks
-        for blk in range(num_blocks):
-            best = float("-inf")
-            for j in range(blk * bs, min((blk + 1) * bs, seqlen)):
-                if j <= qpos:
-                    for head in range(h):
+    sets: list[list[set[int]]] = []
+    for head in range(h):
+        head_sets: list[set[int]] = []
+        for i in range(seqlen):
+            qpos = int(position_ids[0, i])
+            bscore = [float("-inf")] * num_blocks
+            for blk in range(num_blocks):
+                best = float("-inf")
+                for j in range(blk * bs, min((blk + 1) * bs, seqlen)):
+                    if j <= qpos:
                         best = max(best, float(idx_q[0, head, i] @ idx_k[0, 0, j]))
-            bscore[blk] = best
-        for local in range(idxer.local_blocks):
-            bscore[max(qpos // bs - local, 0)] = float("inf")
-        topk = min(idxer.topk_blocks, num_blocks)
-        order = sorted(range(num_blocks), key=lambda b: bscore[b], reverse=True)[:topk]
-        sets.append({b for b in order if bscore[b] != float("-inf")})
+                bscore[blk] = best
+            for local in range(idxer.local_blocks):
+                bscore[max(qpos // bs - local, 0)] = float("inf")
+            topk = min(idxer.topk_blocks, num_blocks)
+            order = sorted(range(num_blocks), key=lambda b: bscore[b], reverse=True)[:topk]
+            head_sets.append({b for b in order if bscore[b] != float("-inf")})
+        sets.append(head_sets)
     return sets
 
 
@@ -121,15 +131,16 @@ def test_indexer_selection_matches_loop_reference() -> None:
     cos, sin = _rope_tables(4, seqlen)
 
     block_indices = idxer(hidden, cos, sin, position_ids)
-    assert block_indices.shape == (1, seqlen, 2)
+    assert block_indices.shape == (1, 2, seqlen, 2)
     assert _selected_sets(block_indices) == _reference_selection(
         idxer, hidden, cos, sin, position_ids
     )
-    # Every query includes its own (local) block, and never a future block.
-    for i in range(seqlen):
-        sel = {int(b) for b in block_indices[0, i].tolist() if b >= 0}
-        assert i // 4 in sel
-        assert all(b <= i // 4 for b in sel)
+    # Every (head, query) includes its own (local) block, and never a future block.
+    for head in range(2):
+        for i in range(seqlen):
+            sel = {int(b) for b in block_indices[0, head, i].tolist() if b >= 0}
+            assert i // 4 in sel
+            assert all(b <= i // 4 for b in sel)
 
 
 def test_build_block_mask_matches_reference() -> None:
@@ -142,14 +153,19 @@ def test_build_block_mask_matches_reference() -> None:
 
     block_indices = idxer(hidden, cos, sin, position_ids)
     mask = idxer.build_block_mask(block_indices, seqlen, position_ids, dtype=torch.float32)
-    assert mask.shape == (1, 1, seqlen, seqlen)
+    # One mask row per QUERY head; each index head's selection covers its
+    # GQA group (num_query_heads=4, 2 index heads -> group size 2).
+    assert mask.shape == (1, 4, seqlen, seqlen)
 
     min_val = torch.finfo(torch.float32).min
     sel = _selected_sets(block_indices)
-    for i in range(seqlen):
-        for j in range(seqlen):
-            keep = (j <= i) and (j // idxer.block_size in sel[i])
-            assert mask[0, 0, i, j].item() == (0.0 if keep else min_val)
+    group = idxer.num_query_heads // idxer.num_heads
+    for qh in range(4):
+        idx_head = qh // group
+        for i in range(seqlen):
+            for j in range(seqlen):
+                keep = (j <= i) and (j // idxer.block_size in sel[idx_head][i])
+                assert mask[0, qh, i, j].item() == (0.0 if keep else min_val)
 
 
 def test_msa_collapses_to_causal_when_all_blocks_selected() -> None:
@@ -163,6 +179,7 @@ def test_msa_collapses_to_causal_when_all_blocks_selected() -> None:
         head_dim=8,
         block_size=block_size,
         topk_blocks=8,
+        num_query_heads=4,
         local_blocks=1,
     ).eval()
     hidden = torch.randn(1, seqlen, 16)
@@ -173,7 +190,7 @@ def test_msa_collapses_to_causal_when_all_blocks_selected() -> None:
     mask = idxer.build_block_mask(block_indices, seqlen, position_ids, dtype=torch.float32)
 
     min_val = torch.finfo(torch.float32).min
-    causal = torch.zeros(1, 1, seqlen, seqlen)
+    causal = torch.zeros(1, 4, seqlen, seqlen)
     causal = causal.masked_fill(
         torch.triu(torch.ones(seqlen, seqlen, dtype=torch.bool), 1), min_val
     )

@@ -62,16 +62,22 @@ def _oracle(
     selected: torch.Tensor,
     seq_len: int,
 ) -> torch.Tensor:
-    """Dense-mask oracle for one request: full history + -inf on non-selected."""
+    """Dense-mask oracle for one request: full history + -inf on non-selected.
+
+    `selected` is `(NUM_KV_HEADS, topk)`: each KV head's GQA group keeps only
+    that head's selected blocks (per-head selection, transformers 5.14
+    semantics)."""
     group = NUM_Q_HEADS // NUM_KV_HEADS
     k = k_full.repeat_interleave(group, dim=1).float()  # (seq, H, d)
     v = v_full.repeat_interleave(group, dim=1).float()
     scores = torch.einsum("hd,shd->hs", q.float(), k) * HEAD_DIM**-0.5
-    keep = torch.zeros(seq_len, dtype=torch.bool)
-    for b in selected.tolist():
-        if b >= 0:
-            keep[b * INDEX_BLOCK : min((b + 1) * INDEX_BLOCK, seq_len)] = True
-    scores = scores.masked_fill(~keep[None, :], float("-inf"))
+    keep = torch.zeros(NUM_Q_HEADS, seq_len, dtype=torch.bool)
+    for kv_h in range(NUM_KV_HEADS):
+        for b in selected[kv_h].tolist():
+            if b >= 0:
+                start, end = b * INDEX_BLOCK, min((b + 1) * INDEX_BLOCK, seq_len)
+                keep[kv_h * group : (kv_h + 1) * group, start:end] = True
+    scores = scores.masked_fill(~keep, float("-inf"))
     return torch.einsum("hs,shd->hd", torch.softmax(scores, dim=-1), v)
 
 
@@ -87,12 +93,17 @@ def test_msa_paged_decode_matches_dense_mask_oracle() -> None:
     q = torch.randn(len(seq_lens), NUM_Q_HEADS, HEAD_DIM)
     block_tables = cache.block_tables_per_request_tensor("cpu")
 
-    # Per-request selections: always the local (last) block plus some others,
-    # padded with -1, mirroring `MiniMaxM3Indexer.select_cached` output.
+    # Per-request selections, one row per KV head (they intentionally differ,
+    # so a group reading the other head's blocks would fail): always the local
+    # (last) block plus some others, padded with -1, mirroring
+    # `MiniMaxM3Indexer.select_cached` output.
     selections = [
-        torch.tensor([2, 0, -1], dtype=torch.int64),  # seq 21 -> blocks 0..2, last partial
-        torch.tensor([0, -1, -1], dtype=torch.int64),  # seq 8 -> single full block
-        torch.tensor([4, 1, 3], dtype=torch.int64),  # seq 33 -> blocks 0..4, last has 1 tok
+        # seq 21 -> blocks 0..2, last partial
+        torch.tensor([[2, 0, -1], [2, 1, -1]], dtype=torch.int64),
+        # seq 8 -> single full block
+        torch.tensor([[0, -1, -1], [0, -1, -1]], dtype=torch.int64),
+        # seq 33 -> blocks 0..4, last has 1 tok
+        torch.tensor([[4, 1, 3], [4, 0, 2]], dtype=torch.int64),
     ]
 
     got = msa_paged_decode_torch(

@@ -138,6 +138,7 @@ def _register_builtin_models() -> None:
     from mini_infer.models import gemma3 as _gemma3  # noqa: F401
     from mini_infer.models import gemma4 as _gemma4  # noqa: F401
     from mini_infer.models import glm_moe_dsa as _glm_moe_dsa  # noqa: F401
+    from mini_infer.models import inkling as _inkling  # noqa: F401
     from mini_infer.models import llama as _llama  # noqa: F401
     from mini_infer.models import minimax_m3 as _minimax_m3  # noqa: F401
     from mini_infer.models import mistral as _mistral  # noqa: F401
