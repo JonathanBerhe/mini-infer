@@ -9,21 +9,21 @@ lowering, tiling, and the scalar-prefetch gather).
 
 Open the notebook straight from the public branch:
 
-https://colab.research.google.com/github/JonathanBerhe/mini-infer/blob/tpu-mixed-batch/scripts/colab/run_tpu.ipynb
+https://colab.research.google.com/github/JonathanBerhe/mini-infer/blob/main/scripts/colab/run_tpu.ipynb
 
 Then:
 1. **Runtime -> Change runtime type -> TPU**.
 2. **Runtime -> Run all**.
 
-The single cell clones the public `tpu-mixed-batch` branch and runs every
-kernel (dense, paged decode, paged prefill, mixed prefill/decode; MHA + GQA)
-with `interpret=False`, checking each against a NumPy reference. A real TPU run
+The single cell clones the public `main` branch and runs every kernel (dense,
+paged decode, paged prefill, mixed prefill/decode; MHA + GQA) with
+`interpret=False`, checking each against a NumPy reference. A real TPU run
 prints `devices: [TpuDevice(...)]` and ends with `ALL PASS`, and it refuses to
 fall back to CPU, so a green run genuinely ran on the TPU.
 
 The `BRANCH` variable at the top of the notebook cell picks what is validated:
-it names the feature branch while one is under validation and moves back to
-`main` when that branch merges.
+`main` by default; set it to a feature branch (and open the notebook from that
+branch) while one is under validation.
 
 Note: on the first run the cell aligns Colab's `libtpu` with its `jaxlib` and
 restarts the runtime once, then you run the cell again. Colab's preinstalled
@@ -46,7 +46,7 @@ gcloud compute tpus tpu-vm create mini-infer-tpu \
   --zone=$ZONE --accelerator-type=v5litepod-1 --version=tpu-ubuntu2204-base
 gcloud compute tpus tpu-vm ssh mini-infer-tpu --zone=$ZONE --command="\
   pip install -q 'jax[tpu]' numpy && \
-  git clone --depth 1 -b tpu-mixed-batch https://github.com/JonathanBerhe/mini-infer.git && \
+  git clone --depth 1 -b main https://github.com/JonathanBerhe/mini-infer.git && \
   cd mini-infer && PYTHONPATH=src python scripts/run_tpu_pallas_kernels.py"
 gcloud compute tpus tpu-vm delete mini-infer-tpu --zone=$ZONE --quiet   # stop billing
 ```
