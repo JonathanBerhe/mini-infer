@@ -96,6 +96,13 @@ class StatePrefixCache:
         state_cache: StateCache, next_logits: torch.Tensor, *, row: int = 0
     ) -> PrefixSnapshot:
         """Clone `state_cache` row `row` into a reusable snapshot."""
+        if not isinstance(state_cache, StateCache):
+            raise TypeError(
+                f"StatePrefixCache snapshots the V4 StateCache only; got "
+                f"{type(state_cache).__name__}. Prefix sharing for the Kimi "
+                f"KimiStateCache (KDA state snapshots) is a follow-up — serve "
+                f"that family with prefix sharing disabled."
+            )
         layers: list[_LayerSnapshot] = []
         for layer_idx in range(state_cache.num_layers):
             layer = state_cache.layer(layer_idx)

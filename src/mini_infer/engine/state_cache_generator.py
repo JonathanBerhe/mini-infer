@@ -21,24 +21,55 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from typing import Any, Protocol, runtime_checkable
 
 import torch
+from torch import nn
 
 from mini_infer.cache.state_cache import StateCache
 from mini_infer.cache.state_prefix_cache import StatePrefixCache
 from mini_infer.engine.sampler import SamplingParams, sample
 from mini_infer.engine.tokenizer import Tokenizer
-from mini_infer.models.deepseek_v4 import (
-    DeepseekV4Config,
-    DeepseekV4ForCausalLM,
-    build_state_cache_layer_specs,
-)
 
 logger = logging.getLogger(__name__)
 
 
+@runtime_checkable
+class StateCacheModelLike(Protocol):
+    """What the state-cache serving stack needs from a model.
+
+    Satisfied by `DeepseekV4ForCausalLM` (StateCache) and
+    `KimiLinearForCausalLM` (KimiStateCache): cache-aware forwards plus a
+    factory for the model's OWN cache class, so the generator and scheduler
+    never construct or introspect a concrete cache type themselves.
+    """
+
+    def build_state_cache(
+        self,
+        *,
+        max_seq_len: int,
+        batch_size: int = 1,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> Any: ...
+
+    def forward_prefill_with_cache(
+        self, input_ids: torch.Tensor, *, state_cache: Any
+    ) -> torch.Tensor: ...
+
+    def forward_decode_with_cache(
+        self, input_id: torch.Tensor, *, start_pos: int, state_cache: Any
+    ) -> torch.Tensor: ...
+
+    def forward_decode_with_cache_ragged(
+        self, input_id: torch.Tensor, *, positions: torch.Tensor, state_cache: Any
+    ) -> torch.Tensor: ...
+
+    def parameters(self) -> Iterator[nn.Parameter]: ...
+
+
 def prefill_with_prefix_cache(
-    model: DeepseekV4ForCausalLM,
+    model: StateCacheModelLike,
     prompt_ids: list[int],
     *,
     state_cache: StateCache,
@@ -110,7 +141,7 @@ class StateCacheGenerator:
 
     def __init__(
         self,
-        model: DeepseekV4ForCausalLM,
+        model: StateCacheModelLike,
         tokenizer: Tokenizer | None = None,
         *,
         device: str | None = None,
@@ -134,27 +165,37 @@ class StateCacheGenerator:
         device: str = "auto",
         dtype: torch.dtype | None = None,
     ) -> StateCacheGenerator:
-        """Load a DeepSeek-V4 checkpoint onto one device and wrap it for generation.
+        """Load a StateCache-model checkpoint onto one device and wrap it.
 
-        This is the single-device entry (local CPU/MPS, or one GPU). For
-        multi-GPU tensor parallelism the model does not fit one device:
-        initialise the process group per rank, call
-        `DeepseekV4ForCausalLM.from_checkpoint(..., device=f"cuda:{rank}")`
-        directly, and construct `StateCacheGenerator(model, tokenizer)` around
-        the per-rank model.
+        Dispatches on the checkpoint's registered architecture: classes with
+        their own `from_checkpoint` (DeepSeek-V4's meta-device streaming
+        constructor) use it; the rest (Kimi Linear) load through the generic
+        `load_model` path. This is the single-device entry (local CPU/MPS, or
+        one GPU). For multi-GPU tensor parallelism, initialise the process
+        group per rank, build the per-rank model directly, and construct
+        `StateCacheGenerator(model, tokenizer)` around it.
         """
         from mini_infer.engine.model_runner import _dtype_for, _resolve_device
+        from mini_infer.models import REGISTRY, checkpoint_architecture, load_model
 
         resolved_device = _resolve_device(device)
         resolved_dtype = dtype if dtype is not None else _dtype_for(resolved_device)
-        model = DeepseekV4ForCausalLM.from_checkpoint(
-            name_or_path, device=resolved_device, dtype=resolved_dtype
-        )
+        arch = checkpoint_architecture(name_or_path)
+        if arch is None:
+            raise ValueError(f"checkpoint {name_or_path!r} declares no `architectures`")
+        model_cls = REGISTRY.lookup(arch)
+        model: StateCacheModelLike
+        if hasattr(model_cls, "from_checkpoint"):
+            model = model_cls.from_checkpoint(
+                name_or_path, device=resolved_device, dtype=resolved_dtype
+            )
+        else:
+            model = load_model(name_or_path, dtype=resolved_dtype, device=resolved_device)  # type: ignore[assignment]
         tokenizer = Tokenizer.from_pretrained(name_or_path)
         return cls(model, tokenizer, device=resolved_device, dtype=resolved_dtype)
 
     @property
-    def model(self) -> DeepseekV4ForCausalLM:
+    def model(self) -> StateCacheModelLike:
         """The wrapped model (for schedulers that drive prefill / decode directly)."""
         return self._model
 
@@ -192,12 +233,10 @@ class StateCacheGenerator:
             raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
 
         params = sampling_params if sampling_params is not None else SamplingParams(temperature=0.0)
-        cfg: DeepseekV4Config = self._model.cfg
-        # Size each layer's compressed history for the full prompt + output, so
+        # Size each layer's per-token state for the full prompt + output, so
         # high-ratio layers don't inherit the densest layer's slot count.
-        max_seq_len = len(prompt_ids) + max_new_tokens
-        state_cache = StateCache(
-            build_state_cache_layer_specs(cfg, max_seq_len=max_seq_len),
+        state_cache = self._model.build_state_cache(
+            max_seq_len=len(prompt_ids) + max_new_tokens,
             batch_size=1,
             device=self.device,
             dtype=self.dtype,
@@ -274,9 +313,8 @@ class StateCacheGenerator:
             raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
 
         params = SamplingParams(temperature=0.0)
-        cfg: DeepseekV4Config = self._model.cfg
-        state_cache = StateCache(
-            build_state_cache_layer_specs(cfg, max_seq_len=len(prompt_ids) + max_new_tokens),
+        state_cache = self._model.build_state_cache(
+            max_seq_len=len(prompt_ids) + max_new_tokens,
             batch_size=1,
             device=self.device,
             dtype=self.dtype,
