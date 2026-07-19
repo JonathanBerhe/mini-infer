@@ -271,6 +271,31 @@ class StateCache:
         """Per-layer state — caller reads/writes the tensors directly."""
         return self._layers[layer_idx]
 
+    def copy_row_from(self, src_cache: StateCache, *, src_row: int, dst_row: int) -> None:
+        """Copy one request's full per-layer state from `src_cache[src_row]` into
+        row `dst_row` (including the CSA indexer sub-state) — the scheduler's
+        admit-into-slot move. Scalar counters are per-cache, not per-row, and
+        deliberately not copied: the batched decode derives per-row compressed
+        counts from each row's own position.
+        """
+        if src_cache.num_layers != self.num_layers:
+            raise ValueError(
+                f"layer count mismatch: src has {src_cache.num_layers}, dst has {self.num_layers}"
+            )
+        for layer_idx in range(self.num_layers):
+            src_layer = src_cache.layer(layer_idx)
+            dst_layer = self._layers[layer_idx]
+            dst_layer.swa_kv[dst_row] = src_layer.swa_kv[src_row]
+            dst_layer.compressed_kv[dst_row] = src_layer.compressed_kv[src_row]
+            dst_layer.cmp_kv_state[dst_row] = src_layer.cmp_kv_state[src_row]
+            dst_layer.cmp_score_state[dst_row] = src_layer.cmp_score_state[src_row]
+            if dst_layer.indexer is not None and src_layer.indexer is not None:
+                dst_layer.indexer.compressed_kv[dst_row] = src_layer.indexer.compressed_kv[src_row]
+                dst_layer.indexer.cmp_kv_state[dst_row] = src_layer.indexer.cmp_kv_state[src_row]
+                dst_layer.indexer.cmp_score_state[dst_row] = src_layer.indexer.cmp_score_state[
+                    src_row
+                ]
+
     def advance_start_pos(self, n: int) -> None:
         """Advance the global token-position counter by `n`."""
         if n < 0:

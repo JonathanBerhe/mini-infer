@@ -36,17 +36,16 @@ import logging
 import queue
 import threading
 from collections.abc import Iterator
+from typing import Any
 
 import torch
 
-from mini_infer.cache.state_cache import StateCache
 from mini_infer.cache.state_prefix_cache import StatePrefixCache
 from mini_infer.engine.sampler import sample
 from mini_infer.engine.state_cache_generator import (
     StateCacheGenerator,
     prefill_with_prefix_cache,
 )
-from mini_infer.models.deepseek_v4 import build_state_cache_layer_specs
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -101,15 +100,18 @@ class StateCacheContinuousScheduler:
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._cache: StateCache | None = None
+        # The model's own cache class (StateCache for V4, KimiStateCache for
+        # Kimi); built through the model factory so this scheduler never
+        # names a concrete cache type.
+        self._cache: Any = None
         self._slots: list[_Slot | None] = [None] * max_batch_size
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._cache = StateCache(
-            build_state_cache_layer_specs(self._model.cfg, max_seq_len=self._max_seq_len),
+        self._cache = self._model.build_state_cache(
+            max_seq_len=self._max_seq_len,
             batch_size=self._max_batch_size,
             device=self._device,
             dtype=self._dtype,
@@ -188,8 +190,8 @@ class StateCacheContinuousScheduler:
             return
 
         # Prefill in a temporary single-row cache, then copy the row into our slot.
-        temp = StateCache(
-            build_state_cache_layer_specs(self._model.cfg, max_seq_len=self._max_seq_len),
+        temp = self._model.build_state_cache(
+            max_seq_len=self._max_seq_len,
             batch_size=1,
             device=self._device,
             dtype=self._dtype,
@@ -216,21 +218,11 @@ class StateCacheContinuousScheduler:
             request=running, position=len(prompt_ids), next_token=first_token
         )
 
-    def _copy_row(self, src_cache: StateCache, *, src: int, dst: int) -> None:
-        """Copy one request's full per-layer state from `src_cache[src]` into the
-        batched cache row `dst` (including the CSA indexer sub-state)."""
+    def _copy_row(self, src_cache: Any, *, src: int, dst: int) -> None:
+        """Move a prefilled request into a batch row; each cache class owns its
+        own row-copy (`StateCache.copy_row_from` / `KimiStateCache.copy_row_from`)."""
         assert self._cache is not None
-        for layer_idx in range(self._cache.num_layers):
-            src_layer = src_cache.layer(layer_idx)
-            dst_layer = self._cache.layer(layer_idx)
-            dst_layer.swa_kv[dst] = src_layer.swa_kv[src]
-            dst_layer.compressed_kv[dst] = src_layer.compressed_kv[src]
-            dst_layer.cmp_kv_state[dst] = src_layer.cmp_kv_state[src]
-            dst_layer.cmp_score_state[dst] = src_layer.cmp_score_state[src]
-            if dst_layer.indexer is not None and src_layer.indexer is not None:
-                dst_layer.indexer.compressed_kv[dst] = src_layer.indexer.compressed_kv[src]
-                dst_layer.indexer.cmp_kv_state[dst] = src_layer.indexer.cmp_kv_state[src]
-                dst_layer.indexer.cmp_score_state[dst] = src_layer.indexer.cmp_score_state[src]
+        self._cache.copy_row_from(src_cache, src_row=src, dst_row=dst)
 
     def _decode_step(self) -> None:
         assert self._cache is not None

@@ -55,6 +55,9 @@ dev = [
     # async HTTP client for the open-loop bench (scripts/http_openloop_bench.py).
     # Streaming + per-token timing via SSE; not used by the server itself.
     "httpx>=0.27",
+    # imported by the vendored Kimi Linear reference the parity tests run
+    # (third_party/kimi_linear_reference; see tests/unit/_kimi_reference_helpers.py).
+    "einops>=0.8.2",
 ]
 
 [tool.ruff]

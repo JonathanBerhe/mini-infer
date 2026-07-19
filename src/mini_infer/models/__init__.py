@@ -11,7 +11,7 @@ imported from `_register_builtin_models()` below.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -81,7 +81,14 @@ def load_model(name: str, *, dtype: torch.dtype, device: str) -> BaseCausalLM:
 
     from mini_infer.models.loader import load_safetensors_state_dict
 
-    hf_config = AutoConfig.from_pretrained(name)
+    try:
+        hf_config = AutoConfig.from_pretrained(name)
+    except (KeyError, ValueError):
+        # Families transformers only knows via trust_remote_code (Kimi
+        # Linear's `kimi_linear` model_type). Rather than executing hub
+        # code for a config, read config.json raw: our `Config.from_hf`
+        # only getattr-reads plain fields, which a namespace satisfies.
+        hf_config = _raw_config_namespace(name)
     if not hf_config.architectures:
         raise ValueError(f"HF config for {name!r} has no `architectures`; can't dispatch")
     arch = hf_config.architectures[0]
@@ -96,14 +103,39 @@ def load_model(name: str, *, dtype: torch.dtype, device: str) -> BaseCausalLM:
     return model
 
 
-def architecture_uses_state_cache(name: str) -> bool:
-    """Whether `name`'s architecture decodes via a per-request StateCache.
+def _raw_config_namespace(name: str) -> Any:
+    """A checkpoint's `config.json` as an attribute namespace (no AutoConfig).
 
-    Reads `config.json`'s `architectures[0]` directly (transformers drops
-    V4-only fields when building a fallback config, but `architectures` is
-    preserved) and checks the registered class's `USES_STATE_CACHE` marker.
-    The API server uses this to route V4 to the StateCacheContinuousScheduler.
-    Returns False (the PagedKVCache path) if the architecture is unregistered.
+    Nested dicts (e.g. Kimi's `linear_attn_config`) stay plain dicts, which is
+    what the owned `Config.from_hf` implementations expect. Executes no code
+    from the hub, unlike `trust_remote_code`.
+    """
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    candidate = Path(name)
+    if candidate.is_dir():
+        config_path = candidate / "config.json"
+    else:
+        from huggingface_hub import hf_hub_download
+
+        config_path = Path(hf_hub_download(name, "config.json"))
+    with config_path.open() as config_file:
+        raw = json.load(config_file)
+    namespace = SimpleNamespace(**raw)
+    if not hasattr(namespace, "architectures"):
+        namespace.architectures = []
+    return namespace
+
+
+def checkpoint_architecture(name: str) -> str | None:
+    """`architectures[0]` straight from a checkpoint's `config.json`.
+
+    Reads the raw file rather than `AutoConfig` so it works for families
+    transformers only knows via `trust_remote_code` (Kimi Linear) and for
+    fallback configs that drop model-specific fields but keep `architectures`.
+    Returns None when the config declares no architectures.
     """
     import json
     from pathlib import Path
@@ -117,10 +149,21 @@ def architecture_uses_state_cache(name: str) -> bool:
         config_path = Path(hf_hub_download(name, "config.json"))
     with config_path.open() as config_file:
         architectures = json.load(config_file).get("architectures") or []
-    if not architectures:
+    return str(architectures[0]) if architectures else None
+
+
+def architecture_uses_state_cache(name: str) -> bool:
+    """Whether `name`'s architecture decodes via a per-request StateCache.
+
+    Checks the registered class's `USES_STATE_CACHE` marker. The API server
+    uses this to route V4 / Kimi to the StateCacheContinuousScheduler.
+    Returns False (the PagedKVCache path) if the architecture is unregistered.
+    """
+    arch = checkpoint_architecture(name)
+    if arch is None:
         return False
     try:
-        model_cls = REGISTRY.lookup(architectures[0])
+        model_cls = REGISTRY.lookup(arch)
     except ValueError:
         return False
     return bool(model_cls.USES_STATE_CACHE)
@@ -139,6 +182,7 @@ def _register_builtin_models() -> None:
     from mini_infer.models import gemma4 as _gemma4  # noqa: F401
     from mini_infer.models import glm_moe_dsa as _glm_moe_dsa  # noqa: F401
     from mini_infer.models import inkling as _inkling  # noqa: F401
+    from mini_infer.models import kimi_linear as _kimi_linear  # noqa: F401
     from mini_infer.models import llama as _llama  # noqa: F401
     from mini_infer.models import minimax_m3 as _minimax_m3  # noqa: F401
     from mini_infer.models import mistral as _mistral  # noqa: F401
@@ -154,6 +198,7 @@ __all__ = [
     "REGISTRY",
     "ModelRegistry",
     "architecture_uses_state_cache",
+    "checkpoint_architecture",
     "load_model",
     "register_model",
 ]

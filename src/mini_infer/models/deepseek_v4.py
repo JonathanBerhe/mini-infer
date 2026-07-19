@@ -814,6 +814,27 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         logits: torch.Tensor = self.lm_head(hidden_states)
         return logits
 
+    def build_state_cache(
+        self,
+        *,
+        max_seq_len: int,
+        batch_size: int = 1,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> StateCache:
+        """Pre-sized per-request cache for this model.
+
+        The factory seam the state-cache generator and scheduler construct
+        caches through, so they stay agnostic of which cache class a family
+        uses (V4's `StateCache` here; Kimi's `KimiStateCache` elsewhere).
+        """
+        return StateCache(
+            build_state_cache_layer_specs(self.cfg, max_seq_len=max_seq_len),
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
     def forward_prefill_with_cache(
         self,
         input_ids: torch.Tensor,
