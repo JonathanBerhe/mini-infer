@@ -1,6 +1,8 @@
 # DSpark evaluation plan
 
 Date: 2026-07-02
+Updated: 2026-07-04, re-checked against main after the MiniMax-M3 (#18)
+and open-loop bench + OOM recovery (#19) merges
 Status: Proposed
 
 Paper: "DSpark: Confidence-Scheduled Speculative Decoding with
@@ -54,7 +56,11 @@ independent replication exists yet.
   K" as a follow-up.
 - The mechanical primitives exist: `forward_step_packed` (multi-token
   verify), `PagedKVCache.truncate_to` (rollback), packed-varlen
-  attention across all families.
+  attention across all families. Since the MiniMax-M3 merge, packed
+  attention also has a per-request additive `block_mask` path
+  (`packed_attention_torch`) and a tested mask-construction pattern
+  (`MiniMaxM3Indexer.build_block_mask`) that the drafter's mask tests
+  can lean on as an oracle.
 - Released artifacts make a port testable without training: BF16
   drafter checkpoints for Qwen3-4B/8B/14B and Gemma4-12B
   (`dspark_qwen3_4b_block7` = 1.39B params, block size 7), plus the
@@ -110,24 +116,34 @@ document why in the ADR.
 ### Stage B: drafter port, batch-1, temperature 0
 
 Implement `Qwen3DSparkModel` in mini-infer: KV injection of tapped
-target hidden states, bidirectional block attention (bespoke mask; SDPA
-fallback is fine at this scale), Markov head, confidence head. Add
-hidden-state taps to the Qwen3 target forward and a plain-tensor side
-cache with truncate (the drafter's own cache stays unpaged; the
-reference uses a cropped DynamicCache and 5 small layers do not justify
-paging).
+target hidden states, bidirectional block attention, Markov head,
+confidence head. Add hidden-state taps to the Qwen3 target forward and
+a plain-tensor side cache with truncate (the drafter's own cache stays
+unpaged; the reference uses a cropped DynamicCache and 5 small layers
+do not justify paging).
+
+Drafter attention: a bespoke additive mask on a plain SDPA call inside
+the drafter module. The shared packed-attention `block_mask` path added
+for MiniMax-M3 MSA is not a structural fit (the dispatcher sources K/V
+exclusively from a `PagedKVCache` and has no injection point for the
+projected target-hidden context keys, and the drafter cache is
+unpaged), but `packed_attention_torch(block_mask=...)` is the right
+unit-test oracle for the bespoke mask, mirroring how the MSA paged
+kernel is validated against the dense-mask reference. The target's
+verify forward keeps its fast causal backends untouched.
 
 Parity contract, in order:
 
 1. Random-weight micro-config CPU unit tests comparing per-position
    base logits U_1..U_gamma, Markov-biased logits, and confidence
-   logits against the DeepSpec reference code (same pattern as the
-   MiniMax-M3 parity tests).
+   logits against the DeepSpec reference code (same pattern as
+   `tests/unit/test_minimax_m3_parity.py`).
 2. Real-checkpoint temperature-0 token-parity fixtures generated with
    the DeepSpec harness (Qwen3-4B target + `dspark_qwen3_4b_block7`) on
    a single short Modal GPU run (L4/A10 class, 24 GB fits both in
    BF16). Fixture generation needs an isolated venv: DeepSpec pins
-   transformers 5.10.2, we are on 5.12.
+   transformers 5.10.2, the repo pins 5.12.x for the MiniMax-M3 parity
+   reference.
 
 Existing golden tests are untouched: greedy verification emits the
 target's exact argmax by construction.
@@ -166,6 +182,15 @@ truncation; DSpark with threshold. EAGLE-3/DFlash comparisons are out
 Deliverable: a docs/benchmarks entry. This would be the first
 third-party measurement of any DSpark claim.
 
+The offline batch-1 metrics need no server. Any serving-level run goes
+through the open-loop harness (`scripts/http_openloop_bench.py`, Modal
+entrypoint `scripts/modal_openloop_bench.py`) with the KV pool sized
+via `MINI_INFER_NUM_BLOCKS` / `MINI_INFER_BLOCK_SIZE`; the 1024 x 16
+dev default holds about 16K token slots and OOMs under load. Direct
+`ModelRunner` construction (fixtures, `SpeculativeRunner` benches)
+takes the same values as kwargs, the env vars only cover the HTTP
+path.
+
 **Gate:** does our tau land in the paper's ballpark (about 3.5 chat,
 5.6 math on Qwen3-4B at block 7)? A large gap means either a port bug
 or a paper problem; both are findings worth writing up.
@@ -177,11 +202,33 @@ or a paper problem; both are findings worth writing up.
   non-anticipating constraint only bites here).
 - Multi-request speculative decoding inside `ContinuousScheduler`
   (rated LARGE: `_admit_waiting`, `_sample_decoders`, `_packed_forward`
-  all assume one token per request per step).
+  all assume one token per request per step, unchanged by #19). This
+  now also interacts with mid-step OOM preemption (ADR-024): a verify
+  chunk appends up to gamma K/V positions per request per step instead
+  of one, so mid-step allocation bursts grow by roughly gamma, the
+  8-block decode headroom drains roughly gamma times faster, and
+  preemption fires more often. The victim is cancelled outright, not
+  paused, so a preempted decoder loses its whole generation, and a
+  mid-append OOM leaves earlier slots with advanced counters and
+  allocated blocks but no written K/V, which `_preempt_on_oom` does not
+  roll back. Re-tune admission headroom and revisit the victim policy
+  as part of this work; see
+  `docs/decisions/ADR-024-engine-oom-preemption.md` and
+  `tests/unit/test_scheduler_oom.py`.
 - SPS(B) profiling plus the batch-global Algorithm 1 scheduler. This is
   the "first open implementation" opportunity, but it only demonstrates
   its value under multi-request load, so it cannot precede scheduler
-  integration.
+  integration. The open-loop harness (results in
+  `docs/benchmarks/2026-04-30-open-loop-rate-sweep.md`) already
+  measures the engine capacity curve under offered load; SPS(B)
+  profiling should extend that harness rather than build a new driver.
+- Sequencing note: `ContinuousScheduler` is not the only multi-request
+  scheduler. PDScheduler (`src/mini_infer/workers/pd_scheduler.py`,
+  plan in `docs/plans/pd-scheduler.md`) drives the disaggregated path
+  and its decode step is also one token per request per step
+  (`DecodeSession.step`). Stage D targets `ContinuousScheduler` only;
+  whether and when the PD path inherits spec decode is a decision to
+  record in the Stage A ADR so the scheduler rework does not fork.
 
 ## Risks
 
