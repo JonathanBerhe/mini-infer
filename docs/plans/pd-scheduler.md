@@ -1,14 +1,15 @@
 # Plan: PDScheduler (continuous batching for PD)
 
-> Status: proposed.
-> Date: 2026-05-16.
-> Replaces `PDStreamingScheduler`'s single-request serial path with a
+> Status: implemented (Slices 1-4 shipped; see ADR-017).
+> Date: 2026-05-16. Implemented: 2026-05-16 through 2026-05-17.
+> Replaced `PDStreamingScheduler`'s single-request serial path with a
 > multi-request scheduler that batches prefill + decode across
-> concurrent requests.
+> concurrent requests. `PDStreamingScheduler` no longer exists in the
+> codebase; `PDScheduler` is the only PD-path scheduler.
 
-## Context
+## Context (as of 2026-05-16, before this plan)
 
-Today's PD path (post-ADR-016) ships:
+The PD path (post-ADR-016) shipped:
 
 - `PrefillWorker.prefill_batch([requests]) -> [handoffs]` (batched prefill).
 - `DecodeWorker.decode_batch([handoffs]) -> [[int]]` (batched decode).
@@ -16,11 +17,11 @@ Today's PD path (post-ADR-016) ships:
 - `PDStreamingScheduler` (HTTP-shaped adapter; pulls requests off a
   queue, runs one through `Orchestrator.run_stream` at a time).
 
-The batched primitives exist but nothing drives them with multiple
+The batched primitives existed but nothing drove them with multiple
 concurrent requests. The HTTP server backed by `PDStreamingScheduler`
-processes requests strictly sequentially — first request runs
-prefill + decode end-to-end, second request waits until the first
-is done.
+processed requests strictly sequentially: first request ran
+prefill + decode end-to-end, second request waited until the first
+was done.
 
 This is the same throughput shape as a one-window food truck: one
 order, one cook, one plate at a time. The improvement path is
@@ -28,33 +29,37 @@ exactly what `ContinuousScheduler` does for non-PD: an admission
 queue + an engine loop that batches prefill chunks + batched decode
 forwards over all in-flight requests.
 
-## Goal
+## Goal (shipped)
 
-After this plan completes:
-
-1. **`PDScheduler`** exposes the same `start / stop / submit / run`
-   surface as `ContinuousScheduler` and `PDStreamingScheduler`, but
-   internally:
+1. **`PDScheduler`** (`src/mini_infer/workers/pd_scheduler.py`) exposes
+   the same `start / stop / submit / run` surface as
+   `ContinuousScheduler`. `PDStreamingScheduler` was removed entirely
+   rather than kept alongside it. Internally `PDScheduler`:
    - Admits multiple requests concurrently.
    - Batches prefill via `PrefillWorker.prefill_batch`.
-   - Batches decode via `DecodeWorker.decode_batch` (one forward per
+   - Batches decode via a long-lived `DecodeSession` (one forward per
      step, all alive decoders share it).
    - Streams tokens per-request to each handle's output queue.
    - Handles EOS / `max_tokens` / cancellation independently per
      request.
-2. **Greedy parity vs `ContinuousScheduler`** on N concurrent
-   requests: token-for-token identical output distributions.
-3. **HTTP toggle**: `MINI_INFER_USE_PD=1` continues to switch the
-   server to PD; the new scheduler replaces `PDStreamingScheduler`.
-4. **Bench** comparing PD vs single-request PD throughput on real
-   hardware (deferred until budget allows).
+2. **Greedy parity vs `ContinuousScheduler`** on N concurrent requests:
+   token-for-token identical output distributions. Covered by
+   `tests/unit/test_pd_scheduler_multi.py`.
+3. **HTTP toggle**: `MINI_INFER_USE_PD=1` switches the server to
+   `PDScheduler` (`src/mini_infer/api/server.py`); `MINI_INFER_PD_MODE`
+   picks `serial` or `parallel` (default `parallel`).
+4. **Bench**: `scripts/bench_pd_scheduler.py` covers the CPU
+   correctness/relative-speedup comparison. The 2x H100 Modal run
+   comparing real cross-GPU phase overlap is still deferred until
+   budget allows (see `roadmap-2026.md`); that part of this goal is
+   not yet closed out.
 
 ## Approach
 
-Mirror `ContinuousScheduler`'s structure (one engine thread, one
-running list, one waiting queue) but with the prefill and decode
-phases distinguished — so each iteration handles both phases of
-different requests in parallel.
+Mirrors `ContinuousScheduler`'s structure (one engine thread, one
+running list, one waiting queue), with the prefill and decode phases
+distinguished so each iteration handles both phases of different
+requests in parallel.
 
 | Phase | What runs | What stays the same |
 |---|---|---|
@@ -81,225 +86,221 @@ follow-on (where the PD throughput win actually shows up).
 
 ## Phased execution
 
-### Slice 1 — Single-thread PDScheduler
+### Slice 1 (shipped): single-thread PDScheduler, mode="serial"
 
 Drop-in replacement for `PDStreamingScheduler`. Same engine-thread
-pattern, but each step:
+pattern, each step:
 
 1. **Admit** waiting requests (up to `max_concurrent` total in-flight).
 2. **Prefill batch**: collect requests in `PREFILLING` state into a
    list; call `PrefillWorker.prefill_batch(...)`; the resulting
    handoffs transition those requests to `DECODING`.
-3. **Decode step**: for all requests in `DECODING` state, build the
-   per-request `last_token` list; call `DecodeWorker.decode_batch_step`
-   (a new lower-level entry point that runs ONE step over the existing
-   decode pool; doesn't loop internally). Each request gets one new
-   token; push to its handle's queue.
+3. **Decode step**: for all requests in `DECODING` state, call
+   `DecodeSession.step()`, which runs ONE batched decode forward over
+   the existing pool and returns `slot_id -> new_token`. Each request
+   gets one new token; push to its handle's queue.
 4. **Reap** requests that hit EOS / `max_tokens` / cancellation; emit
    terminal step.
 
-Per-request state stored in a `RunningRequest`-shaped struct (reuse
-`mini_infer.scheduler.request_state.RunningRequest` if it generalizes
-cleanly; new dataclass otherwise).
+Per-request state is stored in `mini_infer.scheduler.request_state.RunningRequest`,
+reused as planned.
 
-**Critical new primitive**: `DecodeWorker.decode_batch_step`. Today's
-`decode_batch` runs the full per-request loop internally. We need a
-per-step variant the scheduler drives:
+The per-step decode primitive landed as a `DecodeSession` class
+(`src/mini_infer/workers/decode_worker.py`), not as bare methods added
+to `DecodeWorker`:
 
 ```python
-class DecodeWorker:
+class DecodeSession:
     def add_handoff(self, handoff: KVHandoff) -> int:
-        """Materialize handoff into cache; return slot_idx."""
-        ...
+        """Materialize handoff into the cache; return slot_id."""
 
-    def step(self, slot_to_last_token: dict[int, int]) -> dict[int, int]:
-        """Run one batched decode forward; return slot_idx -> new_token."""
-        ...
+    def step(self) -> dict[int, int]:
+        """Run one batched decode forward; return slot_id -> new_token."""
 
-    def remove_slot(self, slot_idx: int) -> None:
+    def remove_slot(self, slot_id: int) -> None:
         """Free the slot (cancellation, EOS, max_tokens)."""
-        ...
 ```
 
-The current `decode_batch(handoffs)` becomes a convenience composition
-over `add_handoff` + repeated `step` + `remove_slot`.
+`DecodeWorker.decode_batch(handoffs)` stayed as a convenience
+composition over a `DecodeSession` for callers that still want the
+whole-loop entry point (existing tests kept passing through the
+refactor, as planned).
 
-**Deliverable**: ~350 LoC source (`workers/pd_scheduler.py` + small
-addition to `decode_worker.py`) + ~250 LoC tests. Single commit.
+**Delivered**: `src/mini_infer/workers/pd_scheduler.py` +
+`DecodeSession` in `decode_worker.py`, plus
+`tests/unit/test_pd_scheduler_multi.py`.
 
-**Test contract**: greedy parity vs `ContinuousScheduler` on N=4
-concurrent requests with different `max_tokens` budgets and one
-mid-stream cancel.
+**Test contract met**: greedy parity vs `ContinuousScheduler` on
+concurrent requests with different `max_tokens` budgets and mid-stream
+cancellation.
 
-### Slice 2 — Two-thread PDScheduler
+### Slice 2 (shipped): two-thread PDScheduler, mode="parallel"
 
-Prefill and decode each run on their own thread. A handoff queue
-sits between them. Decode pool grows when handoffs arrive, shrinks
-on EOS / `max_tokens` / cancel.
+Prefill and decode each run on their own thread. A bounded handoff
+queue sits between them (`maxsize=max_concurrent`, giving
+backpressure). The decode pool grows when handoffs arrive, shrinks on
+EOS / `max_tokens` / cancel.
 
-Why two-thread matters for real PD: on a 2× GPU host (one prefill, one
-decode), the GPUs idle in Variant A whenever the engine thread is
-in the other phase. Two-thread lets the GPUs run continuously.
+Two-thread mode matters for real PD: on a 2-GPU host (one prefill, one
+decode), the GPUs idle in `mode="serial"` whenever the engine thread is
+in the other phase. Two-thread lets both GPUs run continuously.
 
-**Deliverable**: extends `pd_scheduler.py` with a thread mode; ~200
-LoC additional + ~150 LoC tests. Single commit.
+**Delivered**: `pd_scheduler.py` gained the `mode: Literal["serial",
+"parallel"]` constructor parameter; both modes live in the same file
+and share the same test contract.
 
-**Test contract**: same greedy parity vs Slice 1 on the same
-workload. The output distribution must not depend on the threading
-mode.
+**Test contract met**: same greedy parity as Slice 1 on the same
+workload, with `mode="parallel"`. Output distribution does not depend
+on the threading mode.
 
-### Slice 3 — Server wiring
+### Slice 3 (shipped): server wiring
 
-Replace `PDStreamingScheduler` in `api/server.py` with `PDScheduler`
-when `MINI_INFER_USE_PD=1`. Add a `MINI_INFER_PD_MODE` env var to
-pick between `single` / `serial` / `parallel` (`serial` = Variant A,
-`parallel` = Variant B); default `parallel`.
+`PDStreamingScheduler` was removed from `api/server.py` (not kept as a
+fallback); `PDScheduler` backs `/v1/completions` when
+`MINI_INFER_USE_PD=1`. `MINI_INFER_PD_MODE` picks `serial` or
+`parallel` (default `parallel`, matching this plan's stated default).
 
-**Deliverable**: ~50 LoC server edits + ~50 LoC API-level tests.
-Single commit.
+**Delivered**: `src/mini_infer/api/server.py` swap; API-level coverage
+in the existing HTTP test suite.
 
-### Slice 4 — Bench + ADR
+### Slice 4 (partially shipped): bench + ADR
 
-ADR-017 documents the design, the variants A / B, the
-`decode_batch_step` decomposition, and the test contract.
+ADR-017 (`docs/decisions/ADR-017-pd-scheduler.md`, Accepted) documents
+the design, both modes, the `DecodeSession` decomposition, and the
+test contract.
 
-Bench script `scripts/bench_pd_scheduler.py` runs N=1, 2, 4, 8, 16
-concurrent requests through both `ContinuousScheduler` and
-`PDScheduler` (Variants A and B); reports tok/s + per-request
-latency.
+`scripts/bench_pd_scheduler.py` runs concurrent requests through both
+`ContinuousScheduler` and `PDScheduler` (both modes) and reports
+tok/s + per-request latency on CPU. The CPU bench is in; the 2x H100
+Modal run comparing real cross-GPU phase overlap has not been run yet
+(still gated on Modal budget, see `roadmap-2026.md`).
 
-CPU bench is informative (Variant A vs single-request) and free.
-GPU bench (Variant B's parallel phases) requires Modal hardware
+CPU bench is informative (`mode="serial"` vs single-request) and free.
+GPU bench (`mode="parallel"`'s phase overlap) requires Modal hardware
 when budget allows.
 
-**Deliverable**: ~300 LoC ADR-017 + ~200 LoC bench script. Single
-commit.
+## Decisions made
 
-## Decisions to confirm before implementation
-
-1. **One thread vs two thread.** Slice 1 is single-thread; Slice 2
-   adds the two-thread variant. We ship both. The default mode
-   (Variant A vs B) is configurable.
-2. **`max_concurrent`**: how many requests can be in-flight at once?
-   Bounded by KV pool capacity. Default 16 (matches
-   `ContinuousScheduler`).
-3. **Admission policy**: FIFO from the waiting queue. Same as
-   `ContinuousScheduler`. No prefix-cache-aware admission yet (that's
-   a follow-up).
-4. **Prefill chunking inside a batch**: do we chunk long prompts (per
-   `ContinuousScheduler`'s chunked-prefill) or run them whole-prompt?
-   For the first ship: whole-prompt. Chunked-prefill in PD is a
-   non-trivial follow-up because the per-request prefill chunks would
-   each produce a partial KV that the decode worker doesn't yet know
-   how to consume mid-prefill.
-5. **What happens when the KV pool fills**: today
-   `ContinuousScheduler` raises `OOMError` and the API server returns
-   503. Same behaviour here; no preemption.
-6. **Failure mode for one request**: if `PrefillWorker.prefill_batch`
-   raises (e.g., tokenizer error on one prompt), do we fail the whole
-   batch or just that request? For the first ship: fail the whole
-   batch and re-enqueue the survivors. Same recovery shape as a
-   transient model error.
+1. **One thread vs two thread.** Both shipped: `mode="serial"`
+   (Slice 1) and `mode="parallel"` (Slice 2), selected by a
+   constructor parameter. Server default is `parallel`
+   (`MINI_INFER_PD_MODE`).
+2. **`max_concurrent`**: bounded by KV pool capacity.
+   `PDScheduler.DEFAULT_MAX_CONCURRENT = 16`, matching
+   `ContinuousScheduler`. In `mode="parallel"` it also sizes the
+   handoff queue (`maxsize=max_concurrent`), which is what provides
+   backpressure between the two threads.
+3. **Admission policy**: FIFO from the waiting queue, same as
+   `ContinuousScheduler`. No prefix-cache-aware admission; still an
+   open follow-up.
+4. **Prefill chunking inside a batch**: shipped as whole-prompt, as
+   planned. Chunked-prefill in PD remains an open follow-up for the
+   same reason: per-request prefill chunks would each produce a
+   partial KV that the decode session doesn't yet know how to consume
+   mid-prefill.
+5. **What happens when the KV pool fills**: as planned, no
+   preemption. `PrefillWorker.prefill_batch` raising propagates as a
+   batch failure (see decision 6); `ContinuousScheduler`'s separate
+   OOM-preemption path (ADR-024) was not carried over to `PDScheduler`.
+6. **Failure mode for one request**: shipped narrower than planned. If
+   `PrefillWorker.prefill_batch` raises, `_run_prefill_batch` fails the
+   whole batch and emits a terminal `cancelled` step for every request
+   in it (`src/mini_infer/workers/pd_scheduler.py`, `_run_prefill_batch`).
+   The plan's "re-enqueue the survivors" was not implemented; a batch
+   failure currently drops every request in that batch rather than
+   retrying any of them. Worth a follow-up if partial-batch prefill
+   failures turn out to be common in practice.
 
 ## Modal cost
 
-- **Slice 1, 2, 3**: zero Modal cost. CPU multi-process + small models
-  on M1 are enough for correctness.
-- **Slice 4 bench on CPU**: zero Modal cost. Validates relative
-  speedups between single-request and batched.
-- **Slice 4 bench on GPU** (deferred until Modal spend cycle): ~$3-5
-  for an end-to-end throughput run on 2× H100 with Qwen2.5-7B.
+- **Slices 1, 2, 3**: shipped at zero Modal cost, as planned. CPU
+  multi-process + small models on M1 covered correctness.
+- **Slice 4 bench on CPU**: shipped at zero Modal cost. Validates
+  relative speedups between single-request and batched.
+- **Slice 4 bench on GPU** (still deferred): ~$3-5 for an end-to-end
+  throughput run on 2x H100 with Qwen2.5-7B. Not yet run; see
+  `roadmap-2026.md` for when Modal budget opens up for this.
 
-Total to ship Slices 1-4 (excluding the GPU bench): zero Modal
-spend. The throughput claims that require real hardware get added
-post-budget-reset.
+Total spent to ship Slices 1-4 (excluding the still-deferred GPU
+bench): zero Modal spend, as planned.
 
-## Risks
+## Risks (as identified during planning; see ADR-017 for how each landed)
 
-1. **Per-step decode-batch primitive doesn't exist yet.** Today's
-   `decode_batch` runs the whole decode loop internally; we need
-   `add_handoff` / `step` / `remove_slot`. Refactoring the existing
-   path while keeping `decode_batch(handoffs)` working as a
-   convenience wrapper is the cleanest approach but does touch
-   `decode_worker.py`. Risk: the existing batched-parity tests need
-   to keep passing during the refactor.
-2. **Cancellation correctness across slots.** Today
-   `Orchestrator.run_stream` cancels by stopping the loop; in a
-   batched scheduler, mid-batch cancellation needs to mark the slot
-   dead AND keep the forward shape constant (feed a no-op token,
-   discard output). The pattern is already in
-   `_decode_loop_batch`'s heterogeneous-max-tokens test — generalising
-   it for explicit `cancel_event` is the actual work.
-3. **Slot recycling at the KV pool level.** Each EOS / max-tokens
-   frees the slot, but the cache's `remove_request(batch_idx)` shifts
-   later indices down by 1. The scheduler's mapping `request_id ->
-   slot_idx` has to track that shift. `ContinuousScheduler` already
-   handles it; we copy the pattern.
-4. **Variant B's two-thread synchronisation.** Producer/consumer queue
-   between the prefill thread and the decode thread. Standard
-   pattern; risk is correctness (no dropped handoffs on shutdown,
-   no double-add).
+1. **Per-step decode-batch primitive doesn't exist yet.** Resolved:
+   landed as the `DecodeSession` class (`add_handoff` / `step` /
+   `remove_slot`) in `decode_worker.py`, with `decode_batch(handoffs)`
+   kept as a convenience wrapper. Existing batched-parity tests stayed
+   green through the refactor.
+2. **Cancellation correctness across slots.** Resolved: mid-batch
+   cancellation marks the slot dead and keeps the forward shape
+   constant, generalizing the pattern already exercised by
+   `_decode_loop_batch`'s heterogeneous-max-tokens test.
+3. **Slot recycling at the KV pool level.** Resolved: the scheduler's
+   `slot_id -> RunningRequest` mapping tracks the index shift from
+   `remove_request(batch_idx)`, following the pattern already used by
+   `ContinuousScheduler`.
+4. **Parallel mode's two-thread synchronization.** Resolved: a bounded
+   producer/consumer queue (`_handoff_queue`, `maxsize=max_concurrent`)
+   connects the prefill and decode threads; the bound is also what
+   provides backpressure.
 
-## Files to create / modify
+## Files created / modified (as shipped)
 
-NEW source:
+Source:
 
-- `src/mini_infer/workers/pd_scheduler.py` — the new class. Slices 1
-  + 2 land in the same file with a `mode="serial" | "parallel"`
-  parameter.
+- `src/mini_infer/workers/pd_scheduler.py` (new): `PDScheduler`.
+  Slices 1 + 2 landed in the same file with the
+  `mode="serial" | "parallel"` parameter.
+- `src/mini_infer/workers/decode_worker.py` (edited): added the
+  `DecodeSession` class (`add_handoff`, `step`, `remove_slot`).
+  `decode_batch(handoffs)` kept as a convenience wrapper.
+- `src/mini_infer/workers/__init__.py` (edited): exports `PDScheduler`.
+- `src/mini_infer/api/server.py` (edited): `PDStreamingScheduler`
+  removed and replaced by `PDScheduler`. Added `MINI_INFER_PD_MODE`.
+- `README.md` (edited): documents `MINI_INFER_USE_PD` and
+  `MINI_INFER_PD_MODE` in the HTTP server section.
 
-EDIT source:
+Docs:
 
-- `src/mini_infer/workers/decode_worker.py` — add `add_handoff`,
-  `step`, `remove_slot`. Keep `decode_batch(handoffs)` as a
-  convenience wrapper over the new primitives so existing tests
-  stay green.
-- `src/mini_infer/workers/__init__.py` — export `PDScheduler`.
-- `src/mini_infer/api/server.py` — swap `PDStreamingScheduler` for
-  `PDScheduler`. Add `MINI_INFER_PD_MODE` env var.
-- `README.md` — update the HTTP server section to mention the new
-  mode env var.
+- `docs/decisions/ADR-017-pd-scheduler.md` (new): the design ADR,
+  Accepted.
 
-NEW docs:
+Scripts:
 
-- `docs/decisions/ADR-017-pd-scheduler.md` — the design ADR.
+- `scripts/bench_pd_scheduler.py` (new): CPU bench, shipped. Modal GPU
+  bench still deferred.
 
-NEW scripts:
+Tests:
 
-- `scripts/bench_pd_scheduler.py` — CPU bench (free) + Modal bench
-  (deferred).
+- `tests/unit/test_pd_scheduler_multi.py` (new): the scheduler's test
+  file (named `_multi` rather than the plan's `test_pd_scheduler.py`).
 
-NEW tests:
+## Verification (results)
 
-- `tests/unit/test_pd_scheduler.py` — new test file for the
-  scheduler. Per-slice test additions in the same file.
-
-## Verification
-
-Slice-by-slice:
-
-1. **Slice 1**: 4 concurrent requests run through `PDScheduler`;
-   greedy output token-for-token identical to running each through
-   `ContinuousScheduler` separately. Block-pool fully free after
-   each run.
-2. **Slice 2**: same workload, same output, but with `mode="parallel"`.
-   Asserts cross-thread correctness (no dropped handoffs, no double-
-   emit). Performance is NOT asserted at this stage (just correctness).
-3. **Slice 3**: existing API tests (`test_api.py`) pass with
-   `MINI_INFER_USE_PD=1 MINI_INFER_PD_MODE=parallel`. 4 concurrent
-   HTTP streaming requests all complete with the expected tokens.
-4. **Slice 4**: CPU bench prints throughput tables; user-readable
-   comparison vs single-request PD. ADR-017 records the design.
+1. **Slice 1**: concurrent requests through `PDScheduler` in
+   `mode="serial"` produce greedy output token-for-token identical to
+   running each through `ContinuousScheduler` separately. Block-pool
+   fully frees after each run. Covered by
+   `tests/unit/test_pd_scheduler_multi.py`.
+2. **Slice 2**: same workload, same output, with `mode="parallel"`.
+   Cross-thread correctness holds (no dropped handoffs, no double
+   emit).
+3. **Slice 3**: the server's HTTP test coverage passes with
+   `MINI_INFER_USE_PD=1 MINI_INFER_PD_MODE=parallel`; concurrent HTTP
+   streaming requests complete with the expected tokens.
+4. **Slice 4**: the CPU bench prints throughput tables comparing
+   `PDScheduler` against `ContinuousScheduler` and against
+   single-request PD. ADR-017 records the design. The GPU bench is
+   still outstanding.
 
 ## What this gets us
 
-After Slice 4: the PD path supports the same multi-request
-concurrency as `ContinuousScheduler`. The HTTP server backed by PD
-becomes a real concurrent serving target, not a single-request
-demo. Internally, the engine demonstrates the production pattern of
-"separate prefill + decode workers with continuous batching across
-both" — the actual technique vLLM and SGLang use in their
-disaggregated modes.
+The PD path supports the same multi-request concurrency as
+`ContinuousScheduler`. The HTTP server backed by PD is a real
+concurrent serving target, not a single-request demo. Internally, the
+engine demonstrates the production pattern of "separate prefill and
+decode workers with continuous batching across both": the actual
+technique vLLM and SGLang use in their disaggregated modes.
 
 Aligned with the research-paper-engine niche under the "production
 techniques in readable code" axis: the PD scheduler is the
