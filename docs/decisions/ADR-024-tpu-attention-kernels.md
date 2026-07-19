@@ -147,3 +147,38 @@ paged prefill (MHA and GQA), all cosine >= 0.999995 vs the NumPy reference,
 exit 0 (commit 83321f8). The small (1, 1) and (q_len, 1) VMEM scratch shapes
 lowered without issue. The on-TPU confirmation step called out in Consequences
 is complete; results in docs/benchmarks/2026-07-09-tpu-v5e-pallas-kernels.md.
+
+## Amendment (2026-07-09): mixed prefill/decode batches in one launch
+
+The "planned extension" in Consequences is now implemented:
+`pallas_paged_mixed_attention` serves a batch where some sequences are decoding
+(one new token) and some are prefilling (a chunk of new tokens) in a single
+kernel launch, the distribution-aware case the RPA design targets. Without it,
+an engine running continuous batching must split every scheduler step into a
+decode launch plus a prefill launch.
+
+Design, relative to the uniform prefill kernel:
+
+- Queries are padded to the batch-wide `max_q_len`, and a per-sequence `q_lens`
+  array rides in SMEM as a THIRD scalar-prefetch input next to the block table
+  and lengths. Row `t` of sequence `s` is real only if `t < q_lens[s]`; the
+  causal mask becomes `k_pos <= lengths[s] - q_lens[s] + t`, with `q_lens[s]` a
+  runtime scalar where the prefill kernel had a compile-time constant.
+  `q_lens[s] == 0` marks an inactive batch slot, which continuous batching
+  produces naturally.
+- Padding rows exposed a real online-softmax trap: a row with EVERY score
+  masked keeps its running max at the sentinel, so `exp(score - max)` is
+  `exp(0) == 1` at all masked positions and the row would silently return a
+  plausible-looking average of unrelated values. The kernel zeroes masked
+  probabilities explicitly and safe-divides at finalize, so padding rows are
+  exact zeros (a tested contract, not an accident).
+- Layouts are unchanged from the prefill kernel (q transposed, pools
+  heads-first), so no new Mosaic tiling surface is introduced.
+
+The specialized decode and prefill kernels stay: they skip the padding waste
+(decode pays `max_q_len` times its query bandwidth through the mixed kernel)
+and they are the hardware-validated baselines the mixed kernel is tested
+against, per sequence, in tests/unit/test_tpu_pallas_mixed.py. Interpret-mode
+parity is complete (NumPy and PyTorch references, GQA included); on-TPU
+validation rides scripts/run_tpu_pallas_kernels.py, which now includes two
+mixed cases with shuffled physical pages, in the next Colab run.

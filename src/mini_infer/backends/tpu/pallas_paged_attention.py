@@ -38,9 +38,12 @@ sequence's real pages contribute nothing. Slots past a sequence's pages still
 gather some in-bounds dummy page (the caller sets them to a valid index); masking
 makes their contribution zero, so the result is independent of the dummy.
 
-Scope: this kernel supports grouped-query attention (num_kv_heads divides
-num_heads; query head h reads kv head h // (num_heads // num_kv_heads)) and runs
-in interpret mode. On-TPU execution is a follow-up (see ADR-023).
+Scope: this module holds the paged kernel family: single-token decode, uniform
+prefill / multi-query, and mixed prefill/decode batches. All support
+grouped-query attention (num_kv_heads divides num_heads; query head h reads kv
+head h // (num_heads // num_kv_heads)) and run in interpret mode on CPU.
+On-TPU validation goes through scripts/run_tpu_pallas_kernels.py (results in
+docs/benchmarks/, design in ADR-024).
 
 JAX is optional and import-guarded exactly as in pallas_softmax.py /
 pallas_attention.py. With plain `jax` (no `jax[tpu]`), pass `interpret=True` to
@@ -532,6 +535,259 @@ if _JAX_AVAILABLE:
             interpret=interpret,
         )
 
+    def _paged_mixed_launch(
+        q: Array,
+        k_pages: Array,
+        v_pages: Array,
+        block_tables: Array,
+        lengths: Array,
+        q_lens: Array,
+        *,
+        scale: float,
+        interpret: bool,
+    ) -> Array:
+        """Launch paged attention over a mixed prefill/decode batch.
+
+        Like the prefill launch, but the number of real query tokens is a
+        PER-SEQUENCE runtime value (q_lens, scalar-prefetched next to the block
+        table): row t of sequence s is real only if t < q_lens[s]. Real rows sit
+        at the last q_lens[s] absolute positions of the context and attend
+        causally; padding rows have no visible keys and finalize to exact zeros.
+        """
+        num_seqs, max_q_len, num_heads, head_dim = q.shape
+        num_kv_heads, _num_pages, page_size, _ = k_pages.shape
+        max_pages = block_tables.shape[1]
+        q_per_kv = num_heads // num_kv_heads
+
+        grid = (num_seqs, num_heads, max_pages)
+
+        def kernel(
+            block_tables_ref: Any,
+            lengths_ref: Any,
+            q_lens_ref: Any,
+            q_ref: Any,
+            k_ref: Any,
+            v_ref: Any,
+            out_ref: Any,
+            m_scratch: Any,
+            l_scratch: Any,
+            acc_scratch: Any,
+        ) -> None:
+            del block_tables_ref  # used only by the index_maps
+            seq_index = pl.program_id(0)
+            page_index = pl.program_id(2)
+            num_page_steps = pl.num_programs(2)
+
+            @pl.when(page_index == 0)  # type: ignore[untyped-decorator]
+            def _init() -> None:
+                m_scratch[...] = jnp.full_like(m_scratch, _MASK_NEG)
+                l_scratch[...] = jnp.zeros_like(l_scratch)
+                acc_scratch[...] = jnp.zeros_like(acc_scratch)
+
+            length = lengths_ref[seq_index]
+            q_len_s = q_lens_ref[seq_index]  # real query rows for this sequence
+            q_mat = q_ref[...].reshape(max_q_len, head_dim)
+            k = k_ref[...].reshape(page_size, head_dim)
+            v = v_ref[...].reshape(page_size, head_dim)
+
+            scores = jax.lax.dot_general(
+                q_mat,
+                k,
+                (((1,), (1,)), ((), ())),  # contract head_dim
+                preferred_element_type=jnp.float32,
+            )
+            scores = scores * scale  # (max_q_len, page_size)
+
+            # The prefill kernel's causal-by-absolute-position mask, with q_len
+            # now a per-sequence runtime scalar, plus a row-validity term:
+            # padding rows (t >= q_lens[s]) see no keys at all.
+            row_ids = jax.lax.broadcasted_iota(jnp.int32, (max_q_len, page_size), 0)
+            q_pos = (length - q_len_s) + row_ids
+            k_pos = page_index * page_size + jax.lax.broadcasted_iota(
+                jnp.int32, (max_q_len, page_size), 1
+            )
+            valid = (k_pos <= q_pos) & (row_ids < q_len_s)
+            scores = jnp.where(valid, scores, _MASK_NEG)
+
+            m_prev = m_scratch[...]  # (max_q_len, 1)
+            l_prev = l_scratch[...]  # (max_q_len, 1)
+            acc_prev = acc_scratch[...]  # (max_q_len, head_dim)
+
+            m_cur = jnp.max(scores, axis=-1, keepdims=True)
+            m_new = jnp.maximum(m_prev, m_cur)
+            p = jnp.exp(scores - m_new)
+            # A fully-masked row keeps its running max at the sentinel, so
+            # exp(score - max) is exp(0) == 1 at every masked position; without
+            # this zeroing, padding rows would silently average the gathered
+            # (meaningless) values instead of staying empty.
+            p = jnp.where(valid, p, 0.0)
+            correction = jnp.exp(m_prev - m_new)
+            l_new = correction * l_prev + jnp.sum(p, axis=-1, keepdims=True)
+            acc_new = correction * acc_prev + jax.lax.dot_general(
+                p,
+                v,
+                (((1,), (0,)), ((), ())),  # contract page_size
+                preferred_element_type=jnp.float32,
+            )
+
+            m_scratch[...] = m_new
+            l_scratch[...] = l_new
+            acc_scratch[...] = acc_new
+
+            @pl.when(page_index == num_page_steps - 1)  # type: ignore[untyped-decorator]
+            def _finalize() -> None:
+                l_final = l_scratch[...]
+                # Padding rows accumulated nothing (l == 0); divide those by 1
+                # so they finalize to exact zeros instead of 0/0.
+                safe_l = jnp.where(l_final > 0.0, l_final, 1.0)
+                out_ref[...] = (
+                    (acc_scratch[...] / safe_l).reshape(out_ref.shape).astype(out_ref.dtype)
+                )
+
+        # Same layouts as the prefill launch (q carried transposed, pools
+        # heads-first, for the TPU tiling rule); the index_maps gain the q_lens
+        # prefetch argument.
+        q_spec = pl.BlockSpec((1, 1, max_q_len, head_dim), lambda s, h, p, bt, ln, ql: (s, h, 0, 0))
+        out_spec = pl.BlockSpec(
+            (1, 1, max_q_len, head_dim), lambda s, h, p, bt, ln, ql: (s, h, 0, 0)
+        )
+        kv_block = (1, 1, page_size, head_dim)
+        k_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln, ql: (h // q_per_kv, bt[s, p], 0, 0))
+        v_spec = pl.BlockSpec(kv_block, lambda s, h, p, bt, ln, ql: (h // q_per_kv, bt[s, p], 0, 0))
+
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,  # block_tables, lengths, q_lens
+            grid=grid,
+            in_specs=[q_spec, k_spec, v_spec],
+            out_specs=out_spec,
+            scratch_shapes=[
+                pltpu.VMEM((max_q_len, 1), jnp.float32),
+                pltpu.VMEM((max_q_len, 1), jnp.float32),
+                pltpu.VMEM((max_q_len, head_dim), jnp.float32),
+            ],
+        )
+
+        qt = jnp.swapaxes(q, 1, 2)  # (num_seqs, num_heads, max_q_len, head_dim)
+        result: Array = pl.pallas_call(
+            kernel,
+            grid_spec=grid_spec,
+            out_shape=jax.ShapeDtypeStruct(qt.shape, q.dtype),
+            interpret=interpret,
+        )(block_tables, lengths, q_lens, qt, k_pages, v_pages)
+        return jnp.swapaxes(result, 1, 2)
+
+    def pallas_paged_mixed_attention(
+        q: Array,
+        k_pages: Array,
+        v_pages: Array,
+        block_tables: Array,
+        lengths: Array,
+        q_lens: Array,
+        *,
+        scale: float | None = None,
+        interpret: bool = False,
+    ) -> Array:
+        """Paged attention over a mixed prefill/decode batch, in one launch.
+
+        Continuous batching schedules prefill chunks and single-token decode
+        steps in the same iteration. The decode and prefill kernels above each
+        serve one of those shapes, which would force the engine to split every
+        step's batch into two launches. This kernel serves both at once, the
+        distribution-aware case the Ragged Paged Attention design targets: the
+        batch is ragged in the QUERY axis too, so per-sequence query counts ride
+        next to the block table as scalar prefetch.
+
+        Every sequence's queries are padded to the batch-wide max_q_len. Row t
+        of sequence s is real only if t < q_lens[s]: a decode sequence has
+        q_lens[s] == 1, a prefill chunk q_lens[s] > 1, and q_lens[s] == 0 marks
+        an inactive batch slot. Real rows occupy the last q_lens[s] absolute
+        positions of the context (row t sits at position
+        lengths[s] - q_lens[s] + t) and attend causally, exactly as in the
+        prefill kernel. Padding rows come back as exact zeros.
+
+        Args:
+            q: queries padded on the row axis,
+                `(num_seqs, max_q_len, num_heads, head_dim)`; rows at or past
+                `q_lens[s]` are ignored.
+            k_pages: key cache pool, heads-first
+                `(num_kv_heads, num_pages, page_size, head_dim)`.
+            v_pages: value cache pool, same shape as `k_pages`.
+            block_tables: `(num_seqs, max_pages)` int page table (see the decode
+                kernel).
+            lengths: `(num_seqs,)` int total context length per sequence,
+                including that sequence's `q_lens[s]` query tokens.
+            q_lens: `(num_seqs,)` int count of real query rows per sequence.
+                Values must satisfy `0 <= q_lens[s] <= min(max_q_len, lengths[s])`.
+                That is a caller contract: the values are runtime data (they may
+                be traced), so it cannot be validated here.
+            scale: softmax scale. Defaults to `1/sqrt(head_dim)`.
+            interpret: run in Pallas interpret mode on CPU (no TPU needed).
+
+        Returns:
+            `(num_seqs, max_q_len, num_heads, head_dim)`, dtype of `q`; rows at
+            or past `q_lens[s]` are exact zeros.
+
+        Raises:
+            RuntimeError: if JAX is not installed.
+            ValueError: on rank/shape mismatch or an unclean head grouping.
+        """
+        if not _JAX_AVAILABLE:
+            raise RuntimeError(
+                "JAX is not available; install the 'tpu' extra "
+                "(uv sync --extra tpu) to use the Pallas paged attention kernel"
+            )
+        if q.ndim != 4:
+            raise ValueError(
+                "q must be (num_seqs, max_q_len, num_heads, head_dim) for a mixed "
+                f"batch; got rank {q.ndim}"
+            )
+        if k_pages.ndim != 4 or v_pages.shape != k_pages.shape:
+            raise ValueError(
+                "k_pages and v_pages must be heads-first (num_kv_heads, num_pages, "
+                f"page_size, head_dim) and identical; got {k_pages.shape} and {v_pages.shape}"
+            )
+        num_seqs = q.shape[0]
+        if block_tables.ndim != 2 or block_tables.shape[0] != num_seqs:
+            raise ValueError(
+                "block_tables must be (num_seqs, max_pages) matching q's num_seqs; "
+                f"got {block_tables.shape} for num_seqs={num_seqs}"
+            )
+        if lengths.ndim != 1 or lengths.shape[0] != num_seqs:
+            raise ValueError(
+                f"lengths must be (num_seqs,); got {lengths.shape} for num_seqs={num_seqs}"
+            )
+        if q_lens.ndim != 1 or q_lens.shape[0] != num_seqs:
+            raise ValueError(
+                f"q_lens must be (num_seqs,); got {q_lens.shape} for num_seqs={num_seqs}"
+            )
+
+        num_heads, head_dim = q.shape[2], q.shape[3]
+        num_kv_heads = k_pages.shape[0]
+        if num_kv_heads == 0 or num_heads % num_kv_heads != 0:
+            raise ValueError(
+                "num_heads must be a positive multiple of num_kv_heads for "
+                f"grouped-query attention; got {num_heads} query heads and "
+                f"{num_kv_heads} kv heads"
+            )
+        if k_pages.shape[3] != head_dim:
+            raise ValueError(f"head_dim mismatch: q has {head_dim}, k_pages has {k_pages.shape[3]}")
+
+        effective_scale = scale if scale is not None else 1.0 / (head_dim**0.5)
+        block_tables = block_tables.astype(jnp.int32)
+        lengths = lengths.astype(jnp.int32)
+        q_lens = q_lens.astype(jnp.int32)
+
+        return _paged_mixed_launch(
+            q,
+            k_pages,
+            v_pages,
+            block_tables,
+            lengths,
+            q_lens,
+            scale=effective_scale,
+            interpret=interpret,
+        )
+
 else:
 
     def pallas_paged_attention(
@@ -560,6 +816,23 @@ else:
         v_pages: Any,
         block_tables: Any,
         lengths: Any,
+        *,
+        scale: float | None = None,
+        interpret: bool = False,
+    ) -> Any:
+        """Fallback when JAX is absent; gate on `supports_pallas_paged_attention()`."""
+        raise RuntimeError(
+            "JAX is not available; install the 'tpu' extra "
+            "(uv sync --extra tpu) to use the Pallas paged attention kernel"
+        )
+
+    def pallas_paged_mixed_attention(
+        q: Any,
+        k_pages: Any,
+        v_pages: Any,
+        block_tables: Any,
+        lengths: Any,
+        q_lens: Any,
         *,
         scale: float | None = None,
         interpret: bool = False,

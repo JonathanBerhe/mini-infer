@@ -2,11 +2,12 @@
 """Run the Pallas TPU attention kernels on a real TPU and check parity.
 
 The rest of the TPU backend (ADR-023) is validated in Pallas interpret mode on
-CPU. This script is the on-hardware follow-up: it runs the dense, paged, and
-grouped-query kernels with interpret=False on an actual TPU, checks each against
-a NumPy reference (cosine similarity > 0.99, the ADR-023 bar), and prints a short
-timing so Mosaic's lowering of the scalar-prefetch page gather and the VMEM
-scratch state can be confirmed on real silicon.
+CPU. This script is the on-hardware follow-up: it runs the dense, paged decode,
+paged prefill, and mixed prefill/decode kernels (multi-head and grouped-query)
+with interpret=False on an actual TPU, checks each against a NumPy reference
+(cosine similarity > 0.99, the ADR-023 bar), and prints a short timing so
+Mosaic's lowering of the scalar-prefetch page gather and the VMEM scratch state
+can be confirmed on real silicon.
 
 Run on a free TPU (Google Colab TPU runtime, or a Kaggle TPU notebook):
 
@@ -138,6 +139,61 @@ def _make_prefill(num_seqs, q_len, num_heads, num_kv_heads, head_dim, page_size,
     return q, k_pages, v_pages, block_tables, lengths
 
 
+def _mixed_reference(q, k_pages, v_pages, block_tables, lengths, q_lens, scale):
+    num_seqs, _max_q_len, num_heads, _ = q.shape
+    num_kv_heads = k_pages.shape[0]
+    q_per_kv = num_heads // num_kv_heads
+    max_pages = block_tables.shape[1]
+    out = np.zeros_like(q)
+    for s in range(num_seqs):
+        length = int(lengths[s])
+        q_len_s = int(q_lens[s])
+        k_full = np.concatenate(
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        k_ids = np.arange(k_full.shape[1])
+        for h in range(num_heads):
+            kv = h // q_per_kv
+            for t in range(q_len_s):
+                q_pos = length - q_len_s + t
+                scores = (k_full[kv] @ q[s, t, h]) * scale
+                scores = np.where(k_ids <= q_pos, scores, -1e30)
+                scores = scores - scores.max()
+                weights = np.exp(scores)
+                weights /= weights.sum()
+                out[s, t, h] = weights @ v_full[kv]
+    return out
+
+
+def _make_mixed(q_lens, num_heads, num_kv_heads, head_dim, page_size, max_pages, seed):
+    # Physical pages are assigned through a random permutation so the on-TPU run
+    # also proves the block-table gather (not just sequential page reads).
+    rng = np.random.default_rng(seed)
+    q_lens = np.asarray(q_lens, dtype=np.int32)
+    num_seqs = q_lens.shape[0]
+    max_q_len = max(int(q_lens.max()), 1)
+    num_pages = num_seqs * max_pages + 2
+    perm = rng.permutation(num_pages)
+    q = rng.standard_normal((num_seqs, max_q_len, num_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
+    lengths = np.zeros((num_seqs,), dtype=np.int32)
+    cursor = 0
+    for s in range(num_seqs):
+        length = int(rng.integers(max(int(q_lens[s]), 1), max_pages * page_size + 1))
+        lengths[s] = length
+        n_used = (length + page_size - 1) // page_size
+        for pi in range(max_pages):
+            block_tables[s, pi] = perm[cursor] if pi < n_used else int(perm[0])
+            if pi < n_used:
+                cursor += 1
+    return q, k_pages, v_pages, block_tables, lengths, q_lens
+
+
 def _timed(jax, fn, iters=20):
     out = fn()
     jax.block_until_ready(out)  # trigger compile / first run
@@ -164,6 +220,7 @@ def main() -> int:
     from mini_infer.backends.tpu.pallas_attention import pallas_attention
     from mini_infer.backends.tpu.pallas_paged_attention import (
         pallas_paged_attention,
+        pallas_paged_mixed_attention,
         pallas_paged_prefill_attention,
     )
 
@@ -237,6 +294,33 @@ def main() -> int:
         )
         ref = _prefill_reference(q3, kp, vp, bt, ln, 1.0 / (128**0.5))
         all_ok &= _report(f"prefill {label}", out, ref, ms)
+
+    # Mixed prefill/decode batch: one launch serves decode rows (q_lens == 1)
+    # and prefill chunks (q_lens > 1) together, with shuffled physical pages.
+    print("Paged mixed prefill/decode attention:")
+    for label, (nh, nkv) in {"MHA (8 heads)": (8, 8), "GQA (8q/2kv)": (8, 2)}.items():
+        q4, kp, vp, bt, ln, ql = _make_mixed(
+            q_lens=[1, 8, 1, 4, 2, 1, 6, 1],
+            num_heads=nh,
+            num_kv_heads=nkv,
+            head_dim=128,
+            page_size=16,
+            max_pages=8,
+            seed=3,
+        )
+        args = (
+            jnp.asarray(q4),
+            jnp.asarray(kp),
+            jnp.asarray(vp),
+            jnp.asarray(bt),
+            jnp.asarray(ln),
+            jnp.asarray(ql),
+        )
+        ms, out = _timed(
+            jax, lambda args=args: pallas_paged_mixed_attention(*args, interpret=interpret)
+        )
+        ref = _mixed_reference(q4, kp, vp, bt, ln, ql, 1.0 / (128**0.5))
+        all_ok &= _report(f"mixed {label}", out, ref, ms)
 
     print("ALL PASS" if all_ok else "SOME FAILED")
     return 0 if all_ok else 1

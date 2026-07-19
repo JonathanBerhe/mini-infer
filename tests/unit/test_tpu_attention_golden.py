@@ -86,6 +86,45 @@ def _torch_paged_reference(
     return out
 
 
+def _torch_mixed_reference(
+    q: np.ndarray,
+    k_pages: np.ndarray,
+    v_pages: np.ndarray,
+    block_tables: np.ndarray,
+    lengths: np.ndarray,
+    q_lens: np.ndarray,
+    scale: float,
+) -> np.ndarray:
+    """Mixed prefill/decode paged attention in PyTorch; padding rows stay zero."""
+    num_seqs, _max_q_len, num_heads, _ = q.shape
+    num_kv_heads = k_pages.shape[0]
+    q_per_kv = num_heads // num_kv_heads
+    max_pages = block_tables.shape[1]
+    out = np.zeros_like(q)
+    for s in range(num_seqs):
+        length = int(lengths[s])
+        q_len_s = int(q_lens[s])
+        k_full = np.concatenate(
+            [k_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        v_full = np.concatenate(
+            [v_pages[:, block_tables[s, pi]] for pi in range(max_pages)], axis=1
+        )
+        kt = torch.from_numpy(k_full).to(torch.float32)  # (KVH, T, D)
+        vt = torch.from_numpy(v_full).to(torch.float32)
+        k_pos = torch.arange(kt.shape[1])
+        for h in range(num_heads):
+            kv = h // q_per_kv
+            for t in range(q_len_s):
+                q_pos = length - q_len_s + t
+                qh = torch.from_numpy(q[s, t, h]).to(torch.float32)  # (D,)
+                scores = (kt[kv] @ qh) * scale  # (T,)
+                scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+                weights = torch.softmax(scores, dim=-1)
+                out[s, t, h] = (weights @ vt[kv]).numpy()
+    return out
+
+
 def _dense_inputs(num_heads=4, seq=32, head_dim=16, seed=0):
     rng = np.random.default_rng(seed)
     q = rng.standard_normal((num_heads, seq, head_dim)).astype(np.float32)
@@ -166,6 +205,46 @@ def test_paged_grouped_query_matches_torch_reference():
         )
     )
     ref = _torch_paged_reference(q, k_pages, v_pages, block_tables, lengths, scale)
+    assert _cosine(got, ref) > 0.99
+    np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_paged_mixed_matches_torch_reference():
+    # Mixed prefill/decode batch (decode rows have q_lens[s] == 1) with grouped
+    # queries, routed through the dispatcher against the PyTorch reference.
+    rng = np.random.default_rng(10)
+    q_lens = np.array([1, 5, 1, 3], dtype=np.int32)
+    num_seqs, max_q_len = q_lens.shape[0], int(q_lens.max())
+    num_heads, num_kv_heads, head_dim, page_size, max_pages = 8, 2, 16, 8, 4
+    num_pages = num_seqs * max_pages + 2
+    q = rng.standard_normal((num_seqs, max_q_len, num_heads, head_dim)).astype(np.float32)
+    k_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    v_pages = rng.standard_normal((num_kv_heads, num_pages, page_size, head_dim)).astype(np.float32)
+    block_tables = np.zeros((num_seqs, max_pages), dtype=np.int32)
+    lengths = np.zeros((num_seqs,), dtype=np.int32)
+    cursor = 0
+    for s in range(num_seqs):
+        length = int(rng.integers(int(q_lens[s]), max_pages * page_size + 1))
+        lengths[s] = length
+        n_used = (length + page_size - 1) // page_size
+        for pi in range(max_pages):
+            block_tables[s, pi] = cursor if pi < n_used else 0
+            if pi < n_used:
+                cursor += 1
+    scale = 1.0 / (head_dim**0.5)
+
+    got = np.asarray(
+        dispatch_attention(
+            jnp.asarray(q),
+            jnp.asarray(k_pages),
+            jnp.asarray(v_pages),
+            block_tables=jnp.asarray(block_tables),
+            lengths=jnp.asarray(lengths),
+            q_lens=jnp.asarray(q_lens),
+            interpret=True,
+        )
+    )
+    ref = _torch_mixed_reference(q, k_pages, v_pages, block_tables, lengths, q_lens, scale)
     assert _cosine(got, ref) > 0.99
     np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-4)
 
