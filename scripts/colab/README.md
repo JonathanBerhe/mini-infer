@@ -25,15 +25,20 @@ The `BRANCH` variable at the top of the notebook cell picks what is validated:
 `main` by default; set it to a feature branch (and open the notebook from that
 branch) while one is under validation.
 
-Note: on the first run the cell aligns Colab's `libtpu` with its `jaxlib` and
-restarts the runtime once, then you run the cell again. Colab's preinstalled
-`libtpu` can be older than `jaxlib` and reject the compiled kernel with
-"Unsupported version: expected <= 7 but got 8". That is an environment version
-skew, not a kernel bug: the kernel compiles to valid Mosaic; the runtime just
-cannot load what this jaxlib emitted. Colab free-tier TPU availability is also
-dynamic (typically TPU v2); retry later if none is free. If Colab keeps refusing
-to align, use the GCP Cloud TPU path below: a fresh VM installs a matched
-`jax[tpu]` and avoids the skew entirely.
+Note: normally the whole validation is a single run with no installs. The cell
+first probes the environment with a one-line Pallas kernel; only on a broken
+`libtpu` does it install the matched `jax[tpu]` pair and restart the runtime
+once, because the bad `libtpu` is already loaded in the process and a restart
+is the only way to swap it. "Broken" means either Colab's preinstalled
+`libtpu` is older than its `jaxlib` (the skew rejects compiled kernels with
+"Unsupported version: expected <= 7 but got 8", an environment problem, not a
+kernel bug) or the TPU VM's `libtpu` failed to load at all (jax sees no TPU
+despite the TPU runtime). Run the cell again after the reconnect and it
+proceeds. On a non-TPU runtime it installs nothing and just
+tells you to switch the runtime type. Colab free-tier TPU availability is
+dynamic; retry later if none is free. If Colab keeps refusing to align, use
+the GCP Cloud TPU path below: a fresh VM installs a matched `jax[tpu]` and
+avoids the skew entirely.
 
 ## Scriptable alternative: Google Cloud TPU (paid, gcloud, closest to `modal run`)
 
