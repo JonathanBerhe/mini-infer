@@ -3,7 +3,12 @@
 Date: 2026-07-02
 Updated: 2026-07-04, re-checked against main after the MiniMax-M3 (#18)
 and open-loop bench + OOM recovery (#19) merges
-Status: Proposed
+Updated: 2026-07-26, re-checked against main after the TPU backend
+(#20), Inkling (#21), and Kimi Linear (#23) merges (none touch the
+Qwen3/spec-decode/packed-attention/scheduler surfaces this plan
+depends on); transformers dev pin note refreshed for the 5.14.x bump.
+Status: Proposed; Stage A (design study) starting on
+`dspark-drafter-port`.
 
 Paper: "DSpark: Confidence-Scheduled Speculative Decoding with
 Semi-Autoregressive Generation" (DeepSeek-AI + Peking University,
@@ -141,9 +146,22 @@ Parity contract, in order:
 2. Real-checkpoint temperature-0 token-parity fixtures generated with
    the DeepSpec harness (Qwen3-4B target + `dspark_qwen3_4b_block7`) on
    a single short Modal GPU run (L4/A10 class, 24 GB fits both in
-   BF16). Fixture generation needs an isolated venv: DeepSpec pins
-   transformers 5.10.2, the repo pins 5.12.x for the MiniMax-M3 parity
-   reference.
+   BF16). DeepSpec's `requirements.txt` and its checkpoints' own
+   `config.json` both pin transformers 5.10.2 exactly; the repo's dev
+   group has since moved to 5.14.x (bumped for Inkling, following an
+   earlier bump to 5.12.x for MiniMax-M3). Both bumps forced explicit
+   numerics realignment in existing families (GLM-MoE-DSA's indexer
+   RoPE convention broke twice, across the 5.10 to 5.12 and 5.12 to
+   5.14 jumps; MiniMax-M3's block selection broke on the second one),
+   so treat DeepSpec's pin as load-bearing rather than a stale
+   default. Before setting up an isolated venv, try the cheap
+   validation first: run DeepSpec's eval harness under the repo's
+   current dev-pinned transformers against one bundled eval set (e.g.
+   GSM8K) and check the accepted-length number lands near the paper's
+   reported ~5.57 for Qwen3-4B. If it matches, generate fixtures
+   in-repo and skip the isolated venv; if it diverges, that confirms
+   the isolated 5.10.2 venv is warranted and fixtures should record
+   the transformers version they were generated under.
 
 Existing golden tests are untouched: greedy verification emits the
 target's exact argmax by construction.
@@ -246,7 +264,8 @@ or a paper problem; both are findings worth writing up.
   drafter comfortably, and no smaller drafter exists. Local work is
   CPU micro-config only; real checkpoints run on Modal.
 - **Environment split** for fixture generation (transformers 5.10.2 vs
-  5.12) as noted in Stage B.
+  the repo's current 5.14.x dev pin), unless the cheap validation in
+  Stage B shows DeepSpec's reference tolerates the newer version.
 
 ## References
 
