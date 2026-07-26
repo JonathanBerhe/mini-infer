@@ -93,30 +93,42 @@ independent replication exists yet.
 
 ## Evaluation stages and gates
 
-### Stage A: design study (CPU-only, no code shipped)
+### Stage A: design study (CPU-only, no code shipped), done
 
-Read `DSpark_paper.pdf` and the DeepSpec modeling code line by line
-(`deepspec/modeling/dspark/qwen3/modeling.py`,
-`deepspec/eval/dspark/draft_ops.py`, `deepspec/eval/base_evaluator.py`)
-and resolve the parity-critical unknowns:
+Done (2026-07-26), on `dspark-drafter-port`: see
+`docs/decisions/ADR-027-dspark-drafter-port.md`. All five
+parity-critical unknowns resolved against `DeepSpec`'s actual code
+(not the paper's prose) and adversarially re-verified:
 
-- Position ids assigned to mask tokens; whether RoPE applies within the
-  draft block.
-- Whether the drafter needs target hidden states for the FULL prompt at
-  round 1 (forcing hidden-state taps during prefill and a side cache
-  whose memory grows with sequence length) or only for accepted tokens.
-- Confidence head input (pre- vs post-norm h_k) and whether W1 is
-  shared between the Markov and confidence heads.
-- Anchor/bonus token conventions vs our V1 loop's catch-up semantics.
-- Frozen embedding/LM-head provenance: load from the drafter
-  checkpoint or tie to the target's tensors (verify byte-identical).
+- Position ids are sequential and global; RoPE inside the draft block
+  and on the injected target context share one `rotary_emb` call over
+  a single contiguous slice, because context and draft positions are
+  adjacent in the running counter. Subtle enough that the ADR spells
+  out the exact mechanism.
+- Round 1 injects the full prompt's target hidden states; every later
+  round injects only the just-verified window (a full reassignment,
+  not an append). The **gate below does not trigger**: what grows
+  with sequence length is the drafter's own small unpaged K/V cache
+  (linear in generated length, same rate as any ordinary KV cache),
+  not a re-derivation over a growing prompt window.
+- Confidence head consumes the post-final-norm hidden state and
+  shares the Markov head's embedding table exactly (one object, not
+  two tables of the same shape).
+- Anchor for round N+1 is `verification.next_token` from round N
+  (bonus token or corrected token, matching our own convention). No
+  catch-up step needed, unlike ADR-011's V1: the drafter's own
+  self-attention KV is discarded every round regardless of acceptance.
+- Frozen embed/LM-head: the checkpoint ships full, untied copies
+  (`tie_word_embeddings: false`). Load as ordinary weights; no tying
+  plumbing needed.
 
-Deliverable: an ADR proposing the port, with the alternatives
-considered (n-gram/PLD, EAGLE-3 port, MTP-head revival).
+Deliverable: ADR-027, with alternatives considered (registry
+registration, reusing `packed_attention`'s `block_mask`, tying
+embed/LM-head, V4-DSpark, EAGLE-3, n-gram/PLD).
 
-**Gate:** if the hidden-state side cache is architecturally ugly (e.g.
-unbounded prompt-length memory with no clean paging story), stop and
-document why in the ADR.
+**Gate** (did not trigger): if the hidden-state side cache had been
+architecturally ugly (e.g. unbounded prompt-length memory with no
+clean paging story), stop and document why in the ADR.
 
 ### Stage B: drafter port, batch-1, temperature 0
 
