@@ -1,0 +1,107 @@
+{
+  "target": "Qwen/Qwen3-4B",
+  "drafter": "deepseek-ai/dspark_qwen3_4b_block7",
+  "transformers_version": "5.14.1",
+  "dtype": "bfloat16",
+  "prompt": "Explain why speculative decoding speeds up language model inference.",
+  "prompt_token_ids": [
+    840,
+    20772,
+    3170,
+    65736,
+    47116,
+    24722,
+    705,
+    4128,
+    1614,
+    44378,
+    13
+  ],
+  "block_size": 7,
+  "anchor_token_id": 10956,
+  "ref_draft_token_ids": [
+    22160,
+    33479,
+    47116,
+    374,
+    264,
+    1376,
+    374
+  ],
+  "ref_confidence_logits": [
+    2.078125,
+    2.21875,
+    1.453125,
+    -0.57421875,
+    -0.82421875,
+    -1.109375,
+    -1.15625
+  ],
+  "ref_base_logits_argmax": [
+    1388,
+    1388,
+    47116,
+    47116,
+    47116,
+    374,
+    374
+  ],
+  "rounds": [
+    {
+      "round": 0,
+      "start": 11,
+      "accepted": 1,
+      "ref_tokens": [
+        22160,
+        33479,
+        47116,
+        374,
+        264,
+        1376,
+        374
+      ]
+    },
+    {
+      "round": 1,
+      "start": 13,
+      "accepted": 2,
+      "ref_tokens": [
+        374,
+        264,
+        1376,
+        4522,
+        429,
+        4128,
+        1614
+      ]
+    },
+    {
+      "round": 2,
+      "start": 16,
+      "accepted": 3,
+      "ref_tokens": [
+        1483,
+        304,
+        4128,
+        4119,
+        429,
+        4128,
+        4119
+      ]
+    },
+    {
+      "round": 3,
+      "start": 20,
+      "accepted": 2,
+      "ref_tokens": [
+        44378,
+        311,
+        7269,
+        279,
+        4628,
+        705,
+        311
+      ]
+    }
+  ]
+}

@@ -83,7 +83,7 @@ always-collect-and-return-a-dict design was rejected: it would change
 the return shape for every caller and tax every plain Qwen3 request
 with hidden-state bookkeeping it never asked for.
 
-### 3. Drafter attention: bespoke additive mask, not the shared `block_mask` path
+### 3. Drafter attention: its own SDPA call, not the shared `block_mask` path
 
 `packed_attention_torch`'s per-request `block_mask` (added for
 MiniMax-M3 MSA) looks tailor-made for the drafter's bidirectional
@@ -91,11 +91,27 @@ block attention, but it's the wrong fit: the dispatcher sources K/V
 exclusively from a `PagedKVCache`
 (`cache/packed_attention.py:124-135`) with no hook for the drafter's
 second K/V source (the projected, injected target context), and it's
-torch-backend-only. The drafter builds its own additive mask on a
-plain `F.scaled_dot_product_attention` call instead.
-`packed_attention_torch(block_mask=...)` stays useful as the unit-test
-oracle, the same role it plays for MSA's parity tests
-(`tests/unit/test_minimax_m3_parity.py`).
+torch-backend-only. The drafter calls
+`F.scaled_dot_product_attention` directly instead.
+
+Implementation note (found while building it, and simpler than this
+ADR first assumed): at batch-1 inference the drafter needs **no mask at
+all**, not a hand-built one. `DeepSpec`'s training-time mask enforces
+two things, that context keys precede the block's anchor and that draft
+positions only see their own block. During single-request decoding
+both are vacuous: every context key is an already-committed token, and
+there is exactly one block in flight, so "same block" is trivially
+true for every pair. The reference agrees, passing `attention_mask=None`
+at its own inference call site. What makes the drafter's attention
+non-standard is therefore not a mask but the two-source K/V concat plus
+the asymmetric Q/K RoPE (point 4), and `is_causal=False`.
+
+The masked path returns as soon as more than one block is in flight,
+i.e. Stage D's multi-request batching, where `packed_attention_torch`'s
+`block_mask` (or a bespoke equivalent) becomes load-bearing again. Until
+then, `packed_attention_torch(block_mask=...)` still serves as the
+unit-test oracle proving the unmasked call equals an explicitly-masked
+reference, the same role it plays for MSA's parity tests.
 
 ### 4. Confirmed mechanics (bit-parity-critical, verified against `DeepSpec` source and adversarially re-checked)
 

@@ -139,15 +139,17 @@ a plain-tensor side cache with truncate (the drafter's own cache stays
 unpaged; the reference uses a cropped DynamicCache and 5 small layers
 do not justify paging).
 
-Drafter attention: a bespoke additive mask on a plain SDPA call inside
-the drafter module. The shared packed-attention `block_mask` path added
-for MiniMax-M3 MSA is not a structural fit (the dispatcher sources K/V
-exclusively from a `PagedKVCache` and has no injection point for the
-projected target-hidden context keys, and the drafter cache is
-unpaged), but `packed_attention_torch(block_mask=...)` is the right
-unit-test oracle for the bespoke mask, mirroring how the MSA paged
-kernel is validated against the dense-mask reference. The target's
-verify forward keeps its fast causal backends untouched.
+Drafter attention: a plain SDPA call inside the drafter module. The
+shared packed-attention `block_mask` path added for MiniMax-M3 MSA is
+not a structural fit (the dispatcher sources K/V exclusively from a
+`PagedKVCache` and has no injection point for the projected
+target-hidden context keys, and the drafter cache is unpaged), but
+`packed_attention_torch(block_mask=...)` is the right unit-test oracle,
+mirroring how the MSA paged kernel is validated against the dense-mask
+reference. The target's verify forward keeps its fast causal backends
+untouched. As built, batch-1 needs no mask at all (both of the
+reference's training-time mask conditions are vacuous with one block in
+flight); see ADR-027 point 3.
 
 Parity contract, in order:
 

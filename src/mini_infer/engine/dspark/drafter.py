@@ -8,16 +8,19 @@ the previously SAMPLED token so the block's final distribution is exactly
 causal (see `markov_head.py`). Mechanics, citations, and the alternatives
 considered live in `docs/decisions/ADR-027-dspark-drafter-port.md`.
 
-Config is a plain dataclass, no `from_hf` yet: this port is CPU-only /
-random-weight so far (Stage B's micro-config parity tests). Loading the
-real `dspark_qwen3_4b_block7` checkpoint is a separate, Modal-gated step
-(needs a network fetch and doesn't fit comfortably in 16 GB unified memory
-alongside the Qwen3-4B target).
+`Qwen3DSparkConfig.from_hf` reads the released drafter's `config.json`
+(`deepseek-ai/dspark_qwen3_4b_block7` and friends) and `load_weights` takes
+its safetensors state dict; every tensor name is an identity rename onto
+this module hierarchy, so no key remapping table is needed. The real
+checkpoint only runs under GPU (16 GB unified memory can't comfortably hold
+it alongside the Qwen3-4B target), so the CPU tests here exercise
+micro-configs with random weights.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -54,6 +57,57 @@ class Qwen3DSparkConfig:
     markov_rank: int
     enable_confidence_head: bool
     confidence_head_with_markov: bool
+
+    @classmethod
+    def from_hf(cls, hf_config: dict[str, Any]) -> Qwen3DSparkConfig:
+        """Build from a released drafter's `config.json` (parsed dict).
+
+        `rope_theta` moved into a `rope_parameters` sub-dict in recent
+        transformers configs; the released drafters carry the new form and
+        Qwen3 targets the old flat one, so read both (same fallback order as
+        `Qwen3Config.from_hf`).
+        """
+        rope_params = hf_config.get("rope_parameters")
+        if rope_params is not None and "rope_theta" in rope_params:
+            rope_theta = float(rope_params["rope_theta"])
+        else:
+            rope_theta = float(hf_config.get("rope_theta", 10000.0))
+        head_dim = hf_config.get("head_dim") or (
+            hf_config["hidden_size"] // hf_config["num_attention_heads"]
+        )
+        markov_head_type = str(hf_config.get("markov_head_type", "vanilla")).lower()
+        if int(hf_config["markov_rank"]) > 0 and markov_head_type != "vanilla":
+            # `deepspec` also ships "gated" and "rnn" heads. No released Qwen3
+            # drafter uses them, so porting them would be untested code.
+            raise NotImplementedError(
+                f"markov_head_type={markov_head_type!r} is not ported; "
+                "only the released checkpoints' 'vanilla' head is supported"
+            )
+        target_layer_ids = [int(i) for i in hf_config["target_layer_ids"]]
+        if any(i < 0 for i in target_layer_ids):
+            # `deepspec` maps -1 to the target's embedding output. No released
+            # Qwen3 drafter uses it, and it would need a separate tap point.
+            raise NotImplementedError(
+                f"target_layer_ids={target_layer_ids} contains -1 (target embedding "
+                "output), which is not ported; only decoder-layer taps are supported"
+            )
+        return cls(
+            vocab_size=int(hf_config["vocab_size"]),
+            hidden_size=int(hf_config["hidden_size"]),
+            intermediate_size=int(hf_config["intermediate_size"]),
+            num_hidden_layers=int(hf_config["num_hidden_layers"]),
+            num_attention_heads=int(hf_config["num_attention_heads"]),
+            num_key_value_heads=int(hf_config["num_key_value_heads"]),
+            head_dim=int(head_dim),
+            rms_norm_eps=float(hf_config["rms_norm_eps"]),
+            rope_theta=rope_theta,
+            target_layer_ids=target_layer_ids,
+            mask_token_id=int(hf_config["mask_token_id"]),
+            block_size=int(hf_config["block_size"]),
+            markov_rank=int(hf_config["markov_rank"]),
+            enable_confidence_head=bool(hf_config["enable_confidence_head"]),
+            confidence_head_with_markov=bool(hf_config.get("confidence_head_with_markov", False)),
+        )
 
 
 class Qwen3DSparkDecoderLayer(nn.Module):
@@ -201,3 +255,20 @@ class Qwen3DSparkDrafter(nn.Module):
         return self.markov_head.sample_block_tokens(
             base_logits, first_prev_token_ids=first_prev_token_ids, temperature=temperature
         )
+
+    @staticmethod
+    def load_weights(model: Qwen3DSparkDrafter, hf_state_dict: dict[str, torch.Tensor]) -> None:
+        """Load a released drafter checkpoint. Every key is an identity rename.
+
+        The checkpoint ships its own full `embed_tokens` / `lm_head` rather than
+        tying them to the target's (`tie_word_embeddings: false`; they were
+        value-copied from the target and frozen at training time, see ADR-027),
+        so this is a plain `load_state_dict` with no aliasing and nothing
+        expected to be missing.
+        """
+        missing, unexpected = model.load_state_dict(hf_state_dict, strict=False)
+        if missing or unexpected:
+            raise ValueError(
+                f"weight load mismatch for Qwen3DSparkDrafter: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
