@@ -189,21 +189,22 @@ document.
 Done (2026-07-27). Results:
 [docs/benchmarks/2026-07-27-dspark-accepted-length.md](../benchmarks/2026-07-27-dspark-accepted-length.md).
 
-tau lands at 3.79 math / 3.14 code / 3.07 chat (templated, 50 prompts) against
-the paper's ~5.57 / ~5.12 / ~3.49. Threshold 0.30 cuts verified tokens per
-round 18% for a 0.7% tau cost. Per-step conditional acceptance is flat out to
-position 7, reproducing the paper's claim for the sequential head.
+**Gate: MET.** tau lands at 6.24 math / 5.10 code / 3.90 chat (templated,
+greedy, 50 prompts) against the paper's ~5.57 / ~5.12 / ~3.49: code exact,
+math and chat 12% above. Per-step conditional acceptance is flat to position 7
+(0.92 math, 0.87 code, 0.78 chat) with no tail decay, reproducing the paper's
+claim for the sequential head, and position-1 survival of 0.94 on math beats
+the 0.88 it reports for DFlash.
 
-**Gate: partially met, and the two hypotheses this plan named were both
-tested and refuted.** Chat templating was predicted to close the gap; it
-lowers tau in all three domains (-3/-12/-6%). Truncation at 128 tokens was
-predicted to bias the long-answer domains; a 3x longer budget buys 3%. What
-remains, and is the leading explanation, is that the paper measures at
-temperature 1.0 with rejection sampling (acceptance `1 - TV`) while this is
-greedy (acceptance `P(argmax match)`), a strictly harsher bar. The
-confidence head's calibration error points the same way, since it is trained
-against exactly the temperature-1.0 acceptance rate. Confirming this needs
-Stage D's rejection sampling.
+Getting there took three refuted hypotheses. Chat templating, truncation, and
+greedy-vs-temperature-1.0 were each predicted to explain an apparent 30% gap;
+each measured the wrong way or negligible. The cause was a defect in the
+harness: Qwen3's chat template defaults to `enable_thinking=True`, so the
+target emitted `<think>` blocks while the drafter is trained on
+`--disable-thinking` responses (DeepSpec's evaluator hardcodes
+`enable_thinking=False`). One flag moved tau +65/+62/+27%. It also explains
+why templating had looked harmful: raw text never invokes the template, so it
+never triggered thinking mode.
 
 Original plan text follows.
 
