@@ -66,8 +66,18 @@ _BASELINE_LIMIT = int(os.environ.get("DSPARK_BASELINE_LIMIT", "15"))
 _PROBE_MAX_NEW = int(os.environ.get("DSPARK_PROBE_MAX_NEW", "384"))
 _PROBE_SAMPLES = int(os.environ.get("DSPARK_PROBE_SAMPLES", "15"))
 
+# Which prompt formats to run; "templated" alone halves a two-temperature job.
+_ARMS = [a.strip() for a in os.environ.get("DSPARK_ARMS", "raw,templated").split(",")]
+_RUN_SWEEP = os.environ.get("DSPARK_SWEEP", "1") != "0"
+_RUN_PROBE = os.environ.get("DSPARK_PROBE", "1") != "0"
+
 app = modal.App("mini-infer-dspark-bench")
 hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
+# Results land here as each configuration finishes. A long run used to lose
+# everything if the local client's gRPC heartbeat dropped, which is a network
+# blip rather than a job failure; the container keeps its work regardless, so
+# partial results survive and can be fetched afterwards.
+results_vol = modal.Volume.from_name("mini-infer-dspark-results", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -134,7 +144,12 @@ def auroc(observations: list[tuple[float, bool]]) -> float | None:
     return (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
-@app.function(gpu=_GPU, image=image, volumes={"/hf-cache": hf_cache}, timeout=60 * 90)
+@app.function(
+    gpu=_GPU,
+    image=image,
+    volumes={"/hf-cache": hf_cache, "/results": results_vol},
+    timeout=60 * 120,
+)
 def bench(
     samples: int = _SAMPLES,
     max_new: int = _MAX_NEW,
@@ -142,6 +157,9 @@ def bench(
     probe_max_new: int = _PROBE_MAX_NEW,
     probe_samples: int = _PROBE_SAMPLES,
     temperatures: list[float] | None = None,
+    arms: list[str] | None = None,
+    run_sweep: bool = True,
+    run_probe: bool = True,
 ) -> dict[str, Any]:
     """Args are passed explicitly, NOT read from the module globals.
 
@@ -383,11 +401,19 @@ def bench(
     # format, so raw text is off-distribution for it and was the leading
     # suspect for our tau falling short of the paper. Running both isolates
     # that one variable instead of changing scale and formatting together.
+    def checkpoint() -> None:
+        """Flush whatever is finished to the results Volume."""
+        Path("/results").mkdir(parents=True, exist_ok=True)
+        Path("/results/dspark-stage-c.json").write_text(json.dumps(results, indent=2))
+        results_vol.commit()
+
     per_dataset = []
+    results["per_dataset"] = per_dataset
     temps = temperatures if temperatures is not None else [0.0]
+    active_arms = arms if arms is not None else ["raw", "templated"]
     for temperature in temps:
-        for templated in (False, True):
-            arm = "templated" if templated else "raw"
+        for arm in active_arms:
+            templated = arm == "templated"
             for name, domain in _DATASETS.items():
                 prompts = load_prompts(name)
                 row = run_config(
@@ -407,58 +433,65 @@ def bench(
                     f"accept={row['acceptance_rate']:.1%} ece={row['ece']:.3f}",
                     flush=True,
                 )
-    results["per_dataset"] = per_dataset
+                checkpoint()
 
     # Sweep on the templated chat set: the arm we expect to ship, and the
-    # domain where the paper reports the widest acceptance movement.
-    chat_prompts = load_prompts("mt-bench")
-    sweep = [
-        next(
-            r
-            for r in per_dataset
-            if r["dataset"] == "mt-bench" and r["arm"] == "templated" and r["temperature"] == 0.0
-        )
-    ]
-    for th in _SWEEP_THRESHOLDS:
-        row = run_config(
-            "mt-bench",
-            chat_prompts,
-            th,
-            templated=True,
-            max_tokens=max_new,
-            baseline_limit=baseline_limit,
-        )
-        sweep.append(row)
-        print(
-            f"  [sweep] threshold={th}: tau={row['tau']:.2f} "
-            f"offered={row['draft_tokens_per_proposal']:.2f} "
-            f"accept={row['acceptance_rate']:.1%}",
-            flush=True,
-        )
-    results["threshold_sweep"] = sweep
+    # domain where the paper reports the widest acceptance movement. Greedy
+    # only, so it stays comparable to the Stage C numbers.
+    if run_sweep:
+        chat_prompts = load_prompts("mt-bench")
+        sweep = [
+            next(
+                r
+                for r in per_dataset
+                if r["dataset"] == "mt-bench"
+                and r["arm"] == "templated"
+                and r["temperature"] == 0.0
+            )
+        ]
+        for th in _SWEEP_THRESHOLDS:
+            row = run_config(
+                "mt-bench",
+                chat_prompts,
+                th,
+                templated=True,
+                max_tokens=max_new,
+                baseline_limit=baseline_limit,
+            )
+            sweep.append(row)
+            print(
+                f"  [sweep] threshold={th}: tau={row['tau']:.2f} "
+                f"offered={row['draft_tokens_per_proposal']:.2f} "
+                f"accept={row['acceptance_rate']:.1%}",
+                flush=True,
+            )
+        results["threshold_sweep"] = sweep
+        checkpoint()
 
     # Truncation probe. Cutting at `max_new` should bias the long-answer
     # domains down hardest, because math and code answers get formulaic
     # exactly in their later tokens, which is where acceptance is highest.
     # Same prompts, longer budget, one dataset: if tau climbs, the cap was
     # part of the gap.
-    probe_n = max(1, min(samples, probe_samples))
-    probe_prompts = load_prompts("gsm8k")[:probe_n]
-    probe = run_config(
-        "gsm8k",
-        probe_prompts,
-        0.0,
-        templated=True,
-        max_tokens=_PROBE_MAX_NEW,
-        baseline_limit=0,
-    )
-    probe["arm"] = "templated"
-    probe["temperature"] = 0.0
-    results["length_probe"] = probe
-    print(
-        f"  [probe] gsm8k @ {probe_max_new} tokens, n={probe_n}: tau={probe['tau']:.2f}",
-        flush=True,
-    )
+    if run_probe:
+        probe_n = max(1, min(samples, probe_samples))
+        probe_prompts = load_prompts("gsm8k")[:probe_n]
+        probe = run_config(
+            "gsm8k",
+            probe_prompts,
+            0.0,
+            templated=True,
+            max_tokens=probe_max_new,
+            baseline_limit=0,
+        )
+        probe["arm"] = "templated"
+        probe["temperature"] = 0.0
+        results["length_probe"] = probe
+        print(
+            f"  [probe] gsm8k @ {probe_max_new} tokens, n={probe_n}: tau={probe['tau']:.2f}",
+            flush=True,
+        )
+        checkpoint()
 
     return results
 
@@ -474,21 +507,51 @@ def main() -> None:
         probe_max_new=_PROBE_MAX_NEW,
         probe_samples=_PROBE_SAMPLES,
         temperatures=_TEMPERATURES,
+        arms=_ARMS,
+        run_sweep=_RUN_SWEEP,
+        run_probe=_RUN_PROBE,
     )
     out = Path("docs/benchmarks/data")
     out.mkdir(parents=True, exist_ok=True)
     (out / "dspark-stage-c.json").write_text(json.dumps(results, indent=2))
 
-    print("\n=== accepted length by domain: raw vs chat-templated prompts ===")
+    # The comparison the temperature axis exists to make. The paper's Table 1
+    # is temperature 1.0 with rejection sampling, where acceptance is
+    # `1 - TV`; greedy needs an exact argmax match, a strictly harsher bar.
+    paper_tau = {"gsm8k": 5.57, "humaneval": 5.12, "mt-bench": 3.49}
+    by_temp: dict[tuple[str, float], dict[str, Any]] = {
+        (r["dataset"], r["temperature"]): r
+        for r in results["per_dataset"]
+        if r["arm"] == "templated"
+    }
+    temps_seen = sorted({t for _, t in by_temp})
+    if len(temps_seen) > 1:
+        print("\n=== greedy vs temperature 1.0 (templated) ===")
+        print(f"{'dataset':<12}{'T=0 tau':>9}{'T=1 tau':>9}{'delta':>8}{'paper':>8}{'closed':>9}")
+        for name in _DATASETS:
+            lo, hi = by_temp.get((name, 0.0)), by_temp.get((name, 1.0))
+            if not (lo and hi):
+                continue
+            a, b, ref = lo["tau"], hi["tau"], paper_tau[name]
+            # How much of the shortfall the temperature change accounts for.
+            closed = (b - a) / (ref - a) if ref > a else float("nan")
+            print(
+                f"{name:<12}{a:>9.2f}{b:>9.2f}{(b / a - 1) * 100:>7.0f}%{ref:>8.2f}{closed:>8.0%}"
+            )
+
+    print("\n=== accepted length by domain ===")
     print(
-        f"{'dataset':<12}{'domain':<7}{'arm':<11}{'tau':>7}{'accept':>9}{'ECE':>8}{'AUROC':>8}{'div':>6}"
+        f"{'dataset':<12}{'domain':<7}{'T':<5}{'arm':<11}"
+        f"{'tau':>7}{'accept':>9}{'ECE':>8}{'AUROC':>8}{'div':>6}"
     )
     for r in results["per_dataset"]:
         au = f"{r['auroc']:.3f}" if r["auroc"] is not None else "n/a"
-        div = f"{r['greedy_mismatches']}/{r['baseline_checked']}"
+        # Above temperature 0 both sides sample, so there is no token-equality
+        # contract to report against.
+        div = f"{r['greedy_mismatches']}/{r['baseline_checked']}" if r["temperature"] == 0 else "-"
         print(
-            f"{r['dataset']:<12}{r['domain']:<7}{r['arm']:<11}{r['tau']:>7.2f}"
-            f"{r['acceptance_rate']:>8.1%}{r['ece']:>8.3f}{au:>8}{div:>6}"
+            f"{r['dataset']:<12}{r['domain']:<7}{r['temperature']:<5.1f}{r['arm']:<11}"
+            f"{r['tau']:>7.2f}{r['acceptance_rate']:>8.1%}{r['ece']:>8.3f}{au:>8}{div:>6}"
         )
 
     raw = {
@@ -501,19 +564,21 @@ def main() -> None:
         for r in results["per_dataset"]
         if r["arm"] == "templated" and r["temperature"] == 0.0
     }
-    print("\n  chat-template effect on tau:")
+    if raw and tpl:
+        print("\n  chat-template effect on tau:")
     for name in raw:
         a, b = raw[name]["tau"], tpl[name]["tau"]
         delta = f"{(b / a - 1) * 100:+.0f}%" if a else "n/a"
         print(f"    {name:<12}{a:>6.2f} -> {b:>5.2f}  ({delta})")
 
-    print("\n=== confidence threshold sweep (mt-bench, templated) ===")
-    print(f"{'threshold':>10}{'tau':>7}{'offered/round':>15}{'accept':>9}")
-    for r in results["threshold_sweep"]:
-        print(
-            f"{r['threshold']:>10.2f}{r['tau']:>7.2f}"
-            f"{r['draft_tokens_per_proposal']:>15.2f}{r['acceptance_rate']:>8.1%}"
-        )
+    if results.get("threshold_sweep"):
+        print("\n=== confidence threshold sweep (mt-bench, templated) ===")
+        print(f"{'threshold':>10}{'tau':>7}{'offered/round':>15}{'accept':>9}")
+        for r in results["threshold_sweep"]:
+            print(
+                f"{r['threshold']:>10.2f}{r['tau']:>7.2f}"
+                f"{r['draft_tokens_per_proposal']:>15.2f}{r['acceptance_rate']:>8.1%}"
+            )
 
     print("\n=== per-position survival (templated, threshold off) ===")
     for r in results["per_dataset"]:
