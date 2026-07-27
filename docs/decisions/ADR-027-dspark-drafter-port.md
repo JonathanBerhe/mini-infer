@@ -1,7 +1,8 @@
-# ADR-027: DSpark drafter port (Stage A design study)
+# ADR-027: DSpark drafter port
 
 Date: 2026-07-26
-Status: Proposed
+Status: Accepted (drafter ported and validated against the reference;
+confidence scheduling and multi-request batching remain deferred)
 
 ## Context
 
@@ -280,14 +281,56 @@ verify-side packing `ContinuousScheduler` already does).
   optional and defaults to `None`; nothing in `models/`, the scheduler,
   or `PagedKVCache` is modified in a way existing callers would notice.
 
-## Validation
+## Validation (done)
 
-Per `docs/plans/dspark-evaluation.md` Stage B: random-weight
-micro-config CPU unit tests comparing per-position base logits,
-Markov-biased logits, and confidence logits against `DeepSpec`'s
-reference code, followed by real-checkpoint temperature-0 token-parity
-fixtures (Qwen3-4B + `dspark_qwen3_4b_block7`) generated on one short
-Modal GPU run. Existing Qwen3 golden tests are unaffected (point 2).
+Two layers, both passing.
+
+**CPU, micro-config, random weights** (`tests/unit/test_dspark_drafter_parity.py`):
+per-position base logits, Markov-corrected logits, and confidence
+logits against re-transcribed reference formulas. Catches math errors
+but shares an author with the code under test, hence the second layer.
+
+**GPU, real weights, against the actual `DeepSpec` implementation**
+(`scripts/modal_dspark_parity.py`, Qwen3-4B + `dspark_qwen3_4b_block7`,
+one L4): both drafters fed the identical injected context so the
+comparison isolates drafter arithmetic.
+
+- **Draft tokens identical** in the single-round check (7/7 positions)
+  and in all four rounds of a real greedy accept/reject loop
+  (accepting 1, 2, 3, 2 of 7).
+- **bf16 deltas are one rounding step.** Every tensor's worst element
+  differed by ~1 bf16 ULP at that tensor's own scale, with
+  `mean_abs_diff` 20-100x below `max_abs_diff` (nearly all elements
+  bit-identical). Different reduction orders: our materialized-torch
+  attention backend vs HF/DeepSpec's sdpa.
+- **fp32 re-run confirms it was rounding, not a bug.** Rerunning both
+  drafters in fp32 on the same context shrank the deltas by 1600-6700x
+  (`block_hidden` 2.5e-1 -> 7.9e-5, `corrected_logits` 2.5e-1 ->
+  3.7e-5), landing at `rel_l2` ~2e-6, ordinary fp32 accumulation over
+  2560-wide reductions. A wrong formula would not shrink with mantissa
+  width. Tokens identical here too.
+
+Raw numbers: `docs/benchmarks/data/dspark-parity-{raw,fp32}.json`.
+Provenance fixture: `tests/fixtures/dspark/qwen3_4b_block7_greedy.json`.
+
+Two side findings from the run:
+
+- `DeepSpec` runs unmodified under transformers 5.14.1, not just its
+  own pinned 5.10.2, so the isolated-venv fallback the plan held in
+  reserve is not needed.
+- The paper's motivation for the sequential head is visible directly in
+  the outputs. Decoding the raw bidirectional base-logit argmax gives
+  `'ativeative decoding decoding decoding is is'` (the independence
+  collapse a purely parallel proposal suffers); the Markov-corrected
+  sample gives `'ulative modeling decoding is a key is'`.
+
+Existing Qwen3 golden tests are unaffected (point 2); the tap kwarg
+defaults to off and is verified not to change logits when unused.
+
+Not covered, deliberately: check 1 (our Qwen3 forward vs HF) was run in
+bf16 only, since two fp32 copies of the 4B target exceed an L4 and that
+comparison is about pre-existing Qwen3 fidelity, which the Qwen3 golden
+tests already own, rather than about this port.
 
 ## Pointers
 

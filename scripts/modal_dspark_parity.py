@@ -80,8 +80,11 @@ image = (
 _PROMPT = "Explain why speculative decoding speeds up language model inference."
 
 
-def _summarize(name: str, a: Any, b: Any) -> dict[str, Any]:
-    """Difference between two tensors, with metrics that mean something in bf16.
+def _summarize(name: str, a: Any, b: Any, *, mantissa_bits: int = 8) -> dict[str, Any]:
+    """Difference between two tensors, with metrics that mean something in low precision.
+
+    `mantissa_bits` sets the rounding step `ulp_ratio` is measured against: 8
+    for bf16 (the default), 24 for fp32.
 
     The first version of this reported `max_rel_diff` (elementwise, denominator
     clamped at 1e-6) and `allclose(atol=1e-3, rtol=1e-3)`. Both were useless
@@ -107,7 +110,7 @@ def _summarize(name: str, a: Any, b: Any) -> dict[str, Any]:
     diff = (a32 - b32).abs()
     ref_absmax = float(b32.abs().max())
     max_abs = float(diff.max())
-    bf16_ulp = ref_absmax * 2**-8
+    ulp = ref_absmax * 2.0**-mantissa_bits
     return {
         "name": name,
         "shape": list(a32.shape),
@@ -115,7 +118,7 @@ def _summarize(name: str, a: Any, b: Any) -> dict[str, Any]:
         "mean_abs_diff": float(diff.mean()),
         "ref_absmax": ref_absmax,
         "rel_l2": float(diff.norm() / b32.norm().clamp_min(1e-12)),
-        "ulp_ratio": (max_abs / bf16_ulp) if bf16_ulp > 0 else 0.0,
+        "ulp_ratio": (max_abs / ulp) if ulp > 0 else 0.0,
         "exact": bool(torch.equal(a32, b32)),
     }
 
@@ -441,6 +444,167 @@ class _AsAttr:
 
     def __init__(self, d: dict[str, Any]) -> None:
         self.__dict__.update(d)
+
+
+@app.function(gpu=_GPU, image=image, volumes={"/hf-cache": hf_cache}, timeout=60 * 30)
+def drafter_fp32() -> dict[str, Any]:
+    """Settle drift-vs-bug: run BOTH drafters in fp32 on one identical context.
+
+    The bf16 run showed every tensor disagreeing by about one bf16 rounding
+    step while producing identical tokens, which points at kernel reduction
+    order rather than a math error. That is an inference from the magnitudes,
+    not a measurement. In fp32 the rounding step is 2**-24 instead of 2**-8, so
+    a correct port has to agree to roughly 1e-6 relative; an actual math bug
+    stays the same size in both precisions. That is the discriminator.
+
+    Only the drafter comparison runs here (the isolated one: both drafters get
+    the SAME context tensor). Check 1 would need two fp32 copies of the 4B
+    target (~32 GB, over an L4) and is about pre-existing Qwen3 fidelity, which
+    the repo's Qwen3 golden tests already cover, not about this port. The
+    target is loaded in bf16 only to produce a realistic context, then freed
+    before the two fp32 drafters (~5.6 GB each) are built.
+    """
+    import gc
+
+    import torch
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from mini_infer.engine.dspark import Qwen3DSparkConfig, Qwen3DSparkDrafter
+    from mini_infer.engine.dspark.draft_cache import DSparkDraftCache
+
+    device = torch.device("cuda")
+    results: dict[str, Any] = {"gpu": _GPU, "precision": "fp32"}
+
+    snapshot_download(_TARGET)  # cached by the bf16 run; kept so this can run standalone
+    drafter_dir = snapshot_download(_DRAFTER)
+    tokenizer = AutoTokenizer.from_pretrained(_TARGET)
+    prompt_ids = tokenizer.encode(_PROMPT)
+    n_prompt = len(prompt_ids)
+
+    cfg = Qwen3DSparkConfig.from_hf(json.loads((Path(drafter_dir) / "config.json").read_text()))
+    block_size = cfg.block_size
+
+    # Context from a bf16 target, then the target is freed. Both drafters get
+    # this same tensor upcast to fp32, so the context is identical by
+    # construction and every remaining difference is drafter arithmetic.
+    hf_target = (
+        AutoModelForCausalLM.from_pretrained(
+            _TARGET, dtype=torch.bfloat16, attn_implementation="sdpa"
+        )
+        .to(device)
+        .eval()
+    )
+    with torch.inference_mode():
+        hf_out = hf_target(torch.tensor([prompt_ids], device=device), output_hidden_states=True)
+    context = torch.cat([hf_out.hidden_states[i + 1] for i in cfg.target_layer_ids], dim=-1).float()
+    anchor = int(hf_out.logits[0, -1].argmax())
+    del hf_target, hf_out
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"context {tuple(context.shape)} fp32; target freed", flush=True)
+
+    ours = Qwen3DSparkDrafter(cfg)
+    Qwen3DSparkDrafter.load_weights(ours, load_file(str(Path(drafter_dir) / "model.safetensors")))
+    ours = ours.to(device=device, dtype=torch.float32).eval()
+
+    from deepspec.eval.dspark.draft_ops import forward_dspark_draft_block
+    from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
+    from transformers import DynamicCache
+
+    ref = (
+        Qwen3DSparkModel.from_pretrained(
+            drafter_dir, dtype=torch.float32, attn_implementation="sdpa"
+        )
+        .to(device)
+        .eval()
+    )
+    print(
+        f"both drafters in fp32; cuda mem {torch.cuda.memory_allocated() / 2**30:.1f} GiB",
+        flush=True,
+    )
+
+    di = torch.full((1, block_size), int(cfg.mask_token_id), dtype=torch.long, device=device)
+    di[:, 0] = anchor
+    position_ids = torch.arange(n_prompt + 64, device=device).unsqueeze(0)
+
+    with torch.inference_mode():
+        ref_bh = forward_dspark_draft_block(
+            ref,
+            draft_input_ids=di,
+            position_ids=position_ids,
+            past_key_values_draft=DynamicCache(),
+            target_hidden_states=context,
+            start=n_prompt,
+            block_size=block_size,
+        )
+        ref_base = ref.compute_logits(ref_bh[:, :block_size, :])
+        ref_tok, ref_corr = ref.sample_draft_tokens(
+            ref_base,
+            first_prev_token_ids=di[:, 0],
+            temperature=0.0,
+            hidden_states=ref_bh[:, :block_size, :],
+        )
+        ref_conf = ref.predict_confidence_step(
+            ref_bh[:, :block_size, :],
+            prev_token_ids=torch.cat([di[:, :1], ref_tok[:, :-1]], dim=1),
+        )
+
+        cache = DSparkDraftCache(cfg.num_hidden_layers)
+        our_bh = ours.forward_backbone(
+            noise_embedding=ours.embed_tokens(di),
+            target_hidden_states=context,
+            position_ids=position_ids[:, : n_prompt + block_size],
+            past_key_values=cache,
+        )
+        our_base = ours.compute_logits(our_bh[:, :block_size, :])
+        our_tok, our_corr = ours.sample_draft_tokens(
+            our_base, first_prev_token_ids=di[:, 0], temperature=0.0
+        )
+        our_conf = ours.predict_confidence_step(
+            our_bh[:, :block_size, :],
+            prev_token_ids=torch.cat([di[:, :1], our_tok[:, :-1]], dim=1),
+        )
+
+    assert ref_conf is not None and our_conf is not None
+    checks = [
+        _summarize("block_hidden", our_bh, ref_bh, mantissa_bits=24),
+        _summarize("base_logits", our_base, ref_base, mantissa_bits=24),
+        _summarize("corrected_logits", our_corr, ref_corr, mantissa_bits=24),
+        _summarize("confidence_logits", our_conf, ref_conf, mantissa_bits=24),
+    ]
+    results["checks"] = checks
+    results["tokens_equal"] = bool(torch.equal(our_tok, ref_tok))
+    results["ref_tokens"] = ref_tok[0].tolist()
+    results["ours_tokens"] = our_tok[0].tolist()
+    for c in checks:
+        print(
+            f"  {c['name']}: max_abs={c['max_abs_diff']:.3e} rel_l2={c['rel_l2']:.3e} "
+            f"fp32_ulp={c['ulp_ratio']:.1f}",
+            flush=True,
+        )
+    print(f"  tokens equal: {results['tokens_equal']}", flush=True)
+    return results
+
+
+@app.local_entrypoint()
+def fp32() -> None:
+    """Drift-vs-bug confirmation: `uv run modal run scripts/modal_dspark_parity.py::fp32`."""
+    results = drafter_fp32.remote()
+
+    out_dir = Path("docs/benchmarks/data")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "dspark-parity-fp32.json").write_text(json.dumps(results, indent=2))
+
+    print("\n=== DSpark drafter parity, fp32 (both drafters, identical context) ===")
+    for c in results["checks"]:
+        print(
+            f"  {c['name']:<20} max_abs={c['max_abs_diff']:.3e}  "
+            f"rel_l2={c['rel_l2']:.3e}  fp32_ulp={c['ulp_ratio']:.1f}"
+        )
+    print(f"  draft tokens identical: {results['tokens_equal']}")
+    print("\nwrote docs/benchmarks/data/dspark-parity-fp32.json")
 
 
 @app.local_entrypoint()
