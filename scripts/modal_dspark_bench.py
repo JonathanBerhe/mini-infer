@@ -336,7 +336,22 @@ def bench(
             "n_confidence_obs": len(observations),
             "spec_seconds": spec_time,
             "baseline_seconds": base_time,
-            "wallclock_speedup": (base_time / spec_time) if spec_time else 0.0,
+            # Per-prompt, because the two arms cover different prompt counts:
+            # spec runs all of them, the baseline only the first
+            # `baseline_limit`. A raw seconds ratio would compare a 50-prompt
+            # run against a 15-prompt one and read as a slowdown.
+            "spec_seconds_per_prompt": (spec_time / len(prompts)) if prompts else 0.0,
+            "baseline_seconds_per_prompt": (
+                (base_time / baseline_checked) if baseline_checked else None
+            ),
+            "wallclock_speedup_per_prompt": (
+                (base_time / baseline_checked) / (spec_time / len(prompts))
+                if baseline_checked and spec_time and prompts
+                else None
+            ),
+            "mean_predicted_confidence": (
+                sum(p for p, _ in observations) / len(observations) if observations else None
+            ),
             "target_forwards": target_forwards,
             "tokens_generated": tokens_out,
             "greedy_mismatches": mismatches,

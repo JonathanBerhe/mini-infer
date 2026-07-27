@@ -184,7 +184,28 @@ target's exact argmax by construction.
 checkpoints. If parity fails and cannot be root-caused, stop and
 document.
 
-### Stage C: confidence-scheduled truncation, batch-1
+### Stage C: confidence-scheduled truncation, batch-1, done
+
+Done (2026-07-27). Results:
+[docs/benchmarks/2026-07-27-dspark-accepted-length.md](../benchmarks/2026-07-27-dspark-accepted-length.md).
+
+tau lands at 3.79 math / 3.14 code / 3.07 chat (templated, 50 prompts) against
+the paper's ~5.57 / ~5.12 / ~3.49. Threshold 0.30 cuts verified tokens per
+round 18% for a 0.7% tau cost. Per-step conditional acceptance is flat out to
+position 7, reproducing the paper's claim for the sequential head.
+
+**Gate: partially met, and the two hypotheses this plan named were both
+tested and refuted.** Chat templating was predicted to close the gap; it
+lowers tau in all three domains (-3/-12/-6%). Truncation at 128 tokens was
+predicted to bias the long-answer domains; a 3x longer budget buys 3%. What
+remains, and is the leading explanation, is that the paper measures at
+temperature 1.0 with rejection sampling (acceptance `1 - TV`) while this is
+greedy (acceptance `P(argmax match)`), a strictly harsher bar. The
+confidence head's calibration error points the same way, since it is trained
+against exactly the temperature-1.0 acceptance rate. Confirming this needs
+Stage D's rejection sampling.
+
+Original plan text follows.
 
 Add threshold-mode truncation mirroring DeepSpec's
 `_confident_prefix_length` (truncate the draft at the first position
