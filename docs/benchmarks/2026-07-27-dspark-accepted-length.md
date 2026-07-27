@@ -6,6 +6,7 @@ Target: `Qwen/Qwen3-4B`
 Drafter: `deepseek-ai/dspark_qwen3_4b_block7` (block size 7, 5 layers, 1.39B)
 Workload: 50 prompts per dataset from DeepSpec's bundled `eval_datasets/`,
 128 new tokens each, greedy, chat template with `enable_thinking=False`
+(threshold sweep: mt-bench, same settings)
 Engine: mini-infer @ ADR-027 (Stage C)
 Script: `scripts/modal_dspark_bench.py`
 
@@ -141,25 +142,46 @@ against greedy argmax-equality outcomes while it is trained against the
 temperature-1.0 acceptance rate. Practical consequence unchanged: treat these
 values as a ranking signal for prefix truncation, not as probabilities.
 
-## Confidence threshold sweep
+## Confidence threshold sweep (mt-bench, greedy, non-thinking)
 
-Measured before the thinking-mode fix, so the absolute tau values are the
-depressed ones; the shape of the trade is what this shows.
-
-| threshold | tau | draft tokens offered/round | accept rate |
-|---:|---:|---:|---:|
-| off (0.00) | 3.07 | 7.00 | 29.6% |
-| 0.30 | 3.05 | 5.73 | 35.7% |
-| 0.50 | 2.85 | 3.88 | 47.8% |
-| 0.70 | 2.45 | 2.30 | 62.9% |
+| threshold | tau | tau cost | offered/round | width cut | accept rate |
+|---:|---:|---:|---:|---:|---:|
+| off (0.00) | 3.90 | - | 7.00 | - | 41.5% |
+| 0.30 | 3.85 | 1.3% | 6.02 | 14.0% | 47.4% |
+| 0.50 | 3.67 | 5.9% | 4.37 | 37.6% | 60.9% |
+| 0.70 | 3.11 | 20.3% | 2.83 | 59.6% | 74.5% |
 
 Raising the threshold discards tokens that were going to be rejected, so
-acceptance rate climbs while tokens per round falls. Threshold 0.30 cut
-verified tokens 18% for a 0.7% tau cost.
+acceptance rate climbs (41.5% to 74.5%) while tokens per round falls.
 
-This should be re-measured in non-thinking mode before being used to pick an
-operating point: acceptance is now much higher, so the confidence
-distribution has shifted and the useful threshold will differ.
+**0.50 is the interesting operating point here**: it removes 38% of the
+verify width for 6% of the accepted length. Verify cost scales with width
+while tau is what the width buys, so trading 6 for 38 is strongly positive
+whenever the target's per-forward cost grows with the number of tokens
+verified. 0.30 is nearly free (1.3% for 14%) but leaves most of the saving on
+the table; 0.70 crosses over into costing real tokens.
+
+These numbers replace an earlier sweep taken before the thinking-mode fix,
+which is worth recording because the correction did not simply shift the
+curve. Then and now, per unit of tau given up:
+
+| threshold | width cut per 1% tau (thinking, wrong) | (non-thinking, correct) |
+|---:|---:|---:|
+| 0.30 | 27.8x | 10.9x |
+| 0.50 | 6.2x | 6.4x |
+| 0.70 | 3.3x | 2.9x |
+
+The low-threshold end changed by more than a factor of two: at 0.30 the old
+measurement made truncation look almost free because so many tokens were
+being rejected anyway that discarding the least confident ones cost nothing.
+With acceptance at 41.5% instead of 29.6%, low-confidence tokens are more
+often worth keeping, so cheap truncation buys less. Picking an operating
+point from the old numbers would have set the threshold too low.
+
+Caveat: tau alone does not identify the optimum. The right threshold depends
+on the target's cost curve, which is what the paper's batch-global scheduler
+solves against and what cannot be evaluated without multi-request batching
+(Stage D).
 
 ## Wall-clock, reported but not load-bearing
 
@@ -227,7 +249,9 @@ Raw data: `docs/benchmarks/data/dspark-stage-c.json`.
   in non-thinking mode.
 - Single request throughout. The paper's headline is a batch-global scheduler
   under concurrency, which this cannot evaluate at all (Stage D).
-- The threshold sweep and the wall-clock table predate the thinking-mode fix.
+- The wall-clock table predates the thinking-mode fix, so its forward-count
+  saving understates what current acceptance delivers.
+- The threshold sweep covers chat only.
 - Baseline correctness is spot-checked on 15 of 50 prompts.
 
 ## Pointers
