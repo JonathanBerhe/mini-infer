@@ -67,3 +67,24 @@ def test_encode_chat_refuses_without_a_template() -> None:
     assert not tok.has_chat_template()
     with pytest.raises(ValueError, match="no chat_template"):
         tok.encode_chat("hello")
+
+
+@pytest.mark.requires_model
+def test_enable_thinking_changes_the_generation_prompt() -> None:
+    """Qwen3's reasoning mode is a template flag, and it is not cosmetic.
+
+    Defaulting to thinking mode makes the model emit a `<think>` block before
+    answering. Anything compared against a model tuned on non-thinking output
+    has to disable it, which is why DSpark's own evaluator hardcodes
+    `enable_thinking=False`; getting this wrong silently depresses draft
+    acceptance rather than failing.
+    """
+    tok = Tokenizer.from_pretrained(_MODEL)
+    thinking = tok.encode_chat("What is 2+2?", enable_thinking=True)
+    plain = tok.encode_chat("What is 2+2?", enable_thinking=False)
+
+    assert len(plain) > len(thinking), "non-thinking pre-closes the block, adding tokens"
+    assert tok._tokenizer.decode(plain).rstrip().endswith("</think>")
+    assert "<think>" not in tok._tokenizer.decode(thinking)
+    # Unset must not silently pick a mode of our own.
+    assert tok.encode_chat("What is 2+2?") == thinking

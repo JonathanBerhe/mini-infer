@@ -296,7 +296,13 @@ def bench(
 
         for prompt_idx, text in enumerate(prompts):
             if templated:
-                prompt_ids = target.tokenizer.encode_chat(text)[:512]
+                # enable_thinking=False mirrors DeepSpec's own evaluator, which
+                # hardcodes it, and its training data, regenerated with
+                # --disable-thinking. Qwen3's template otherwise defaults to
+                # thinking mode and the target emits a <think> block the
+                # drafter never saw in training, which depresses acceptance and
+                # is what made the first templated arm look WORSE than raw.
+                prompt_ids = target.tokenizer.encode_chat(text, enable_thinking=False)[:512]
             else:
                 prompt_ids = target.tokenizer.encode(text)[:512]
             if not prompt_ids:
