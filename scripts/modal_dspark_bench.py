@@ -49,7 +49,14 @@ _DEEPSPEC_REPO = "https://github.com/deepseek-ai/DeepSpec.git"
 
 # One per domain the paper breaks out, so our tau is comparable per-domain
 # rather than averaged into a single number that hides the spread.
-_DATASETS = {"gsm8k": "math", "humaneval": "code", "mt-bench": "chat"}
+_ALL_DATASETS = {"gsm8k": "math", "humaneval": "code", "mt-bench": "chat"}
+# Restrictable so a targeted re-run (e.g. re-sweeping the threshold on chat)
+# does not re-measure domains that are already settled.
+_DATASETS = {
+    k: v
+    for k, v in _ALL_DATASETS.items()
+    if k in os.environ.get("DSPARK_DATASETS", ",".join(_ALL_DATASETS)).split(",")
+}
 # Swept on the chat set only: it is where the paper reports the widest
 # acceptance movement (45.7% -> 95.7%) and where truncation should matter most,
 # since chat is the low-tau domain.
@@ -158,6 +165,7 @@ def bench(
     probe_samples: int = _PROBE_SAMPLES,
     temperatures: list[float] | None = None,
     arms: list[str] | None = None,
+    datasets: dict[str, str] | None = None,
     run_sweep: bool = True,
     run_probe: bool = True,
 ) -> dict[str, Any]:
@@ -191,7 +199,9 @@ def bench(
     )
     from mini_infer.engine.model_runner import ModelRunner
 
+    active_datasets = datasets if datasets is not None else _DATASETS
     results: dict[str, Any] = {
+        "datasets": list(active_datasets),
         "gpu": _GPU,
         "target": _TARGET,
         "drafter": _DRAFTER,
@@ -420,7 +430,7 @@ def bench(
     for temperature in temps:
         for arm in active_arms:
             templated = arm == "templated"
-            for name, domain in _DATASETS.items():
+            for name, domain in active_datasets.items():
                 prompts = load_prompts(name)
                 row = run_config(
                     name,
@@ -514,6 +524,7 @@ def main() -> None:
         probe_samples=_PROBE_SAMPLES,
         temperatures=_TEMPERATURES,
         arms=_ARMS,
+        datasets=_DATASETS,
         run_sweep=_RUN_SWEEP,
         run_probe=_RUN_PROBE,
     )
@@ -534,7 +545,7 @@ def main() -> None:
     if len(temps_seen) > 1:
         print("\n=== greedy vs temperature 1.0 (templated) ===")
         print(f"{'dataset':<12}{'T=0 tau':>9}{'T=1 tau':>9}{'delta':>8}{'paper':>8}{'closed':>9}")
-        for name in _DATASETS:
+        for name in results.get("datasets", _DATASETS):
             lo, hi = by_temp.get((name, 0.0)), by_temp.get((name, 1.0))
             if not (lo and hi):
                 continue
