@@ -54,6 +54,11 @@ _DATASETS = {"gsm8k": "math", "humaneval": "code", "mt-bench": "chat"}
 # acceptance movement (45.7% -> 95.7%) and where truncation should matter most,
 # since chat is the low-tau domain.
 _SWEEP_THRESHOLDS = [0.3, 0.5, 0.7]
+# Temperatures to measure tau at. The paper's Table 1 is temperature 1.0 with
+# rejection sampling; Stage C measured greedy, where acceptance needs an exact
+# argmax match instead of the softer 1 - TV criterion. Running both is the
+# direct test of whether that difference explains the gap.
+_TEMPERATURES = [float(t) for t in os.environ.get("DSPARK_TEMPS", "0.0,1.0").split(",")]
 # The baseline costs ~3x the speculative run and only serves the correctness
 # check, so it is spot-checked on a subset rather than every prompt.
 _BASELINE_LIMIT = int(os.environ.get("DSPARK_BASELINE_LIMIT", "15"))
@@ -136,6 +141,7 @@ def bench(
     baseline_limit_arg: int = _BASELINE_LIMIT,
     probe_max_new: int = _PROBE_MAX_NEW,
     probe_samples: int = _PROBE_SAMPLES,
+    temperatures: list[float] | None = None,
 ) -> dict[str, Any]:
     """Args are passed explicitly, NOT read from the module globals.
 
@@ -245,6 +251,7 @@ def bench(
         templated: bool,
         max_tokens: int,
         baseline_limit: int,
+        temperature: float = 0.0,
     ) -> dict[str, Any]:
         """`baseline_limit` caps how many prompts also run target-alone.
 
@@ -253,7 +260,9 @@ def bench(
         tau is measured on every prompt; the baseline is spot-checked on the
         first `baseline_limit` of them.
         """
-        spec = DSparkSpeculativeRunner(target, drafter, confidence_threshold=threshold)
+        spec = DSparkSpeculativeRunner(
+            target, drafter, confidence_threshold=threshold, temperature=temperature
+        )
         tau_num = tau_den = 0
         offered_total = accepted_total = 0
         offered_at = [0] * block_size
@@ -294,7 +303,11 @@ def bench(
                     if accepted > p:
                         survived_at[p] += 1
 
-            if prompt_idx >= baseline_limit:
+            if temperature > 0.0 or prompt_idx >= baseline_limit:
+                # Above temperature 0 both sides sample, so token equality
+                # against a baseline is not the contract and a "mismatch"
+                # count would just measure the RNG. Distribution preservation
+                # is covered by tests/unit/test_dspark_rejection_sampling.py.
                 continue
             baseline_checked += 1
             expected, bt = target_alone(prompt_ids, max_tokens)
@@ -318,6 +331,7 @@ def bench(
         return {
             "dataset": name,
             "threshold": threshold,
+            "temperature": temperature,
             "templated": templated,
             "max_new_tokens": max_tokens,
             "baseline_checked": baseline_checked,
@@ -370,33 +384,41 @@ def bench(
     # suspect for our tau falling short of the paper. Running both isolates
     # that one variable instead of changing scale and formatting together.
     per_dataset = []
-    for templated in (False, True):
-        arm = "templated" if templated else "raw"
-        for name, domain in _DATASETS.items():
-            prompts = load_prompts(name)
-            row = run_config(
-                name,
-                prompts,
-                0.0,
-                templated=templated,
-                max_tokens=max_new,
-                baseline_limit=baseline_limit,
-            )
-            row["domain"] = domain
-            row["arm"] = arm
-            per_dataset.append(row)
-            print(
-                f"  [{arm}] {name} ({domain}): tau={row['tau']:.2f} "
-                f"accept={row['acceptance_rate']:.1%} ece={row['ece']:.3f} "
-                f"mismatch={row['greedy_mismatches']}/{row['baseline_checked']}",
-                flush=True,
-            )
+    temps = temperatures if temperatures is not None else [0.0]
+    for temperature in temps:
+        for templated in (False, True):
+            arm = "templated" if templated else "raw"
+            for name, domain in _DATASETS.items():
+                prompts = load_prompts(name)
+                row = run_config(
+                    name,
+                    prompts,
+                    0.0,
+                    templated=templated,
+                    max_tokens=max_new,
+                    baseline_limit=baseline_limit,
+                    temperature=temperature,
+                )
+                row["domain"] = domain
+                row["arm"] = arm
+                per_dataset.append(row)
+                print(
+                    f"  [T={temperature} {arm}] {name} ({domain}): tau={row['tau']:.2f} "
+                    f"accept={row['acceptance_rate']:.1%} ece={row['ece']:.3f}",
+                    flush=True,
+                )
     results["per_dataset"] = per_dataset
 
     # Sweep on the templated chat set: the arm we expect to ship, and the
     # domain where the paper reports the widest acceptance movement.
     chat_prompts = load_prompts("mt-bench")
-    sweep = [next(r for r in per_dataset if r["dataset"] == "mt-bench" and r["arm"] == "templated")]
+    sweep = [
+        next(
+            r
+            for r in per_dataset
+            if r["dataset"] == "mt-bench" and r["arm"] == "templated" and r["temperature"] == 0.0
+        )
+    ]
     for th in _SWEEP_THRESHOLDS:
         row = run_config(
             "mt-bench",
@@ -431,6 +453,7 @@ def bench(
         baseline_limit=0,
     )
     probe["arm"] = "templated"
+    probe["temperature"] = 0.0
     results["length_probe"] = probe
     print(
         f"  [probe] gsm8k @ {probe_max_new} tokens, n={probe_n}: tau={probe['tau']:.2f}",
@@ -450,6 +473,7 @@ def main() -> None:
         baseline_limit_arg=_BASELINE_LIMIT,
         probe_max_new=_PROBE_MAX_NEW,
         probe_samples=_PROBE_SAMPLES,
+        temperatures=_TEMPERATURES,
     )
     out = Path("docs/benchmarks/data")
     out.mkdir(parents=True, exist_ok=True)
@@ -467,8 +491,16 @@ def main() -> None:
             f"{r['acceptance_rate']:>8.1%}{r['ece']:>8.3f}{au:>8}{div:>6}"
         )
 
-    raw = {r["dataset"]: r for r in results["per_dataset"] if r["arm"] == "raw"}
-    tpl = {r["dataset"]: r for r in results["per_dataset"] if r["arm"] == "templated"}
+    raw = {
+        r["dataset"]: r
+        for r in results["per_dataset"]
+        if r["arm"] == "raw" and r["temperature"] == 0.0
+    }
+    tpl = {
+        r["dataset"]: r
+        for r in results["per_dataset"]
+        if r["arm"] == "templated" and r["temperature"] == 0.0
+    }
     print("\n  chat-template effect on tau:")
     for name in raw:
         a, b = raw[name]["tau"], tpl[name]["tau"]
@@ -485,7 +517,7 @@ def main() -> None:
 
     print("\n=== per-position survival (templated, threshold off) ===")
     for r in results["per_dataset"]:
-        if r["arm"] != "templated":
+        if r["arm"] != "templated" or r["temperature"] != 0.0:
             continue
         cells = " ".join(
             f"{v:.2f}" if v is not None else "  -  " for v in r["survival_by_position"]
