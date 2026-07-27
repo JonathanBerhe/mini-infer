@@ -216,7 +216,11 @@ def _forced_proposal(runner: _Runner, prompt_ids: list[int], expected: list[int]
         nxt = list(expected[idx + 1 : idx + 1 + _BLOCK])
         if partial and len(nxt) > 2:
             nxt = [*nxt[:2], (nxt[2] + 1) % vocab, *nxt[3:]]
-        return [*nxt, *([0] * (_BLOCK - len(nxt)))], None
+        toks = [*nxt, *([0] * (_BLOCK - len(nxt)))]
+        probs = torch.zeros(1, len(toks), vocab)
+        for i, t in enumerate(toks):
+            probs[0, i, t] = 1.0
+        return toks, None, probs
 
     return _propose
 

@@ -44,6 +44,12 @@ from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.dspark.draft_cache import DSparkDraftCache
 from mini_infer.engine.dspark.drafter import Qwen3DSparkDrafter
 from mini_infer.engine.dspark.proposal import confident_prefix_length
+from mini_infer.engine.dspark.sampling import (
+    accepted_prefix_length,
+    logits_to_probs,
+    sample_from_probs,
+    sample_residual,
+)
 from mini_infer.engine.model_runner import ModelRunner
 
 
@@ -110,6 +116,14 @@ class DSparkSpeculativeRunner:
     `confidence_threshold` of 0 disables truncation (verify the whole block);
     a positive value cuts the proposal at the first draft token whose
     predicted survival probability falls below it.
+
+    `temperature` of 0 is greedy, where output is provably token-identical to
+    target-alone decoding. Above 0 the loop switches to rejection sampling,
+    which is distribution-preserving rather than token-identical: the emitted
+    tokens are a draw from the target's own distribution, so per-run outputs
+    differ from any particular target-alone run while the distribution matches
+    (see `sampling.py` for why, and the statistical test in
+    `tests/unit/test_dspark_rejection_sampling.py`).
     """
 
     def __init__(
@@ -118,7 +132,10 @@ class DSparkSpeculativeRunner:
         drafter: Qwen3DSparkDrafter,
         *,
         confidence_threshold: float = 0.0,
+        temperature: float = 0.0,
     ) -> None:
+        if temperature < 0.0:
+            raise ValueError(f"temperature must be non-negative, got {temperature}")
         if not 0.0 <= confidence_threshold <= 1.0:
             raise ValueError(f"confidence_threshold must be in [0, 1], got {confidence_threshold}")
         if confidence_threshold > 0.0 and drafter.confidence_head is None:
@@ -129,6 +146,7 @@ class DSparkSpeculativeRunner:
         self.target = target
         self.drafter = drafter
         self.confidence_threshold = confidence_threshold
+        self.temperature = temperature
         self.block_size = drafter.cfg.block_size
         self._tap_layers = frozenset(drafter.cfg.target_layer_ids)
         self._ordered_taps = list(drafter.cfg.target_layer_ids)
@@ -183,7 +201,7 @@ class DSparkSpeculativeRunner:
             start = len(prompt_ids)
 
             while len(generated) < max_tokens:
-                draft_tokens, confidence = self._propose(
+                draft_tokens, confidence, draft_probs = self._propose(
                     anchor=anchor, context=context, start=start, draft_cache=draft_cache
                 )
                 stats.n_drafter_forwards += 1
@@ -212,14 +230,11 @@ class DSparkSpeculativeRunner:
                 )
                 stats.n_target_forwards += 1
 
-                target_argmax = verify_logits[0].argmax(dim=-1).tolist()
-                accepted = 0
-                for i, tok in enumerate(offered):
-                    if target_argmax[i] == tok:
-                        accepted += 1
-                    else:
-                        break
-                bonus = int(target_argmax[accepted])
+                accepted, bonus = self._verify(
+                    verify_logits=verify_logits,
+                    offered=offered,
+                    draft_probs=draft_probs,
+                )
 
                 if confidence is not None:
                     conf_probs = confidence[0].sigmoid().tolist()
@@ -272,8 +287,15 @@ class DSparkSpeculativeRunner:
         context: torch.Tensor,
         start: int,
         draft_cache: DSparkDraftCache,
-    ) -> tuple[list[int], torch.Tensor | None]:
-        """One drafter round: a block of candidate tokens plus their confidence logits."""
+    ) -> tuple[list[int], torch.Tensor | None, torch.Tensor]:
+        """One drafter round: candidate tokens, confidence logits, and draft probs.
+
+        The probabilities are the Markov-CORRECTED ones, not the backbone's raw
+        base logits, because those are the distribution the tokens were
+        actually drawn from. Rejection sampling compares the target against
+        the proposal distribution, so using the uncorrected logits here would
+        silently break losslessness.
+        """
         cfg = self.drafter.cfg
         device = context.device
         draft_input_ids = torch.full(
@@ -303,13 +325,59 @@ class DSparkSpeculativeRunner:
 
             hidden = block_hidden[:, : self.block_size, :]
             base_logits = self.drafter.compute_logits(hidden)
-            sampled, _ = self.drafter.sample_draft_tokens(
+            sampled, corrected_logits = self.drafter.sample_draft_tokens(
                 base_logits,
                 first_prev_token_ids=draft_input_ids[:, 0],
-                temperature=0.0,
+                temperature=self.temperature,
             )
+            draft_probs = logits_to_probs(corrected_logits, self.temperature)
             confidence = self.drafter.predict_confidence_step(
                 hidden,
                 prev_token_ids=torch.cat([draft_input_ids[:, :1], sampled[:, :-1]], dim=1),
             )
-        return sampled[0].tolist(), confidence
+        return sampled[0].tolist(), confidence, draft_probs
+
+    def _verify(
+        self,
+        *,
+        verify_logits: torch.Tensor,
+        offered: list[int],
+        draft_probs: torch.Tensor,
+    ) -> tuple[int, int]:
+        """Accept a prefix of `offered` and pick the token that follows it.
+
+        Greedy and temperature > 0 are the same algorithm at different
+        temperatures (`logits_to_probs` emits one-hots when greedy, which
+        collapses the ratio test to argmax equality), but greedy is kept on an
+        explicit integer-comparison path: it is the temperature-0 bit-parity
+        contract Stage B and C rest on, and routing it through multinomial
+        draws would make a provable property depend on an RNG.
+        """
+        if self.temperature < 1e-5:
+            target_argmax = verify_logits[0].argmax(dim=-1).tolist()
+            accepted = 0
+            for i, tok in enumerate(offered):
+                if target_argmax[i] == tok:
+                    accepted += 1
+                else:
+                    break
+            return accepted, int(target_argmax[accepted])
+
+        target_probs = logits_to_probs(verify_logits, self.temperature)
+        if not offered:
+            return 0, int(sample_from_probs(target_probs[:, -1:, :])[0, 0].item())
+
+        proposed = torch.tensor([offered], device=verify_logits.device, dtype=torch.long)
+        # verify_logits has one position per input token; position i predicts
+        # what follows input i, so the draft positions are all but the last.
+        accepted = accepted_prefix_length(
+            target_probs[:, :-1, :], draft_probs[:, : len(offered), :], proposed
+        )
+        if accepted < len(offered):
+            # Rejected at `accepted`: emit from the residual so the overall
+            # distribution stays exactly the target's.
+            bonus_t = sample_residual(target_probs[:, accepted, :], draft_probs[:, accepted, :])
+            return accepted, int(bonus_t[0].item())
+        # Everything accepted: the bonus is a free draw from the target's
+        # distribution at the position after the last draft token.
+        return accepted, int(sample_from_probs(target_probs[:, -1:, :])[0, 0].item())

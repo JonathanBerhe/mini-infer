@@ -124,6 +124,18 @@ class _StubRunner:
         return logits
 
 
+def _one_hot(tokens: list[int]) -> torch.Tensor:
+    """What `logits_to_probs` yields at temperature 0 for these tokens.
+
+    The greedy path never reads draft probs, but returning a real one-hot
+    keeps the fake honest if a caller ever runs it at temperature > 0.
+    """
+    probs = torch.zeros(1, len(tokens), _VOCAB)
+    for i, t in enumerate(tokens):
+        probs[0, i, t] = 1.0
+    return probs
+
+
 def _build(seed: int = 0, *, confidence: bool = True, num_blocks: int = 64):
     torch.manual_seed(seed)
     model = Qwen3ForCausalLM(_target_config()).eval()
@@ -247,7 +259,8 @@ def test_self_drafting_accepts_everything() -> None:
         # will not emit, so the tail round still exercises a rejection.
         idx = start - len(prompt)
         nxt = expected[idx + 1 : idx + 1 + _BLOCK]
-        return [*nxt, *([_EOS] * (_BLOCK - len(nxt)))], None
+        toks = [*nxt, *([_EOS] * (_BLOCK - len(nxt)))]
+        return toks, None, _one_hot(toks)
 
     spec._propose = _perfect_proposal  # type: ignore[method-assign]
     got, stats = spec.run_greedy(prompt, 9)
@@ -334,3 +347,49 @@ def test_threshold_out_of_range_rejected() -> None:
     runner, drafter, _ = _build()
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         DSparkSpeculativeRunner(runner, drafter, confidence_threshold=1.5)
+
+
+# --- temperature > 0 -------------------------------------------------------
+
+
+def test_sampling_run_completes_and_reports_stats() -> None:
+    """Temperature > 0 takes the rejection-sampling path and stays well-formed.
+
+    Token equality against a baseline is NOT the contract here (both sides
+    sample), so this checks structure; the distribution property itself is
+    tested in `test_dspark_rejection_sampling.py`.
+    """
+    runner, drafter, _ = _build()
+    spec = DSparkSpeculativeRunner(runner, drafter, temperature=1.0)
+    got, stats = spec.run_greedy([5, 9, 13, 21], 12)
+
+    assert 0 < len(got) <= 12
+    assert all(0 <= t < _VOCAB for t in got)
+    for offered, accepted, committed in zip(
+        stats.proposal_lengths, stats.accepted_draft_lengths, stats.acceptance_lengths, strict=True
+    ):
+        assert 0 <= accepted <= offered <= _BLOCK
+        assert committed == accepted + 1
+
+
+def test_sampling_output_varies_across_seeds() -> None:
+    """Sampling must actually sample: different seeds give different sequences.
+
+    Guards against a wiring mistake where the temperature path silently falls
+    through to argmax, which would look correct in every structural check while
+    quietly making the sampler deterministic.
+    """
+    runner, drafter, _ = _build()
+    spec = DSparkSpeculativeRunner(runner, drafter, temperature=1.5)
+    outs = []
+    for seed in range(6):
+        torch.manual_seed(seed)
+        got, _ = spec.run_greedy([5, 9, 13, 21], 10)
+        outs.append(tuple(got))
+    assert len(set(outs)) > 1, f"identical across seeds, sampler may be stuck: {outs[0]}"
+
+
+def test_negative_temperature_rejected() -> None:
+    runner, drafter, _ = _build()
+    with pytest.raises(ValueError, match="non-negative"):
+        DSparkSpeculativeRunner(runner, drafter, temperature=-0.5)
