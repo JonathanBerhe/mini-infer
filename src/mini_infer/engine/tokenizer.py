@@ -37,6 +37,40 @@ class Tokenizer:
     def decode(self, token_ids: Sequence[int]) -> str:
         return str(self._tokenizer.decode(list(token_ids), skip_special_tokens=True))
 
+    def has_chat_template(self) -> bool:
+        return getattr(self._tokenizer, "chat_template", None) is not None
+
+    def encode_chat(self, user_message: str) -> list[int]:
+        """Encode a single user turn through the model's own chat template.
+
+        Instruction-tuned checkpoints are trained almost entirely on templated
+        text, so feeding raw prompts puts the model off-distribution. That
+        matters for anything measuring agreement between two models (a
+        speculative drafter and its target): both still work, but acceptance
+        drops, because the drafter was tuned on the templated distribution.
+
+        `add_generation_prompt=True` appends the assistant header so the next
+        token continues the reply rather than the user's own turn. Raises if
+        the tokenizer ships no template, rather than silently degrading to
+        plain `encode`, so a caller asking for templating knows it happened.
+        """
+        if not self.has_chat_template():
+            raise ValueError("tokenizer has no chat_template; use encode() instead")
+        out = self._tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_message}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        # transformers 5.x returns a BatchEncoding here, not the flat id list
+        # older versions returned; iterating the mapping yields its KEYS, so
+        # unwrap explicitly rather than trusting the return shape.
+        if hasattr(out, "input_ids") or isinstance(out, dict):
+            out = out["input_ids"]
+        # A batched call would nest one list per conversation; we pass one.
+        if out and isinstance(out[0], list):
+            out = out[0]
+        return [int(t) for t in out]
+
     @property
     def eos_token_id(self) -> int:
         eos = self._tokenizer.eos_token_id

@@ -54,6 +54,12 @@ _DATASETS = {"gsm8k": "math", "humaneval": "code", "mt-bench": "chat"}
 # acceptance movement (45.7% -> 95.7%) and where truncation should matter most,
 # since chat is the low-tau domain.
 _SWEEP_THRESHOLDS = [0.3, 0.5, 0.7]
+# The baseline costs ~3x the speculative run and only serves the correctness
+# check, so it is spot-checked on a subset rather than every prompt.
+_BASELINE_LIMIT = int(os.environ.get("DSPARK_BASELINE_LIMIT", "15"))
+# Longer-generation probe for the truncation hypothesis.
+_PROBE_MAX_NEW = int(os.environ.get("DSPARK_PROBE_MAX_NEW", "384"))
+_PROBE_SAMPLES = int(os.environ.get("DSPARK_PROBE_SAMPLES", "15"))
 
 app = modal.App("mini-infer-dspark-bench")
 hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
@@ -124,7 +130,13 @@ def auroc(observations: list[tuple[float, bool]]) -> float | None:
 
 
 @app.function(gpu=_GPU, image=image, volumes={"/hf-cache": hf_cache}, timeout=60 * 90)
-def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
+def bench(
+    samples: int = _SAMPLES,
+    max_new: int = _MAX_NEW,
+    baseline_limit_arg: int = _BASELINE_LIMIT,
+    probe_max_new: int = _PROBE_MAX_NEW,
+    probe_samples: int = _PROBE_SAMPLES,
+) -> dict[str, Any]:
     """Args are passed explicitly, NOT read from the module globals.
 
     The globals are populated from env vars at import time, and the remote
@@ -195,7 +207,16 @@ def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
                         break
         return rows
 
+    baseline_cache: dict[tuple[tuple[int, ...], int], tuple[list[int], float]] = {}
+
     def target_alone(prompt_ids: list[int], max_tokens: int) -> tuple[list[int], float]:
+        # The baseline is a property of (prompt, length) alone, so the
+        # threshold sweep re-derived an identical answer for every threshold.
+        # Caching it turns the sweep's dominant cost into a lookup; the cached
+        # timing is still the real measured one from the first computation.
+        key = (tuple(prompt_ids), max_tokens)
+        if key in baseline_cache:
+            return baseline_cache[key]
         cache = PagedKVCache(target.block_pool)
         cache.add_request_slot()
         try:
@@ -210,11 +231,28 @@ def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
                 token = int(logits[0, -1].argmax())
                 out.append(token)
                 pos += 1
-            return out[:max_tokens], time.perf_counter() - t0
+            result = (out[:max_tokens], time.perf_counter() - t0)
+            baseline_cache[key] = result
+            return result
         finally:
             cache.free()
 
-    def run_config(name: str, prompts: list[str], threshold: float) -> dict[str, Any]:
+    def run_config(
+        name: str,
+        prompts: list[str],
+        threshold: float,
+        *,
+        templated: bool,
+        max_tokens: int,
+        baseline_limit: int,
+    ) -> dict[str, Any]:
+        """`baseline_limit` caps how many prompts also run target-alone.
+
+        The baseline costs one target forward per token, several times what
+        the speculative run costs, and it only serves the correctness check.
+        tau is measured on every prompt; the baseline is spot-checked on the
+        first `baseline_limit` of them.
+        """
         spec = DSparkSpeculativeRunner(target, drafter, confidence_threshold=threshold)
         tau_num = tau_den = 0
         offered_total = accepted_total = 0
@@ -223,35 +261,22 @@ def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
         observations: list[tuple[float, bool]] = []
         spec_time = base_time = 0.0
         mismatches = 0
+        baseline_checked = 0
         divergence_indices: list[int] = []
         divergence_fracs: list[float] = []
         target_forwards = 0
         tokens_out = 0
 
-        for text in prompts:
-            prompt_ids = target.tokenizer.encode(text)[:512]
+        for prompt_idx, text in enumerate(prompts):
+            if templated:
+                prompt_ids = target.tokenizer.encode_chat(text)[:512]
+            else:
+                prompt_ids = target.tokenizer.encode(text)[:512]
             if not prompt_ids:
                 continue
             t0 = time.perf_counter()
-            got, st = spec.run_greedy(prompt_ids, max_new)
+            got, st = spec.run_greedy(prompt_ids, max_tokens)
             spec_time += time.perf_counter() - t0
-            expected, bt = target_alone(prompt_ids, max_new)
-            base_time += bt
-            if got != expected:
-                mismatches += 1
-                div = next(
-                    (i for i, (a, b) in enumerate(zip(got, expected, strict=False)) if a != b),
-                    min(len(got), len(expected)),
-                )
-                # Where the FIRST token differs, as a fraction of the
-                # generation. One flipped token makes every later token differ
-                # too (different context), so a binary mismatch flag cannot
-                # distinguish "one late tie-break flipped" from "wrong from the
-                # start". Divergences clustered late are the signature of
-                # accumulated rounding; divergence at index 0 would mean the
-                # very first verify disagreed, i.e. a logic bug.
-                divergence_indices.append(div)
-                divergence_fracs.append(div / max(1, len(expected)))
 
             tau_num += sum(st.acceptance_lengths)
             tau_den += len(st.acceptance_lengths)
@@ -269,9 +294,33 @@ def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
                     if accepted > p:
                         survived_at[p] += 1
 
+            if prompt_idx >= baseline_limit:
+                continue
+            baseline_checked += 1
+            expected, bt = target_alone(prompt_ids, max_tokens)
+            base_time += bt
+            if got != expected:
+                mismatches += 1
+                div = next(
+                    (i for i, (a, b) in enumerate(zip(got, expected, strict=False)) if a != b),
+                    min(len(got), len(expected)),
+                )
+                # Where the FIRST token differs, as a fraction of the
+                # generation. One flipped token makes every later token differ
+                # too (different context), so a binary mismatch flag cannot
+                # distinguish "one late tie-break flipped" from "wrong from the
+                # start". Divergences clustered late are the signature of
+                # accumulated rounding; divergence at index 0 would mean the
+                # very first verify disagreed, i.e. a logic bug.
+                divergence_indices.append(div)
+                divergence_fracs.append(div / max(1, len(expected)))
+
         return {
             "dataset": name,
             "threshold": threshold,
+            "templated": templated,
+            "max_new_tokens": max_tokens,
+            "baseline_checked": baseline_checked,
             "num_prompts": len(prompts),
             "tau": (tau_num / tau_den) if tau_den else 0.0,
             "draft_tokens_per_proposal": (offered_total / tau_den) if tau_den else 0.0,
@@ -298,34 +347,80 @@ def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
             "min_divergence_index": min(divergence_indices) if divergence_indices else None,
         }
 
+    baseline_limit = max(1, min(samples, baseline_limit_arg))
+
+    # Two arms over the same prompts. The first run fed raw dataset text; the
+    # drafter was trained on target-regenerated responses in the model's chat
+    # format, so raw text is off-distribution for it and was the leading
+    # suspect for our tau falling short of the paper. Running both isolates
+    # that one variable instead of changing scale and formatting together.
     per_dataset = []
-    for name, domain in _DATASETS.items():
-        prompts = load_prompts(name)
-        print(f"{name} ({domain}): {len(prompts)} prompts", flush=True)
-        row = run_config(name, prompts, 0.0)
-        row["domain"] = domain
-        per_dataset.append(row)
-        print(
-            f"  tau={row['tau']:.2f} accept={row['acceptance_rate']:.1%} "
-            f"ece={row['ece']:.3f} auroc={row['auroc']} "
-            f"mismatch={row['greedy_mismatches']}",
-            flush=True,
-        )
+    for templated in (False, True):
+        arm = "templated" if templated else "raw"
+        for name, domain in _DATASETS.items():
+            prompts = load_prompts(name)
+            row = run_config(
+                name,
+                prompts,
+                0.0,
+                templated=templated,
+                max_tokens=max_new,
+                baseline_limit=baseline_limit,
+            )
+            row["domain"] = domain
+            row["arm"] = arm
+            per_dataset.append(row)
+            print(
+                f"  [{arm}] {name} ({domain}): tau={row['tau']:.2f} "
+                f"accept={row['acceptance_rate']:.1%} ece={row['ece']:.3f} "
+                f"mismatch={row['greedy_mismatches']}/{row['baseline_checked']}",
+                flush=True,
+            )
     results["per_dataset"] = per_dataset
 
-    sweep = [next(r for r in per_dataset if r["dataset"] == "mt-bench")]
+    # Sweep on the templated chat set: the arm we expect to ship, and the
+    # domain where the paper reports the widest acceptance movement.
     chat_prompts = load_prompts("mt-bench")
+    sweep = [next(r for r in per_dataset if r["dataset"] == "mt-bench" and r["arm"] == "templated")]
     for th in _SWEEP_THRESHOLDS:
-        row = run_config("mt-bench", chat_prompts, th)
+        row = run_config(
+            "mt-bench",
+            chat_prompts,
+            th,
+            templated=True,
+            max_tokens=max_new,
+            baseline_limit=baseline_limit,
+        )
         sweep.append(row)
         print(
-            f"  threshold={th}: tau={row['tau']:.2f} "
+            f"  [sweep] threshold={th}: tau={row['tau']:.2f} "
             f"offered={row['draft_tokens_per_proposal']:.2f} "
-            f"accept={row['acceptance_rate']:.1%} "
-            f"mismatch={row['greedy_mismatches']}",
+            f"accept={row['acceptance_rate']:.1%}",
             flush=True,
         )
     results["threshold_sweep"] = sweep
+
+    # Truncation probe. Cutting at `max_new` should bias the long-answer
+    # domains down hardest, because math and code answers get formulaic
+    # exactly in their later tokens, which is where acceptance is highest.
+    # Same prompts, longer budget, one dataset: if tau climbs, the cap was
+    # part of the gap.
+    probe_n = max(1, min(samples, probe_samples))
+    probe_prompts = load_prompts("gsm8k")[:probe_n]
+    probe = run_config(
+        "gsm8k",
+        probe_prompts,
+        0.0,
+        templated=True,
+        max_tokens=_PROBE_MAX_NEW,
+        baseline_limit=0,
+    )
+    probe["arm"] = "templated"
+    results["length_probe"] = probe
+    print(
+        f"  [probe] gsm8k @ {probe_max_new} tokens, n={probe_n}: tau={probe['tau']:.2f}",
+        flush=True,
+    )
 
     return results
 
@@ -334,23 +429,38 @@ def bench(samples: int = _SAMPLES, max_new: int = _MAX_NEW) -> dict[str, Any]:
 def main() -> None:
     # Explicit args: the remote container re-imports this module without
     # the caller's env, so the globals cannot be relied on there.
-    results = bench.remote(samples=_SAMPLES, max_new=_MAX_NEW)
+    results = bench.remote(
+        samples=_SAMPLES,
+        max_new=_MAX_NEW,
+        baseline_limit_arg=_BASELINE_LIMIT,
+        probe_max_new=_PROBE_MAX_NEW,
+        probe_samples=_PROBE_SAMPLES,
+    )
     out = Path("docs/benchmarks/data")
     out.mkdir(parents=True, exist_ok=True)
     (out / "dspark-stage-c.json").write_text(json.dumps(results, indent=2))
 
-    print("\n=== DSpark accepted length by domain (threshold off) ===")
+    print("\n=== accepted length by domain: raw vs chat-templated prompts ===")
     print(
-        f"{'dataset':<12}{'domain':<8}{'tau':>7}{'accept':>9}{'ECE':>8}{'AUROC':>8}{'mismatch':>10}"
+        f"{'dataset':<12}{'domain':<7}{'arm':<11}{'tau':>7}{'accept':>9}{'ECE':>8}{'AUROC':>8}{'div':>6}"
     )
     for r in results["per_dataset"]:
         au = f"{r['auroc']:.3f}" if r["auroc"] is not None else "n/a"
+        div = f"{r['greedy_mismatches']}/{r['baseline_checked']}"
         print(
-            f"{r['dataset']:<12}{r['domain']:<8}{r['tau']:>7.2f}"
-            f"{r['acceptance_rate']:>8.1%}{r['ece']:>8.3f}{au:>8}{r['greedy_mismatches']:>10}"
+            f"{r['dataset']:<12}{r['domain']:<7}{r['arm']:<11}{r['tau']:>7.2f}"
+            f"{r['acceptance_rate']:>8.1%}{r['ece']:>8.3f}{au:>8}{div:>6}"
         )
 
-    print("\n=== confidence threshold sweep (mt-bench) ===")
+    raw = {r["dataset"]: r for r in results["per_dataset"] if r["arm"] == "raw"}
+    tpl = {r["dataset"]: r for r in results["per_dataset"] if r["arm"] == "templated"}
+    print("\n  chat-template effect on tau:")
+    for name in raw:
+        a, b = raw[name]["tau"], tpl[name]["tau"]
+        delta = f"{(b / a - 1) * 100:+.0f}%" if a else "n/a"
+        print(f"    {name:<12}{a:>6.2f} -> {b:>5.2f}  ({delta})")
+
+    print("\n=== confidence threshold sweep (mt-bench, templated) ===")
     print(f"{'threshold':>10}{'tau':>7}{'offered/round':>15}{'accept':>9}")
     for r in results["threshold_sweep"]:
         print(
@@ -358,11 +468,21 @@ def main() -> None:
             f"{r['draft_tokens_per_proposal']:>15.2f}{r['acceptance_rate']:>8.1%}"
         )
 
-    print("\n=== per-position survival (threshold off) ===")
+    print("\n=== per-position survival (templated, threshold off) ===")
     for r in results["per_dataset"]:
+        if r["arm"] != "templated":
+            continue
         cells = " ".join(
             f"{v:.2f}" if v is not None else "  -  " for v in r["survival_by_position"]
         )
         print(f"  {r['dataset']:<12}{cells}")
+
+    probe = results.get("length_probe")
+    if probe:
+        base = tpl.get(probe["dataset"])
+        print("\n=== generation-length probe (gsm8k, templated) ===")
+        if base:
+            print(f"  {base['max_new_tokens']:>4} tokens: tau={base['tau']:.2f}")
+        print(f"  {probe['max_new_tokens']:>4} tokens: tau={probe['tau']:.2f}")
 
     print("\nwrote docs/benchmarks/data/dspark-stage-c.json")
