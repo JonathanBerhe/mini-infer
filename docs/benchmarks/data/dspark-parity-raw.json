@@ -1,0 +1,416 @@
+{
+  "gpu": "L4",
+  "target": "Qwen/Qwen3-4B",
+  "drafter": "deepseek-ai/dspark_qwen3_4b_block7",
+  "transformers_version": "5.14.1",
+  "check1_tap_parity": [
+    {
+      "name": "tap_layer_1",
+      "shape": [
+        1,
+        11,
+        2560
+      ],
+      "max_abs_diff": 0.015625,
+      "mean_abs_diff": 0.000582473527174443,
+      "max_rel_diff": 1953.125,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "tap_layer_9",
+      "shape": [
+        1,
+        11,
+        2560
+      ],
+      "max_abs_diff": 0.15625,
+      "mean_abs_diff": 0.005161043722182512,
+      "max_rel_diff": 17578.125,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "tap_layer_17",
+      "shape": [
+        1,
+        11,
+        2560
+      ],
+      "max_abs_diff": 0.375,
+      "mean_abs_diff": 0.010045764967799187,
+      "max_rel_diff": 19531.25,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "tap_layer_25",
+      "shape": [
+        1,
+        11,
+        2560
+      ],
+      "max_abs_diff": 1.0,
+      "mean_abs_diff": 0.0257402416318655,
+      "max_rel_diff": 85937.5,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "tap_layer_33",
+      "shape": [
+        1,
+        11,
+        2560
+      ],
+      "max_abs_diff": 3.0,
+      "mean_abs_diff": 0.08322223275899887,
+      "max_rel_diff": 140625.0,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "target_logits",
+      "shape": [
+        1,
+        11,
+        151936
+      ],
+      "max_abs_diff": 0.28125,
+      "mean_abs_diff": 0.034717027097940445,
+      "max_rel_diff": 65918.1640625,
+      "allclose_1e-3": false,
+      "exact": false
+    }
+  ],
+  "check2_single_round": [
+    {
+      "name": "block_hidden",
+      "shape": [
+        1,
+        7,
+        2560
+      ],
+      "max_abs_diff": 0.25,
+      "mean_abs_diff": 0.016623767092823982,
+      "max_rel_diff": 46875.0,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "base_logits",
+      "shape": [
+        1,
+        7,
+        151936
+      ],
+      "max_abs_diff": 0.1875,
+      "mean_abs_diff": 0.021984441205859184,
+      "max_rel_diff": 11649.740234375,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "corrected_logits",
+      "shape": [
+        1,
+        7,
+        151936
+      ],
+      "max_abs_diff": 0.25,
+      "mean_abs_diff": 0.021980104967951775,
+      "max_rel_diff": 109375.0,
+      "allclose_1e-3": false,
+      "exact": false
+    },
+    {
+      "name": "confidence_logits",
+      "shape": [
+        1,
+        7
+      ],
+      "max_abs_diff": 0.01171875,
+      "mean_abs_diff": 0.00390625,
+      "max_rel_diff": 0.014218009077012539,
+      "allclose_1e-3": false,
+      "exact": false
+    }
+  ],
+  "check2_tokens_equal": true,
+  "check2_ref_tokens": [
+    22160,
+    33479,
+    47116,
+    374,
+    264,
+    1376,
+    374
+  ],
+  "check2_ours_tokens": [
+    22160,
+    33479,
+    47116,
+    374,
+    264,
+    1376,
+    374
+  ],
+  "check3_rounds": [
+    {
+      "round": 0,
+      "start": 11,
+      "accepted": 1,
+      "tokens_equal": true,
+      "base_logits": {
+        "name": "r0_base",
+        "shape": [
+          1,
+          7,
+          151936
+        ],
+        "max_abs_diff": 0.1875,
+        "mean_abs_diff": 0.021984441205859184,
+        "max_rel_diff": 11649.740234375,
+        "allclose_1e-3": false,
+        "exact": false
+      },
+      "ref_tokens": [
+        22160,
+        33479,
+        47116,
+        374,
+        264,
+        1376,
+        374
+      ],
+      "ours_tokens": [
+        22160,
+        33479,
+        47116,
+        374,
+        264,
+        1376,
+        374
+      ]
+    },
+    {
+      "round": 1,
+      "start": 13,
+      "accepted": 2,
+      "tokens_equal": true,
+      "base_logits": {
+        "name": "r1_base",
+        "shape": [
+          1,
+          7,
+          151936
+        ],
+        "max_abs_diff": 0.15625,
+        "mean_abs_diff": 0.019120005890727043,
+        "max_rel_diff": 24414.64453125,
+        "allclose_1e-3": false,
+        "exact": false
+      },
+      "ref_tokens": [
+        374,
+        264,
+        1376,
+        4522,
+        429,
+        4128,
+        1614
+      ],
+      "ours_tokens": [
+        374,
+        264,
+        1376,
+        4522,
+        429,
+        4128,
+        1614
+      ]
+    },
+    {
+      "round": 2,
+      "start": 16,
+      "accepted": 3,
+      "tokens_equal": true,
+      "base_logits": {
+        "name": "r2_base",
+        "shape": [
+          1,
+          7,
+          151936
+        ],
+        "max_abs_diff": 0.125,
+        "mean_abs_diff": 0.014925185590982437,
+        "max_rel_diff": 21240.697265625,
+        "allclose_1e-3": false,
+        "exact": false
+      },
+      "ref_tokens": [
+        1483,
+        304,
+        4128,
+        4119,
+        429,
+        4128,
+        4119
+      ],
+      "ours_tokens": [
+        1483,
+        304,
+        4128,
+        4119,
+        429,
+        4128,
+        4119
+      ]
+    },
+    {
+      "round": 3,
+      "start": 20,
+      "accepted": 2,
+      "tokens_equal": true,
+      "base_logits": {
+        "name": "r3_base",
+        "shape": [
+          1,
+          7,
+          151936
+        ],
+        "max_abs_diff": 0.125,
+        "mean_abs_diff": 0.017392029985785484,
+        "max_rel_diff": 11725.7998046875,
+        "allclose_1e-3": false,
+        "exact": false
+      },
+      "ref_tokens": [
+        44378,
+        311,
+        7269,
+        279,
+        4628,
+        705,
+        311
+      ],
+      "ours_tokens": [
+        44378,
+        311,
+        7269,
+        279,
+        4628,
+        705,
+        311
+      ]
+    }
+  ],
+  "check3_all_tokens_equal": true,
+  "fixture": {
+    "target": "Qwen/Qwen3-4B",
+    "drafter": "deepseek-ai/dspark_qwen3_4b_block7",
+    "transformers_version": "5.14.1",
+    "dtype": "bfloat16",
+    "prompt": "Explain why speculative decoding speeds up language model inference.",
+    "prompt_token_ids": [
+      840,
+      20772,
+      3170,
+      65736,
+      47116,
+      24722,
+      705,
+      4128,
+      1614,
+      44378,
+      13
+    ],
+    "block_size": 7,
+    "anchor_token_id": 10956,
+    "ref_draft_token_ids": [
+      22160,
+      33479,
+      47116,
+      374,
+      264,
+      1376,
+      374
+    ],
+    "ref_confidence_logits": [
+      2.078125,
+      2.21875,
+      1.453125,
+      -0.57421875,
+      -0.82421875,
+      -1.109375,
+      -1.15625
+    ],
+    "ref_base_logits_argmax": [
+      1388,
+      1388,
+      47116,
+      47116,
+      47116,
+      374,
+      374
+    ],
+    "rounds": [
+      {
+        "round": 0,
+        "start": 11,
+        "accepted": 1,
+        "ref_tokens": [
+          22160,
+          33479,
+          47116,
+          374,
+          264,
+          1376,
+          374
+        ]
+      },
+      {
+        "round": 1,
+        "start": 13,
+        "accepted": 2,
+        "ref_tokens": [
+          374,
+          264,
+          1376,
+          4522,
+          429,
+          4128,
+          1614
+        ]
+      },
+      {
+        "round": 2,
+        "start": 16,
+        "accepted": 3,
+        "ref_tokens": [
+          1483,
+          304,
+          4128,
+          4119,
+          429,
+          4128,
+          4119
+        ]
+      },
+      {
+        "round": 3,
+        "start": 20,
+        "accepted": 2,
+        "ref_tokens": [
+          44378,
+          311,
+          7269,
+          279,
+          4628,
+          705,
+          311
+        ]
+      }
+    ]
+  }
+}

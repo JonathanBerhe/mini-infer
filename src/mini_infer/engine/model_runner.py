@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import torch
 
@@ -168,6 +169,9 @@ class ModelRunner:
         packed_input_ids: list[int],
         cu_seqlens_q: list[int],
         position_offsets: list[int],
+        *,
+        tap_layers: frozenset[int] | None = None,
+        hidden_state_sink: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run ONE packed-varlen forward; return the raw packed logits.
 
@@ -182,6 +186,14 @@ class ModelRunner:
             position_offsets: per-request absolute position of each request's
                 first new q-token. Equals `cache.seq_lens_list()[batch_idx]`
                 BEFORE this step's append.
+            tap_layers / hidden_state_sink: forwarded to the model only when
+                `tap_layers` is set, to collect per-layer hidden states. Used
+                by the DSpark drafter, which needs the target's hidden states
+                at a fixed set of layers as its injected context
+                (`engine/dspark/`). Only models whose `forward` accepts these
+                kwargs support it (Qwen3 today); passing them to a model that
+                doesn't will raise, which is the intended loud failure rather
+                than a silently empty sink.
 
         Returns:
             A `(1, total_q, vocab_size)` tensor with logits at every q
@@ -215,12 +227,18 @@ class ModelRunner:
 
         cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=device)
 
+        extra: dict[str, Any] = {}
+        if tap_layers is not None:
+            extra["tap_layers"] = tap_layers
+            extra["hidden_state_sink"] = hidden_state_sink
+
         with torch.inference_mode():
             logits: torch.Tensor = self._model(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 past_key_values=cache,
                 cu_seqlens_q=cu_seqlens_q_t,
+                **extra,
             )
         return logits
 

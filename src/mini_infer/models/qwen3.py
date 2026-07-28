@@ -122,11 +122,29 @@ class Qwen3ForCausalLM(BaseCausalLM):
         position_ids: torch.Tensor,
         past_key_values: PagedKVCache,
         cu_seqlens_q: torch.Tensor,
+        *,
+        tap_layers: frozenset[int] | None = None,
+        hidden_state_sink: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """Args beyond the base contract:
+
+        tap_layers / hidden_state_sink: for the DSpark drafter (see
+        `engine/dspark/`), which needs POST-block hidden states from a fixed
+        set of layers as injected context. `None` by default so every
+        existing caller (scheduler, golden tests, the two-model spec-decode
+        path) sees no behavior change and pays no extra cost; passing
+        `tap_layers` records `hidden_state_sink[i] = x` right after layer `i`
+        runs, matching DeepSpec's `extract_context_feature` convention
+        (0-indexed layer output, not the HF `output_hidden_states` tuple's
+        embedding-offset indexing).
+        """
         x = self.model.embed_tokens(input_ids)
         position_embeddings = self.rotary_emb(x, position_ids)
-        for layer in self.model.layers:
+        for i, layer in enumerate(self.model.layers):
             x = layer(x, position_embeddings, past_key_values, cu_seqlens_q)
+            if tap_layers is not None and i in tap_layers:
+                assert hidden_state_sink is not None
+                hidden_state_sink[i] = x
         x = self.model.norm(x)
         logits: torch.Tensor = self.lm_head(x)
         return logits
