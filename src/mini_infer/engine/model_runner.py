@@ -44,11 +44,13 @@ def _dtype_for(device: str) -> torch.dtype:
 class ModelRunner:
     """Loads a HF causal LM and runs packed-varlen forwards against a paged KV cache.
 
-    All forwards (prefill, decode, chunked-prefill) flow through `forward_step`,
-    which packs per-request q-tokens into a single sequence and dispatches the
-    patched attention layer's varlen path. The convenience wrappers (`prefill`,
-    `decode`, `decode_batch`, `prefill_chunk`) build the right packed inputs
-    for their single-request / uniform-q-len cases and call `forward_step`.
+    All forwards (prefill, decode, chunked-prefill) flow through
+    `forward_step_packed`, which packs per-request q-tokens into a single
+    sequence, dispatches the patched attention layer's varlen path, and returns
+    logits at every packed position. `forward_step` slices the last position per
+    request on top of it; the convenience wrappers (`prefill`, `decode`,
+    `decode_batch`, `prefill_chunk`) build the right packed inputs for their
+    single-request / uniform-q-len cases and call it.
     """
 
     def __init__(
@@ -150,9 +152,12 @@ class ModelRunner:
     ) -> list[torch.Tensor]:
         """Run ONE packed-varlen forward; return last-position logits per request.
 
-        See `forward_step_packed` for the underlying packed-logits path. This
-        helper slices the last position per request and is the standard entry
-        point for the scheduler.
+        A last-position convenience over `forward_step_packed`, which is the
+        actual primitive: this slices row `cu_seqlens_q[i + 1] - 1` per request,
+        at any q-length. The single-request / uniform-q-len wrappers below and
+        the prefill worker use it. A caller that reads positions other than each
+        request's last one, or that wants the packed tensor to slice itself (the
+        scheduler), calls `forward_step_packed`.
         """
         packed_logits = self.forward_step_packed(
             cache, packed_input_ids, cu_seqlens_q, position_offsets

@@ -12,8 +12,9 @@ bit-parity CI job and locally when the models are present.
 Coverage note: only four families have a small enough checkpoint to smoke this
 way (Qwen2, Qwen3, Llama, Gemma 3). Mistral / Gemma 4 / Mixtral / DeepSeek-V2
 have no small public checkpoint (Mixtral and V2 are far too large for CI), but
-they ride the identical `ModelRunner` + `ContinuousScheduler` + `forward_step`
-path proven here, and each one's forward is covered by its golden tests.
+they ride the identical `ModelRunner` + `ContinuousScheduler` +
+`forward_step_packed` path proven here, and each one's forward is covered by its
+golden tests.
 DeepSeek-V4 (the StateCache path) is smoked separately and synthetically in
 `test_api_state_cache.py`, since it has no single-GPU checkpoint.
 """

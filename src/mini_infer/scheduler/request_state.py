@@ -78,6 +78,13 @@ class RunningRequest:
     client disconnects on a streaming request. The engine checks it at safe
     points (before sampling each decoder, before admitting from the queue)
     and finishes the request with finish_reason="cancelled" when set.
+
+    `pending_decode_tokens` holds tokens that have been sampled and emitted but
+    not yet fed through a forward. Sampling happens before the forward while a
+    forward can fail recoverably (a mid-step OOM the engine retries), so the
+    step has to be idempotent: without this, the retry would sample the same
+    `last_logits` again and emit a duplicate of a token the client already has.
+    Cleared by the forward that consumes them.
     """
 
     request: Request
@@ -90,6 +97,7 @@ class RunningRequest:
     tokens_generated: list[int] = dataclasses.field(default_factory=list)
     last_logits: torch.Tensor | None = None
     last_text: str = ""
+    pending_decode_tokens: list[int] | None = None
     finish_reason: FinishReason | None = None
 
 

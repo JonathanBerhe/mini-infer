@@ -273,15 +273,58 @@ cancel path, which cancels its victim outright, not as a drain rate.
    Gate: plain path unchanged, including the golden suite.
 2. **Drafter state and the draft/verify phases**, with the slices of point 5
    and the emission rules of point 8.
-3. **OOM rollback and idempotence.** `tests/unit/test_scheduler_oom.py` today
-   OOMs the first forward of a single request that has no `last_logits`
-   (lines 144-186), so it cannot reach the partial-append state; a test there
-   would pass vacuously. Needs two speculators in flight with a mid-append
-   raise.
+3. **OOM rollback and idempotence.** Both tests in
+   `tests/unit/test_scheduler_oom.py` raise from the fake runner BEFORE it
+   touches the cache, so neither reaches the partial-append state and a test
+   modelled on them would pass vacuously. Needs two speculators in flight with a
+   raise from inside `append_kv_packed`. The emission half of idempotence is
+   already done, see the findings below.
 4. **Benchmark.** Accepted length and throughput against concurrency on the
    open-loop harness, which doubles as the SPS(B) curve the batch-global
    scheduler needs. Requires stats plumbing (point below) and a `num_blocks`
    chosen so headroom is not the binding constraint.
+
+## Findings from staging step 1
+
+Step 1 landed as described: per-request token lists through `_sample_decoders`
+and `_packed_forward`, `forward_step_packed` as the scheduler's forward, and a
+plain path that is unchanged step for step (the third finding below then changed
+what it does after a recoverable OOM). An audit of the touched surface turned up
+three things that bear on later stages and were not in this plan.
+
+**The fully-fused TurboQuant attention path requires q_len == 1 everywhere.**
+`packed_attention.py` gates it on `q.shape[0] == cu_seqlens_q.shape[0] - 1`
+(total_q == batch_size), so any step carrying a verify window falls through to
+the materialized V2a path. That is a documented fallback, not a correctness
+issue, but a `kv_quant="turbo3"` run loses the fused kernel on every speculative
+step. Step 4 must not report a speculative turbo3 run against a plain turbo3
+baseline without saying so.
+
+**The bench harnesses count stream items as tokens.** `http_openloop_bench.py`
+increments `n_tokens` once per non-empty text chunk and derives ITL as
+`decode_span / (n_tokens - 1)`; `modal_packed_bench.py` takes the mean
+inter-arrival of consecutive stream items. A verify step that commits several
+tokens emits them as one `GenerationStep`, so both metrics read as fewer, slower
+tokens. This is part of the stats plumbing step 4 already needs: either emit one
+step per committed token, or carry a token count on the step.
+
+**On the plain path an OOM retry re-emitted a token, now fixed.**
+`_sample_decoders` appends and emits before the forward, and `last_logits` is
+only overwritten by a forward that completes, so every surviving decoder used to
+re-sample the same `last_logits` on the retry and append a duplicate of the token
+it had already streamed. A rollback cannot fix this: the token is already on the
+output queue and may already be at the client. So the sampled tokens are held in
+`RunningRequest.pending_decode_tokens` and the retry RE-FEEDS them instead of
+sampling again, cleared by the forward that consumes them. This is point 7's
+idempotence guard for the plain path, and the spec path should use the same
+shape: hold the round, do not re-derive it.
+
+What that fix does NOT do is roll back cache lengths, so point 6 stands
+unchanged. Regression test:
+`test_scheduler_oom.py::test_oom_retry_does_not_re_emit_an_already_emitted_token`,
+which needs two requests (a prefiller absorbs the preemption so the decoder
+survives) and drives `_step` inline, since the interleaving is racy through the
+engine thread.
 
 ## Gate, split three ways
 
