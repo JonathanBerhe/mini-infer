@@ -82,7 +82,16 @@ def test_msa_kernel_matches_torch_reference(dtype: torch.dtype) -> None:
     assert out.shape == ref.shape
     cs = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
     assert float(cs) > 0.999, f"kernel vs torch reference cosine {float(cs):.6f}"
-    atol = 1e-5 if dtype == torch.float32 else 2e-2
+    # fp32 does NOT get an fp32-tight bound. The QK product is
+    # `tl.dot(q, tl.trans(k), out_dtype=tl.float32)` with no `input_precision`
+    # (msa_paged_attention.py:252), so on Ampere+ fp32 inputs go through TF32
+    # tensor cores: 10 mantissa bits, ~5e-4 relative per product, growing over
+    # the head_dim reduction. Measured max_abs_diff on A10 is 6.7e-4. bf16 keeps
+    # the looser bound for a different reason (the kernel's comment is right that
+    # bf16 products are exact in the fp32 accumulator, so only reduction order
+    # differs there). The cosine assert above is the logic check; this bound is
+    # only here to catch a gross magnitude error.
+    atol = 5e-3 if dtype == torch.float32 else 2e-2
     assert torch.allclose(out.float(), ref.float(), atol=atol), (
         f"max_abs_diff={(out.float() - ref.float()).abs().max().item():.6f}"
     )

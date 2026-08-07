@@ -357,63 +357,73 @@ def test_fused_block_size_64() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# End-to-end logits parity on a real Qwen2.5-0.5B turbo3 cache
+# Dequant parity on a real Qwen2.5-0.5B turbo3 cache
 # ─────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.requires_cuda
 @pytest.mark.requires_model
-def test_qwen_05b_turbo3_first_token_logits_match_python_path() -> None:
-    """First-position logits must match the Python-loop path within
-    cosine sim > 0.999 — the right correctness bar for a fused dequant
-    kernel.
+def test_qwen_05b_turbo3_prefill_materialize_fused_matches_python() -> None:
+    """Fused and Python dequant must agree, per layer, on a cache a REAL
+    prefill populated.
 
-    Strict greedy-token equality is too tight: the fused kernel's
-    `tl.dot` reduction order differs from PyTorch's `matmul` by a few
-    LSBs of bf16, which is enough to flip argmax through 24 layers of
-    decode in turbo3's already-noisy regime (logit-cosine-sim ~0.99 vs
-    bf16 even on the Python loop). Materialized K/V agree at cosine
-    sim 1.000000 across all shape configurations
-    (`test_fused_matches_python_loop_*` above); this is the model-level
-    end-to-end version of the same check.
+    Same assertion as `test_fused_matches_python_loop_*` above, but the pool
+    state comes from an actual Qwen2.5-0.5B forward rather than hand-written
+    blocks: real strides and dims, radii from real activations rather than
+    randn*0.1, and a partial final block whose tail slots hold the quantized
+    ZERO vector (a real append leaves them dequant-of-nothing; the fixtures
+    fill whole blocks with random data before shrinking `_num_tokens`, so
+    they never store that state).
 
-    Validated on Modal A10 in `scripts/modal_packed_bench.py
-    --config turbo_parity` (2026-05-02 run): all four random-fixture
-    parity checks at cos sim 1.0; fused/python greedy tokens diverge
-    after a few decode steps but the per-step logit cosine sim stays
-    above 0.999.
+    This test used to assert fused-vs-python FIRST-TOKEN LOGIT cosine > 0.999.
+    That quantity is not well-defined for turbo3, so the bar was retired, not
+    loosened, on this evidence (A10, 2026-07-29: measured 0.805):
+
+    - The two dequant paths legitimately differ by bf16-LSB reduction order
+      (`tl.dot` vs `torch.matmul`). The write path then re-quantizes every
+      appended block through `searchsorted` at EVERY layer
+      (`paged_kv_cache.py`, `_write_packed_kv_compressed`), so a layer-L read
+      perturbation crosses a quantization step boundary at layer L+1 and grows
+      to whole codec steps by layer 24. Logits diverge macroscopically with
+      both paths correct.
+    - The record agrees: the 2026-05-02 bench run's greedy decode diverged at
+      generated token 0, which IS the argmax of the prefill logits
+      (`docs/benchmarks/2026-05-02-turboquant-v2a.md`). Its E2E comparison is
+      explicitly informational and computes no logit cosine; the 0.999 logit
+      bar was never measured by anything. The prior form of this test passed
+      `use_cache=False`, which bypassed the paged cache, so it compared two
+      unquantized bf16 runs and validated nothing.
+
+    Comparing what the two paths read back from the SAME stored bytes is the
+    level at which they are defined to agree, and it is deterministic.
     """
-    import torch
-
     from mini_infer.cache import turbo_kernel
     from mini_infer.engine.model_runner import ModelRunner
 
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     prompt = "The capital of France is"
 
-    def _first_token_logits() -> torch.Tensor:
-        runner = ModelRunner.from_pretrained(model_name, kv_quant="turbo3")
-        input_ids = runner.tokenizer.encode(prompt)
-        x = torch.tensor([input_ids], device=runner.device, dtype=torch.long)
-        with torch.inference_mode():
-            return runner._model(x, use_cache=False).logits[0, -1, :].float().cpu()
+    runner = ModelRunner.from_pretrained(model_name, kv_quant="turbo3")
+    if not turbo_kernel.supports_fused_kernel(runner.device):
+        pytest.skip("fused turbo kernel unavailable; both halves would be the Python loop")
 
-    saved = turbo_kernel._FUSED_DISABLED_FOR_BENCH
+    # One real prefill writes compressed K/V for every layer; whichever read
+    # path it used internally, the stored bytes are now fixed, and both halves
+    # below read those same bytes.
+    pool_cache, logits = runner.prefill(runner.tokenizer.encode(prompt))
+    assert torch.isfinite(logits).all(), "prefill produced non-finite logits"
 
-    turbo_kernel._FUSED_DISABLED_FOR_BENCH = True
-    try:
-        python_logits = _first_token_logits()
-    finally:
-        turbo_kernel._FUSED_DISABLED_FOR_BENCH = saved
-
-    turbo_kernel._FUSED_DISABLED_FOR_BENCH = False
-    try:
-        fused_logits = _first_token_logits()
-    finally:
-        turbo_kernel._FUSED_DISABLED_FOR_BENCH = saved
-
-    cos = _cosine_sim(fused_logits, python_logits)
-    assert cos > 0.999, f"fused vs python first-token logit cosine sim {cos:.6f} below 0.999"
+    for layer_idx in range(runner.block_pool.num_layers):
+        k_fused, v_fused, k_python, v_python = _materialize_two_paths(
+            runner.block_pool, pool_cache, layer_idx
+        )
+        for name, fused, python in (("K", k_fused, k_python), ("V", v_fused, v_python)):
+            cos = _cosine_sim(fused, python)
+            max_abs = (fused.float() - python.float()).abs().max().item()
+            assert cos > 0.999, (
+                f"layer {layer_idx} {name}: fused vs python cosine {cos:.6f} "
+                f"below 0.999 (max_abs_diff={max_abs:.6f})"
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────
