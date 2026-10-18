@@ -14,9 +14,15 @@ or on localhost — these guards are belt-and-suspenders):
   and cancels the request when the client drops the connection.
 - A global exception handler converts uncaught engine errors into a sanitized
   503 instead of letting FastAPI emit a stack trace.
+- If the engine thread is not running (it crashed, or the server is shutting
+  down), a request fails instead of hanging: a 503 with error type
+  `engine_unavailable`, or, once a stream has started, an SSE error event
+  followed by `[DONE]`. The process stays up; every later request gets the
+  same 503 until the server restarts.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -44,9 +50,11 @@ from mini_infer.engine.model_runner import (
 )
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
+from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.models import architecture_uses_state_cache
 from mini_infer.scheduler import (
     ContinuousScheduler,
+    GenerationStep,
     Request,
     RequestHandle,
     StateCacheContinuousScheduler,
@@ -87,6 +95,14 @@ DEFAULT_PORT = 8000
 # the per-step overhead negligible while still cancelling within a typical
 # token's wall-clock budget.
 _DISCONNECT_POLL_SECONDS = 0.1
+
+# Longest time one read of the next step holds a worker thread of the event
+# loop's default executor (min(32, cpus + 4) threads, shared by every request
+# in flight). A request that waits long for its next step, for example in the
+# admission queue, gives the worker back this often, so that requests with
+# steps to read get a turn. It does not make the pool large enough for every
+# request: past that point, unread output queues still fill and drop steps.
+_STEP_POLL_SECONDS = 0.25
 
 logger = logging.getLogger(__name__)
 _API_KEY = os.environ.get("MINI_INFER_API_KEY")
@@ -182,7 +198,7 @@ async def completions(
     req: CompletionRequest,
     fastapi_req: FastAPIRequest,
     _auth: None = Depends(_verify_auth),
-) -> StreamingResponse | CompletionResponse:
+) -> StreamingResponse | JSONResponse | CompletionResponse:
     scheduler: ContinuousScheduler | PDScheduler | StateCacheContinuousScheduler = (
         fastapi_req.app.state.scheduler
     )
@@ -198,8 +214,13 @@ async def completions(
     completion_id = f"cmpl-{uuid4().hex[:12]}"
     created = int(time.time())
 
-    if req.stream:
+    try:
         handle = scheduler.submit(internal)
+    except EngineNotRunningError:
+        logger.error("%s: rejected, the engine is not running", completion_id)
+        return _engine_unavailable_response()
+
+    if req.stream:
 
         async def event_stream() -> AsyncIterator[str]:
             """Stream generation steps as SSE.
@@ -209,11 +230,20 @@ async def completions(
             the engine emit a terminal step and unblocks the consumer's
             `get_step()` so resources (KV blocks, batch slot) are freed
             promptly.
+
+            The 200 status is already sent when the first step is awaited, so
+            a dead engine is reported in-band: an error event, then `[DONE]`,
+            as vLLM and SGLang do. The OpenAI client raises on that event.
             """
             watcher = asyncio.create_task(_watch_disconnect(fastapi_req, handle))
             try:
                 while True:
-                    step = await asyncio.to_thread(handle.get_step)
+                    try:
+                        step = await _next_step(handle)
+                    except EngineNotRunningError:
+                        logger.error("%s: the engine stopped mid-stream", completion_id)
+                        yield f"data: {json.dumps(_ENGINE_UNAVAILABLE)}\n\n"
+                        break
                     chunk = CompletionChunk(
                         id=completion_id,
                         created=created,
@@ -232,7 +262,24 @@ async def completions(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    result = scheduler.run(internal)
+    # Read step by step like the stream. One blocking `wait()` would hold a
+    # worker thread for the whole generation, and the output queues of other
+    # requests would go unread meanwhile. The cancel in `finally` frees the
+    # batch slot if this coroutine is cancelled, for example at shutdown; on a
+    # finished request it does nothing.
+    try:
+        text_parts: list[str] = []
+        while True:
+            step = await _next_step(handle)
+            if step.finish_reason is not None:
+                break
+            text_parts.append(step.text)
+    except EngineNotRunningError:
+        logger.error("%s: the engine stopped before the request finished", completion_id)
+        return _engine_unavailable_response()
+    finally:
+        handle.cancel()
+    result = handle.build_result("".join(text_parts), step.finish_reason)
     return CompletionResponse(
         id=completion_id,
         created=created,
@@ -244,6 +291,29 @@ async def completions(
             total_tokens=result.prompt_tokens + len(result.tokens),
         ),
     )
+
+
+# A fixed message: the cause is in the server log, and the response must not
+# carry internal state (see `_unhandled_exception_handler`).
+_ENGINE_UNAVAILABLE = {"error": {"type": "engine_unavailable", "message": "engine is not running"}}
+
+
+def _engine_unavailable_response() -> JSONResponse:
+    return JSONResponse(status_code=503, content=_ENGINE_UNAVAILABLE)
+
+
+async def _next_step(handle: RequestHandle) -> GenerationStep:
+    """Await the next step without holding a worker thread for long.
+
+    Each read blocks a worker of the default executor for at most
+    `_STEP_POLL_SECONDS`, then gives it back and tries again. The handle
+    raises `EngineNotRunningError` when the engine thread is gone.
+    """
+    while True:
+        try:
+            return await asyncio.to_thread(handle.get_step, _STEP_POLL_SECONDS)
+        except TimeoutError:
+            continue
 
 
 async def _watch_disconnect(fastapi_req: FastAPIRequest, handle: RequestHandle) -> None:

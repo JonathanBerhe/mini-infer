@@ -26,6 +26,7 @@ import threading
 from collections.abc import Iterator
 
 from mini_infer.engine.tp_state_cache_server import TensorParallelStateCacheServer
+from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -54,6 +55,8 @@ class TensorParallelStateCacheScheduler:
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # True while `stop()` runs; see `ContinuousScheduler._stopping`.
+        self._stopping = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -65,20 +68,47 @@ class TensorParallelStateCacheScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        """Signal the engine thread to exit, join it, and cancel what is left.
+
+        The request being served finishes inside `_serve`. After a clean join,
+        every request still waiting ends with `finish_reason="cancelled"`.
+        """
+        self._stopping = True
+        try:
+            self._stop_event.set()
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=timeout)
+                self._thread = None
+                if not thread.is_alive():
+                    while True:
+                        try:
+                            running = self._waiting.get_nowait()
+                        except queue.Empty:
+                            break
+                        self._finish(running, "cancelled")
+        finally:
+            self._stopping = False
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the leader's engine thread is alive. A leader blocked in a
+        collective (for example because a follower died) still counts as alive."""
+        return self._thread is not None and self._thread.is_alive()
 
     def submit(self, request: Request) -> RequestHandle:
-        if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError("scheduler not running; call start() before submit()")
+        """Enqueue a request; its handle raises `EngineNotRunningError` if the
+        engine thread dies before the request finishes."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
             output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
-        return RequestHandle(running)
+        thread_alive = thread.is_alive
+        return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
 
     def run(self, request: Request) -> GenerationResult:
         return self.submit(request).wait()

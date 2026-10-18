@@ -21,6 +21,7 @@ from mini_infer.bench.dspark_sweep import StepRecord, SweepPoint, run_point, tok
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.dspark import DSparkSpec
 from mini_infer.engine.sampler import SamplingParams
+from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.scheduler.request_state import Request, RequestHandle, RunningRequest
 from tests.unit._dspark_doubles import MicroRunner, micro_setup
 
@@ -121,7 +122,7 @@ def test_point_fails_fast_when_the_engine_thread_dies() -> None:
     crashing = _CrashingRunner(runner._model, runner.block_pool)
 
     start = time.perf_counter()
-    with pytest.raises(RuntimeError, match="engine thread died"):
+    with pytest.raises(EngineNotRunningError):
         run_point(crashing, ["abc"], concurrency=1, max_tokens=4, timeout_s=600.0)
     assert time.perf_counter() - start < 30.0
 

@@ -1,0 +1,847 @@
+"""A dead engine thread fails its requests instead of hanging them.
+
+Every scheduler runs its engine on a thread that dies on an unexpected
+exception, and after that no request in flight ever receives its terminal
+step. These tests pin the three layers that turn that into an error:
+
+- `RequestHandle` polls the liveness of the thread that owns its request
+  whenever its queue stays empty, hands out every buffered step first, and
+  then raises `EngineNotRunningError`.
+- Each of the five schedulers binds its handles to its engine thread(s) and
+  rejects `submit()` once that thread is gone.
+- The HTTP endpoint answers a dead engine with a 503 (or an SSE error event
+  once a stream has started), and never blocks the event loop while it waits.
+
+All engines here are model-free doubles on CPU. Every blocking call runs
+under `_bounded`, so a regression fails within seconds instead of hanging the
+suite (no pytest-timeout plugin is installed).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import queue
+import threading
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from typing import Any, TypeVar
+
+import pytest
+import torch
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from mini_infer.api.server import _unhandled_exception_handler, completions
+from mini_infer.cache.block_pool import BlockPool
+from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.engine.sampler import SamplingParams
+from mini_infer.exceptions import EngineNotRunningError
+from mini_infer.scheduler import (
+    ContinuousScheduler,
+    StateCacheContinuousScheduler,
+    TensorParallelStateCacheContinuousScheduler,
+    TensorParallelStateCacheScheduler,
+)
+from mini_infer.scheduler.request_state import (
+    GenerationStep,
+    Request,
+    RequestHandle,
+    RunningRequest,
+)
+from mini_infer.workers import PDScheduler
+
+T = TypeVar("T")
+
+_VOCAB = 32
+# Short enough that a dead engine shows up fast, long enough to be a real slice.
+_POLL_S = 0.05
+_BOUND_S = 10.0
+
+
+@pytest.fixture(autouse=True)
+def _fast_liveness_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(RequestHandle, "LIVENESS_POLL_SECONDS", _POLL_S)
+
+
+class _InjectedCrashError(Exception):
+    """The one exception the doubles raise, so a test can tell the injected
+    death apart from a double that broke for some other reason."""
+
+
+@pytest.fixture
+def crashes(monkeypatch: pytest.MonkeyPatch) -> list[type[BaseException]]:
+    """Exception types of engine threads that died during the test.
+
+    Replacing the hook also keeps pytest's unhandled-thread-exception warning
+    out of the report: the deaths here are the point of the test.
+    """
+    seen: list[type[BaseException]] = []
+
+    def hook(args: threading.ExceptHookArgs) -> None:
+        seen.append(args.exc_type)
+
+    monkeypatch.setattr(threading, "excepthook", hook)
+    return seen
+
+
+def _bounded(fn: Callable[[], T], timeout: float = _BOUND_S) -> T:
+    """Run `fn` on a daemon thread; fail the test if it does not return in time."""
+    out: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            out["value"] = fn()
+        except BaseException as exc:  # re-raised on the test thread below
+            out["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        pytest.fail(f"call did not return within {timeout}s (it would hang without a bound)")
+    if "error" in out:
+        raise out["error"]
+    return out["value"]  # type: ignore[no-any-return]
+
+
+def _wait_until(predicate: Callable[[], object], timeout: float = _BOUND_S) -> None:
+    """Poll `predicate` until it is true; fail the test instead of spinning forever."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            pytest.fail(f"condition not reached within {timeout}s")
+        time.sleep(0.001)
+
+
+def _request(max_tokens: int = 4, prompt: str = "abc") -> Request:
+    return Request(
+        prompt=prompt, sampling_params=SamplingParams(temperature=0.0), max_tokens=max_tokens
+    )
+
+
+def _bare(*steps: GenerationStep) -> RunningRequest:
+    req = RunningRequest(request=_request(), output_queue=queue.Queue())
+    for step in steps:
+        req.output_queue.put(step)
+    return req
+
+
+def _token(text: str = "x") -> GenerationStep:
+    return GenerationStep(text=text, num_tokens=1)
+
+
+def _dead() -> bool:
+    return False
+
+
+# ---- RequestHandle ------------------------------------------------------
+
+
+@pytest.mark.parametrize("call", ["get_step", "steps", "wait"])
+def test_handle_on_a_dead_engine_raises_instead_of_blocking(call: str) -> None:
+    req = _bare()
+    handle = RequestHandle(req, engine_alive=_dead)
+    calls: dict[str, Callable[[], object]] = {
+        "get_step": handle.get_step,
+        "steps": lambda: list(handle.steps()),
+        "wait": handle.wait,
+    }
+    with pytest.raises(EngineNotRunningError):
+        _bounded(calls[call])
+    # The handle cancels the request, so an engine that still holds it drops it.
+    assert req.cancel_event.is_set()
+
+
+def test_handle_hands_out_buffered_steps_before_the_error() -> None:
+    handle = RequestHandle(_bare(_token("a"), _token("b")), engine_alive=_dead)
+    assert _bounded(handle.get_step).text == "a"
+    assert _bounded(handle.get_step).text == "b"
+    with pytest.raises(EngineNotRunningError):
+        _bounded(handle.get_step)
+
+
+def test_handle_steps_yields_buffered_steps_then_raises() -> None:
+    handle = RequestHandle(_bare(_token("a"), _token("b")), engine_alive=_dead)
+    seen: list[str] = []
+
+    def drain() -> None:
+        for step in handle.steps():
+            seen.append(step.text)
+
+    with pytest.raises(EngineNotRunningError):
+        _bounded(drain)
+    assert seen == ["a", "b"]
+
+
+def test_handle_returns_a_last_step_put_just_before_the_thread_exited() -> None:
+    """The thread can put its terminal step after the timed-out read but before
+    the liveness read. The handle must look once more instead of raising."""
+    req = _bare()
+
+    def exits_after_its_last_put() -> bool:
+        req.output_queue.put_nowait(GenerationStep(text="", finish_reason="length"))
+        return False
+
+    handle = RequestHandle(req, engine_alive=exits_after_its_last_put)
+    assert _bounded(handle.get_step).finish_reason == "length"
+
+
+def test_handle_wait_returns_a_result_when_the_terminal_step_races_the_exit() -> None:
+    req = _bare(_token("a"))
+
+    def exits_after_its_last_put() -> bool:
+        req.output_queue.put_nowait(GenerationStep(text="", finish_reason="stop"))
+        return False
+
+    result = _bounded(RequestHandle(req, engine_alive=exits_after_its_last_put).wait)
+    assert (result.text, result.finish_reason) == ("a", "stop")
+
+
+def test_handle_keeps_polling_after_a_first_alive_read() -> None:
+    """Liveness is read on every empty slice, not once at the start."""
+    reads: list[bool] = []
+
+    def alive_once() -> bool:
+        reads.append(not reads)
+        return reads[-1]
+
+    with pytest.raises(EngineNotRunningError):
+        _bounded(RequestHandle(_bare(), engine_alive=alive_once).wait)
+    assert reads == [True, False]
+
+
+def test_handle_waits_through_empty_slices_while_the_engine_lives() -> None:
+    """A slow engine is not a dead one: an empty slice alone is no error."""
+    req = _bare()
+
+    def produce_late() -> None:
+        time.sleep(4 * _POLL_S)
+        req.output_queue.put(_token("late"))
+        req.output_queue.put(GenerationStep(text="", finish_reason="length"))
+
+    threading.Thread(target=produce_late, daemon=True).start()
+    result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
+    assert (result.text, result.finish_reason) == ("late", "length")
+
+
+def test_handle_timeout_on_a_live_engine_raises_timeout_error() -> None:
+    handle = RequestHandle(_bare(), engine_alive=lambda: True)
+    with pytest.raises(TimeoutError):
+        _bounded(lambda: handle.wait(timeout=0.1))
+    with pytest.raises(TimeoutError):
+        _bounded(lambda: handle.get_step(timeout=0.1))
+
+
+def test_handle_timeout_on_a_dead_engine_reports_the_dead_engine() -> None:
+    handle = RequestHandle(_bare(), engine_alive=_dead)
+    start = time.monotonic()
+    with pytest.raises(EngineNotRunningError):
+        _bounded(lambda: handle.wait(timeout=5.0))
+    assert time.monotonic() - start < 2.0
+
+
+def test_handle_reports_a_dead_engine_even_when_the_timeout_is_shorter_than_a_poll() -> None:
+    """The server reads in slices shorter than `LIVENESS_POLL_SECONDS` and
+    retries on `TimeoutError`. If the deadline won over liveness, that retry
+    loop would never see the dead engine."""
+    handle = RequestHandle(_bare(), engine_alive=_dead)
+    with pytest.raises(EngineNotRunningError):
+        _bounded(lambda: handle.get_step(timeout=_POLL_S / 5))
+
+
+def test_handle_without_a_liveness_check_keeps_blocking() -> None:
+    """`engine_alive=None` (a bare handle in a test) keeps the old behavior."""
+    req = _bare()
+    handle = RequestHandle(req)
+    got: list[GenerationStep] = []
+    reader = threading.Thread(target=lambda: got.append(handle.get_step()), daemon=True)
+    reader.start()
+    reader.join(6 * _POLL_S)
+    assert reader.is_alive() and not got
+    req.output_queue.put(_token("late"))
+    reader.join(_BOUND_S)
+    assert [s.text for s in got] == ["late"]
+
+
+def test_build_result_ignores_the_terminal_step_text() -> None:
+    """`PDScheduler` puts an error string into its terminal step; that text is
+    not completion output."""
+    req = _bare(_token("a"), GenerationStep(text="engine error: boom", finish_reason="cancelled"))
+    result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
+    assert (result.text, result.finish_reason) == ("a", "cancelled")
+
+
+# ---- model-free engines ---------------------------------------------------
+
+
+class _CharTokenizer:
+    """One id per character; every id decodes to exactly one character."""
+
+    eos_token_id = -1  # never sampled: the doubles favor token 0
+
+    def encode(self, text: str) -> list[int]:
+        return [(ord(c) % (_VOCAB - 1)) + 1 for c in text]
+
+    def decode(self, ids: list[int]) -> str:
+        return "".join(chr(97 + (i % 26)) for i in ids)
+
+
+class _ScriptedRunner:
+    """Duck-typed ModelRunner: a real BlockPool and a forward with three knobs.
+
+    `crash_on_call` raises `_InjectedCrashError` on that 1-based forward call,
+    which kills a `ContinuousScheduler` engine thread. `gate`, when set,
+    makes every forward wait for it, so an engine can be alive but stalled.
+    `delay_s` slows each forward down. Logits always favor token 0.
+    """
+
+    def __init__(
+        self,
+        *,
+        crash_on_call: int | None = None,
+        gate: threading.Event | None = None,
+        delay_s: float = 0.0,
+    ) -> None:
+        self.block_pool = BlockPool(
+            num_blocks=256,
+            block_size=16,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=8,
+            dtype=torch.float32,
+            device="cpu",
+            attention_backend="torch",
+        )
+        self.tokenizer = _CharTokenizer()
+        self.calls = 0
+        self.entered = threading.Event()
+        self._crash_on_call = crash_on_call
+        self._gate = gate
+        self._delay_s = delay_s
+
+    def forward_step_packed(
+        self,
+        cache: PagedKVCache,
+        packed_input_ids: list[int],
+        cu_seqlens_q: list[int],
+        position_offsets: list[int],
+    ) -> torch.Tensor:
+        self.calls += 1
+        self.entered.set()
+        if self.calls == self._crash_on_call:
+            raise _InjectedCrashError("injected engine-thread crash")
+        if self._gate is not None:
+            self._gate.wait(_BOUND_S)
+        if self._delay_s:
+            time.sleep(self._delay_s)
+        logits = torch.full((1, cu_seqlens_q[-1], _VOCAB), -1.0)
+        logits[..., 0] = 1.0
+        return logits
+
+
+def _emit_then_crash(running: RunningRequest) -> None:
+    """What an injected engine step does: emit one token step, then die."""
+    running.output_queue.put_nowait(_token("x"))
+    raise _InjectedCrashError("injected engine-thread crash")
+
+
+def _state_cache_generator() -> Any:
+    model = SimpleNamespace(build_state_cache=lambda **_: object())
+    return SimpleNamespace(
+        model=model, device="cpu", dtype=torch.float32, tokenizer=_CharTokenizer()
+    )
+
+
+def _continuous() -> tuple[ContinuousScheduler, int]:
+    # Forward 1 is the prefill and forward 2 the first decode, each followed
+    # by one emitted token; forward 3 crashes.
+    return ContinuousScheduler(_ScriptedRunner(crash_on_call=3)), 2  # type: ignore[arg-type]
+
+
+def _state_cache() -> tuple[StateCacheContinuousScheduler, int]:
+    sched = StateCacheContinuousScheduler(_state_cache_generator(), max_batch_size=2)
+    sched._prefill_into_slot = lambda running, _slot: _emit_then_crash(running)  # type: ignore[method-assign]
+    return sched, 1
+
+
+def _tp() -> tuple[TensorParallelStateCacheScheduler, int]:
+    server = SimpleNamespace(is_leader=True, tokenizer=_CharTokenizer())
+    sched = TensorParallelStateCacheScheduler(server)  # type: ignore[arg-type]
+    sched._serve = _emit_then_crash  # type: ignore[method-assign]
+    return sched, 1
+
+
+def _tp_continuous() -> tuple[TensorParallelStateCacheContinuousScheduler, int]:
+    server = SimpleNamespace(
+        is_leader=True, max_batch_size=2, tokenizer=_CharTokenizer(), shutdown=lambda: None
+    )
+    sched = TensorParallelStateCacheContinuousScheduler(server)  # type: ignore[arg-type]
+    sched._prefill_into_slot = lambda running, _slot: _emit_then_crash(running)  # type: ignore[method-assign]
+    return sched, 1
+
+
+def _crash_on_admit(sched: PDScheduler) -> None:
+    """Kill the thread that admits (serial: the only one; parallel: prefill)."""
+
+    def admit() -> None:
+        try:
+            running = sched._waiting.get_nowait()
+        except queue.Empty:
+            return
+        _emit_then_crash(running)
+
+    sched._admit_waiting = admit  # type: ignore[method-assign]
+
+
+def _pd_serial() -> tuple[PDScheduler, int]:
+    sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
+    _crash_on_admit(sched)
+    return sched, 1
+
+
+def _pd_parallel_prefill_dies() -> tuple[PDScheduler, int]:
+    """Only the prefill thread dies; the decode thread lives on."""
+    sched = PDScheduler(_ScriptedRunner(), mode="parallel")  # type: ignore[arg-type]
+    _crash_on_admit(sched)
+    return sched, 1
+
+
+_SCHEDULERS: dict[str, Callable[[], tuple[Any, int]]] = {
+    "continuous": _continuous,
+    "state-cache-continuous": _state_cache,
+    "tp-state-cache": _tp,
+    "tp-state-cache-continuous": _tp_continuous,
+    "pd-serial": _pd_serial,
+    "pd-parallel-prefill-dies": _pd_parallel_prefill_dies,
+}
+
+
+@pytest.mark.parametrize("name", list(_SCHEDULERS))
+def test_engine_death_fails_the_request_in_flight(
+    name: str, crashes: list[type[BaseException]], caplog: pytest.LogCaptureFixture
+) -> None:
+    sched, n_buffered = _SCHEDULERS[name]()
+    sched.start()
+    try:
+        handle = sched.submit(_request(max_tokens=8))
+        texts: list[str] = []
+        with pytest.raises(EngineNotRunningError):
+            while True:
+                step = _bounded(handle.get_step)
+                assert step.finish_reason is None
+                texts.append(step.text)
+        # Steps emitted before the death still reach the caller.
+        assert len(texts) == n_buffered
+        assert crashes == [_InjectedCrashError]
+        # The handle's error points to the log, so the cause must be there.
+        assert any(
+            r.levelno == logging.ERROR and "crashed" in r.getMessage() and r.exc_info
+            for r in caplog.records
+        )
+        assert not sched.is_running
+        with pytest.raises(EngineNotRunningError, match="not running"):
+            sched.submit(_request())
+    finally:
+        sched.stop()
+
+
+def test_pd_parallel_decode_thread_death_fails_the_request(
+    crashes: list[type[BaseException]],
+) -> None:
+    """The prefill thread lives, but no request can finish without decode."""
+    sched = PDScheduler(_ScriptedRunner(), mode="parallel")  # type: ignore[arg-type]
+    sched._admit_waiting = lambda: None  # type: ignore[method-assign]
+    armed = threading.Event()
+
+    def drain() -> None:
+        if armed.is_set():
+            raise _InjectedCrashError("injected decode-thread crash")
+
+    sched._drain_new_handoffs = drain  # type: ignore[method-assign]
+    sched.start()
+    try:
+        handle = sched.submit(_request())
+        armed.set()
+        with pytest.raises(EngineNotRunningError):
+            _bounded(handle.wait)
+        assert crashes == [_InjectedCrashError]
+        assert sched._thread is not None and sched._thread.is_alive()
+        assert not sched.is_running
+    finally:
+        sched.stop()
+
+
+@pytest.mark.parametrize("mode", ["serial", "parallel"])
+def test_pd_submit_needs_a_running_engine(mode: str) -> None:
+    sched = PDScheduler(_ScriptedRunner(), mode=mode)  # type: ignore[arg-type]
+    with pytest.raises(EngineNotRunningError, match="not running"):
+        sched.submit(_request())
+    sched.start()
+    sched.stop()
+    with pytest.raises(EngineNotRunningError, match="not running"):
+        sched.submit(_request())
+
+
+def _wait_concurrently(handles: list[RequestHandle]) -> tuple[list[Any], list[threading.Thread]]:
+    """Start one `wait()` per handle on daemon threads, so they wait during a
+    `stop()` instead of after it."""
+    results: list[Any] = []
+
+    def wait(handle: RequestHandle) -> None:
+        try:
+            results.append(handle.wait().finish_reason)
+        except EngineNotRunningError as exc:
+            results.append(type(exc).__name__)
+
+    waiters = [threading.Thread(target=wait, args=(h,), daemon=True) for h in handles]
+    for waiter in waiters:
+        waiter.start()
+    return results, waiters
+
+
+def _join_all(waiters: list[threading.Thread]) -> None:
+    for waiter in waiters:
+        waiter.join(_BOUND_S)
+        assert not waiter.is_alive(), "a waiter did not return within the bound"
+
+
+def test_pd_stop_cancels_a_request_in_flight_instead_of_failing_it() -> None:
+    """`stop()` sends 'cancelled' after the engine threads exit; the handle
+    must wait for it instead of reporting a dead engine in that window."""
+    sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
+    # Admitted but never prefilled: the request parks in `_prefilling`.
+    sched._run_prefill_batch = lambda: None  # type: ignore[method-assign]
+    emit_terminal = sched._emit_terminal
+
+    def slow_emit_terminal(r: RunningRequest, reason: str, *, error: str | None = None) -> None:
+        time.sleep(4 * _POLL_S)  # several liveness polls see dead threads here
+        emit_terminal(r, reason, error=error)
+
+    sched._emit_terminal = slow_emit_terminal  # type: ignore[method-assign]
+    sched.start()
+    try:
+        handle = sched.submit(_request())
+        _wait_until(lambda: sched._prefilling)
+        results, waiters = _wait_concurrently([handle])
+        sched.stop()
+        _join_all(waiters)
+        assert results == ["cancelled"]
+    finally:
+        sched.stop()
+
+
+def test_pd_stop_cancels_a_request_that_was_never_admitted() -> None:
+    sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
+    sched._admit_waiting = lambda: None  # type: ignore[method-assign]
+    sched.start()
+    try:
+        handle = sched.submit(_request())
+        sched.stop()
+        assert _bounded(handle.wait).finish_reason == "cancelled"
+    finally:
+        sched.stop()
+
+
+def test_continuous_stop_cancels_requests_in_flight_and_frees_their_blocks() -> None:
+    """A clean `stop()` is a boundary: every request left running or waiting
+    ends as 'cancelled', the pool gets its blocks back, and a restarted
+    engine starts empty."""
+    runner = _ScriptedRunner(delay_s=0.002)
+    sched = ContinuousScheduler(runner, max_concurrent=1)  # type: ignore[arg-type]
+    free_at_start = runner.block_pool.num_free_blocks
+    finish = sched._finish
+
+    def slow_finish(req: RunningRequest, reason: Any) -> None:
+        time.sleep(4 * _POLL_S)  # the waiters poll a dead thread meanwhile
+        finish(req, reason)
+
+    sched.start()
+    try:
+        running = sched.submit(_request(max_tokens=100_000))
+        waiting = sched.submit(_request(max_tokens=4))  # max_concurrent=1: never admitted
+        assert _bounded(running.get_step).finish_reason is None
+        sched._finish = slow_finish  # type: ignore[method-assign]
+        results, waiters = _wait_concurrently([running, waiting])
+        sched.stop()
+        _join_all(waiters)
+        assert results == ["cancelled", "cancelled"]
+        assert runner.block_pool.num_free_blocks == free_at_start
+        sched._finish = finish  # type: ignore[method-assign]
+        sched.start()
+        assert _bounded(sched.submit(_request(max_tokens=3)).wait).finish_reason == "length"
+    finally:
+        sched.stop()
+
+
+def _occupy_slots(sched: Any) -> None:
+    """Make a slot scheduler hold its requests forever, with no model."""
+
+    def occupy(running: RunningRequest, slot_idx: int) -> None:
+        sched._slots[slot_idx] = SimpleNamespace(request=running)
+
+    sched._prefill_into_slot = occupy
+    sched._decode_step = lambda: time.sleep(0.001)
+
+
+@pytest.mark.parametrize("name", ["state-cache-continuous", "tp-state-cache-continuous"])
+def test_slot_schedulers_stop_cancels_slotted_and_waiting_requests(name: str) -> None:
+    sched: Any
+    if name == "state-cache-continuous":
+        sched = StateCacheContinuousScheduler(_state_cache_generator(), max_batch_size=1)
+    else:
+        server = SimpleNamespace(
+            is_leader=True, max_batch_size=1, tokenizer=_CharTokenizer(), shutdown=lambda: None
+        )
+        sched = TensorParallelStateCacheContinuousScheduler(server)  # type: ignore[arg-type]
+    _occupy_slots(sched)
+    sched.start()
+    try:
+        slotted = sched.submit(_request())
+        _wait_until(lambda: any(sched._slots))
+        waiting = sched.submit(_request())  # the only slot is taken
+        results, waiters = _wait_concurrently([slotted, waiting])
+        sched.stop()
+        _join_all(waiters)
+        assert results == ["cancelled", "cancelled"]
+        assert not any(sched._slots)
+    finally:
+        sched.stop()
+
+
+def test_tp_stop_cancels_the_requests_still_waiting() -> None:
+    server = SimpleNamespace(is_leader=True, tokenizer=_CharTokenizer())
+    sched = TensorParallelStateCacheScheduler(server)  # type: ignore[arg-type]
+    serving = threading.Event()
+
+    def serve(running: RunningRequest) -> None:
+        # Holds the one request it serves until `stop()`, then ends it the
+        # way `_serve` ends a cancelled generation.
+        serving.set()
+        sched._stop_event.wait(_BOUND_S)
+        sched._finish(running, "cancelled")
+
+    sched._serve = serve  # type: ignore[method-assign]
+    sched.start()
+    try:
+        served = sched.submit(_request())
+        _wait_until(serving.is_set)
+        waiting = sched.submit(_request())
+        sched.stop()
+        assert _bounded(served.wait).finish_reason == "cancelled"
+        assert _bounded(waiting.wait).finish_reason == "cancelled"
+    finally:
+        sched.stop()
+
+
+def test_a_handle_stays_bound_to_the_thread_that_crashed(
+    crashes: list[type[BaseException]],
+) -> None:
+    """After a crash, a quick `start()` brings up a thread that never saw the
+    request (the StateCache schedulers keep no trace of it). The handle must
+    watch the thread that owned it, or it would wait on the new one forever."""
+    sched, _ = _state_cache()  # each prefill emits one step, then crashes
+    sched.start()
+    try:
+        handle = sched.submit(_request())
+        _wait_until(lambda: not sched.is_running)
+        sched.start()
+        assert sched.is_running
+        assert _bounded(handle.get_step).text == "x"
+        with pytest.raises(EngineNotRunningError):
+            _bounded(lambda: handle.wait(timeout=2.0))
+        assert crashes == [_InjectedCrashError]
+    finally:
+        sched.stop()
+
+
+# ---- HTTP -----------------------------------------------------------------
+
+
+class _Server:
+    """The real `completions` route on a fresh app over one scheduler.
+
+    Every handle the endpoint gets is recorded, so teardown can end it: if a
+    regression leaves the endpoint blocked, `TestClient` cannot exit until the
+    handle's queue gets its terminal step.
+    """
+
+    def __init__(self, sched: Any, *, start: bool = True) -> None:
+        self.sched = sched
+        self.handles: list[RequestHandle] = []
+        self.submitted = threading.Semaphore(0)
+        submit = sched.submit
+
+        def spy(request: Request) -> RequestHandle:
+            handle: RequestHandle = submit(request)
+            self.handles.append(handle)
+            self.submitted.release()
+            return handle
+
+        sched.submit = spy
+        app = FastAPI()
+        app.add_api_route("/v1/completions", completions, methods=["POST"], response_model=None)
+        app.add_api_route("/ping", lambda: {"ok": True}, methods=["GET"])
+        app.add_exception_handler(Exception, _unhandled_exception_handler)
+        app.state.scheduler = sched
+        self.app = app
+        if start:
+            sched.start()
+
+    def release(self) -> None:
+        """Give every recorded handle a terminal step, making room if needed."""
+        for handle in self.handles:
+            out = handle._req.output_queue
+            with contextlib.suppress(queue.Empty):
+                if out.full():
+                    out.get_nowait()
+            with contextlib.suppress(queue.Full):
+                out.put_nowait(GenerationStep(text="", finish_reason="stop"))
+
+
+@pytest.fixture
+def serve() -> Iterator[Callable[..., tuple[_Server, TestClient]]]:
+    opened: list[tuple[_Server, TestClient, list[threading.Event]]] = []
+
+    def open_server(
+        sched: Any, *, start: bool = True, gates: tuple[threading.Event, ...] = ()
+    ) -> tuple[_Server, TestClient]:
+        server = _Server(sched, start=start)
+        client = TestClient(server.app)
+        client.__enter__()
+        opened.append((server, client, list(gates)))
+        return server, client
+
+    yield open_server
+    for server, client, gates in opened:
+        for gate in gates:
+            gate.set()
+        server.release()
+        client.__exit__(None, None, None)
+        server.sched.stop()
+
+
+def _post(client: TestClient, *, stream: bool = False, max_tokens: int = 4) -> Any:
+    return client.post(
+        "/v1/completions",
+        json={"model": "m", "prompt": "abc", "max_tokens": max_tokens, "stream": stream},
+    )
+
+
+def _sse_events(client: TestClient, max_tokens: int = 8) -> tuple[int, list[str]]:
+    with client.stream(
+        "POST",
+        "/v1/completions",
+        json={"model": "m", "prompt": "abc", "max_tokens": max_tokens, "stream": True},
+    ) as response:
+        events = [
+            line[len("data: ") :] for line in response.iter_lines() if line.startswith("data: ")
+        ]
+        return response.status_code, events
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_http_rejects_a_request_when_the_engine_is_not_running(
+    serve: Callable[..., tuple[_Server, TestClient]], stream: bool
+) -> None:
+    _, client = serve(ContinuousScheduler(_ScriptedRunner()), start=False)  # type: ignore[arg-type]
+    response = _bounded(lambda: _post(client, stream=stream))
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["type"] == "engine_unavailable"
+
+
+def test_http_non_streaming_request_fails_when_the_engine_dies(
+    serve: Callable[..., tuple[_Server, TestClient]], crashes: list[type[BaseException]]
+) -> None:
+    _, client = serve(ContinuousScheduler(_ScriptedRunner(crash_on_call=1)))  # type: ignore[arg-type]
+    response = _bounded(lambda: _post(client))
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "type": "engine_unavailable",
+        "message": "engine is not running",
+    }
+    assert crashes == [_InjectedCrashError]
+
+
+def test_http_stream_reports_a_mid_stream_death_in_band(
+    serve: Callable[..., tuple[_Server, TestClient]], crashes: list[type[BaseException]]
+) -> None:
+    _, client = serve(ContinuousScheduler(_ScriptedRunner(crash_on_call=3)))  # type: ignore[arg-type]
+    status, events = _bounded(lambda: _sse_events(client))
+    assert status == 200
+    *chunks, error, done = events
+    assert [json.loads(c)["choices"][0] for c in chunks] == [
+        {"text": "a", "index": 0, "finish_reason": None},
+        {"text": "a", "index": 0, "finish_reason": None},
+    ]
+    assert json.loads(error)["error"]["type"] == "engine_unavailable"
+    assert done == "[DONE]"
+    assert crashes == [_InjectedCrashError]
+
+
+def test_http_non_streaming_request_does_not_block_the_event_loop(
+    serve: Callable[..., tuple[_Server, TestClient]],
+) -> None:
+    """While one completion waits on a stalled engine, other routes answer."""
+    gate = threading.Event()
+    runner = _ScriptedRunner(gate=gate)
+    _, client = serve(ContinuousScheduler(runner), gates=(gate,))  # type: ignore[arg-type]
+    pending: list[Any] = []
+    first = threading.Thread(target=lambda: pending.append(_post(client)), daemon=True)
+    first.start()
+    assert runner.entered.wait(_BOUND_S)
+    # Several liveness slices pass while the engine is stalled: an empty slice
+    # on a live engine must not fail the request.
+    time.sleep(6 * _POLL_S)
+    assert _bounded(lambda: client.get("/ping"), timeout=2.0).status_code == 200
+    assert first.is_alive()
+    gate.set()
+    first.join(_BOUND_S)
+    assert not first.is_alive()
+    body = pending[0].json()
+    assert pending[0].status_code == 200
+    assert body["choices"][0] == {"text": "aaaa", "index": 0, "finish_reason": "length"}
+
+
+def test_http_non_streaming_requests_do_not_starve_each_other_of_threads(
+    serve: Callable[..., tuple[_Server, TestClient]],
+) -> None:
+    """With one executor thread and small output queues, two concurrent
+    completions both keep every token. A request that held the thread for its
+    whole generation would leave the other's queue unread, and that queue
+    drops steps once it is full."""
+    gate = threading.Event()
+    sched = ContinuousScheduler(_ScriptedRunner(gate=gate, delay_s=0.005))  # type: ignore[arg-type]
+    sched.DEFAULT_OUTPUT_QUEUE_SIZE = 4  # type: ignore[misc]
+    server, client = serve(sched, gates=(gate,))
+
+    async def one_executor_thread() -> None:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+
+    assert client.portal is not None
+    client.portal.call(one_executor_thread)
+    max_tokens = 12
+    responses: list[Any] = []
+    posts = [
+        threading.Thread(
+            target=lambda: responses.append(_post(client, max_tokens=max_tokens)), daemon=True
+        )
+        for _ in range(2)
+    ]
+    for post in posts:
+        post.start()
+    for _ in posts:
+        assert server.submitted.acquire(timeout=_BOUND_S)
+    gate.set()
+    for post in posts:
+        post.join(_BOUND_S)
+        assert not post.is_alive()
+    for response in responses:
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["text"] == "a" * max_tokens
+        assert response.json()["usage"]["completion_tokens"] == max_tokens

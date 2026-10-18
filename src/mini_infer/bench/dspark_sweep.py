@@ -268,11 +268,6 @@ class SweepPoint:
         return out
 
 
-# Slice length for waiting on results. Short enough that a dead engine thread
-# is noticed within seconds, long enough that polling costs nothing.
-_WAIT_SLICE_S = 2.0
-
-
 def run_point(
     runner: ModelRunner,
     prompts: Sequence[str],
@@ -289,12 +284,9 @@ def run_point(
 
     Fails fast when the engine thread dies. Any exception other than
     `OutOfMemoryError` ends that thread, and then no request in flight ever
-    gets its terminal step. So results are awaited in short slices, and after
-    each slice the scheduler is asked whether it still runs. A slice that
-    times out may drop the text of steps it already took off the queue; the
-    point never reads text, because tokens come from each request itself.
-    `timeout_s` still bounds the whole point, for an engine that lives but
-    stalls.
+    gets its terminal step. The handle notices within one liveness poll and
+    raises `EngineNotRunningError`; the traceback is in the log. `timeout_s`
+    still bounds the whole point, for an engine that lives but stalls.
     """
     if concurrency < 1:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -319,20 +311,12 @@ def run_point(
         deadline = start + timeout_s
         results: list[GenerationResult] = []
         for handle in handles:
-            while True:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"sweep point (concurrency={concurrency}) exceeded {timeout_s:.0f}s"
-                    )
-                try:
-                    results.append(handle.wait(timeout=min(_WAIT_SLICE_S, remaining)))
-                    break
-                except TimeoutError:
-                    if not sched.is_running:
-                        raise RuntimeError(
-                            "the engine thread died; its traceback is in the log"
-                        ) from None
+            try:
+                results.append(handle.wait(timeout=max(0.0, deadline - time.perf_counter())))
+            except TimeoutError:
+                raise TimeoutError(
+                    f"sweep point (concurrency={concurrency}) exceeded {timeout_s:.0f}s"
+                ) from None
         wall_s = time.perf_counter() - start
     finally:
         sched.stop()

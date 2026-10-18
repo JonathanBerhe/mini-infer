@@ -28,6 +28,7 @@ from mini_infer.engine.sampler import sample
 from mini_infer.engine.tp_state_cache_continuous_server import (
     TensorParallelStateCacheContinuousServer,
 )
+from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -67,6 +68,8 @@ class TensorParallelStateCacheContinuousScheduler:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._slots: list[_Slot | None] = [None] * server.max_batch_size
+        # True while `stop()` runs; see `ContinuousScheduler._stopping`.
+        self._stopping = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -79,23 +82,63 @@ class TensorParallelStateCacheContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        """Signal the engine thread to exit, join it, cancel what is left, and
+        release the followers.
+
+        After a clean join, every request in a slot or still waiting ends with
+        `finish_reason="cancelled"`. A timed-out join cancels nothing, because
+        the thread can still touch the slots.
+        """
+        self._stopping = True
+        try:
+            self._stop_event.set()
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=timeout)
+                self._thread = None
+                if not thread.is_alive():
+                    self._cancel_in_flight()
+        finally:
+            self._stopping = False
         # The engine thread has exited, so no broadcast is in flight; tell the
         # followers to leave run_follower_loop (else they block on the next op).
         self._server.shutdown()
 
+    @property
+    def is_running(self) -> bool:
+        """Whether the leader's engine thread is alive. A leader blocked in a
+        collective (for example because a follower died) still counts as alive."""
+        return self._thread is not None and self._thread.is_alive()
+
     def submit(self, request: Request) -> RequestHandle:
-        if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError("scheduler not running; call start() before submit()")
+        """Enqueue a request; its handle raises `EngineNotRunningError` if the
+        engine thread dies before the request finishes."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
             output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
-        return RequestHandle(running)
+        thread_alive = thread.is_alive
+        return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
+
+    def _cancel_in_flight(self) -> None:
+        """Finish every request in a slot or still waiting as 'cancelled'.
+
+        Runs only after the engine thread exited; `start()` resets the slots.
+        """
+        for slot_idx, slot in enumerate(self._slots):
+            if slot is not None:
+                self._finish(slot.request, "cancelled")
+                self._slots[slot_idx] = None
+        while True:
+            try:
+                running = self._waiting.get_nowait()
+            except queue.Empty:
+                break
+            self._finish(running, "cancelled")
 
     def run(self, request: Request) -> GenerationResult:
         return self.submit(request).wait()

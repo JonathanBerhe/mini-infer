@@ -66,7 +66,7 @@ from mini_infer.engine.dspark.spec import (
 )
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample
-from mini_infer.exceptions import OutOfMemoryError
+from mini_infer.exceptions import EngineNotRunningError, OutOfMemoryError
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -172,6 +172,10 @@ class ContinuousScheduler:
         self._pre_forward_seq_lens: list[int] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # True while `stop()` runs. `stop()` cancels the requests left in
+        # flight after the engine thread exits, so handles must keep waiting
+        # for those terminal steps instead of reporting a dead engine.
+        self._stopping = False
         # Chrome Trace Event recording. When `trace_out` is set, each engine
         # step that runs a forward appends a duration event to `_trace_events`;
         # `stop()` writes them out as JSON. `_trace_t0` anchors `ts` at zero
@@ -184,10 +188,10 @@ class ContinuousScheduler:
     def is_running(self) -> bool:
         """Whether the engine thread is alive.
 
-        False after `stop()`, and also after the thread died on an exception
-        other than `OutOfMemoryError`. In that second case no request in
-        flight ever receives its terminal step, so a caller that waits on
-        results can poll this to fail fast instead of waiting out a timeout.
+        False before `start()`, after `stop()`, and after the thread died on
+        an exception other than `OutOfMemoryError`. In that last case no
+        request in flight receives its terminal step from the engine; each
+        handle notices the dead thread on its own (see `RequestHandle`).
         """
         return self._thread is not None and self._thread.is_alive()
 
@@ -202,25 +206,75 @@ class ContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit and join it (with the given timeout)."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        """Signal the engine thread to exit, join it, and cancel what is left.
+
+        After a clean join, every request still running or waiting ends with
+        `finish_reason="cancelled"` and its KV blocks go back to the pool, so
+        a later `start()` begins with an empty batch. If the join times out,
+        the thread can still touch that state, so nothing is cancelled; the
+        handles then fail through their liveness check once it exits.
+        """
+        self._stopping = True
+        try:
+            self._stop_event.set()
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=timeout)
+                self._thread = None
+                if not thread.is_alive():
+                    self._cancel_in_flight()
+        finally:
+            self._stopping = False
         if self._trace_events is not None and self._trace_out is not None:
             with open(self._trace_out, "w") as f:
                 json.dump({"traceEvents": self._trace_events}, f)
 
     def submit(self, request: Request) -> RequestHandle:
-        """Enqueue a request and return a handle the caller drains for output."""
-        if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError("scheduler not running; call start() before submit()")
+        """Enqueue a request and return a handle the caller drains for output.
+
+        The handle watches the engine thread that runs now. If that thread
+        dies, the handle raises `EngineNotRunningError`; if `stop()` ends it,
+        the request finishes as 'cancelled'.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
             output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
-        return RequestHandle(running)
+        # The thread is read first: a dead thread plus `_stopping` False means
+        # either a crash or a `stop()` that already pushed its terminal steps.
+        thread_alive = thread.is_alive
+        return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
+
+    def _cancel_in_flight(self) -> None:
+        """Finish every request still running or waiting as 'cancelled'.
+
+        `stop()` calls this only after the engine thread exited, so no other
+        thread touches this state. A `submit()` on another thread that races
+        `stop()` can still enqueue after the drain; its handle then fails
+        through the liveness check.
+        """
+        for req in self._running:
+            if req.state != RequestState.DONE:
+                self._finish(req, "cancelled")
+        while True:
+            try:
+                req = self._waiting.get_nowait()
+            except queue.Empty:
+                break
+            self._finish(req, "cancelled")
+        try:
+            self._reap_done()
+        except Exception:
+            # The thread can have died in the middle of a step and left the
+            # cache half-updated. The terminal steps above went out anyway;
+            # only the blocks of those requests are lost.
+            logger.exception("stop(): could not free the KV blocks of cancelled requests")
+            self._running.clear()
+            self._batched_cache = None
 
     def run(self, request: Request) -> GenerationResult:
         """Submit and block until the request completes; returns the aggregated result."""
