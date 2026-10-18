@@ -469,7 +469,7 @@ class PDScheduler:
         r.last_text = (r.last_text or "") + text
         try:
             r.output_queue.put(
-                GenerationStep(text=text, finish_reason=None),
+                GenerationStep(text=text, finish_reason=None, num_tokens=1),
                 timeout=10.0,
             )
         except queue.Full:

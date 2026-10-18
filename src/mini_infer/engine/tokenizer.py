@@ -83,6 +83,29 @@ class Tokenizer:
             out = out[0]
         return [int(t) for t in out]
 
+    def render_chat(self, user_message: str, *, enable_thinking: bool | None = None) -> str:
+        """The same single user turn as `encode_chat`, rendered to text, not ids.
+
+        For paths that take a prompt as text, such as `Request`, whose
+        admission runs plain `encode()` over it. Whether that round-trip
+        reproduces `encode_chat` depends on the tokenizer (it must parse the
+        template's special-token strings back into the same ids and add no
+        extra BOS), so a caller that relies on the equivalence has to assert
+        it rather than assume it.
+        """
+        if not self.has_chat_template():
+            raise ValueError("tokenizer has no chat_template; use the raw text instead")
+        kwargs: dict[str, object] = {}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        out = self._tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_message}],
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        )
+        return str(out)
+
     @property
     def eos_token_id(self) -> int:
         eos = self._tokenizer.eos_token_id

@@ -110,7 +110,7 @@ class TensorParallelStateCacheScheduler:
             current_text = tokenizer.decode(running.tokens_generated)
             delta = current_text[len(running.last_text) :]
             running.last_text = current_text
-            self._emit(running, GenerationStep(text=delta))
+            self._emit(running, GenerationStep(text=delta, num_tokens=1))
 
         try:
             self._server.generate_ids(

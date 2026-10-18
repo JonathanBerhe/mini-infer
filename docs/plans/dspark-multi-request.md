@@ -353,7 +353,8 @@ The work has four steps:
    Done, see the findings of step 3. The failure injection is
    `tests/unit/_oom_injection.py`.
 4. Benchmark. Measure the accepted length and the throughput against
-   concurrency, on the open-loop benchmark. That also gives the SPS(B) curve
+   concurrency. See the design of step 4 below for why this runs inside the
+   engine and not on the open-loop benchmark. That also gives the SPS(B) curve
    that the batch-global scheduler needs. This step requires the stats
    plumbing (see the deferred items) and a `num_blocks` value so large that
    headroom is not the limit.
@@ -516,6 +517,66 @@ their start-vs-slot assertion. A prefiller with an inflated slot now fails
 loudly instead of storing its chunk past a hole. The OOM tests cover a
 surviving prefiller and a slot that keeps extra blocks. A rollback that skips
 prefilling slots fails the test with the surviving prefiller.
+
+## Design of staging step 4
+
+Step 4 runs inside the engine process, not through the HTTP open-loop
+benchmark that the staging list names. That benchmark has six problems for
+this purpose:
+
+- The server cannot enable dspark.
+- Its default prompt is longer than `max_spec_prompt_tokens`, so every
+  request quietly runs the plain path.
+- Its client counts stream chunks as tokens.
+- Its GPU image uses library versions that the DSpark path never ran on.
+- Its arrival rate does not control how many requests are in flight.
+- No channel carries the speculative statistics out of the engine.
+
+The in-process driver is `mini_infer.bench.dspark_sweep`. A point submits a
+fixed list of prompts at once to a scheduler whose `max_concurrent` is the
+level under test. While a prompt still waits, the scheduler keeps that many
+requests in flight, as a closed loop. Every level uses the same prompts, so a
+change between levels is a change of concurrency, not of workload.
+
+After the last admission the batch drains, and the two arms drain
+differently. Plain requests of one length finish together, but speculative
+requests finish at different rounds. So a point reports two speeds.
+
+The whole run counts every token. The steady part counts only the steps in
+which a prompt still waited, so every slot was busy. A point also reports its
+mean in-flight count, weighted by time, which shows how far the run fell
+short of its label. The steady speedup is the fair comparison between the
+arms.
+
+Two pieces of plumbing serve both drivers. `GenerationStep.num_tokens` says
+how many tokens a step carries, so a client can count tokens instead of
+steps. `GenerationResult.spec_summary` carries a fixed-size `SpecSummary` of
+the speculative rounds. `_finish` builds it, because the reap drops the full
+statistics right after. A request that did not speculate reports None.
+
+The sweep refuses a point that does not measure what its label says. It
+raises in two cases: a dspark point holds a request that did not speculate,
+or a request was cancelled at admission. A timed pass puts a GPU synchronize at
+every phase boundary and records every forward's width and duration. Those
+barriers slow the step, so the throughput numbers come from the untimed
+points only. Each stored point carries a fingerprint of its prompts and
+configuration, so a rerun with another configuration refuses the old results.
+
+Three caveats apply to the results. The attention backend is `torch`, the
+only one that the DSpark path ran on with a GPU. It rebuilds the packed K/V
+for every layer of every forward, so it can favor speculation, which needs
+fewer forwards. Token agreement in bf16 is statistical, not exact.
+
+The third caveat is about tau. Near `max_tokens`, the scheduler offers
+fewer tokens than the drafter proposed, so a request's last rounds commit
+less. The batch-1 runner never shortens a proposal for room. So `tau` is
+biased low against batch-1, and `tau_unclamped` leaves those rounds out to
+make the comparison fair. An EOS inside a committed block still drops the
+tokens from it on. So the throughput numbers count the tokens that each
+request really returned.
+
+The HTTP open-loop benchmark stays useful for latency under live traffic.
+It needs a server setting for dspark and a client that sums `num_tokens`.
 
 ## Gate, split three ways
 

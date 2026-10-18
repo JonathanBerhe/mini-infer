@@ -180,6 +180,17 @@ class ContinuousScheduler:
         self._trace_events: list[dict[str, object]] | None = [] if trace_out is not None else None
         self._trace_t0: float | None = None
 
+    @property
+    def is_running(self) -> bool:
+        """Whether the engine thread is alive.
+
+        False after `stop()`, and also after the thread died on an exception
+        other than `OutOfMemoryError`. In that second case no request in
+        flight ever receives its terminal step, so a caller that waits on
+        results can poll this to fail fast instead of waiting out a timeout.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         """Spawn the engine thread. Idempotent if the thread is already running."""
         if self._thread is not None and self._thread.is_alive():
@@ -346,11 +357,18 @@ class ContinuousScheduler:
         # Snapshot the phase BEFORE `_packed_forward` mutates request states
         # (e.g. PREFILLING -> DECODING when the last chunk lands).
         trace_phase: str | None = None
+        n_verify = 0
         if alive and self._trace_events is not None:
             trace_phase = self._classify_phase(alive)
+            # Requests carrying a verify window in this forward. `offered` is
+            # set by the draft phase and cleared by verify, so it must be read
+            # here, before the forward.
+            n_verify = sum(1 for r in alive if r.spec is not None and r.spec.offered is not None)
 
+        total_q = 0
         if alive:
             packed_logits, cu_seqlens_q, sink = self._packed_forward(alive, sampled_decode_tokens)
+            total_q = cu_seqlens_q[-1]
             self._verify_speculators(alive, packed_logits, cu_seqlens_q, sink)
 
         if alive and self._trace_events is not None:
@@ -365,7 +383,16 @@ class ContinuousScheduler:
                     "dur": (time.perf_counter() - step_start) * 1e6,
                     "pid": 0,
                     "tid": 0,
-                    "args": {"B": len(alive), "phase": trace_phase},
+                    # B counts requests, total_q counts the q-tokens of the
+                    # forward. Plain decoding makes them equal; prefill chunks
+                    # and verify windows make total_q larger, which is the
+                    # quantity a step's cost actually follows.
+                    "args": {
+                        "B": len(alive),
+                        "phase": trace_phase,
+                        "total_q": total_q,
+                        "n_verify": n_verify,
+                    },
                 }
             )
 
@@ -571,7 +598,7 @@ class ContinuousScheduler:
                 self._finish(req, "stop")
                 continue
             req.tokens_generated.append(next_token)
-            self._emit_new_text(req)
+            self._emit_new_text(req, 1)
             if len(req.tokens_generated) >= req.request.max_tokens:
                 self._finish(req, "length")
                 continue
@@ -579,18 +606,20 @@ class ContinuousScheduler:
             sampled[id(req)] = req.pending_decode_tokens
         return sampled
 
-    def _emit_new_text(self, req: RunningRequest) -> None:
+    def _emit_new_text(self, req: RunningRequest, num_tokens: int) -> None:
         """Decode-and-diff: re-decode all tokens so far and emit the new suffix.
 
         Handles multi-byte UTF-8 sequences correctly at the cost of O(n) work
         per call (one tokenizer call, one string slice). A call covering
         several newly appended tokens emits ONE step carrying their whole
         delta, which is how the speculative path streams a committed block.
+        `num_tokens` says how many tokens that one step carries, so a consumer
+        can count tokens without counting steps.
         """
         current_text = self._runner.tokenizer.decode(req.tokens_generated)
         delta = current_text[len(req.last_text) :]
         req.last_text = current_text
-        self._emit(req, GenerationStep(text=delta))
+        self._emit(req, GenerationStep(text=delta, num_tokens=num_tokens))
 
     def _draft_speculators(self) -> dict[int, list[int]]:
         """Draft one block per speculating DECODING request; return verify inputs.
@@ -642,7 +671,7 @@ class ContinuousScheduler:
                     self._finish(req, "stop")
                     continue
                 req.tokens_generated.append(anchor)
-                self._emit_new_text(req)
+                self._emit_new_text(req, 1)
                 if len(req.tokens_generated) >= req.request.max_tokens:
                     self._finish(req, "length")
                     continue
@@ -684,6 +713,7 @@ class ContinuousScheduler:
                 # occupies one slot of the remaining room, so at most
                 # `room - 1` draft tokens are worth verifying.
                 spec.offered = offered[: max(0, room - 1)]
+                spec.room_clamped = len(spec.offered) < len(offered)
                 spec.confidence = confidence
                 spec.draft_probs = draft_probs
                 spec.drafted_for_start = spec.start
@@ -877,6 +907,9 @@ class ContinuousScheduler:
             spec.stats.proposal_lengths.append(len(spec.offered))
             spec.stats.accepted_draft_lengths.append(accepted)
             spec.stats.acceptance_lengths.append(accepted + 1)
+            if spec.room_clamped:
+                spec.stats.room_clamped_rounds += 1
+                spec.stats.room_clamped_committed += accepted + 1
 
             committed = [*spec.offered[:accepted], bonus]
             room = req.request.max_tokens - len(req.tokens_generated)
@@ -891,7 +924,7 @@ class ContinuousScheduler:
                 emitted.append(tok)
             if emitted:
                 req.tokens_generated.extend(emitted)
-                self._emit_new_text(req)
+                self._emit_new_text(req, len(emitted))
 
             if hit_eos:
                 self._finish(req, "stop")
@@ -919,6 +952,7 @@ class ContinuousScheduler:
             spec.draft_probs = None
             spec.confidence = None
             spec.drafted_for_start = None
+            spec.room_clamped = False
 
     def _reap_done(self) -> None:
         """Free blocks for finished requests; shift batch_idx for survivors."""
@@ -957,7 +991,15 @@ class ContinuousScheduler:
         so this MUST go through; if the queue is full we drop the most
         recent intermediate step to make room rather than block the engine
         thread.
+
+        A speculator's stats are summarized here, not in the reap. The reap
+        drops `spec` and runs after this, and the summary must be in place
+        before the terminal step goes out: the queue put is what makes it
+        visible to the API thread that reads `GenerationResult`.
         """
+        if req.spec is not None:
+            assert self._dspark is not None
+            req.spec_summary = req.spec.stats.summary(self._dspark.block_size)
         req.finish_reason = reason
         req.state = RequestState.DONE
         terminal = GenerationStep(text="", finish_reason=reason)

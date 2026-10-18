@@ -247,7 +247,7 @@ class StateCacheContinuousScheduler:
             current_text = tokenizer.decode(request.tokens_generated)
             delta = current_text[len(request.last_text) :]
             request.last_text = current_text
-            self._emit(request, GenerationStep(text=delta))
+            self._emit(request, GenerationStep(text=delta, num_tokens=1))
             if len(request.tokens_generated) >= request.request.max_tokens:
                 self._finish(request, "length")
                 self._slots[slot_idx] = None

@@ -56,6 +56,11 @@ class DSparkStats:
     n_target_forwards: int = 0
     n_drafter_forwards: int = 0
     confidence_observations: list[tuple[float, bool]] = dataclasses.field(default_factory=list)
+    # Rounds whose proposal the scheduler shortened to fit the request's
+    # remaining `max_tokens` room, and what they committed. The batch-1
+    # runner never shortens a proposal that way, so these stay 0 there.
+    room_clamped_rounds: int = 0
+    room_clamped_committed: int = 0
 
     @property
     def mean_acceptance_length(self) -> float:
@@ -80,6 +85,11 @@ class DSparkStats:
         `i-1` did. `None` where no round offered that position (which
         truncation makes common at deep positions).
         """
+        offered, survived = self._position_counts(block_size)
+        return [(survived[p] / offered[p]) if offered[p] else None for p in range(block_size)]
+
+    def _position_counts(self, block_size: int) -> tuple[list[int], list[int]]:
+        """Per draft position: rounds that offered it, and rounds that kept it."""
         offered = [0] * block_size
         survived = [0] * block_size
         for proposal_len, accepted in zip(
@@ -90,7 +100,98 @@ class DSparkStats:
                     offered[pos] += 1
                 if accepted > pos:
                     survived[pos] += 1
-        return [(survived[p] / offered[p]) if offered[p] else None for p in range(block_size)]
+        return offered, survived
+
+    def summary(self, block_size: int) -> SpecSummary:
+        """Reduce these stats to the fixed-size form that outlives the request."""
+        offered, survived = self._position_counts(block_size)
+        return SpecSummary(
+            rounds=len(self.acceptance_lengths),
+            committed=sum(self.acceptance_lengths),
+            offered=sum(self.proposal_lengths),
+            accepted=sum(self.accepted_draft_lengths),
+            drafter_forwards=self.n_drafter_forwards,
+            offered_by_position=tuple(offered),
+            survived_by_position=tuple(survived),
+            room_clamped_rounds=self.room_clamped_rounds,
+            room_clamped_committed=self.room_clamped_committed,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SpecSummary:
+    """One request's speculative statistics, reduced to fixed-size numbers.
+
+    Built when the request finishes, because the reap drops `DSparkStats`
+    together with the rest of the speculative state. Fixed size on purpose: a
+    benchmark pools hundreds of requests, and pooling needs only sums and
+    per-position counts, never the per-round lists. (`confidence_observations`
+    alone holds one entry per offered token, so it is not carried at all.)
+
+    `committed` counts `accepted + 1` per round, DeepSpec's definition. It is
+    NOT the number of tokens the client received: the first anchor belongs to
+    no round, and an EOS inside a committed block drops the tokens from it
+    on. Throughput must count `GenerationResult.tokens` instead.
+
+    The `max_tokens` limit never drops a committed token, because the
+    scheduler shortens the proposal at draft time instead: with room for n
+    more tokens it offers at most n - 1. The last rounds of a request
+    therefore commit less than an unconstrained round, so `tau` is biased low
+    against the batch-1 benchmark, whose runner never shortens a proposal for
+    room. `room_clamped_*` counts those rounds, and `tau_unclamped` leaves
+    them out. That is the number to compare with batch-1 and with the paper.
+    """
+
+    rounds: int
+    committed: int
+    offered: int
+    accepted: int
+    drafter_forwards: int
+    offered_by_position: tuple[int, ...]
+    survived_by_position: tuple[int, ...]
+    room_clamped_rounds: int = 0
+    room_clamped_committed: int = 0
+
+    @property
+    def tau(self) -> float:
+        """Committed tokens per round, the bonus token included."""
+        return self.committed / self.rounds if self.rounds else 0.0
+
+    @property
+    def tau_unclamped(self) -> float:
+        """`tau` over the rounds whose proposal was not shortened for room."""
+        rounds = self.rounds - self.room_clamped_rounds
+        committed = self.committed - self.room_clamped_committed
+        return committed / rounds if rounds else 0.0
+
+    @classmethod
+    def pool(cls, summaries: list[SpecSummary]) -> SpecSummary:
+        """Sum many requests into one summary, so `tau` pools over all rounds.
+
+        Pooling sums before it divides, as DeepSpec's evaluator does. The mean
+        of per-request tau values is a different number: it weights a short
+        request's few rounds as much as a long request's many.
+        """
+        if not summaries:
+            raise ValueError("cannot pool an empty list of summaries")
+        width = len(summaries[0].offered_by_position)
+        if any(len(s.offered_by_position) != width for s in summaries):
+            raise ValueError("summaries come from drafters with different block sizes")
+        return cls(
+            rounds=sum(s.rounds for s in summaries),
+            committed=sum(s.committed for s in summaries),
+            offered=sum(s.offered for s in summaries),
+            accepted=sum(s.accepted for s in summaries),
+            drafter_forwards=sum(s.drafter_forwards for s in summaries),
+            offered_by_position=tuple(
+                sum(s.offered_by_position[p] for s in summaries) for p in range(width)
+            ),
+            survived_by_position=tuple(
+                sum(s.survived_by_position[p] for s in summaries) for p in range(width)
+            ),
+            room_clamped_rounds=sum(s.room_clamped_rounds for s in summaries),
+            room_clamped_committed=sum(s.room_clamped_committed for s in summaries),
+        )
 
 
 def propose_block(
@@ -353,3 +454,6 @@ class SpecDecodeState:
     confidence: torch.Tensor | None = None
     start: int | None = None
     drafted_for_start: int | None = None
+    # Whether the round in flight offered fewer tokens than the drafter
+    # proposed, because the request had no room for more (see SpecSummary).
+    room_clamped: bool = False

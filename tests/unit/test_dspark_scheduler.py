@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import queue
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 import torch
@@ -40,56 +41,27 @@ from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
 from mini_infer.engine.dspark import (
     DSparkSpec,
-    Qwen3DSparkConfig,
     Qwen3DSparkDrafter,
+    SpecSummary,
 )
 from mini_infer.engine.dspark.draft_cache import DSparkDraftCache
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.exceptions import OutOfMemoryError
-from mini_infer.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from mini_infer.scheduler import ContinuousScheduler, Request
-from mini_infer.scheduler.request_state import RequestState, RunningRequest
+from mini_infer.scheduler.request_state import (
+    GenerationStep,
+    RequestHandle,
+    RequestState,
+    RunningRequest,
+)
+from tests.unit._dspark_doubles import EOS as _EOS
+from tests.unit._dspark_doubles import HIDDEN as _HIDDEN
+from tests.unit._dspark_doubles import VOCAB as _VOCAB
+from tests.unit._dspark_doubles import CharTokenizer as _CharTokenizer
+from tests.unit._dspark_doubles import MicroRunner as _MicroRunner
+from tests.unit._dspark_doubles import drafter_config as _drafter_config
+from tests.unit._dspark_doubles import micro_setup as _micro_setup
 from tests.unit._oom_injection import MidAppendOom
-
-_VOCAB = 64
-_HIDDEN = 32
-_TAPS = [1, 3]
-_BLOCK = 3
-_EOS = 63
-_MASK = 62
-
-
-def _drafter_config(*, confidence: bool = False) -> Qwen3DSparkConfig:
-    return Qwen3DSparkConfig(
-        vocab_size=_VOCAB,
-        hidden_size=_HIDDEN,
-        intermediate_size=40,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        rms_norm_eps=1e-6,
-        rope_theta=10000.0,
-        target_layer_ids=list(_TAPS),
-        mask_token_id=_MASK,
-        block_size=_BLOCK,
-        markov_rank=5,
-        enable_confidence_head=confidence,
-        confidence_head_with_markov=confidence,
-    )
-
-
-class _CharTokenizer:
-    """One id per character, ids in [1, 60) so EOS and mask stay reserved."""
-
-    eos_token_id = _EOS
-    vocab_size = _VOCAB
-
-    def encode(self, text: str) -> list[int]:
-        return [(ord(c) % 59) + 1 for c in text]
-
-    def decode(self, ids: list[int]) -> str:
-        return "".join(chr(97 + (i % 26)) for i in ids)
 
 
 def _enqueue(
@@ -760,79 +732,6 @@ def test_speculators_survive_a_mid_append_oom() -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _target_config() -> Qwen3Config:
-    return Qwen3Config(
-        vocab_size=_VOCAB,
-        hidden_size=_HIDDEN,
-        intermediate_size=40,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        rms_norm_eps=1e-6,
-        rope_theta=10000.0,
-        tie_word_embeddings=False,
-    )
-
-
-class _MicroRunner:
-    """Duck-typed ModelRunner over a real (random) Qwen3, CPU fp32."""
-
-    supports_hidden_state_taps = True
-
-    def __init__(self, model: Qwen3ForCausalLM, pool: BlockPool) -> None:
-        self._model = model
-        self.block_pool = pool
-        self.tokenizer = _CharTokenizer()
-
-    def forward_step_packed(
-        self,
-        cache: PagedKVCache,
-        packed_input_ids: list[int],
-        cu_seqlens_q: list[int],
-        position_offsets: list[int],
-        *,
-        tap_layers: frozenset[int] | None = None,
-        hidden_state_sink: dict[int, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        position_ids_flat: list[int] = []
-        for batch_idx in range(cache.batch_size):
-            q_len = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
-            offset = position_offsets[batch_idx]
-            position_ids_flat.extend(range(offset, offset + q_len))
-        extra = {}
-        if tap_layers is not None:
-            extra = {"tap_layers": tap_layers, "hidden_state_sink": hidden_state_sink}
-        with torch.inference_mode():
-            logits: torch.Tensor = self._model(
-                input_ids=torch.tensor([packed_input_ids], dtype=torch.long),
-                position_ids=torch.tensor([position_ids_flat], dtype=torch.long),
-                past_key_values=cache,
-                cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32),
-                **extra,
-            )
-        return logits
-
-
-def _micro_setup(
-    seed: int = 0, *, confidence: bool = False, block_size: int = 8
-) -> tuple[_MicroRunner, Qwen3DSparkDrafter]:
-    torch.manual_seed(seed)
-    model = Qwen3ForCausalLM(_target_config()).eval()
-    pool = BlockPool(
-        num_blocks=128,
-        block_size=block_size,
-        num_layers=4,
-        num_kv_heads=2,
-        head_dim=8,
-        dtype=torch.float32,
-        device="cpu",
-        attention_backend="torch",
-    )
-    drafter = Qwen3DSparkDrafter(_drafter_config(confidence=confidence)).eval()
-    return _MicroRunner(model, pool), drafter
-
-
 def _generate(sched: ContinuousScheduler, prompts: list[str], max_tokens: int) -> list[list[int]]:
     reqs = [_enqueue(sched, p, max_tokens) for p in prompts]
     _run_to_done(sched, reqs)
@@ -1116,3 +1015,126 @@ def test_slot_that_raised_keeps_its_claimed_blocks_without_leaking() -> None:
     sched._step()  # the reap frees the finished request's slot
     pool = runner.block_pool
     assert pool.num_free_blocks == pool.num_blocks
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Benchmark plumbing: token counts, stats that outlive the request, trace
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _drain_steps(req: RunningRequest) -> list[GenerationStep]:
+    steps: list[GenerationStep] = []
+    while True:
+        try:
+            steps.append(req.output_queue.get_nowait())
+        except queue.Empty:
+            return steps
+
+
+def test_every_step_carries_its_token_count() -> None:
+    """A verify step streams its whole committed block as ONE step, so the
+    step must say how many tokens it holds. Summed over a request, the counts
+    equal the tokens generated, on the speculative and the plain path alike."""
+    sched, _runner, _spec = _spec_sched(_next_token, [[42, 43, 44]])
+    spec_req = _enqueue(sched, "ab", 8)
+    plain_req = _enqueue(sched, "cd", 4, SamplingParams(temperature=0.0, top_k=5))
+    _run_to_done(sched, [spec_req, plain_req])
+
+    counts: dict[str, list[int]] = {}
+    for name, req in (("spec", spec_req), ("plain", plain_req)):
+        steps = _drain_steps(req)
+        body, terminal = steps[:-1], steps[-1]
+        assert terminal.finish_reason is not None and terminal.num_tokens == 0
+        assert sum(s.num_tokens for s in body) == len(req.tokens_generated)
+        counts[name] = [s.num_tokens for s in body]
+
+    # The anchor streams alone, then the accept-all round streams 42, 43, 44
+    # and the bonus 45 as one step of 4. The plain request is 1 per step.
+    assert counts["spec"][:2] == [1, 4]
+    assert counts["plain"] == [1, 1, 1, 1]
+
+
+def test_speculative_stats_outlive_the_request() -> None:
+    """The reap drops the speculative state, so `_finish` reduces the stats
+    to a fixed-size summary first, and the handle hands it to the caller. A
+    request that did not speculate reports None, which is how a benchmark
+    tells a quiet downgrade from a real run."""
+    sched, _runner, _spec = _spec_sched(_next_token, [[42, 43, 44], [46, 7, 48]])
+    spec_req = _enqueue(sched, "ab", 16)
+    plain_req = _enqueue(sched, "cd", 4, SamplingParams(temperature=0.0, top_k=5))
+    _run_to_done(sched, [spec_req, plain_req])
+    sched._step()  # the reap: spec state is gone after this
+
+    assert spec_req.spec is None
+    result = RequestHandle(spec_req).wait()
+    summary = result.spec_summary
+    assert summary is not None
+    assert result.tokens == spec_req.tokens_generated
+    # Round 1 accepts 3 of 3, round 2 accepts 1 of 3 (7 is rejected at
+    # position 1), and later rounds offer nothing, so each commits its bonus.
+    assert summary.offered_by_position[:3] == (2, 2, 2)
+    assert summary.survived_by_position[:3] == (2, 1, 1)
+    assert summary.committed == sum([4, 2]) + (summary.rounds - 2)
+    assert summary.tau == summary.committed / summary.rounds
+    assert summary.drafter_forwards == summary.rounds
+
+    assert RequestHandle(plain_req).wait().spec_summary is None
+
+
+def test_pooled_tau_sums_before_it_divides() -> None:
+    """DeepSpec pools tau over all rounds. The mean of per-request tau values
+    is a different number, because it weights a short request's few rounds as
+    much as a long request's many."""
+    short = SpecSummary(1, 4, 3, 3, 1, (1, 1, 1), (1, 1, 1))  # tau 4.0
+    long = SpecSummary(9, 9, 27, 0, 9, (9, 9, 9), (0, 0, 0))  # tau 1.0
+    pooled = SpecSummary.pool([short, long])
+
+    assert pooled.rounds == 10 and pooled.committed == 13
+    assert pooled.tau == 1.3
+    assert pooled.tau != (short.tau + long.tau) / 2
+    assert pooled.offered_by_position == (10, 10, 10)
+    assert pooled.survived_by_position == (1, 1, 1)
+    with pytest.raises(ValueError, match="block sizes"):
+        SpecSummary.pool([short, SpecSummary(1, 1, 0, 0, 1, (0,), (0,))])
+
+
+def test_trace_records_forward_width_and_verify_count(tmp_path: Path) -> None:
+    """A step's cost follows its q-token count, not its request count, so the
+    trace records both, plus how many verify windows the forward carried."""
+    runner = _ScriptedRunner(_next_token)
+    sched = ContinuousScheduler(
+        runner,  # type: ignore[arg-type]
+        trace_out=str(tmp_path / "trace.json"),
+        dspark=_ScriptedSpec([[42, 43, 44]]),
+    )
+    req = _enqueue(sched, "ab", 8)
+    sched._step()  # prefill: 2 q-tokens, no verify
+    sched._step()  # anchor + 3 offered: 4 q-tokens, one verify window
+
+    assert sched._trace_events is not None
+    first, second = (e["args"] for e in sched._trace_events[:2])
+    assert first == {"B": 1, "phase": "prefill", "total_q": 2, "n_verify": 0}
+    assert second == {"B": 1, "phase": "decode", "total_q": 4, "n_verify": 1}
+    assert req.tokens_generated == [41, 42, 43, 44, 45]
+
+
+def test_rounds_shortened_for_room_are_counted_apart() -> None:
+    """Near max_tokens the scheduler offers fewer tokens than the drafter
+    proposed, so those rounds commit less. They are counted apart, because
+    the batch-1 runner never shortens a proposal for room, and a tau that
+    mixes them in is biased low against it."""
+    # max_tokens 6: anchor 41, then room 5 offers [42, 43, 44] in full (an
+    # unclamped round of 4), then room 1 cuts [46, 47, 48] to nothing, a
+    # clamped round that commits only its bonus.
+    sched, _runner, _spec = _spec_sched(_next_token, [[42, 43, 44], [46, 47, 48]])
+    req = _enqueue(sched, "ab", 6)
+    _run_to_done(sched, [req])
+
+    summary = RequestHandle(req).wait().spec_summary
+    assert summary is not None
+    assert summary.rounds == 2 and summary.committed == 4 + 1
+    assert summary.room_clamped_rounds == 1 and summary.room_clamped_committed == 1
+    assert summary.tau == 2.5  # (4 + 1) / 2
+    assert summary.tau_unclamped == 4.0  # the clamped round left out
+    pooled = SpecSummary.pool([summary, summary])
+    assert pooled.room_clamped_rounds == 2 and pooled.tau_unclamped == 4.0
