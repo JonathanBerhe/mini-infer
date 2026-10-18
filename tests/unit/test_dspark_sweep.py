@@ -1,11 +1,7 @@
-"""The concurrency-sweep driver (`mini_infer.bench.dspark_sweep`), on CPU.
+"""CPU tests for the concurrency-sweep driver (`mini_infer.bench.dspark_sweep`).
 
-These run the real engine thread over the micro models, so they test the
-driver the GPU benchmark will use, not a copy of it. Exact token equality is
-asserted only at concurrency 1: with more requests in flight, the engine
-thread's timing decides which requests share a step, and an exact assertion
-across different batch compositions would test thread scheduling, not the
-driver. Higher concurrency is covered by counts and invariants instead.
+The tests run the real engine thread over the micro models. Thread timing decides which
+requests share a step, so the tests assert exact tokens only at concurrency 1.
 """
 
 from __future__ import annotations
@@ -29,9 +25,7 @@ _PROMPTS = ["hello world", "qrstu", "xy"]
 
 
 def test_dspark_point_matches_plain_and_reports_tau() -> None:
-    """The fp32 greedy contract through the driver: the speculative arm emits
-    exactly the plain arm's tokens, and it reports tau because every request
-    really speculated."""
+    """At fp32 greedy, the DSpark arm emits the tokens of the plain arm and reports tau."""
     runner, drafter = micro_setup(seed=6)
     plain = run_point(runner, _PROMPTS, concurrency=1, max_tokens=10)
     spec = run_point(runner, _PROMPTS, concurrency=1, max_tokens=10, dspark=DSparkSpec(drafter))
@@ -47,8 +41,7 @@ def test_dspark_point_matches_plain_and_reports_tau() -> None:
 
 
 def test_timed_point_attributes_time_without_changing_output() -> None:
-    """The timed scheduler only adds barriers and clocks: same tokens, one
-    record per packed forward, and every phase boundary synchronized."""
+    """A timed point emits the same tokens and syncs at every phase boundary."""
     runner, drafter = micro_setup(seed=7)
     calls = 0
 
@@ -68,16 +61,14 @@ def test_timed_point_attributes_time_without_changing_output() -> None:
     )
 
     assert timed.tokens == untimed.tokens
-    # Every point records its forwards; only a timed one has phase times.
     assert untimed.phases is None and untimed.steps
     assert timed.phases is not None and timed.steps
     assert timed.phases.forward_s > 0 and timed.phases.draft_s > 0
-    # Each step that forwards crosses four barrier-bracketed phases.
+    # Each step that forwards runs four phases, with a sync before and after each.
     assert calls >= 8 * len(timed.steps)
     for step in timed.steps:
         assert step.batch >= 1 and step.n_verify <= step.batch <= step.total_q
-    # At concurrency 1, a verify window is the only way a step feeds more
-    # than one token after prefill, so some forward must be wider than 1.
+    # At concurrency 1, only a verify window feeds more than one token after prefill.
     assert any(s.n_verify == 1 and s.total_q > 1 for s in timed.steps)
 
 
@@ -87,16 +78,14 @@ def test_point_at_higher_concurrency_completes_with_consistent_counts() -> None:
 
     assert point.concurrency == 3 and point.n_requests == len(_PROMPTS)
     assert point.generated_tokens == sum(len(t) for t in point.tokens)
-    # Never past max_tokens. Zero is legal: a random target can pick EOS as
-    # its very first token, and EOS is never emitted.
+    # No lower bound: a random target can pick EOS first, and the scheduler never emits EOS.
     assert all(len(t) <= 6 for t in point.tokens)
     assert point.tokens_per_s > 0
 
 
 def test_point_counts_requests_that_did_not_speculate() -> None:
-    """A prompt over the speculation limit runs the plain path with only a log
-    line. The point must count it, or a "DSpark" result could quietly be the
-    plain path."""
+    """A prompt over the speculation limit takes the plain path with only a log line.
+    The point must count it, or a DSpark result can hide plain-path requests."""
     runner, drafter = micro_setup(seed=9)
     spec = DSparkSpec(drafter, max_spec_prompt_tokens=4)
     point = run_point(runner, ["hello world", "xyz"], concurrency=1, max_tokens=4, dspark=spec)
@@ -116,8 +105,7 @@ class _CrashingRunner(MicroRunner):
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_point_fails_fast_when_the_engine_thread_dies() -> None:
-    """A dead engine thread never sends a terminal step. The point must notice
-    within seconds, not wait out its whole budget of GPU time."""
+    """A dead engine thread sends no terminal step, so the point must raise before `timeout_s`."""
     runner, _ = micro_setup(seed=10)
     crashing = _CrashingRunner(runner._model, runner.block_pool)
 
@@ -148,12 +136,8 @@ def test_token_agreement_measures_exact_matches_and_common_prefixes() -> None:
 
 @pytest.mark.requires_model
 def test_rendered_chat_encodes_to_the_same_ids_as_encode_chat() -> None:
-    """The benchmark sends the chat template as TEXT, because `Request` takes
-    text and admission runs plain `encode`. That only reproduces the
-    templated ids if the tokenizer parses the template's special-token strings
-    back into the same ids and adds no BOS. Qwen3 checkpoints share one
-    tokenizer, so the small one stands in for the 4B target here; the GPU
-    script asserts the same thing on the real tokenizer before it measures."""
+    """`Request` takes text, so plain `encode` of the rendered chat must give the `encode_chat` ids.
+    Qwen3 checkpoints share one tokenizer, so the 0.6B tokenizer stands in for the 4B target."""
     from mini_infer.engine.tokenizer import Tokenizer
 
     tok = Tokenizer.from_pretrained("Qwen/Qwen3-0.6B")
@@ -164,8 +148,7 @@ def test_rendered_chat_encodes_to_the_same_ids_as_encode_chat() -> None:
 
 
 def test_sweep_measures_the_grid_and_resumes_without_rerunning(tmp_path: Path) -> None:
-    """One file per point, only this grid's points returned, and a rerun over
-    the same folder measures nothing that is already there."""
+    """The sweep writes one file per point, and a rerun measures nothing twice."""
     from mini_infer.bench.dspark_sweep import run_sweep
 
     runner, drafter = micro_setup(seed=11)
@@ -197,14 +180,13 @@ def test_sweep_measures_the_grid_and_resumes_without_rerunning(tmp_path: Path) -
     assert set(points) == expected
     assert commits == len(expected)
     assert all((tmp_path / f"{k}.json").exists() for k in expected)
-    # fp32 greedy at concurrency 1: the dspark arm reproduces the plain arm.
     agreement = points["a-dspark-t0.0-c1"]["agreement_vs_plain"]
     assert agreement["exact_matches"] == agreement["n_requests"] == 2
     assert isinstance(points["a-dspark-t0.0-c1"]["speedup_vs_plain"], float)
     assert points["a-timed-dspark-c1"]["steps"]
 
     again = run_sweep(runner, drafter, {"a": ["hello", "xyz"]}, **grid)  # type: ignore[arg-type]
-    assert commits == len(expected)  # nothing measured twice
+    assert commits == len(expected)
     assert set(again) == expected
 
 
@@ -226,8 +208,7 @@ def test_sweep_refuses_a_dspark_point_that_did_not_speculate(tmp_path: Path) -> 
 
 
 def test_sweep_refuses_a_point_with_cancelled_requests(tmp_path: Path) -> None:
-    """A prompt that can never fit the pool is cancelled at admission, and the
-    point would then measure fewer requests than the grid claims."""
+    """Admission cancels a prompt that never fits the pool, so the point has too few requests."""
     from mini_infer.bench.dspark_sweep import run_sweep
 
     runner, drafter = micro_setup(seed=13)  # 128 blocks of 8 tokens
@@ -263,9 +244,8 @@ def _point_with_steps(steps: list[StepRecord]) -> SweepPoint:
 
 
 def test_steady_throughput_ignores_the_drain() -> None:
-    """While a prompt waits, every slot is busy; after the last admission the
-    batch drains. The steady number covers only the busy part, and the mean
-    in-flight count says how far the whole run fell short of the label."""
+    """Steady throughput ends at the last step with a prompt waiting, so the drain does not count.
+    `mean_in_flight` weights the batch of each step by the step time."""
     steps = [
         StepRecord(batch=2, total_q=2, n_verify=0, waiting=2, forward_s=0.0, end_s=1.0, emitted=10),
         StepRecord(batch=2, total_q=2, n_verify=0, waiting=1, forward_s=0.0, end_s=2.0, emitted=20),
@@ -288,8 +268,7 @@ def test_steady_throughput_is_none_without_a_waiting_prompt() -> None:
 
 
 def test_sweep_refuses_points_from_a_different_grid(tmp_path: Path) -> None:
-    """A rerun into the same folder with other settings would mix an older
-    grid's numbers into the new one, so it raises instead."""
+    """A rerun with other settings or another `identity` raises, so old numbers never mix in."""
     from mini_infer.bench.dspark_sweep import run_sweep
 
     runner, drafter = micro_setup(seed=14)

@@ -174,7 +174,7 @@ def main(prompt: str = "The capital of France is", max_tokens: int = 32) -> None
     print(f"\nHTTP status: {result['status_code']}")
     body = result["body"]
     if result["status_code"] != 200:
-        # For example the 503 sent when the engine thread is gone: no `choices`.
+        # A non-200 body (for example the 503 for a dead engine thread) has no `choices`.
         raise RuntimeError(f"request failed: {body}")
     print(f"prompt: {prompt!r}")
     print(f"served completion: {body['choices'][0]['text']!r}")

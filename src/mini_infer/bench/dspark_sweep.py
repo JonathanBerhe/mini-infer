@@ -1,36 +1,18 @@
 """Concurrency sweep for DSpark speculative decoding inside `ContinuousScheduler`.
 
-One measurement point runs a fixed list of prompts through a fresh scheduler
-whose `max_concurrent` is the concurrency under test. All prompts are
-submitted at once. The scheduler admits them up to that cap and starts the
-next one as soon as a slot frees, so `concurrency` requests are in flight
-while any prompt still waits (a closed loop). After the last admission the
-batch drains, and the in-flight count falls to zero. Every point of a sweep
-uses the same prompts, so a change between points is a change of
-concurrency, not of workload. The in-process driver is chosen over the HTTP
-open-loop benchmark for this: the server cannot enable dspark, that client
-counts stream chunks as tokens, and its arrival rate does not control the
-batch size that the cost curve needs.
+A point runs one arm, "plain" or "dspark", on a new scheduler with
+`max_concurrent` set to the concurrency under test. All prompts are submitted
+at once. So while a prompt waits, `concurrency` requests are in flight if the
+block pool has room (a closed loop), and then the batch drains. All points of
+a dataset use the same prompts, so only the concurrency or the arm changes.
+Throughput counts tokens, not stream steps, because a verify step streams
+several tokens as one step. The sweep runs in-process because the server
+cannot enable DSpark. See ADR-031.
 
-What a point reports:
-
-- throughput over the whole run and over the steady part only (the steps in
-  which a prompt still waited), plus the time-weighted mean in-flight count,
-  all counted from each request's own tokens, which is exact even when a
-  verify step streams several tokens as one step;
-- `SpecSummary` pooled over every request that speculated, for tau and
-  per-position survival, plus the number of requests that did NOT speculate.
-  A quiet admission downgrade would otherwise make a "DSpark" point measure
-  the plain path;
-- one record per packed forward (requests, q-tokens, verify windows, queued
-  requests, tokens streamed so far), and with `timed=True` wall time per
-  phase (sample, draft, forward, verify), the raw material for the cost curve.
-
-Timing honesty on a GPU: kernels run asynchronously, so a host timer charges
-GPU work to whichever later phase first synchronizes. A timed point therefore
-calls `sync` (pass `torch.cuda.synchronize`) at every phase boundary. Those
-barriers slow the step, so a timed point attributes time and an untimed point
-measures throughput; one run cannot do both.
+GPU kernels run asynchronously, so a host timer charges GPU work to the next
+phase that synchronizes. A timed point calls `sync` (pass `torch.cuda.synchronize`)
+at every phase boundary, and these barriers slow the step. So a timed point
+gives the time per phase, and an untimed point gives the throughput.
 """
 
 from __future__ import annotations
@@ -70,17 +52,15 @@ class PhaseTimes:
 
 @dataclasses.dataclass(frozen=True)
 class StepRecord:
-    """One packed forward: how wide it was, what was waiting, how far the run was.
+    """One packed forward: its width, the queue behind it, and its place in the run.
 
-    `batch` counts requests in the forward and `total_q` counts its q-tokens.
-    Their difference is what speculation adds: a verify window feeds
-    `1 + len(offered)` tokens where plain decoding feeds 1. `waiting` is how
-    many requests were still queued, so `waiting > 0` marks a step with every
-    slot busy. `end_s` (seconds since the point started) and `emitted`
-    (tokens streamed so far) locate the step in the run.
-
-    `forward_s` is trustworthy only in a timed point: without a GPU barrier a
-    host timer measures kernel launches, not kernels.
+    `batch` counts requests and `total_q` counts query tokens. Prefill chunks
+    and verify windows make `total_q` larger. A verify window feeds
+    `1 + len(offered)` tokens, and `n_verify` counts those windows. `waiting > 0`
+    marks a step with full admission: every slot was busy, or the pool had no
+    room. `end_s` is seconds since the point started, and `emitted` counts
+    tokens streamed so far. `forward_s` is correct only in a timed point.
+    Without a barrier, a host timer measures only kernel launches.
     """
 
     batch: int
@@ -93,18 +73,12 @@ class StepRecord:
 
 
 class InstrumentedScheduler(ContinuousScheduler):
-    """A `ContinuousScheduler` that records every forward, and can time phases.
+    """A `ContinuousScheduler` that records every forward and can time each phase.
 
-    For benchmarks only. It wraps the private phase methods, so it is coupled
-    to `_step`'s structure on purpose, and it lives next to the benchmark
-    rather than in the scheduler so that the serving path carries none of it.
-
-    Every forward gets a `StepRecord`, at the cost of a clock read and a queue
-    size, with no barrier. With `timed=True` it also sums wall time per phase,
-    calling `sync` (pass `torch.cuda.synchronize`) at every phase boundary.
-    Those barriers slow the step, so a timed point attributes time and an
-    untimed point measures throughput. Read `phases` and `steps` after
-    `stop()`: the engine thread writes them.
+    For benchmarks only. It wraps the private phase methods, so it depends on
+    the structure of `_step`. An untimed record costs a few clock reads and one
+    queue size read, with no barrier. Read `phases` and `steps` only after
+    `stop()`, because the engine thread writes them.
     """
 
     def __init__(
@@ -172,7 +146,7 @@ class InstrumentedScheduler(ContinuousScheduler):
     def _packed_forward(
         self, alive: list[RunningRequest], sampled_decode_tokens: dict[int, list[int]]
     ) -> tuple[torch.Tensor, list[int], dict[int, torch.Tensor] | None]:
-        # Counted before the call: the verify phase clears `offered` later.
+        # The verify phase clears `offered` after this method, so count it here.
         n_verify = sum(1 for r in alive if r.spec is not None and r.spec.offered is not None)
         waiting = self._waiting.qsize()
         t0 = time.perf_counter()
@@ -202,16 +176,13 @@ class InstrumentedScheduler(ContinuousScheduler):
 
 @dataclasses.dataclass(frozen=True)
 class SweepPoint:
-    """The outcome of one measurement point. JSON-ready through `to_json`.
+    """The outcome of one measurement point. `to_json` gives a JSON-ready dict.
 
-    Two throughput numbers, because a finite batch drains. `tokens_per_s`
-    covers the whole run, start to last result. But once no prompt waits, the
-    in-flight count falls below `concurrency`, and the two arms fall unevenly:
-    plain requests of one length finish together, while speculative requests
-    finish at different rounds. `steady_tokens_per_s` covers only the steps in
-    which a prompt was still waiting, so every slot was busy, and compares the
-    arms at the concurrency the label names. `mean_in_flight` says how far the
-    whole run fell short of it.
+    A finite batch drains at the end, and speculative requests finish at
+    different rounds, so the drain differs between arms. `tokens_per_s` covers
+    the whole run. `steady_tokens_per_s` covers only the steps in which a prompt
+    still waited, so it compares the arms while admission was full.
+    `mean_in_flight` shows how far the whole run fell below `concurrency`.
     """
 
     arm: str
@@ -247,11 +218,7 @@ class SweepPoint:
 
     @property
     def steady_tokens_per_s(self) -> float | None:
-        """Throughput up to the last step in which a prompt was still waiting.
-
-        None when no step had a prompt waiting, which happens when the point
-        has no more prompts than `concurrency`.
-        """
+        """Throughput up to the last step in which a prompt waited, or None if none did."""
         steady = [s for s in self.steps if s.waiting > 0]
         if not steady:
             return None
@@ -280,13 +247,11 @@ def run_point(
     sync: Callable[[], None] | None = None,
     timeout_s: float = 1800.0,
 ) -> SweepPoint:
-    """Run `prompts` through a fresh scheduler with `concurrency` in flight.
+    """Run `prompts` through a new scheduler with `concurrency` requests in flight.
 
-    Fails fast when the engine thread dies. Any exception other than
-    `OutOfMemoryError` ends that thread, and then no request in flight ever
-    gets its terminal step. The handle notices within one liveness poll and
-    raises `EngineNotRunningError`; the traceback is in the log. `timeout_s`
-    still bounds the whole point, for an engine that lives but stalls.
+    Raises `EngineNotRunningError` within one liveness poll if the engine thread
+    dies, and the log holds the traceback. See ADR-028. `timeout_s` bounds the
+    whole point, for an engine that is alive but stalls.
     """
     if concurrency < 1:
         raise ValueError(f"concurrency must be positive, got {concurrency}")
@@ -305,9 +270,9 @@ def run_point(
             sched.submit(Request(prompt=p, sampling_params=params, max_tokens=max_tokens))
             for p in prompts
         ]
-        # Drained in submission order. A later request's queue fills while an
-        # earlier one is drained, but a step carries a whole committed block,
-        # so `max_tokens` well under the queue cap cannot overflow it.
+        # The loop drains handles in submission order, so later queues fill meanwhile.
+        # Each step carries at least one token, so a queue holds at most
+        # `max_tokens` steps plus the terminal one. That must stay under the queue cap.
         deadline = start + timeout_s
         results: list[GenerationResult] = []
         for handle in handles:
@@ -344,13 +309,10 @@ def run_point(
 
 @dataclasses.dataclass(frozen=True)
 class TokenAgreement:
-    """How closely one arm's tokens follow another's, request by request.
+    """How closely the tokens of one arm follow those of another, per request.
 
-    On CPU fp32 greedy speculation must match the plain path exactly. On a
-    GPU in bf16 it need not: a different matmul shape flips a near-tie and the
-    two outputs part ways. So the bf16 gate is statistical, and these are its
-    numbers: how many requests match exactly, and how far each one agrees
-    before its first different token.
+    Greedy speculation must match the plain path exactly in CPU fp32. In GPU
+    bf16 a new matmul shape can flip a near-tie, so the pass criterion is statistical.
     """
 
     n_requests: int
@@ -368,7 +330,7 @@ class TokenAgreement:
 
 
 def token_agreement(reference: list[list[int]], candidate: list[list[int]]) -> TokenAgreement:
-    """Compare two arms' per-request tokens; the lists must be in the same order."""
+    """Compare the tokens of two arms per request. Both lists must use the same request order."""
     if len(reference) != len(candidate):
         raise ValueError(f"{len(reference)} reference requests vs {len(candidate)} candidates")
     prefixes: list[int] = []
@@ -403,31 +365,22 @@ def run_sweep(
     max_spec_prompt_tokens: int = 1024,
     identity: str = "",
 ) -> dict[str, dict[str, Any]]:
-    """Measure every point of the grid, one JSON file per point in `out_dir`.
+    """Measure every point of the grid, and write one JSON file per point to `out_dir`.
 
-    Per dataset and concurrency: the plain arm, then the dspark arm at each
-    confidence threshold, with tau and token agreement against the plain arm
-    at the same level. Then a timed pass (plain and dspark at threshold 0) at
-    each of `timed_concurrencies`.
+    Per dataset and concurrency, it runs the plain arm, then the dspark arm at
+    each threshold, and stores the dspark speedup and token agreement against
+    plain. Then a timed pass runs both arms (dspark at threshold 0) at each of
+    `timed_concurrencies`.
 
-    Resumable: a point whose file already exists is skipped, so a rerun after
-    a dropped connection or a failed point measures only what is missing.
-    `on_checkpoint` runs after each file write (a volume commit, on Modal).
-    Each file carries a fingerprint of what produced it: the dataset's
-    prompts, `max_tokens`, the speculation limit, and `identity`, which names
-    the models and settings that the folder name does not show. A stored point
-    with a different fingerprint raises instead of mixing an older grid's
-    numbers into this one, and a new folder is the way to measure a new grid.
-
-    Raises if a dspark point has any request that did not speculate, because
-    that point would then be measuring the plain path under the dspark label.
-    Raises as well if any request of any point was cancelled: admission
-    rejects a request that can never fit the pool, and the point would then
-    measure fewer requests than the grid claims.
+    The sweep resumes: it skips a point whose file exists. `on_checkpoint` runs
+    after each file write (for example a Modal volume commit). Each file stores
+    a fingerprint of the prompts, `max_tokens`, `max_spec_prompt_tokens`, and
+    `identity` (models and settings that the folder name omits). A stored point
+    with another fingerprint raises, so an older grid never mixes in. A point
+    that does not measure what its label says also raises (`_require_complete`).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Only this grid's points, not every file in the folder: a rerun may share
-    # the folder with other files, such as run metadata or an older grid.
+    # Return only this grid. The folder can also hold run metadata or older grids.
     points: dict[str, dict[str, Any]] = {}
 
     fingerprint = ""
@@ -491,8 +444,6 @@ def run_sweep(
                 payload["speedup_vs_plain"] = (
                     point.tokens_per_s / plain_rate if plain_rate else None
                 )
-                # The steady speedup compares the arms while every slot was
-                # busy, where the whole-run ratio also mixes in the drain.
                 steady, plain_steady = point.steady_tokens_per_s, plain["steady_tokens_per_s"]
                 payload["steady_speedup_vs_plain"] = (
                     steady / plain_steady if steady is not None and plain_steady else None
@@ -521,12 +472,10 @@ def run_sweep(
 
 
 def _require_complete(key: str, point: SweepPoint) -> None:
-    """Refuse a point that did not measure what its label says.
+    """Raise if a point did not measure what its label says.
 
-    A cancelled request means admission rejected it (it can never fit the
-    pool), so the point covers fewer requests than the grid claims. A dspark
-    point with a request that did not speculate measures the plain path for
-    that request under the dspark label.
+    A cancelled request (rejected at admission or preempted on OOM) raises. A dspark
+    request that admission moved to the plain path, with only an INFO log, also raises.
     """
     cancelled = point.finish_reasons.get("cancelled", 0)
     if cancelled:

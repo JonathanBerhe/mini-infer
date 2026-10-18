@@ -5,23 +5,15 @@ class OutOfMemoryError(Exception):
 class EngineNotRunningError(RuntimeError):
     """Raised when a request needs an engine thread that is not running.
 
-    `submit()` raises it before the scheduler is started or after its engine
-    thread is gone. A `RequestHandle` raises it when its queue is empty and the
-    thread that owned the request died on an exception (a clean `stop()`
-    finishes the requests in flight as 'cancelled' instead). No further step
-    will arrive, so a caller that kept waiting would wait forever.
-
-    It subclasses `RuntimeError` because every scheduler except `PDScheduler`
-    raised a plain `RuntimeError` from `submit()` for the same condition
-    before this type existed.
+    `submit()` raises it before `start()` and after the thread is gone. A handle
+    raises it when its queue is empty and its thread died, so the caller does not
+    wait forever. A clean `stop()` ends requests as 'cancelled' instead. See ADR-028.
     """
 
 
 class RequestFailedError(RuntimeError):
     """Raised by a `RequestHandle` when the engine failed this one request.
 
-    The engine thread caught the error, logged it, and keeps serving other
-    requests. The message is fixed on purpose: the cause can hold internal
-    state (paths, shapes, device details), so it goes only to the log, never
-    to the client.
+    The engine logged the cause and keeps serving other requests. The cause can
+    hold internal state (paths, shapes, devices), so the client gets a fixed message.
     """

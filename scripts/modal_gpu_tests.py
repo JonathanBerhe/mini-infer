@@ -1,15 +1,9 @@
-"""Run the `gpu` / `requires_cuda` unit tests on a real CUDA GPU.
+"""Run the `gpu` and `requires_cuda` unit tests on a real CUDA GPU.
 
-`tests/conftest.py` skips both markers when CUDA is absent, so ~38 tests never
-execute on a Mac dev box or in CI: the Triton kernels (paged attention, INT8
-W8A16, TurboQuant dequant, MSA decode, hc_sinkhorn), the FlashInfer backend, and
-the FP8 / NVFP4 KV paths. This runs exactly that deselected set in a container
-that has nvcc, flash-attn and FlashInfer, and fails loudly if any of them fail.
-
-Capability-gated tests (FP8 / NVFP4 need Hopper or newer, the HC kernel needs a
-power-of-2 multiplier) skip themselves through their `supports_*` predicates, so
-a green run on a small GPU means "nothing broken here", not "everything ran".
-The summary line reports passed / skipped so the difference is visible.
+CI and a Mac skip both markers, so ~38 tests (Triton kernels, FlashInfer, FP8 / NVFP4 KV) never
+run there. This script runs that set in a container with nvcc, flash-attn, and FlashInfer, and
+fails if any test fails. Some tests skip on a small GPU (NVFP4 needs Blackwell, SM_100+), so a
+green run means "nothing failed", not "every test ran".
 
 Run with:
     uv run modal run scripts/modal_gpu_tests.py
@@ -24,19 +18,16 @@ import modal
 
 app = modal.App("mini-infer-gpu-tests")
 
-# Modal 1.4 fixes `gpu` at decorator evaluation time, so it comes from the
-# environment rather than a CLI flag. A10 (SM_86) runs the Triton kernels and
-# flash-attn paths; FP8 / NVFP4 self-skip below Hopper.
+# Modal 1.4 fixes `gpu` when the decorator runs, so the GPU comes from the environment.
+# An A10 (SM_86) runs the Triton kernels, the flash-attn paths, and FP8 KV.
 _TEST_GPU = os.environ.get("MINI_INFER_TEST_GPU", "A10")
 
-# Worst-case spend bound, not an expected duration: a hung container bills for
-# the whole timeout, and the per-second rate on the big GPUs is several times
-# the A10's. Override downward when running somewhere expensive
-# (`MINI_INFER_TEST_TIMEOUT=900`).
+# A cost cap, not an expected duration. The tests take about 2 min, plus a ~1 GB download and
+# the FlashInfer kernel build, and a short cap costs a rerun. A hung container bills the whole
+# cap, at several times the A10 rate on a large GPU (lower it with `MINI_INFER_TEST_TIMEOUT=900`).
 _TEST_TIMEOUT = int(os.environ.get("MINI_INFER_TEST_TIMEOUT", "1800"))
 
-# Same pinned torch + flash-attn pair as `modal_packed_bench.py`; flash-attn
-# 2.8+ is what has `flash_attn_varlen_func`'s `block_table` parameter.
+# The torch and flash-attn pins of `modal_packed_bench.py` (`block_table` needs flash-attn 2.8+).
 FLASH_ATTN_WHEEL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/"
     "v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
@@ -45,8 +36,7 @@ FLASH_ATTN_WHEEL = (
 _REPO = Path(__file__).parent.parent
 
 image = (
-    # CUDA dev image (has nvcc) so FlashInfer's JIT-compiled kernels can build
-    # on first call.
+    # A devel image, because FlashInfer compiles its kernels with nvcc at the first call.
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
     .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")
     .pip_install(
@@ -59,18 +49,14 @@ image = (
     )
     .pip_install(FLASH_ATTN_WHEEL)
     .pip_install("flashinfer-python>=0.6.10rc1")
-    # The tests are a package (`tests/unit/conftest.py` imports
-    # `tests.unit._kimi_reference_helpers`), so the tree goes in whole, and
-    # pyproject.toml comes along for the marker definitions.
+    # `tests/unit/conftest.py` imports other test modules, so the image gets the whole tree.
+    # `pyproject.toml` supplies the marker definitions.
     .add_local_dir(str(_REPO / "tests"), "/root/tests")
     .add_local_file(str(_REPO / "pyproject.toml"), "/root/pyproject.toml")
     .add_local_python_source("mini_infer")
 )
 
 
-# Model-loading tests download ~1 GB and FlashInfer JIT-compiles on first call,
-# so the budget is generous relative to the ~2 min of actual test time. A
-# too-tight timeout costs a whole second run.
 @app.function(image=image, gpu=_TEST_GPU, timeout=_TEST_TIMEOUT)
 def run_gpu_tests() -> str:
     import torch
@@ -87,7 +73,7 @@ def run_gpu_tests() -> str:
             "-m",
             "gpu or requires_cuda",
             "-v",
-            "-rs",  # report why each test skipped: on a small GPU that IS the result
+            "-rs",  # print the reason for each skip: on a small GPU, skips are a result
             "--no-header",
             "--tb=short",
             "-p",
@@ -107,15 +93,12 @@ def run_gpu_tests() -> str:
         "no pytest summary line",
     )
     if proc.returncode != 0:
-        # Everything from the FAILURES banner on: assertion messages carry the
-        # numbers a numerics failure has to be judged on, and a GPU minute is
-        # too expensive to spend twice because the traceback was truncated.
+        # Keep all output from the FAILURES banner on: it shows how far off a numerics failure
+        # is, and a truncated traceback costs a second GPU run.
         start = proc.stdout.find("= FAILURES =")
         detail = proc.stdout[start:] if start != -1 else proc.stdout
-        # Counts and the per-test verdict list go FIRST. A single JIT compile
-        # error can dump tens of thousands of characters of C++ template
-        # diagnostics, and when that lands ahead of the summary the truncation
-        # eats the one line that says what else passed or failed.
+        # The counts and verdicts go first, so that the truncation keeps them. One JIT compile
+        # error can print tens of thousands of characters.
         verdicts = "\n".join(
             line for line in lines if line.startswith(("FAILED", "ERROR", "SKIPPED"))
         )
@@ -124,8 +107,7 @@ def run_gpu_tests() -> str:
             f"{summary}\n{verdicts}\n\n{detail[:20000]}"
             f"\n--- stderr tail ---\n{proc.stderr[-2000:]}"
         )
-    # Skips are printed in full: a capability-gated test that skipped is NOT a
-    # test that passed, and on a pre-Hopper GPU several of these do skip.
+    # Print every skip in full, because a test that skipped did not pass.
     skips = "\n".join(line for line in lines if line.strip().startswith("SKIPPED"))
     return f"OK | gpu={gpu_name} | torch={torch.__version__} | {summary}\n{skips}"
 

@@ -11,35 +11,27 @@ Each step does:
    cache); their first chunk lands in the next forward.
 2. For DECODING requests, sample the next token from prior `last_logits`,
    emit it, and check finish conditions. Some requests transition to DONE here.
-   A request whose tokens a previous step sampled but could not feed (its
-   forward hit a recoverable OOM) hands those back instead of sampling again.
+   After a recoverable OOM, a request feeds its already emitted tokens again.
 3. Reap any DONE requests (free blocks, shift batch indices). This happens
    BEFORE the forward so the forward only runs over the alive set.
 4. Build packed inputs over the alive in-flight set: each prefilling request
    contributes its next chunk's tokens, each decoding request contributes the
-   token list step 2 produced for it. ONE `runner.forward_step_packed(...)`
-   call per step.
-5. Slice each request's last-position logits out of the packed result and
-   advance prefill state.
+   tokens from step 2. ONE `runner.forward_step_packed(...)` call per step.
+5. Distribute per-request last-position logits and advance prefill state.
 
-A decoding request's contribution is a LIST, not a single token, so requests
-with different q-lengths ride one forward. Plain sampling fills it with exactly
-one token; DSpark speculative decoding (opt-in via the `dspark` constructor
-argument) fills it with `[anchor, *offered]`, the drafted block the same
-forward then verifies. The speculative phases wrap steps 2 and 5:
+With `dspark` set, admission decides once whether a request speculates. A
+speculator feeds `[anchor, *offered]`: its last committed token, then a drafted
+block that the same forward verifies. Plain requests share the batch.
+Speculators add two phases:
 
-2b. `_draft_speculators`: for each speculating DECODING request, draft a block
-    off the last committed token (the anchor) and the injected target context.
-    Requests whose forward failed last step reuse their pending proposal.
-5b. `_verify_speculators`: slice each speculator's window out of the packed
-    logits, accept the longest matching prefix plus the target's own bonus
-    token, emit, roll the KV slot back to the committed length, and refresh
-    the drafter's context from this forward's tapped hidden states.
+2b. `_draft_speculators`: draft a block from the anchor and the injected
+    context (target hidden states at the tap layers).
+5b. `_verify_speculators`: accept a prefix of the draft plus one bonus token,
+    emit them, roll the slot back to the committed length, and take the next
+    injected context from this forward.
 
-A request speculates only if it was eligible at admission (greedy or plain
-temperature sampling, prompt under the configured cap); everything else in
-the same batch runs the plain path, so mixed batches are the normal case,
-not a special one.
+(INV): the target slot length equals the draft cache length plus the context
+rows. See ADR-031.
 
 Throughput-wise this is "Approach 2": prefill chunks and decode tokens share
 the same forward pass. The matmul cost amortizes across all in-flight q-tokens.
@@ -133,25 +125,16 @@ class ContinuousScheduler:
         trace_out: str | None = None,
         dspark: DSparkSpec | None = None,
     ) -> None:
-        # A prefix-cache hit pre-populates a slot with positions that never
-        # pass through a forward, so those positions produce no tapped hidden
-        # states and the drafter's injected context comes up short of the
-        # target slot length. That violates the RoPE invariant the drafter
-        # rotates against and kills the engine thread. Refusing the
-        # combination at construction is the loudest failure available;
-        # injecting only the post-prefix suffix would feed the drafter less
-        # context than it trained on, which is a measurement, not a fallback.
+        # Prefix-cache hits skip the forward, so they give no tapped hidden
+        # states, and the short context breaks (INV). See ADR-031.
         if dspark is not None and runner.block_pool.prefix_cache is not None:
             raise ValueError(
                 "DSpark speculative decoding cannot run with a prefix cache: "
                 "cached prompt positions never produce the tapped hidden states "
                 "the drafter needs. Construct the runner with prefix_cache=False."
             )
-        # The drafter is fed the target's hidden states at tapped layers, which
-        # only a model whose forward accepts the tap kwargs can produce. Without
-        # this check the mismatch surfaces as a TypeError inside the first
-        # forward that carries a speculator, which `_engine_loop` does not catch
-        # and which therefore kills every in-flight request rather than one.
+        # Without this guard, the first speculating forward raises a TypeError
+        # that kills the engine thread and every in-flight request.
         if dspark is not None and not runner.supports_hidden_state_taps:
             raise ValueError(
                 f"DSpark speculative decoding needs a target whose forward accepts "
@@ -166,19 +149,16 @@ class ContinuousScheduler:
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._running: list[RunningRequest] = []
         self._batched_cache: PagedKVCache | None = None
-        # Per-slot cache lengths saved right before the packed forward and
-        # cleared the moment it returns. Non-None only while a forward is in
-        # flight or after one raised, which is exactly when
-        # `_roll_back_partial_append` needs it.
+        # Slot lengths before the packed forward, for `_roll_back_partial_append`.
+        # Not None only while a forward runs or after one raised.
         self._pre_forward_seq_lens: list[int] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        # True while `stop()` runs. `stop()` cancels the requests left in
-        # flight after the engine thread exits, so handles must keep waiting
-        # for those terminal steps instead of reporting a dead engine.
+        # True while `stop()` runs. Handles then count the engine as alive,
+        # because `stop()` sends the terminal steps after the thread exits.
         self._stopping = False
-        # Set by the engine thread when it dies on an exception; `stop()`
-        # reads it after the join. A crash must not turn into 'cancelled'.
+        # Set when an exception kills the engine thread. `stop()` reads it after
+        # the join, so that a crash does not become 'cancelled'. See ADR-028.
         self._crashed = False
         # Chrome Trace Event recording. When `trace_out` is set, each engine
         # step that runs a forward appends a duration event to `_trace_events`;
@@ -192,10 +172,8 @@ class ContinuousScheduler:
     def is_running(self) -> bool:
         """Whether the engine thread is alive.
 
-        False before `start()`, after `stop()`, and after the thread died on
-        an exception other than `OutOfMemoryError`. In that last case no
-        request in flight receives its terminal step from the engine; each
-        handle notices the dead thread on its own (see `RequestHandle`).
+        False before `start()`, after `stop()`, and after a crash (any exception
+        other than `OutOfMemoryError`).
         """
         return self._thread is not None and self._thread.is_alive()
 
@@ -204,9 +182,8 @@ class ContinuousScheduler:
         if self._thread is not None and self._thread.is_alive():
             return
         if self._crashed:
-            # The old thread died and no `stop()` ended its requests. They
-            # must not move to the new thread: their handles watch the dead
-            # one, and the state they left can be half-updated.
+            # No `stop()` ended the requests of the dead thread. Their handles
+            # watch that thread, and their state can be half-updated.
             self._end_in_flight(crashed=True)
         self._stop_event.clear()
         self._crashed = False
@@ -216,16 +193,14 @@ class ContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit, join it, and end what is left.
+        """Signal the engine thread to exit, join it, and end the requests left.
 
-        After a clean join, every request still running or waiting ends with
-        `finish_reason="cancelled"`. If the thread crashed, they end with no
-        terminal step, so their handles raise `EngineNotRunningError`, the
-        same as when no `stop()` follows the crash. Either way the KV blocks
-        go back to the pool, so a later `start()` begins with an empty batch.
-        If the join times out, the thread can still touch that state, so
-        nothing is ended; the handles fail through their liveness check once
-        it exits.
+        After a clean join, each leftover request ends as 'cancelled'. After a
+        crash, they get no terminal step, so their handles raise
+        `EngineNotRunningError`. Both cases free the blocks, so a later `start()`
+        begins empty. If the join times out, `stop()` ends nothing, because the
+        thread can still change the state. The handles then fail through the
+        liveness check.
         """
         self._stopping = True
         try:
@@ -245,9 +220,8 @@ class ContinuousScheduler:
     def submit(self, request: Request) -> RequestHandle:
         """Enqueue a request and return a handle the caller drains for output.
 
-        The handle watches the engine thread that runs now. If that thread
-        dies, the handle raises `EngineNotRunningError`; if `stop()` ends it,
-        the request finishes as 'cancelled'.
+        The handle watches the engine thread that runs now, not a later one. It
+        raises `EngineNotRunningError` if that thread dies.
         """
         thread = self._thread
         if thread is None or not thread.is_alive():
@@ -257,19 +231,17 @@ class ContinuousScheduler:
             output_queue=StepQueue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
-        # The thread is read first: a dead thread plus `_stopping` False means
-        # either a crash or a `stop()` that already pushed its terminal steps.
+        # Read the thread before `_stopping`. Then a dead thread with `_stopping`
+        # False means a crash or a `stop()` that already pushed its terminal steps.
         thread_alive = thread.is_alive
         return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
 
     def _end_in_flight(self, *, crashed: bool) -> None:
         """End every request still running or waiting, and free their blocks.
 
-        `stop()` calls this only after the engine thread exited, so no other
-        thread touches this state. After a clean exit each request finishes as
-        'cancelled'. After a crash it gets no terminal step (see `stop()`). A
-        `submit()` on another thread that races `stop()` can still enqueue
-        after the drain; its handle then fails through the liveness check.
+        Callers run this only after the engine thread exited, so no thread
+        changes this state. A `submit()` during `stop()` can enqueue after the
+        drain. Its handle then fails through the liveness check.
         """
         leftover = [r for r in self._running if r.state != RequestState.DONE]
         while True:
@@ -288,8 +260,7 @@ class ContinuousScheduler:
         try:
             self._reap_done()
         except Exception:
-            # The thread died in the middle of a step and can have left the
-            # cache half-updated; only the blocks of these requests are lost.
+            # A crash mid-step can leave the cache half-updated. Only these blocks leak.
             logger.exception("stop(): could not free the KV blocks after the crash")
             self._running.clear()
             self._batched_cache = None
@@ -314,8 +285,7 @@ class ContinuousScheduler:
         `finish_reason="cancelled"` to its client. Other exceptions still
         crash the thread loudly, because they signal real bugs.
 
-        The crash handler wraps the whole loop, so an exception raised inside
-        the OOM handler itself also counts as a crash.
+        The crash handler wraps the whole loop, so an OOM-handler error is a crash too.
         """
         try:
             while not self._stop_event.is_set():
@@ -341,16 +311,12 @@ class ContinuousScheduler:
         (FILO), matching the intuition that the most recent admission is
         what pushed us past the watermark.
 
-        Survivors resume the failed step exactly. Every slot's cache length is
-        first rolled back to what it was before the forward
-        (`_roll_back_partial_append`). Plain decoders keep the tokens they
-        already sampled and emitted in `pending_decode_tokens`, and speculators
-        keep their whole round (anchor, proposal, and drafter cache), so the
-        retry re-feeds the same inputs at the same positions and the client
-        never sees a token twice.
+        The survivors repeat the failed step exactly: slots roll back, plain
+        decoders resend `pending_decode_tokens`, and speculators reuse their
+        round. So the client never gets a token twice.
         """
-        # Before the reap: the saved lengths are indexed by the batch_idx
-        # values the failed forward used, and the reap shifts them.
+        # Roll back before the reap. The snapshot uses the slot indices of the
+        # failed forward, and the reap shifts them.
         self._roll_back_partial_append()
         candidates = [
             r
@@ -369,35 +335,19 @@ class ContinuousScheduler:
     def _roll_back_partial_append(self) -> None:
         """Return every slot to the length it had before the forward that raised.
 
-        `append_kv_packed` works in two phases. On layer 0 it first advances
-        each slot's token count and allocates its blocks, slot by slot, and
-        only then writes any K/V. When the pool runs dry at slot j, slots
-        0..j-1 already claim positions that hold no data. The retry takes its
-        position offsets from those counts, so without this a plain decoder
-        writes its token at the wrong position (silent corruption) and a
-        speculator fails its start-vs-slot assertion (a dead engine thread,
-        because only `OutOfMemoryError` is caught).
+        On layer 0, `append_kv_packed` advances each slot's count and allocates
+        its blocks before it writes any K/V. An OOM at slot j leaves slots
+        0..j-1 with claimed positions that hold no data. Without this rollback,
+        the retry writes a plain decoder's token at the wrong position silently.
+        A speculator fails its start-vs-slot assertion and kills the engine.
 
-        Speculator state needs no undo here. Drafting finishes before the
-        forward starts, so each speculator's drafter cache and proposal are
-        complete and consistent at `spec.start`, and the retry reuses them
-        through the `drafted_for_start` guard. Rolling the drafter cache back
-        as well would break (INV) on that reuse path.
-
-        Safe to apply to every slot unconditionally. `truncate_to` only
-        shrinks and is a no-op at the current length, and it cannot land inside
-        a published prefix block: publication happens on the last layer, after
-        every write, so a layer-0 failure publishes nothing new.
-
-        Blocks: every slot whose count advanced gets the blocks it claimed past
-        the boundary freed. The slot whose `allocate` raised is different. It
-        adds blocks to its list before it advances its count, so it can keep
-        blocks it received before the raise while its count stays put, and
-        `truncate_to` leaves them alone. They do not leak: the retry feeds that
-        slot the same q-length, so the append reuses exactly those blocks, and
-        `remove_request` frees them if the slot is the victim or is cancelled.
-        Between this rollback and the retry, that one slot holds more blocks
-        than its length needs.
+        Speculator state needs no undo: drafting ends before the forward, and
+        the retry reuses the proposal. A draft cache rollback on that reuse path
+        breaks (INV). Every slot can take `truncate_to`, because it is a no-op at
+        the current length. Publication happens on the last layer, so a layer-0
+        failure leaves no new published block for `truncate_to` to cut into. The
+        slot that raised keeps its new blocks until the retry reuses them or
+        `remove_request` frees them. See ADR-031.
         """
         snapshot = self._pre_forward_seq_lens
         self._pre_forward_seq_lens = None
@@ -437,9 +387,7 @@ class ContinuousScheduler:
         n_verify = 0
         if alive and self._trace_events is not None:
             trace_phase = self._classify_phase(alive)
-            # Requests carrying a verify window in this forward. `offered` is
-            # set by the draft phase and cleared by verify, so it must be read
-            # here, before the forward.
+            # Count verify windows now, because the verify phase clears `offered`.
             n_verify = sum(1 for r in alive if r.spec is not None and r.spec.offered is not None)
 
         total_q = 0
@@ -460,10 +408,8 @@ class ContinuousScheduler:
                     "dur": (time.perf_counter() - step_start) * 1e6,
                     "pid": 0,
                     "tid": 0,
-                    # B counts requests, total_q counts the q-tokens of the
-                    # forward. Plain decoding makes them equal; prefill chunks
-                    # and verify windows make total_q larger, which is the
-                    # quantity a step's cost actually follows.
+                    # Step cost follows total_q (q-tokens), not B (requests).
+                    # Prefill chunks and verify windows make total_q exceed B.
                     "args": {
                         "B": len(alive),
                         "phase": trace_phase,
@@ -521,13 +467,9 @@ class ContinuousScheduler:
 
             running.prompt_token_ids = self._runner.tokenizer.encode(running.request.prompt)
 
-            # A prompt that tokenizes to nothing has no q-tokens to contribute,
-            # so admitting it would put a zero-length window in the packed
-            # forward: `cu_seqlens_q` would not advance for its slot and the
-            # last-position slice would read index -1 of an empty logits
-            # tensor. That IndexError is not `OutOfMemoryError`, so it kills the
-            # engine thread and every other in-flight request with it. Finish it
-            # here with nothing generated, as StateCacheContinuousScheduler does.
+            # An empty prompt fails an assertion in `_packed_forward`, which kills
+            # the engine thread. Finish it here with no output, as
+            # StateCacheContinuousScheduler does.
             if not running.prompt_token_ids:
                 logger.info("empty prompt: finishing request without generating")
                 self._finish(running, "stop")
@@ -543,20 +485,11 @@ class ContinuousScheduler:
             required_blocks = plain_blocks
             if running.spec is not None:
                 assert self._dspark is not None
-                # A round appends `1 + len(offered)` positions but commits only
-                # `accepted + 1`, and truncation returns the difference, so
-                # steady-state blocks per EMITTED token are unchanged by
-                # speculation. What is new is only the intra-step transient of
-                # the in-flight verify window; multiplying the whole headroom
-                # by the block length would throttle achievable concurrency.
+                # Truncation frees the rejected positions of each round, so only
+                # the verify window in flight needs extra blocks. See ADR-031.
                 spec_blocks = math.ceil((self._dspark.block_size + 1) / block_size) + 1
                 if plain_blocks + spec_blocks > block_pool.num_blocks:
-                    # Speculation is an optimization, never a reason to refuse
-                    # work the plain path could serve. Downgrade instead of
-                    # falling through to the permanent rejection below: turning
-                    # a servable request into finish_reason="cancelled" purely
-                    # because dspark is configured would be a regression from
-                    # the non-speculative engine.
+                    # Speculation must never refuse a request that the plain path can serve.
                     logger.info(
                         "request not speculating: pool capacity %d cannot hold its prompt "
                         "plus %d blocks of verify-window headroom",
@@ -609,20 +542,12 @@ class ContinuousScheduler:
             self._running.append(running)
 
     def _spec_state_for(self, running: RunningRequest) -> SpecDecodeState | None:
-        """Decide at admission whether this request speculates; None runs plain.
+        """Decide at admission whether this request speculates. None means plain.
 
-        Decided once, here, so the rest of the engine never re-evaluates
-        eligibility mid-request. Two downgrades, both logged at INFO because
-        they silently change latency, not output:
-
-        - top-k / top-p sampling: the spec path builds distributions through
-          `logits_to_probs`, which applies temperature only. Silently ignoring
-          the caller's filtering would change sampling semantics, so those
-          requests run the plain path instead (mixed batches are the normal
-          case). Threading top-k/top-p through both sides is deferred.
-        - prompts over `max_spec_prompt_tokens`: the injected context buffers
-          tapped hidden states per prompt token outside the block pool's
-          accounting (see `DSparkSpec`).
+        A request with top-k or top-p runs plain, because the spec path applies
+        temperature only, not the filter. A prompt over `max_spec_prompt_tokens`
+        runs plain, because its injected context grows with the prompt outside
+        the block pool. Both log at INFO: they change latency, not output.
         """
         if self._dspark is None:
             return None
@@ -651,15 +576,10 @@ class ContinuousScheduler:
         by `id(req)` so the caller can look them up after `_reap_done` shifts
         `batch_idx`).
 
-        Each value is the list of tokens that request feeds into the next
-        forward. Plain sampling always yields exactly one; the list is what
-        lets a request whose next forward spans several positions share the
-        packed forward with everyone else.
-
-        A request whose tokens were sampled but never consumed (its forward
-        raised a recoverable OOM) is NOT sampled again: it hands the same tokens
-        back. Sampling emits, and an emitted token cannot be recalled from the
-        client's stream, so re-sampling would duplicate it.
+        Each value is a one-token list, the type that speculators also use.
+        After a recoverable OOM, a request resends `pending_decode_tokens` and
+        does NOT sample again: it already emitted them, and the stream cannot
+        take a token back.
         """
         sampled: dict[int, list[int]] = {}
         tokenizer = self._runner.tokenizer
@@ -686,12 +606,8 @@ class ContinuousScheduler:
     def _emit_new_text(self, req: RunningRequest, num_tokens: int) -> None:
         """Decode-and-diff: re-decode all tokens so far and emit the new suffix.
 
-        Handles multi-byte UTF-8 sequences correctly at the cost of O(n) work
-        per call (one tokenizer call, one string slice). A call covering
-        several newly appended tokens emits ONE step carrying their whole
-        delta, which is how the speculative path streams a committed block.
-        `num_tokens` says how many tokens that one step carries, so a consumer
-        can count tokens without counting steps.
+        Handles multi-byte UTF-8 correctly at O(n) cost per call. One call emits
+        ONE step, and `num_tokens` says how many tokens it carries.
         """
         current_text = self._runner.tokenizer.decode(req.tokens_generated)
         delta = current_text[len(req.last_text) :]
@@ -699,26 +615,13 @@ class ContinuousScheduler:
         self._emit(req, GenerationStep(text=delta, num_tokens=num_tokens))
 
     def _draft_speculators(self) -> dict[int, list[int]]:
-        """Draft one block per speculating DECODING request; return verify inputs.
+        """Draft one block per speculating DECODING request. Return verify inputs.
 
-        Each entry is `[anchor, *offered]`: the last committed token plus the
-        drafted block after confidence truncation and `max_tokens` clamping.
-        The packed forward appends K/V for exactly those positions, and
-        `_verify_speculators` judges them after it runs.
-
-        Three cases per request, in order:
-
-        - No anchor yet (the request finished prefill last step): sample it
-          from `last_logits` like any plain decoder, emit it, run the finish
-          checks, and finalize the injected context accumulated across the
-          prompt's chunks. The draft then hangs off that anchor in the same
-          step, so speculation starts without a wasted round.
-        - A proposal already exists for this exact `start` (the previous
-          forward raised recoverably and the engine retried): reuse it. The
-          proposal is a pure function of `(anchor, context, start)`, and
-          re-drafting would double-mutate the draft cache.
-        - Otherwise draft, clamping the proposal so a fully accepted block
-          plus its bonus can never overshoot `max_tokens`.
+        Each entry is `[anchor, *offered]`: the last committed token, then the
+        clamped drafted block. A request with no anchor yet (prefill ended last
+        step) samples and emits its anchor like a plain decoder, then drafts in
+        the same step. A retry after a recoverable OOM reuses its proposal,
+        because a second draft folds the context in twice and breaks (INV).
         """
         if self._dspark is None:
             return {}
@@ -732,8 +635,7 @@ class ContinuousScheduler:
             assert req.batch_idx is not None
 
             if spec.anchor is None:
-                # The prompt's tapped hidden states, accumulated chunk by
-                # chunk, become round 1's injected context.
+                # The tapped rows of the prompt chunks become the round-1 context.
                 assert spec.context_parts, "spec request reached DECODING with no tapped context"
                 spec.context = (
                     torch.cat(spec.context_parts, dim=1)
@@ -763,15 +665,10 @@ class ContinuousScheduler:
             )
 
             if not (spec.drafted_for_start == spec.start and spec.offered is not None):
-                # The invariant everything hinges on: the drafter's RoPE
-                # rotates keys against an unsliced cos/sin table, so the
-                # injected context plus the drafter's own cache must land
-                # exactly at the target slot length. It is a PREcondition of
-                # proposing (the forward folds the context into the cache and
-                # truncates back to `start`), which is why it sits inside the
-                # draft branch: on the reuse path the fold already happened.
-                # Asserted rather than trusted, because every known violation
-                # route fails unrecoverably later (INV).
+                # The drafter's RoPE uses an unsliced cos/sin table, so (INV) is a
+                # precondition of drafting. On the reuse path the fold into the
+                # draft cache already happened, so the check lives only here.
+                # A violation fails later with no recovery.
                 assert target_len == spec.draft_cache.get_seq_length() + spec.context.shape[1], (
                     f"(INV) target_slot_seq_len={target_len} != "
                     f"draft_cache_len={spec.draft_cache.get_seq_length()} + "
@@ -785,10 +682,8 @@ class ContinuousScheduler:
                     draft_cache=spec.draft_cache,
                     temperature=req.request.sampling_params.temperature,
                 )
-                # Clamp at draft time so the verify forward does not append
-                # K/V for positions that can never commit: the bonus token
-                # occupies one slot of the remaining room, so at most
-                # `room - 1` draft tokens are worth verifying.
+                # Clamp so the verify forward appends no K/V that cannot commit.
+                # The bonus token takes one place of `room`.
                 spec.offered = offered[: max(0, room - 1)]
                 spec.room_clamped = len(spec.offered) < len(offered)
                 spec.confidence = confidence
@@ -809,18 +704,11 @@ class ContinuousScheduler:
         `self._running` after the reap). `position_offsets` therefore line up
         with `cache.seq_lens_list()`.
 
-        A decoder's q-length this step is `len(tokens)`, so `cu_seqlens_q`
-        advances by that instead of by 1. The forward returns one packed
-        `(1, total_q, vocab)` tensor and each request's last-position logits
-        are sliced out of it at `cu_seqlens_q[index + 1] - 1`.
-
-        Returns `(packed_logits, cu_seqlens_q, sink)` so `_verify_speculators`
-        can slice each speculator's window out of the same forward; `sink` is
-        None when nothing speculated.
-
-        Reaching the end of this method is what marks a decoder's tokens as
-        consumed. A forward that raises leaves `pending_decode_tokens` set, and
-        the retry re-feeds them rather than sampling and emitting again.
+        A decoder's q-length is `len(tokens)`. Request `index` has its
+        last-position logits at row `cu_seqlens_q[index + 1] - 1`. Returns
+        `(packed_logits, cu_seqlens_q, sink)` for `_verify_speculators`. `sink`
+        is None when no request speculates. If the forward raises,
+        `pending_decode_tokens` stays set, so the retry feeds the same tokens.
         """
         assert self._batched_cache is not None
 
@@ -830,51 +718,38 @@ class ContinuousScheduler:
         cache_seq_lens = self._batched_cache.seq_lens_list()
 
         for index, req in enumerate(alive):
-            # The packed lists are built in `alive` order and the cache is read
-            # per slot; `index` serves as both only because a reap leaves
-            # `_running` in slot order. With variable q-lengths a mismatch would
-            # write one request's K/V at another's positions, so pin it here.
+            # `index` is both the packed position and the slot, because a reap keeps
+            # `_running` in slot order. A mismatch writes K/V at another request's positions.
             assert req.batch_idx is not None and req.batch_idx == index
             if req.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING):
                 chunk_start = req.tokens_prefilled
-                # A prefiller's slot length and its prefill counter advance
-                # together, chunk by chunk (and a prefix-cache hit sets both at
-                # admission). A slot ahead of its counter means an append that
-                # claimed positions without writing them; feeding the chunk
-                # anyway would store its K/V past a hole, silently. The
-                # speculators' start-vs-slot assertion guards the same failure.
+                # The slot length and the prefill counter advance together. A slot
+                # ahead of its counter holds positions that an append claimed and
+                # did not write. This chunk then stores its K/V after a gap, silently.
                 assert chunk_start == cache_seq_lens[req.batch_idx], (
                     f"prefill at {chunk_start} disagrees with slot length "
                     f"{cache_seq_lens[req.batch_idx]}"
                 )
                 chunk_end = min(chunk_start + self._chunk_size, len(req.prompt_token_ids))
                 chunk_tokens = req.prompt_token_ids[chunk_start:chunk_end]
-                # Same hazard as the decode branch below: no rows of its own
-                # means the last-position slice reads a neighbour. Unreachable
-                # now that admission rejects empty prompts and the prefix
-                # cache's last-token rule always leaves a token unprocessed.
+                # With no rows, the last-position slice reads a neighbor's logits.
+                # Admission and the prefix cache keep at least one token here.
                 assert chunk_tokens, "prefilling request contributed no tokens"
                 packed_input_ids.extend(chunk_tokens)
                 cu_seqlens_q.append(cu_seqlens_q[-1] + len(chunk_tokens))
                 position_offsets.append(chunk_start)
             else:
                 next_tokens = sampled_decode_tokens[id(req)]
-                # A slot contributing zero tokens gets no row of its own in the
-                # packed forward, and the last-position slice below would then
-                # silently read the PREVIOUS request's logits.
+                # With no rows, the last-position slice reads a neighbor's logits.
                 assert next_tokens, "decoding request contributed no tokens"
                 packed_input_ids.extend(next_tokens)
                 cu_seqlens_q.append(cu_seqlens_q[-1] + len(next_tokens))
                 position_offsets.append(cache_seq_lens[req.batch_idx])
 
-        # Tapped hidden states are collected only when some request in this
-        # batch speculates: the sink covers EVERY request's rows, and each
-        # speculator later slices its own window out by `cu_seqlens_q`. A
-        # batch with no speculators skips the tap kwargs entirely, which is
-        # also what keeps non-Qwen3 models working when dspark is off.
+        # Tap hidden states only when a request speculates. The sink covers every
+        # request's rows. With no speculator, no tap kwargs go in, so other models
+        # keep working.
         sink: dict[int, torch.Tensor] | None = None
-        # Saved for `_roll_back_partial_append`: if the forward raises
-        # mid-append, these are the lengths every slot must return to.
         self._pre_forward_seq_lens = cache_seq_lens
         if self._dspark is not None and any(r.spec is not None for r in alive):
             sink = {}
@@ -890,9 +765,8 @@ class ContinuousScheduler:
             packed_logits = self._runner.forward_step_packed(
                 self._batched_cache, packed_input_ids, cu_seqlens_q, position_offsets
             )
-        # The forward landed, so every slot now legitimately holds the K/V it
-        # appended. Clear the snapshot BEFORE anything else can fail: a stale
-        # one would let a later rollback undo writes that really happened.
+        # Every slot now holds its K/V. Clear the snapshot BEFORE anything else
+        # can fail, or a later rollback undoes real writes.
         self._pre_forward_seq_lens = None
 
         # Distribute logits and advance prefill state.
@@ -902,9 +776,8 @@ class ContinuousScheduler:
                 tokens_added = cu_seqlens_q[index + 1] - cu_seqlens_q[index]
                 req.tokens_prefilled += tokens_added
                 if req.spec is not None:
-                    # This chunk's tapped hidden states become part of round
-                    # 1's injected context; cloned so the buffer does not pin
-                    # the whole packed activation.
+                    # `context_window` clones the rows, so they do not pin the
+                    # whole packed activation.
                     assert sink is not None and self._dspark is not None
                     req.spec.context_parts.append(
                         context_window(
@@ -920,9 +793,7 @@ class ContinuousScheduler:
                 else:
                     req.state = RequestState.CHUNKED_PREFILLING
             elif req.spec is not None:
-                # A speculator's last row is the logits after its last OFFERED
-                # token, which may be rejected; the verify phase derives the
-                # real continuation, so leave nothing tempting behind.
+                # The last row follows an OFFERED token that verify can reject.
                 req.last_logits = None
             else:
                 req.last_logits = packed_logits[0, last_pos, :]
@@ -936,18 +807,12 @@ class ContinuousScheduler:
         cu_seqlens_q: list[int],
         sink: dict[int, torch.Tensor] | None,
     ) -> None:
-        """Judge each in-flight proposal against the forward that just ran.
+        """Judge each proposal in flight against the forward that just ran.
 
-        Membership is keyed off `spec.offered is not None`, never off
-        `RequestState`: `_packed_forward` flips PREFILLING -> DECODING
-        mid-iteration, so a request that just finished prefill is DECODING by
-        now while having no proposal, and reading a verify window for it would
-        take the argmax at its chunk's first position and emit garbage.
-
-        Emission follows the scheduler's conventions, which differ from the
-        batch-1 runner's in two deliberate ways: EOS is dropped, not emitted
-        (`run_greedy` appends it), and the commit is clamped so
-        `len(tokens_generated)` can never overshoot `max_tokens`.
+        Select by `spec.offered is not None`, never by state: a request that just
+        finished prefill is DECODING with no proposal, and verifying it emits
+        garbage. Unlike `run_greedy`, the scheduler does not emit EOS. Like it,
+        the scheduler clamps the commit to `max_tokens`.
         """
         if self._dspark is None:
             return
@@ -961,9 +826,7 @@ class ContinuousScheduler:
 
             lo = cu_seqlens_q[index]
             width = 1 + len(spec.offered)
-            # A wrong offset here reads ANOTHER request's logits and emits
-            # plausible wrong tokens with no error at all, so the window is
-            # pinned to the request's own packed extent.
+            # A wrong offset reads ANOTHER request's logits and emits wrong tokens silently.
             assert cu_seqlens_q[index + 1] - lo == width, (
                 f"verify window mismatch: cu_seqlens_q spans "
                 f"{cu_seqlens_q[index + 1] - lo} rows, expected {width}"
@@ -993,8 +856,6 @@ class ContinuousScheduler:
             emitted: list[int] = []
             hit_eos = False
             for tok in committed[:room]:
-                # The scheduler's convention: stop BEFORE the first EOS and do
-                # not emit it. The opposite of `run_greedy`, which appends it.
                 if tok == tokenizer.eos_token_id:
                     hit_eos = True
                     break
@@ -1009,18 +870,14 @@ class ContinuousScheduler:
             if len(req.tokens_generated) >= req.request.max_tokens:
                 self._finish(req, "length")
                 continue
-            # A finished request skips the rollback: its blocks are about to
-            # be freed wholesale by the reaper. A continuing one rolls its
-            # slot back to exactly the committed prefix; the verify forward
-            # wrote K/V for every offered token and the rejected tail is
-            # wrong, so the next round rewrites those positions.
+            # Roll the slot back to the committed prefix. The next round rewrites
+            # the rejected tail. A finished request skips this, because the reap
+            # frees its blocks.
             new_start = spec.start + len(emitted)
             self._batched_cache.truncate_to(req.batch_idx, new_start)
 
-            # Next round's context is the target's hidden states for the
-            # committed window only: rows 0..accepted of this request's verify
-            # window, i.e. the anchor plus the accepted tokens. REPLACES the
-            # previous context rather than appending, mirroring `deepspec`.
+            # The next context is the committed rows only (anchor plus accepted).
+            # It REPLACES the old context, as in `deepspec`.
             assert sink is not None and self._dspark is not None
             spec.context = context_window(sink, self._dspark.ordered_taps, lo, lo + accepted + 1)
             spec.anchor = bonus
@@ -1051,9 +908,8 @@ class ContinuousScheduler:
                         and surviving.batch_idx > finished.batch_idx
                     ):
                         surviving.batch_idx -= 1
-            # Drop speculative state with the request: the API handle keeps
-            # the RunningRequest alive after completion, and the drafter
-            # cache plus injected context must not outlive the generation.
+            # The API handle keeps the RunningRequest alive after completion,
+            # and the draft cache and context must not live that long.
             finished.spec = None
             self._running.remove(finished)
 
@@ -1069,10 +925,8 @@ class ContinuousScheduler:
         recent intermediate step to make room rather than block the engine
         thread.
 
-        A speculator's stats are summarized here, not in the reap. The reap
-        drops `spec` and runs after this, and the summary must be in place
-        before the terminal step goes out: the queue put is what makes it
-        visible to the API thread that reads `GenerationResult`.
+        Summarize speculator stats before the reap drops `spec` and before the
+        terminal-step put, which publishes the summary to the API thread.
         """
         if req.spec is not None:
             assert self._dspark is not None

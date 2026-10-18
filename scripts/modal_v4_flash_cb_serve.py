@@ -129,8 +129,8 @@ def _run_one_rank(
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
                     responses = list(pool.map(fire, prompts))
                 elapsed = time.perf_counter() - started
-            # A non-200 body has no `choices` (for example the 503 sent when
-            # the engine thread is gone), so keep its error instead.
+            # A non-200 body (for example the 503 for a dead engine thread) has
+            # no `choices`. Keep its `error` instead.
             completions_out = [
                 {
                     "prompt": p,

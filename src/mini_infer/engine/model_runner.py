@@ -45,13 +45,14 @@ def _dtype_for(device: str) -> torch.dtype:
 class ModelRunner:
     """Loads a HF causal LM and runs packed-varlen forwards against a paged KV cache.
 
-    All forwards (prefill, decode, chunked-prefill) flow through
-    `forward_step_packed`, which packs per-request q-tokens into a single
-    sequence, dispatches the patched attention layer's varlen path, and returns
-    logits at every packed position. `forward_step` slices the last position per
-    request on top of it; the convenience wrappers (`prefill`, `decode`,
-    `decode_batch`, `prefill_chunk`) build the right packed inputs for their
-    single-request / uniform-q-len cases and call it.
+    All forwards (prefill, decode, chunked prefill) go through
+    `forward_step_packed`. It packs the new tokens (q-tokens) of all requests
+    into one sequence, runs the varlen (variable-length) path of the patched
+    attention layer, and returns logits at every packed position.
+    `forward_step` takes the last position of each request from that result.
+    The wrappers `prefill`, `decode`, `decode_batch`, and `prefill_chunk` build
+    the packed inputs for one request, or for requests with the same q-length,
+    and call `forward_step`.
     """
 
     def __init__(
@@ -146,13 +147,14 @@ class ModelRunner:
 
     @property
     def supports_hidden_state_taps(self) -> bool:
-        """Whether this model's forward accepts `tap_layers` / `hidden_state_sink`.
+        """True if the forward of the model accepts `tap_layers` and `hidden_state_sink`.
 
-        Only a model that records per-layer hidden states can feed the DSpark
-        drafter its injected context (Qwen3 today). Introspecting the signature
-        beats keeping a list of family names here: a model that grows tap
-        support starts reporting True with no edit to this file, and one that
-        never had it can't be silently handed the kwargs and die mid-forward.
+        The DSpark drafter takes per-layer hidden states of the target as its
+        context. Only a model that accepts these kwargs can record them (Qwen3
+        today). This property reads the signature, not a list of family names.
+        Thus a model that adds tap support reports True with no edit to this
+        file. A caller can refuse a model without it before the first forward.
+        Without that refusal, the first forward with the kwargs raises a `TypeError`.
         """
         return "tap_layers" in inspect.signature(self._model.forward).parameters
 
@@ -165,12 +167,11 @@ class ModelRunner:
     ) -> list[torch.Tensor]:
         """Run ONE packed-varlen forward; return last-position logits per request.
 
-        A last-position convenience over `forward_step_packed`, which is the
-        actual primitive: this slices row `cu_seqlens_q[i + 1] - 1` per request,
-        at any q-length. The single-request / uniform-q-len wrappers below and
-        the prefill worker use it. A caller that reads positions other than each
-        request's last one, or that wants the packed tensor to slice itself (the
-        scheduler), calls `forward_step_packed`.
+        This is a wrapper over `forward_step_packed`. For request `i`, it takes
+        row `cu_seqlens_q[i + 1] - 1`, at any q-length. The wrappers below and
+        the prefill worker use it. A caller that reads other positions, or that
+        slices the packed tensor itself (the scheduler), calls
+        `forward_step_packed`.
         """
         packed_logits = self.forward_step_packed(
             cache, packed_input_ids, cu_seqlens_q, position_offsets

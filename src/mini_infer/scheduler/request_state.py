@@ -37,10 +37,8 @@ class Request:
 class GenerationResult:
     """The aggregated outcome of one request.
 
-    `spec_summary` is set only when the request speculated: it is the fixed-size
-    summary of its DSpark rounds (see `SpecSummary`). None means the request ran
-    the plain path, either because speculation was off or because admission
-    downgraded it, which is how a benchmark can tell the two cases apart.
+    `spec_summary` is a fixed-size summary of the DSpark rounds, or None when the
+    request ran the plain path (speculation off, or downgraded at admission).
     """
 
     text: str
@@ -54,21 +52,15 @@ class GenerationResult:
 class GenerationStep:
     """One step of streaming generation; finish_reason set on the final step only.
 
-    `num_tokens` is how many generated tokens this step carries. Every
-    scheduler sets it on the steps that carry tokens: one per step on the
-    single-token paths, and the whole committed block on a speculative verify
-    step, which arrives as ONE step with one text delta. Terminal steps carry
-    0. How EOS shows up depends on the scheduler: `ContinuousScheduler` and the
-    StateCache schedulers drop it, while `PDScheduler` streams it as an
-    ordinary one-token step before its terminal step. A consumer that counts
-    steps instead of summing this field undercounts speculative output by the
-    accepted length.
+    `num_tokens` is the number of generated tokens in the step, 0 on a terminal
+    step. A speculative verify step carries its whole committed block as one
+    step, so a consumer must sum this field, not count steps. `ContinuousScheduler`
+    and the StateCache schedulers do not emit EOS. `PDScheduler` emits it as a
+    one-token step before its terminal step.
 
-    `failed` marks a terminal step for a request that the engine failed (an
-    exception it caught and logged). Such a step carries
-    `finish_reason="cancelled"` for the engine's own bookkeeping, but a
-    `RequestHandle` never hands it out: it raises `RequestFailedError`
-    instead, so a client can tell a failure from a cancellation.
+    `failed` marks the terminal step of a request that the engine failed. It
+    carries `finish_reason="cancelled"`, but a `RequestHandle` raises
+    `RequestFailedError` instead of returning it. See ADR-030.
     """
 
     text: str
@@ -80,18 +72,10 @@ class GenerationStep:
 class StepQueue(queue.Queue[GenerationStep]):
     """The output queue of one request: a `queue.Queue` that can wake an asyncio reader.
 
-    The engine thread puts steps with the ordinary calls. A reader on an event
-    loop sets a listener, and every put calls it, so the reader can wait on
-    the loop instead of on a thread (see `RequestHandle.get_step_async`).
-
-    The listener runs on the engine thread after each put, outside the
-    queue's lock, so it must return at once. A listener that raises
-    `RuntimeError` (the reader's event loop closed under it) does not fail
-    the put: the step stays in the queue, and the engine keeps running.
-
-    No wakeup is lost. The listener is read after the step is in the queue,
-    and a reader sets it before it reads the queue. So a put either sees the
-    new listener or lands before the reader's read.
+    Each put calls the listener on the engine thread, outside the queue lock, so the
+    listener must return at once. A `RuntimeError` from it (the reader's loop closed)
+    is ignored. No wakeup is lost: a put reads the listener after the step is in the
+    queue, and a reader sets the listener before it reads the queue. See ADR-029.
     """
 
     def __init__(self, maxsize: int = 0) -> None:
@@ -103,7 +87,7 @@ class StepQueue(queue.Queue[GenerationStep]):
             self._listener = listener
 
     def put(self, item: GenerationStep, block: bool = True, timeout: float | None = None) -> None:
-        # `put_nowait` calls this too.
+        # `put_nowait` calls this too, so both put paths call the listener.
         super().put(item, block, timeout)
         listener = self._listener
         if listener is not None:
@@ -148,22 +132,16 @@ class RunningRequest:
     points (before sampling each decoder, before admitting from the queue)
     and finishes the request with finish_reason="cancelled" when set.
 
-    `pending_decode_tokens` holds tokens that have been sampled and emitted but
-    not yet fed through a forward. Sampling happens before the forward while a
-    forward can fail recoverably (a mid-step OOM the engine retries), so the
-    step has to be idempotent: without this, the retry would sample the same
-    `last_logits` again and emit a duplicate of a token the client already has.
-    Cleared by the forward that consumes them.
+    `pending_decode_tokens` holds tokens that the engine sampled and emitted but
+    did not yet feed through a forward. A retry after a mid-step OOM reuses them,
+    so it does not sample `last_logits` again and emit a duplicate token. The
+    forward that consumes them clears the field.
 
-    `spec` is the DSpark speculative-decoding state, present only on requests
-    the scheduler decided to speculate for at admission. Kept as one optional
-    field so a type every scheduler shares carries no technique-specific
-    members; the reaper clears it when the request finishes, since the API
-    handle keeps the `RunningRequest` itself alive.
-
-    `spec_summary` is what survives that clearing: `_finish` reduces the
-    request's `DSparkStats` to a fixed-size `SpecSummary` just before it puts
-    the terminal step, so the API thread can read it after the stream ends.
+    `spec` is the DSpark state of a request chosen for speculation at admission, else
+    None. One field keeps DSpark members out of this type, which every scheduler shares.
+    `_reap_done` clears it at finish, because the API handle keeps the `RunningRequest`
+    alive. `spec_summary` survives the clear: `_finish` writes it before the terminal
+    step, so the API thread can read it after the stream ends.
     """
 
     request: Request
@@ -185,23 +163,15 @@ class RunningRequest:
 class RequestHandle:
     """API-side handle for a submitted request; drained from the API thread.
 
-    `engine_alive` reports whether a step can still arrive for this request.
-    Each scheduler binds it at `submit()` to the thread object it has at that
-    moment, not to whatever thread it has later: after a crash and a quick
-    `start()`, the new thread can lack the request (the StateCache schedulers
-    reset their slots), and the handle must not wait on it.
-    It also stays True while `stop()` runs, because `stop()` finishes the
-    requests left in flight as 'cancelled' after the thread has exited.
+    `engine_alive` reports whether a step can still arrive. Each scheduler binds it
+    at `submit()` to the engine threads that run then, because a thread from a later
+    `start()` can lack the request. It returns True while `stop()` runs, because
+    `stop()` sends the 'cancelled' steps after the thread exits. See ADR-028.
 
-    Liveness is read only when the queue stays empty for one poll slice
-    (`LIVENESS_POLL_SECONDS`). Steps already buffered are always handed out
-    first, and a dead engine is reported as `EngineNotRunningError` within
-    one slice. A thread that is alive but stuck (for example a tensor-parallel
-    leader blocked in a collective whose follower died) still looks alive;
-    this check covers only a thread that exited.
-
-    `engine_alive=None` keeps the old unbounded blocking, for tests that build
-    a handle over a bare `RunningRequest` with no engine behind it.
+    The handle calls it only after the queue stays empty for one poll slice, so buffered
+    steps come first. An exited thread makes the handle raise `EngineNotRunningError`,
+    but a stuck thread looks alive (for example a tensor-parallel leader that waits on a
+    dead follower). `engine_alive=None` turns the check off, for tests.
     """
 
     # Read at call time, not bound as a default argument, so a test can lower it.
@@ -219,8 +189,7 @@ class RequestHandle:
     def steps(self) -> Iterator[GenerationStep]:
         """Yield GenerationStep as the engine produces them; ends after the final step.
 
-        Raises `EngineNotRunningError` after the last buffered step when the
-        engine thread exits without a terminal step.
+        Raises `EngineNotRunningError` if the engine exits before the terminal step.
         """
         while True:
             step = self._next_step(deadline=None)
@@ -231,10 +200,8 @@ class RequestHandle:
     def wait(self, timeout: float | None = None) -> GenerationResult:
         """Block until complete; return the aggregated result.
 
-        `timeout` bounds the whole wait, in seconds, and raises `TimeoutError`
-        when it runs out while the engine is still alive. A dead engine raises
-        `EngineNotRunningError` instead, within one poll slice, with or
-        without a timeout.
+        If `timeout` (seconds) runs out on the whole wait, raises `TimeoutError`. A dead
+        engine raises `EngineNotRunningError` within one poll slice, timeout or not.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         text_parts: list[str] = []
@@ -245,13 +212,10 @@ class RequestHandle:
             text_parts.append(step.text)
 
     def build_result(self, text: str, finish_reason: FinishReason) -> GenerationResult:
-        """Aggregate a finished request: the caller's text plus the engine's counts.
+        """Build the result of a finished request from the step text the caller read.
 
-        `text` is the concatenation of the non-terminal steps the caller read.
-        A terminal step's text is not part of it. Call this only after the
-        terminal step arrived, because
-        the queue put of that step is what makes the engine-side fields
-        (`tokens_generated`, `spec_summary`) safe to read from this thread.
+        Call only after the terminal step arrives: its queue put makes the
+        engine-side fields safe to read from this thread.
         """
         return GenerationResult(
             text=text,
@@ -275,8 +239,7 @@ class RequestHandle:
     def get_step(self, timeout: float | None = None) -> GenerationStep:
         """Block until the next GenerationStep arrives. Thread-safe.
 
-        `timeout` raises `TimeoutError` when it runs out while the engine is
-        still alive. A dead engine raises `EngineNotRunningError`.
+        Raises `TimeoutError` on timeout and `EngineNotRunningError` if the engine is dead.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         return self._next_step(deadline)
@@ -284,24 +247,19 @@ class RequestHandle:
     async def get_step_async(self) -> GenerationStep:
         """`get_step()` for a caller on an asyncio event loop, without a thread.
 
-        The output queue (a `StepQueue`) wakes the loop on every put, so this
-        wait holds no worker thread, however many requests are in flight. A
-        blocking `get_step()` in `asyncio.to_thread` holds one thread of a
-        small shared pool per waiting request, and the queues of requests
-        that get no thread fill up and drop steps. Liveness is polled on the
-        same slices, with the same checks, as in `get_step()`.
+        The `StepQueue` wakes the loop on each put. `asyncio.to_thread` holds a pool thread
+        per waiting request, so requests without a thread can drop steps. See ADR-029.
         """
         out = self._req.output_queue
         if not isinstance(out, StepQueue):
             raise TypeError("get_step_async() needs a StepQueue as the output queue")
         loop = asyncio.get_running_loop()
         ready = asyncio.Event()
-        # Runs on the engine thread: `call_soon_threadsafe` is the one
-        # asyncio call that is safe from another thread.
+        # The listener runs on the engine thread, and `asyncio.Event` is not thread-safe.
         out.set_listener(lambda: loop.call_soon_threadsafe(ready.set))
         try:
             while True:
-                # Clear before reading: a put after the read sets it again.
+                # Clear before the read, so that a put after the read sets it again.
                 ready.clear()
                 try:
                     return self._take(out.get_nowait())
@@ -322,9 +280,8 @@ class RequestHandle:
     def _next_step(self, deadline: float | None) -> GenerationStep:
         """Return the next step, polling engine liveness while the queue is empty.
 
-        The order of the checks matters. The queue comes first, so buffered
-        steps always reach the caller before an error. Liveness comes before
-        the deadline, so a dead engine is reported as dead and not as slow.
+        The queue comes first, so buffered steps reach the caller before an error.
+        Liveness comes before the deadline, so a dead engine raises `EngineNotRunningError`.
         """
         while True:
             timeout: float | None = None
@@ -344,22 +301,19 @@ class RequestHandle:
                 raise TimeoutError("request did not finish within the timeout")
 
     def _after_empty_poll(self) -> GenerationStep | None:
-        """Decide what a poll slice that found the queue empty means.
+        """Handle an empty poll slice: return None while the engine can still send a step.
 
-        Returns None to keep waiting while the engine can still send a step.
-        Once liveness reads False, one more non-blocking read is needed: the
-        thread can put its last step between the empty read and the liveness
-        read, and a thread that exited made all its puts visible. If that
-        read is empty too, no step will ever come.
+        When `engine_alive` returns False, read the queue once more. The thread can put
+        its last step between the empty read and the liveness read. An exited thread
+        made all its puts visible, so an empty second read means no step will come.
         """
         if self._engine_alive is None or self._engine_alive():
             return None
         try:
             return self._take(self._req.output_queue.get_nowait())
         except queue.Empty:
-            # A restarted scheduler or a surviving PD prefill thread can still
-            # hold this request; cancel it so that the engine does not spend
-            # work on output nobody reads.
+            # A restarted scheduler or a live PD prefill thread can still hold the
+            # request. Cancel it, so no engine works for output that nobody reads.
             self.cancel()
             raise EngineNotRunningError(
                 "engine not running: the engine thread exited before this request "
@@ -368,10 +322,9 @@ class RequestHandle:
 
     @staticmethod
     def _take(step: GenerationStep) -> GenerationStep:
-        """Hand out a step, or raise if it reports a failed request.
+        """Return the step, or raise `RequestFailedError` if it is `failed`.
 
-        Every read of the queue goes through here, so no caller can receive a
-        failed request's terminal step as if it were a cancellation.
+        Every queue read calls this, so no caller sees a failure as a cancellation.
         """
         if step.failed:
             raise RequestFailedError(

@@ -1,16 +1,10 @@
-"""The pieces of a DSpark round that batch-1 and the scheduler share.
+"""The DSpark round math that the batch-1 runner and the scheduler share.
 
-`DSparkSpeculativeRunner` (speculative.py) owns the batch-1 LOOP; the
-multi-request path in `ContinuousScheduler` interleaves the same round with
-other requests' work across engine steps. What must not fork between them is
-the round itself: how a block is proposed and how a verify window is judged.
-Both live here as functions of explicit state, and both callers delegate, so
-the fp32-exact batch-1 tests keep gating the math the scheduler runs.
-
-`DSparkSpec` is the scheduler's constructor-facing bundle (drafter plus the
-knobs a serving deployment sets once), and `SpecDecodeState` is the
-per-request mutable state a `RunningRequest` carries between engine steps.
-Neither is used by the batch-1 runner.
+DSpark is a speculative decoder: a small drafter proposes a block of tokens, and
+one target forward verifies them and keeps an accepted prefix. Both
+`DSparkSpeculativeRunner` and `ContinuousScheduler` call `propose_block` and
+`verify_block`, so the fp32-exact batch-1 tests also cover the scheduler's math.
+`DSparkSpec` and `SpecDecodeState` serve only the scheduler (ADR-031).
 """
 
 from __future__ import annotations
@@ -32,22 +26,14 @@ from mini_infer.engine.dspark.sampling import (
 
 @dataclasses.dataclass
 class DSparkStats:
-    """Per-run counters, named to match `deepspec`'s evaluator metrics.
+    """Per-run counters, named to match the `deepspec` evaluator metrics.
 
-    `acceptance_lengths[i]` is round i's committed token count INCLUDING the
-    bonus (`accepted + 1`), which is what the reference calls acceptance
-    length and reports as tau. `proposal_lengths[i]` is how many draft tokens
-    that round actually offered for verification, i.e. after confidence
-    truncation, so the two together show what truncation traded away.
-    `confidence_observations` pairs each offered token's predicted survival
-    PROBABILITY (the sigmoid of the confidence head's logit, which the head
-    itself does not apply) with whether it actually survived, which is the raw
-    material for a calibration curve. Both recorders sigmoid before storing,
-    so a consumer that squashes again gets a silently compressed curve.
-
-    In the multi-request scheduler `n_target_forwards` stays 0: a packed
-    forward is shared by every in-flight request, so a per-request count of
-    target forwards has no meaning there.
+    `acceptance_lengths[i]` is `accepted + 1` for round i, the bonus included (tau).
+    `proposal_lengths[i]` is the draft tokens that round i offered after confidence
+    truncation. `confidence_observations` pairs the survival probability of each
+    offered token, already through the sigmoid, with whether the token survived.
+    The scheduler keeps `n_target_forwards` at 0, because all requests share one
+    packed forward.
     """
 
     acceptance_lengths: list[int] = dataclasses.field(default_factory=list)
@@ -56,15 +42,14 @@ class DSparkStats:
     n_target_forwards: int = 0
     n_drafter_forwards: int = 0
     confidence_observations: list[tuple[float, bool]] = dataclasses.field(default_factory=list)
-    # Rounds whose proposal the scheduler shortened to fit the request's
-    # remaining `max_tokens` room, and what they committed. The batch-1
-    # runner never shortens a proposal that way, so these stay 0 there.
+    # Rounds that the scheduler shortened to fit `max_tokens`, and their committed tokens.
+    # The batch-1 runner never shortens a round, so both stay 0 there.
     room_clamped_rounds: int = 0
     room_clamped_committed: int = 0
 
     @property
     def mean_acceptance_length(self) -> float:
-        """Mean committed tokens per verification round (tau), bonus included."""
+        """Mean committed tokens per round (tau), bonus included."""
         if not self.acceptance_lengths:
             return 0.0
         return sum(self.acceptance_lengths) / len(self.acceptance_lengths)
@@ -76,20 +61,16 @@ class DSparkStats:
         return sum(self.proposal_lengths) / len(self.proposal_lengths)
 
     def accept_rates_by_position(self, block_size: int) -> list[float | None]:
-        """Cumulative survival per draft position, `deepspec`'s definition.
+        """Cumulative survival rate per draft position, as `deepspec` defines it.
 
-        Entry `i` is (rounds whose accepted prefix reached past position `i`) /
-        (rounds that offered a token at position `i`). Because acceptance is a
-        prefix count, this is the probability that positions `0..i` ALL
-        survived, not the conditional probability that `i` survived given
-        `i-1` did. `None` where no round offered that position (which
-        truncation makes common at deep positions).
+        Entry `i` is (rounds that accepted `i`) / (rounds that offered `i`), or `None`
+        if no round offered it. A round that accepted `i` also accepted `0..i-1`.
         """
         offered, survived = self._position_counts(block_size)
         return [(survived[p] / offered[p]) if offered[p] else None for p in range(block_size)]
 
     def _position_counts(self, block_size: int) -> tuple[list[int], list[int]]:
-        """Per draft position: rounds that offered it, and rounds that kept it."""
+        """Per draft position: the rounds that offered it and the rounds that accepted it."""
         offered = [0] * block_size
         survived = [0] * block_size
         for proposal_len, accepted in zip(
@@ -120,26 +101,17 @@ class DSparkStats:
 
 @dataclasses.dataclass(frozen=True)
 class SpecSummary:
-    """One request's speculative statistics, reduced to fixed-size numbers.
+    """One request's speculative statistics, as fixed-size sums that a benchmark can pool.
 
-    Built when the request finishes, because the reap drops `DSparkStats`
-    together with the rest of the speculative state. Fixed size on purpose: a
-    benchmark pools hundreds of requests, and pooling needs only sums and
-    per-position counts, never the per-round lists. (`confidence_observations`
-    alone holds one entry per offered token, so it is not carried at all.)
+    The scheduler builds it at finish, because the reap drops `DSparkStats`.
 
-    `committed` counts `accepted + 1` per round, DeepSpec's definition. It is
-    NOT the number of tokens the client received: the first anchor belongs to
-    no round, and an EOS inside a committed block drops the tokens from it
-    on. Throughput must count `GenerationResult.tokens` instead.
+    `committed` counts `accepted + 1` per round, as DeepSpec does. It is not the
+    client's token count (`GenerationResult.tokens`): the first anchor is in no
+    round, and EOS drops tokens.
 
-    The `max_tokens` limit never drops a committed token, because the
-    scheduler shortens the proposal at draft time instead: with room for n
-    more tokens it offers at most n - 1. The last rounds of a request
-    therefore commit less than an unconstrained round, so `tau` is biased low
-    against the batch-1 benchmark, whose runner never shortens a proposal for
-    room. `room_clamped_*` counts those rounds, and `tau_unclamped` leaves
-    them out. That is the number to compare with batch-1 and with the paper.
+    With room for n more tokens, the scheduler offers at most n - 1 drafts, so
+    `max_tokens` never drops a committed token. Those last rounds commit less and
+    lower `tau`. `tau_unclamped` excludes them: compare it with batch-1 and the paper.
     """
 
     rounds: int
@@ -154,7 +126,7 @@ class SpecSummary:
 
     @property
     def tau(self) -> float:
-        """Committed tokens per round, the bonus token included."""
+        """Committed tokens per round, bonus included."""
         return self.committed / self.rounds if self.rounds else 0.0
 
     @property
@@ -166,11 +138,9 @@ class SpecSummary:
 
     @classmethod
     def pool(cls, summaries: list[SpecSummary]) -> SpecSummary:
-        """Sum many requests into one summary, so `tau` pools over all rounds.
+        """Sum the summaries before dividing, as DeepSpec does.
 
-        Pooling sums before it divides, as DeepSpec's evaluator does. The mean
-        of per-request tau values is a different number: it weights a short
-        request's few rounds as much as a long request's many.
+        A mean of per-request `tau` values gives a short request the weight of a long one.
         """
         if not summaries:
             raise ValueError("cannot pool an empty list of summaries")
@@ -203,18 +173,14 @@ def propose_block(
     draft_cache: DSparkDraftCache,
     temperature: float,
 ) -> tuple[list[int], torch.Tensor | None, torch.Tensor]:
-    """One drafter round: candidate tokens, confidence logits, and draft probs.
+    """One drafter round: draft tokens, confidence logits, and draft probs.
 
-    The probabilities are the Markov-CORRECTED ones, not the backbone's raw
-    base logits, because those are the distribution the tokens were actually
-    drawn from. Rejection sampling compares the target against the proposal
-    distribution, so using the uncorrected logits here would silently break
-    losslessness.
+    The drafter samples the tokens from the Markov-corrected logits, and the probs
+    come from the same logits. Rejection sampling against the raw base logits
+    breaks the output distribution with no error.
 
-    Leaves `draft_cache` at exactly `start` positions: the forward appends
-    K/V for the injected context and the block, and the block's share is
-    dropped unconditionally before the outcome is known (ADR-027, no
-    catch-up step).
+    On return, `draft_cache` holds exactly `start` positions: this function always
+    drops the block K/V (ADR-027: no catch-up step).
     """
     cfg = drafter.cfg
     block_size = cfg.block_size
@@ -224,10 +190,8 @@ def propose_block(
     )
     draft_input_ids[0, 0] = anchor
 
-    # One contiguous position span covering the injected context and then
-    # the block. The drafter's RoPE rotates keys over the whole span and
-    # queries over just its tail, so this slice has to cover both segments
-    # (ADR-027 point 4); its length is always ctx_len + block_size.
+    # One span of positions, ctx_len + block_size long: the injected context, then the
+    # block. RoPE rotates keys over all of it and queries over the tail (ADR-027 point 4).
     cache_len = draft_cache.get_seq_length()
     position_ids = torch.arange(
         cache_len, start + block_size, device=device, dtype=torch.long
@@ -240,8 +204,6 @@ def propose_block(
             position_ids=position_ids,
             past_key_values=draft_cache,
         )
-        # Drop this round's block K/V, keep the accumulated context
-        # projections. Unconditional, before we know the outcome.
         draft_cache.truncate_to(start)
 
         hidden = block_hidden[:, :block_size, :]
@@ -266,17 +228,14 @@ def verify_block(
     draft_probs: torch.Tensor,
     temperature: float,
 ) -> tuple[int, int]:
-    """Accept a prefix of `offered` and pick the token that follows it.
+    """Accept a prefix of `offered` and pick the bonus token that follows it.
 
-    `verify_logits` is the target's `(1, 1 + len(offered), vocab)` window over
-    `[anchor, *offered]`; position i predicts what follows input i.
+    Returns `(accepted, bonus)`. `verify_logits` is the target's
+    `(1, 1 + len(offered), vocab)` window over `[anchor, *offered]`.
 
-    Greedy and temperature > 0 are the same algorithm at different
-    temperatures (`logits_to_probs` emits one-hots when greedy, which
-    collapses the ratio test to argmax equality), but greedy is kept on an
-    explicit integer-comparison path: it is the temperature-0 bit-parity
-    contract Stage B and C rest on, and routing it through multinomial
-    draws would make a provable property depend on an RNG.
+    Sampling at temperature 0 gives the same result as greedy. Greedy keeps its own
+    integer-compare path anyway: it carries the temperature-0 bit-parity contract,
+    and multinomial draws would make that contract depend on an RNG.
     """
     if temperature < 1e-5:
         target_argmax = verify_logits[0].argmax(dim=-1).tolist()
@@ -293,18 +252,14 @@ def verify_block(
         return 0, int(sample_from_probs(target_probs[:, -1:, :])[0, 0].item())
 
     proposed = torch.tensor([offered], device=verify_logits.device, dtype=torch.long)
-    # verify_logits has one position per input token; position i predicts
-    # what follows input i, so the draft positions are all but the last.
+    # The last row predicts the bonus. The rows before it score the offered tokens.
     accepted = accepted_prefix_length(
         target_probs[:, :-1, :], draft_probs[:, : len(offered), :], proposed
     )
     if accepted < len(offered):
-        # Rejected at `accepted`: emit from the residual so the overall
-        # distribution stays exactly the target's.
+        # Rejected: sample the residual, so the output distribution stays the target's.
         bonus_t = sample_residual(target_probs[:, accepted, :], draft_probs[:, accepted, :])
         return accepted, int(bonus_t[0].item())
-    # Everything accepted: the bonus is a free draw from the target's
-    # distribution at the position after the last draft token.
     return accepted, int(sample_from_probs(target_probs[:, -1:, :])[0, 0].item())
 
 
@@ -314,15 +269,12 @@ def context_window(
     lo: int,
     hi: int,
 ) -> torch.Tensor:
-    """One request's slice of a packed tap sink, concatenated in config order.
+    """One request's rows of a packed tap sink, concatenated in config order.
 
-    `sink[layer]` is `(1, total_q, hidden)` covering EVERY request's q-tokens;
-    `[lo, hi)` comes from that request's `cu_seqlens_q` window. Two things are
-    load-bearing: the concat follows `ordered_taps` (the drafter's `fc` was
-    trained against exactly that ordering, and a sorted or set-ordered concat
-    silently feeds it permuted features), and the result is `.clone()`d (an
-    un-cloned slice is a view that pins the whole packed activation for the
-    request's lifetime).
+    `sink[layer]` is `(1, total_q, hidden)` over all requests, and `[lo, hi)` is this
+    request's `cu_seqlens_q` window. The order must follow `ordered_taps`: the drafter's
+    `fc` learned that order, and another order feeds it permuted features with no error.
+    The clone stops a view from pinning the whole packed activation.
     """
     rows = torch.cat([sink[i][:, lo:hi, :] for i in ordered_taps], dim=-1).clone()
     assert rows.shape[1] == hi - lo
@@ -331,24 +283,17 @@ def context_window(
 
 @dataclasses.dataclass
 class DSparkSpec:
-    """Constructor-facing bundle for speculative decoding in the scheduler.
+    """The drafter and the speculative-decoding settings that the scheduler takes.
 
-    `confidence_threshold` of 0 disables truncation (verify the whole block);
-    a positive value cuts the proposal at the first draft token whose
-    predicted survival probability falls below it.
+    `confidence_threshold` truncates the proposal at the first draft token whose
+    predicted survival probability is below it. 0 turns truncation off.
 
-    `max_spec_prompt_tokens` caps which prompts speculate at all. The injected
-    context buffers one row of tapped hidden states per prompt token OUTSIDE
-    the block pool's accounting, so its exhaustion is a plain host/GPU OOM that
-    `_preempt_on_oom` cannot recover; longer prompts run the plain path.
-
-    Size it from the arithmetic, not the default: a row costs
-    `len(target_layer_ids) * hidden_size * dtype_bytes`, which at Qwen3-4B
-    shapes (5 taps, hidden 2560, bf16) is 25.6 KB, so 1024 tokens is ~26 MB per
-    speculating request and `max_concurrent` of those is what has to fit
-    alongside the weights and the pool. The buffer only reaches that peak
-    during prefill; after the first verify it shrinks to at most
-    `block_size + 1` rows.
+    `max_spec_prompt_tokens` is the longest prompt that speculates. Longer prompts
+    use the plain path. The injected context holds one tap row per prompt token,
+    outside the block pool, so `_preempt_on_oom` cannot recover from its OOM. A row
+    costs `len(target_layer_ids) * hidden_size * dtype_bytes`, so a 1024-token prompt
+    costs ~26 MB per request at Qwen3-4B shapes (5 taps, hidden 2560, bf16). After the
+    first verify, the buffer holds at most `block_size + 1` rows.
     """
 
     drafter: Qwen3DSparkDrafter
@@ -396,9 +341,7 @@ class DSparkSpec:
     ) -> tuple[list[int], torch.Tensor | None, torch.Tensor]:
         """Draft one block and truncate it to the confident prefix.
 
-        Returns `(offered, confidence, draft_probs)` where `offered` already
-        reflects confidence truncation; the caller still clamps it to the
-        request's remaining `max_tokens` room.
+        The caller must still clamp `offered` to the request's `max_tokens` room.
         """
         tokens, confidence, draft_probs = propose_block(
             self.drafter,
@@ -418,30 +361,23 @@ class DSparkSpec:
 
 @dataclasses.dataclass
 class SpecDecodeState:
-    """Per-request speculative state a `RunningRequest` carries across steps.
+    """The speculative state that a `RunningRequest` carries across engine steps.
 
-    `start` is the target slot length this round was drafted at, and the
-    invariant everything hinges on is
+    `start` is the target slot length at which the scheduler drafted this round.
+    The drafter's RoPE uses an unsliced cos/sin table, so the scheduler asserts this
+    invariant before every draft:
 
         target_slot_seq_len == draft_cache_len + context_rows        (INV)
 
-    because the drafter's RoPE rotates keys against an unsliced cos/sin table
-    (`engine/dspark/attention.py`); the scheduler asserts it before every
-    draft rather than trusting the arithmetic.
+    `offered is not None` marks a round in flight. Verify selects by it, not by
+    `RequestState`: a request fresh from prefill is DECODING with no proposal.
+    `drafted_for_start` lets a retry after a failed forward reuse the proposal. Its
+    inputs `(anchor, context, start)` do not change on a retry. The first draft already
+    folded the context into `draft_cache`, so a second draft breaks (INV).
 
-    `offered is not None` marks a round in flight: the verify phase keys its
-    membership off that, never off `RequestState`, because a request that
-    just finished prefill is DECODING by verify time while having no
-    proposal. `drafted_for_start` makes re-drafting idempotent: a retry after
-    a failed forward reuses the proposal instead of drafting (and emitting
-    state changes) twice, sound because the proposal is a pure function of
-    `(anchor, context, start)`.
-
-    `context_parts` accumulates the prompt's tapped hidden states across
-    prefill chunks; the first draft concatenates them into `context`, and
-    every verify thereafter REPLACES `context` with the freshly committed
-    window, so the buffer shrinks to at most `block_size + 1` rows after the
-    first round.
+    `context_parts` collects the prompt taps across prefill chunks. The first draft
+    joins them into `context`. Each verify replaces `context` with at most
+    `block_size + 1` committed rows. See ADR-031.
     """
 
     draft_cache: DSparkDraftCache
@@ -454,6 +390,5 @@ class SpecDecodeState:
     confidence: torch.Tensor | None = None
     start: int | None = None
     drafted_for_start: int | None = None
-    # Whether the round in flight offered fewer tokens than the drafter
-    # proposed, because the request had no room for more (see SpecSummary).
+    # True when `max_tokens` room shortened the proposal in flight (see `SpecSummary`).
     room_clamped: bool = False

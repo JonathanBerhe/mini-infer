@@ -364,38 +364,28 @@ def test_fused_block_size_64() -> None:
 @pytest.mark.requires_cuda
 @pytest.mark.requires_model
 def test_qwen_05b_turbo3_prefill_materialize_fused_matches_python() -> None:
-    """Fused and Python dequant must agree, per layer, on a cache a REAL
-    prefill populated.
+    """Fused and Python dequant agree, layer by layer, on a cache that a real
+    prefill filled.
 
-    Same assertion as `test_fused_matches_python_loop_*` above, but the pool
-    state comes from an actual Qwen2.5-0.5B forward rather than hand-written
-    blocks: real strides and dims, radii from real activations rather than
-    randn*0.1, and a partial final block whose tail slots hold the quantized
-    ZERO vector (a real append leaves them dequant-of-nothing; the fixtures
-    fill whole blocks with random data before shrinking `_num_tokens`, so
-    they never store that state).
+    The assertion is the same as in `test_fused_matches_python_loop_*` above.
+    Here the pool state comes from a real Qwen2.5-0.5B forward: real strides
+    and dimensions, radii from real activations, and a partial last block.
+    The tail slots of that block hold the quantized zero vector. The fixtures
+    never store that state, because they write random data into every slot.
 
-    This test used to assert fused-vs-python FIRST-TOKEN LOGIT cosine > 0.999.
-    That quantity is not well-defined for turbo3, so the bar was retired, not
-    loosened, on this evidence (A10, 2026-07-29: measured 0.805):
+    The test does not compare logits. For turbo3, fused and Python logits are
+    not defined to agree (A10, 2026-07-29: cosine 0.805). The two dequant paths
+    differ in the lowest bf16 bits (`tl.dot` vs `torch.matmul` reduction order).
+    Each layer re-quantizes every appended block through `searchsorted`
+    (`paged_kv_cache.py`, `_write_packed_kv_compressed`). Thus a small read
+    difference at layer L crosses a quantization step at layer L+1 and grows
+    to whole steps by layer 24. The logits diverge, but both paths are correct.
+    The 2026-05-02 bench run shows the same: its greedy decode diverged at
+    generated token 0, which is the argmax of the prefill logits
+    (`docs/benchmarks/2026-05-02-turboquant-v2a.md`).
 
-    - The two dequant paths legitimately differ by bf16-LSB reduction order
-      (`tl.dot` vs `torch.matmul`). The write path then re-quantizes every
-      appended block through `searchsorted` at EVERY layer
-      (`paged_kv_cache.py`, `_write_packed_kv_compressed`), so a layer-L read
-      perturbation crosses a quantization step boundary at layer L+1 and grows
-      to whole codec steps by layer 24. Logits diverge macroscopically with
-      both paths correct.
-    - The record agrees: the 2026-05-02 bench run's greedy decode diverged at
-      generated token 0, which IS the argmax of the prefill logits
-      (`docs/benchmarks/2026-05-02-turboquant-v2a.md`). Its E2E comparison is
-      explicitly informational and computes no logit cosine; the 0.999 logit
-      bar was never measured by anything. The prior form of this test passed
-      `use_cache=False`, which bypassed the paged cache, so it compared two
-      unquantized bf16 runs and validated nothing.
-
-    Comparing what the two paths read back from the SAME stored bytes is the
-    level at which they are defined to agree, and it is deterministic.
+    The two paths are defined to agree on what they read back from the same
+    stored bytes, and that comparison is deterministic.
     """
     from mini_infer.cache import turbo_kernel
     from mini_infer.engine.model_runner import ModelRunner
@@ -407,9 +397,9 @@ def test_qwen_05b_turbo3_prefill_materialize_fused_matches_python() -> None:
     if not turbo_kernel.supports_fused_kernel(runner.device):
         pytest.skip("fused turbo kernel unavailable; both halves would be the Python loop")
 
-    # One real prefill writes compressed K/V for every layer; whichever read
-    # path it used internally, the stored bytes are now fixed, and both halves
-    # below read those same bytes.
+    # One real prefill writes compressed K/V for every layer. The stored bytes
+    # are now fixed, so both read paths below read the same bytes, whichever
+    # path the prefill used.
     pool_cache, logits = runner.prefill(runner.tokenizer.encode(prompt))
     assert torch.isfinite(logits).all(), "prefill produced non-finite logits"
 

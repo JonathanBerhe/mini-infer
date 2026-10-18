@@ -77,7 +77,7 @@ class TensorParallelStateCacheContinuousScheduler:
         if self._thread is not None and self._thread.is_alive():
             return
         if self._crashed:
-            # See `ContinuousScheduler.start`: no request moves to a new thread.
+            # Requests of the crashed thread must not move to the new one. See ADR-028.
             self._end_in_flight(crashed=True)
         self._stop_event.clear()
         self._crashed = False
@@ -88,13 +88,9 @@ class TensorParallelStateCacheContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit, join it, end what is left, and
-        release the followers.
+        """Join the engine thread, end what is left, and release the followers.
 
-        After a clean join, every request in a slot or still waiting ends with
-        `finish_reason="cancelled"`. After a crash they end with no terminal
-        step, so their handles raise `EngineNotRunningError`. A timed-out join
-        ends nothing, because the thread can still touch the slots.
+        Leftovers end as `ContinuousScheduler.stop` describes.
         """
         self._stopping = True
         try:
@@ -113,13 +109,14 @@ class TensorParallelStateCacheContinuousScheduler:
 
     @property
     def is_running(self) -> bool:
-        """Whether the leader's engine thread is alive. A leader blocked in a
-        collective (for example because a follower died) still counts as alive."""
+        """Whether the leader's engine thread is alive.
+
+        A leader blocked on a dead follower (in a call that waits for every rank) counts as alive.
+        """
         return self._thread is not None and self._thread.is_alive()
 
     def submit(self, request: Request) -> RequestHandle:
-        """Enqueue a request; its handle raises `EngineNotRunningError` if the
-        engine thread dies before the request finishes."""
+        """Enqueue a request. Its handle raises `EngineNotRunningError` if the thread dies."""
         thread = self._thread
         if thread is None or not thread.is_alive():
             raise EngineNotRunningError("scheduler not running; call start() before submit()")
@@ -132,11 +129,7 @@ class TensorParallelStateCacheContinuousScheduler:
         return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
 
     def _end_in_flight(self, *, crashed: bool) -> None:
-        """End every request in a slot or still waiting.
-
-        Runs only after the engine thread exited. A clean exit finishes each
-        one as 'cancelled'; a crash sends no terminal step (see `stop()`).
-        """
+        """End every request in a slot or waiting. Call only after the engine thread exits."""
         leftover = [slot.request for slot in self._slots if slot is not None]
         self._slots = [None] * self._max_batch_size
         while True:

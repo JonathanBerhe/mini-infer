@@ -83,8 +83,7 @@ class PDScheduler:
     """
 
     DEFAULT_MAX_CONCURRENT = 16
-    # How long `_emit_terminal` waits for a full output queue to drain before
-    # it drops a buffered step to make room for the terminal step.
+    # `_emit_terminal` waits this long on a full output queue, then drops one step.
     TERMINAL_PUT_TIMEOUT_S = 5.0
 
     def __init__(
@@ -106,16 +105,13 @@ class PDScheduler:
         # Per-mode threads. Serial uses `_thread` only; parallel uses both.
         self._thread: threading.Thread | None = None
         self._decode_thread: threading.Thread | None = None
-        # True while `stop()` runs. `stop()` pushes the 'cancelled' terminal
-        # steps from the caller's thread after the engine threads are joined,
-        # so handles must keep waiting until then instead of reporting a dead
-        # engine (see `submit`).
+        # Liveness flags, see ADR-028. While `stop()` runs, `_stopping` keeps the
+        # handles waiting for the 'cancelled' steps that it pushes after the joins.
         self._stopping = False
-        # Set by an engine thread that dies on an exception; `stop()` reads it
-        # after the joins. A crash must not turn into 'cancelled'.
+        # Set when an engine thread crashes. In-flight requests then end with no terminal step.
         self._crashed = False
-        # Threads whose join in `stop()` timed out. `stop()` could not drain
-        # their state; `start()` does it once they have exited.
+        # Threads whose `stop()` join timed out. They can still change the state,
+        # so the next `start()` or `stop()` drains it after they exit.
         self._undrained: list[threading.Thread] = []
 
         # Engine-thread-only state. In serial mode the single engine thread
@@ -157,11 +153,8 @@ class PDScheduler:
             return
         old_threads = [*self._engine_threads(), *self._undrained]
         if (self._crashed or self._undrained) and not any(t.is_alive() for t in old_threads):
-            # The old threads died, or a `stop()` timed out on them, and no
-            # one ended their requests. Those must not move to the new
-            # threads: their handles watch the old ones, and the state they
-            # left can be half-updated. The handles already fail through the
-            # liveness check, so no terminal step goes out.
+            # Crashed or timed-out threads left this state. It must not move to the new
+            # threads: it can be half-updated, and its handles watch the old threads.
             self._end_in_flight(crashed=True)
             self._undrained = []
         self._stop_event.clear()
@@ -202,20 +195,16 @@ class PDScheduler:
         fully-free state. Final terminal steps with
         `finish_reason="cancelled"` are pushed to every still-active
         request, including those never admitted, so API consumers don't
-        hang on `get_step()`. `_stopping` keeps their handles waiting for
-        those steps after the engine threads are gone. If an engine thread
-        crashed, no terminal step goes out: the handles then raise
-        `EngineNotRunningError`, as they do when no `stop()` follows. If a
-        join times out, nothing is drained, because that thread can still
-        touch the state; the handles fail through their liveness check, and
-        the next `start()` drains once those threads have exited.
+        hang on `get_step()`.
+
+        After a crash, the handles raise `EngineNotRunningError` instead. After a
+        timed-out join, the drain waits for the next `start()` or `stop()`, because
+        the live thread can still change the state.
         """
         self._stopping = True
         try:
             self._stop_event.set()
-            # A thread left over from an earlier timed-out stop counts too.
-            # Its requests end with no terminal step, as in `start()`: their
-            # handles watch that thread and fail once it exits.
+            # Threads of an earlier timed-out join count too, with no terminal step.
             threads = [*self._engine_threads(), *self._undrained]
             leftover = bool(self._undrained)
             # Wake up any thread blocked on a queue.get(timeout=...). The poll
@@ -235,11 +224,10 @@ class PDScheduler:
             self._stopping = False
 
     def _end_in_flight(self, *, crashed: bool) -> None:
-        """Release every slot and end every request, after the threads exited.
+        """Release every slot and end every request, after the engine threads exit.
 
-        A clean exit finishes each request as 'cancelled'; a crash sends no
-        terminal step (see `stop()`). Slots are released either way, so the
-        block pool returns to fully free.
+        Requests end as 'cancelled'. With `crashed=True` (a crash or a timed-out join),
+        no step goes out, because the handles fail through their liveness check.
         """
 
         def end(r: RunningRequest) -> None:
@@ -247,8 +235,8 @@ class PDScheduler:
                 self._emit_terminal(r, reason="cancelled")
 
         # Drain remaining state in dependency order: free decode slots
-        # first (so the block pool releases), then end the requests of
-        # any still-active handles.
+        # first (so the block pool releases), then end the requests that are
+        # still active.
         if self._session is not None:
             for slot_id in list(self._decoding.keys()):
                 if self._session.is_active(slot_id):
@@ -259,7 +247,7 @@ class PDScheduler:
         self._handoffs.clear()
         # In parallel mode the handoff queue may hold un-decoded handoffs;
         # they were prefilled but never reached the decode session. Their
-        # requests still need ending.
+        # requests must end too.
         if self._handoff_queue is not None:
             while True:
                 try:
@@ -270,10 +258,8 @@ class PDScheduler:
         for r in self._prefilling:
             end(r)
         self._prefilling.clear()
-        # Submitted but never admitted. `submit` rejects new requests once
-        # the stop event is set. A `submit` on another thread that passed
-        # its check just before can still land here after this drain; its
-        # handle then fails through the liveness check.
+        # Requests never admitted. A `submit` on another thread that races the stop
+        # event can queue after this drain. Its handle fails through its liveness check.
         while True:
             try:
                 r = self._waiting.get_nowait()
@@ -285,11 +271,7 @@ class PDScheduler:
 
     @property
     def is_running(self) -> bool:
-        """Whether every engine thread of the mode is alive.
-
-        In parallel mode one dead thread stalls every request (no prefill, or
-        no decode), so the engine counts as running only while both live.
-        """
+        """True only while every engine thread lives. One dead thread stalls every request."""
         threads = self._engine_threads()
         return bool(threads) and all(t.is_alive() for t in threads)
 
@@ -297,11 +279,7 @@ class PDScheduler:
         return [t for t in (self._thread, self._decode_thread) if t is not None]
 
     def _run_logged(self, loop: Callable[[], None]) -> None:
-        """Thread target: run one engine loop and log a crash before the thread dies.
-
-        A dead thread fails its requests through the handles' liveness check
-        (`RequestHandle`); this log line is where the cause shows up.
-        """
+        """Thread target: run one engine loop. On a crash, log the cause and set `_crashed`."""
         try:
             loop()
         except Exception:
@@ -316,14 +294,11 @@ class PDScheduler:
 
         The handle's `get_step()` blocks until the engine produces the
         next token; the final step carries a `finish_reason` indicating
-        normal completion, EOS, max-tokens, or client-cancel. If an engine
-        thread dies first, the handle raises `EngineNotRunningError`.
+        normal completion, EOS, max-tokens, or client-cancel.
 
-        Before `start()`, and once `stop()` begins, it raises
-        `EngineNotRunningError` instead of queueing the request. The handle
-        watches the threads that run now, so a request outlives neither of
-        them. `stop()` sends its own 'cancelled' terminal steps, and
-        `_stopping` keeps the handle waiting for them.
+        Raises `EngineNotRunningError` before `start()`, after a crash, or once `stop()`
+        begins. The handle raises it too if a thread that ran at submit time dies,
+        unless a clean `stop()` ends the request as 'cancelled'.
         """
         threads = self._engine_threads()
         if self._stop_event.is_set() or not self.is_running:
@@ -339,10 +314,8 @@ class PDScheduler:
         self._waiting.put(running)
 
         def engine_alive() -> bool:
-            # The threads are read first: dead threads plus `_stopping` False
-            # means either a crash or a `stop()` that already pushed its
-            # terminal steps. The other order lets a stop that begins between
-            # the two reads look like a crash.
+            # Read the threads before `_stopping`, so dead threads with `_stopping` False
+            # mean a crash or a finished `stop()`. The other order can see a stop as a crash.
             return all(t.is_alive() for t in threads) or self._stopping
 
         return RequestHandle(running, engine_alive=engine_alive)
@@ -399,9 +372,8 @@ class PDScheduler:
         try:
             handoffs = self._prefill_worker.prefill_batch(requests)
         except OutOfMemoryError:
-            # The batch does not fit in the KV pool: a resource limit, not an
-            # engine failure, so it ends as 'cancelled', like the preemption
-            # of `ContinuousScheduler`.
+            # A full KV pool is a resource limit, not an engine failure, so the batch
+            # ends as 'cancelled', as an OOM preemption does in `ContinuousScheduler`.
             logger.warning("PDScheduler: KV pool full during prefill; cancelling the batch")
             for r in prefilling:
                 self._emit_terminal(r, reason="cancelled")
@@ -524,12 +496,9 @@ class PDScheduler:
                     except queue.Full:
                         continue
                 else:
-                    # Stop requested while the put was blocked; the decode
-                    # thread will not see this handoff. Hand the request back
-                    # to `_prefilling`, so that `stop()` ends it after the
-                    # joins, where it knows whether a thread crashed. (The
-                    # handoff holds no pool blocks: `prefill_batch` frees its
-                    # slots before it returns.)
+                    # A stop began while the put blocked. `stop()` ends this request after
+                    # the joins, when it knows whether a thread crashed. The handoff
+                    # holds no pool blocks: `prefill_batch` frees its slots on return.
                     self._prefilling.append(r)
 
     def _decode_thread_loop(self) -> None:
@@ -637,14 +606,10 @@ class PDScheduler:
     def _emit_terminal(self, r: RunningRequest, reason: str, *, failed: bool = False) -> None:
         """Push the final `GenerationStep` with a `finish_reason`.
 
-        `failed` marks a request that the engine failed; the handle turns that
-        step into `RequestFailedError`. The step carries no text: the cause is
-        in the log, and step text goes to the client as completion output.
-
-        The terminal step must arrive, or the handle waits forever on a live
-        engine. So after `TERMINAL_PUT_TIMEOUT_S` on a full queue, one
-        buffered intermediate step makes room for it, as in
-        `ContinuousScheduler._finish`.
+        `failed=True` makes the handle raise `RequestFailedError`. The step has no text,
+        because the client gets step text as output. The cause goes to the log.
+        On a full queue, it drops the oldest step after `TERMINAL_PUT_TIMEOUT_S`, because
+        a lost terminal step hangs the handle on a live engine. See ADR-030.
         """
         if r.state == RequestState.DONE:
             # Already terminated; idempotent.

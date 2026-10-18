@@ -1,25 +1,13 @@
 """Engine problems reach the caller as errors, and output is never lost.
 
-Every scheduler runs its engine on a thread that dies on an unexpected
-exception, and after that no request in flight ever receives its terminal
-step. These tests pin the layers that turn engine problems into errors
-(ADR-028, ADR-030) and the event-loop reads of the server (ADR-029):
+An unexpected exception kills a scheduler's engine thread. These tests pin how
+handles, schedulers, and the HTTP endpoint report a dead engine, a failed request,
+or a clean `stop()` (ADR-028, ADR-029, ADR-030). A handle always hands out its
+buffered steps before it raises.
 
-- `RequestHandle` polls the liveness of the thread that owns its request
-  whenever its queue stays empty, hands out every buffered step first, and
-  then raises `EngineNotRunningError`. A step marked `failed` raises
-  `RequestFailedError`. `get_step_async` waits on the event loop with the
-  same rules.
-- Each of the five schedulers binds its handles to its engine thread(s),
-  rejects `submit()` once that thread is gone, and cancels what is left in a
-  clean `stop()`.
-- The HTTP endpoint answers a dead engine with a 503, a failed request with
-  a 500 (or an SSE error event once a stream has started), never blocks the
-  event loop, and keeps every token's text with one executor thread.
-
-All engines here are model-free doubles on CPU. Every blocking call runs
-under `_bounded` or `_wait_until`, so a regression fails within seconds
-instead of hanging the suite (no pytest-timeout plugin is installed).
+All engines are CPU test doubles with no model. No pytest-timeout plugin is
+installed, so every wait has a time limit (`_bounded`, `_wait_until`, or
+`timeout`). A regression fails fast and does not hang the suite.
 """
 
 from __future__ import annotations
@@ -64,7 +52,6 @@ from mini_infer.workers import PDScheduler
 T = TypeVar("T")
 
 _VOCAB = 32
-# Short enough that a dead engine shows up fast, long enough to be a real slice.
 _POLL_S = 0.05
 _BOUND_S = 10.0
 
@@ -75,17 +62,12 @@ def _fast_liveness_poll(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _InjectedCrashError(Exception):
-    """The one exception the doubles raise, so a test can tell the injected
-    death apart from a double that broke for some other reason."""
+    """What the doubles raise to kill an engine thread, unlike an accidental error."""
 
 
 @pytest.fixture
 def crashes(monkeypatch: pytest.MonkeyPatch) -> list[type[BaseException]]:
-    """Exception types of engine threads that died during the test.
-
-    Replacing the hook also keeps pytest's unhandled-thread-exception warning
-    out of the report: the deaths here are the point of the test.
-    """
+    """Exception types of engine threads that die in the test, kept out of pytest's warnings."""
     seen: list[type[BaseException]] = []
 
     def hook(args: threading.ExceptHookArgs) -> None:
@@ -96,13 +78,13 @@ def crashes(monkeypatch: pytest.MonkeyPatch) -> list[type[BaseException]]:
 
 
 def _bounded(fn: Callable[[], T], timeout: float = _BOUND_S) -> T:
-    """Run `fn` on a daemon thread; fail the test if it does not return in time."""
+    """Run `fn` on a daemon thread, and fail the test if it does not return in time."""
     out: dict[str, Any] = {}
 
     def target() -> None:
         try:
             out["value"] = fn()
-        except BaseException as exc:  # re-raised on the test thread below
+        except BaseException as exc:
             out["error"] = exc
 
     worker = threading.Thread(target=target, daemon=True)
@@ -116,7 +98,6 @@ def _bounded(fn: Callable[[], T], timeout: float = _BOUND_S) -> T:
 
 
 def _wait_until(predicate: Callable[[], object], timeout: float = _BOUND_S) -> None:
-    """Poll `predicate` until it is true; fail the test instead of spinning forever."""
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() > deadline:
@@ -185,8 +166,7 @@ def test_handle_steps_yields_buffered_steps_then_raises() -> None:
 
 
 def test_handle_returns_a_last_step_put_just_before_the_thread_exited() -> None:
-    """The thread can put its terminal step after the timed-out read but before
-    the liveness read. The handle must look once more instead of raising."""
+    """A put between the empty read and the liveness read must still reach the caller."""
     req = _bare()
 
     def exits_after_its_last_put() -> bool:
@@ -209,7 +189,6 @@ def test_handle_wait_returns_a_result_when_the_terminal_step_races_the_exit() ->
 
 
 def test_handle_keeps_polling_after_a_first_alive_read() -> None:
-    """Liveness is read on every empty slice, not once at the start."""
     reads: list[bool] = []
 
     def alive_once() -> bool:
@@ -222,7 +201,6 @@ def test_handle_keeps_polling_after_a_first_alive_read() -> None:
 
 
 def test_handle_waits_through_empty_slices_while_the_engine_lives() -> None:
-    """A slow engine is not a dead one: an empty slice alone is no error."""
     req = _bare()
 
     def produce_late() -> None:
@@ -252,16 +230,15 @@ def test_handle_timeout_on_a_dead_engine_reports_the_dead_engine() -> None:
 
 
 def test_handle_reports_a_dead_engine_even_when_the_timeout_is_shorter_than_a_poll() -> None:
-    """The server reads in slices shorter than `LIVENESS_POLL_SECONDS` and
-    retries on `TimeoutError`. If the deadline won over liveness, that retry
-    loop would never see the dead engine."""
+    """Liveness must win over a short deadline, or a caller that retries on `TimeoutError`
+    never sees the dead engine."""
     handle = RequestHandle(_bare(), engine_alive=_dead)
     with pytest.raises(EngineNotRunningError):
         _bounded(lambda: handle.get_step(timeout=_POLL_S / 5))
 
 
 def test_handle_without_a_liveness_check_keeps_blocking() -> None:
-    """`engine_alive=None` (a bare handle in a test) keeps the old behavior."""
+    """With `engine_alive=None`, `get_step()` blocks until a step arrives."""
     req = _bare()
     handle = RequestHandle(req)
     got: list[GenerationStep] = []
@@ -275,7 +252,6 @@ def test_handle_without_a_liveness_check_keeps_blocking() -> None:
 
 
 def test_build_result_ignores_the_terminal_step_text() -> None:
-    """The text of a terminal step is not completion output."""
     req = _bare(_token("a"), GenerationStep(text="not output", finish_reason="cancelled"))
     result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
     assert (result.text, result.finish_reason) == ("a", "cancelled")
@@ -287,8 +263,7 @@ def _failed_terminal() -> GenerationStep:
 
 @pytest.mark.parametrize("call", ["get_step", "steps", "wait", "get_step_async"])
 def test_a_failed_request_raises_after_its_buffered_steps(call: str) -> None:
-    """A failed request ends with `RequestFailedError`, never with a step that
-    looks like a cancellation. Output produced before the failure comes first."""
+    """A failed request ends with `RequestFailedError`, not a step that looks cancelled."""
     handle = RequestHandle(_bare(_token("a"), _failed_terminal()), engine_alive=lambda: True)
     seen: list[str] = []
 
@@ -313,8 +288,7 @@ def test_a_failed_request_raises_after_its_buffered_steps(call: str) -> None:
 
 @pytest.mark.parametrize("call", ["get_step", "get_step_async"])
 def test_a_failed_terminal_step_is_reported_after_the_engine_exits(call: str) -> None:
-    """The last-chance read after a dead engine also checks for failure: the
-    failed step lands between the empty read and the liveness read."""
+    """The last read after a dead engine also checks for a failed step."""
     req = _bare()
 
     def exits_after_its_failed_put() -> bool:
@@ -331,15 +305,14 @@ def test_a_failed_terminal_step_is_reported_after_the_engine_exits(call: str) ->
 
 
 def _run_async(fn: Callable[[], Any]) -> Any:
-    """Run a coroutine function on a fresh event loop, under `_bounded`."""
     return _bounded(lambda: asyncio.run(fn()))
 
 
 def test_get_step_async_wakes_on_a_put_without_waiting_for_a_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The engine's put wakes the loop at once; the poll slice is only for
-    liveness. A slice this long would show up in the latency otherwise."""
+    """A put wakes the loop at once. With a 5 s poll slice, a read that waits for the
+    slice fails the 1 s limit."""
     monkeypatch.setattr(RequestHandle, "LIVENESS_POLL_SECONDS", 5.0)
     req = _bare()
     handle = RequestHandle(req, engine_alive=lambda: True)
@@ -362,8 +335,7 @@ def test_get_step_async_hands_out_buffered_steps_then_reports_a_dead_engine() ->
         _run_async(drain)
     assert seen == ["a", "b"]
     assert req.cancel_event.is_set()
-    # The listener does not outlive the wait: a later put must not call into
-    # a loop that is gone.
+    # The listener must not outlive the wait, or a later put calls into a closed loop.
     assert req.output_queue._listener is None  # type: ignore[attr-defined]
 
 
@@ -392,8 +364,7 @@ def test_get_step_async_needs_a_step_queue() -> None:
 
 
 def test_step_queue_put_survives_a_reader_whose_loop_closed() -> None:
-    """The listener runs on the engine thread. A reader's loop that closed
-    under it must not turn the engine's put into a crash."""
+    """A put must not crash the engine thread when the reader's loop is closed."""
     loop = asyncio.new_event_loop()
     loop.close()
     out = StepQueue()
@@ -406,7 +377,7 @@ def test_step_queue_put_survives_a_reader_whose_loop_closed() -> None:
 
 
 class _CharTokenizer:
-    """One id per character; every id decodes to exactly one character."""
+    """One id per character. Every id decodes to exactly one character."""
 
     eos_token_id = -1  # never sampled: the doubles favor token 0
 
@@ -418,13 +389,9 @@ class _CharTokenizer:
 
 
 class _ScriptedRunner:
-    """Duck-typed ModelRunner: a real BlockPool and a forward with three knobs.
+    """Duck-typed ModelRunner with a real BlockPool. Its logits favor token 0.
 
-    `crash_on_call` raises `_InjectedCrashError` on that 1-based forward call,
-    which kills a `ContinuousScheduler` engine thread. `gate`, when set,
-    makes every forward wait for it, so an engine can be alive but stalled.
-    `delay_s` slows each forward down. Logits always favor token 0.
-    """
+    `crash_on_call` crashes on that 1-based forward call. `gate` stalls a live engine."""
 
     def __init__(
         self,
@@ -465,8 +432,7 @@ class _ScriptedRunner:
             self._gate.wait(_BOUND_S)
         if self._delay_s:
             time.sleep(self._delay_s)
-        # Append K/V like a one-layer model, so that the cache really holds
-        # blocks from the pool and a test can see them come back.
+        # Append K/V so the cache holds real pool blocks, and a test sees them come back.
         kv = torch.zeros(cu_seqlens_q[-1], 1, 8)
         cache.append_kv_packed(kv, kv, torch.tensor(cu_seqlens_q, dtype=torch.int32), 0)
         logits = torch.full((1, cu_seqlens_q[-1], _VOCAB), -1.0)
@@ -475,7 +441,6 @@ class _ScriptedRunner:
 
 
 def _emit_then_crash(running: RunningRequest) -> None:
-    """What an injected engine step does: emit one token step, then die."""
     running.output_queue.put_nowait(_token("x"))
     raise _InjectedCrashError("injected engine-thread crash")
 
@@ -488,8 +453,7 @@ def _state_cache_generator() -> Any:
 
 
 def _continuous() -> tuple[ContinuousScheduler, int]:
-    # Forward 1 is the prefill and forward 2 the first decode, each followed
-    # by one emitted token; forward 3 crashes.
+    # Forwards 1 (prefill) and 2 (decode) each emit one token. Forward 3 crashes.
     return ContinuousScheduler(_ScriptedRunner(crash_on_call=3)), 2  # type: ignore[arg-type]
 
 
@@ -516,7 +480,7 @@ def _tp_continuous() -> tuple[TensorParallelStateCacheContinuousScheduler, int]:
 
 
 def _crash_on_admit(sched: PDScheduler) -> None:
-    """Kill the thread that admits (serial: the only one; parallel: prefill)."""
+    """Kill the thread that admits requests (serial: the only thread, parallel: prefill)."""
 
     def admit() -> None:
         try:
@@ -535,7 +499,6 @@ def _pd_serial() -> tuple[PDScheduler, int]:
 
 
 def _pd_parallel_prefill_dies() -> tuple[PDScheduler, int]:
-    """Only the prefill thread dies; the decode thread lives on."""
     sched = PDScheduler(_ScriptedRunner(), mode="parallel")  # type: ignore[arg-type]
     _crash_on_admit(sched)
     return sched, 1
@@ -618,8 +581,7 @@ def test_pd_submit_needs_a_running_engine(mode: str) -> None:
 
 
 def _wait_concurrently(handles: list[RequestHandle]) -> tuple[list[Any], list[threading.Thread]]:
-    """Start one `wait()` per handle on daemon threads, so they wait during a
-    `stop()` instead of after it."""
+    """Start one `wait()` per handle on a thread, so they wait during a `stop()`."""
     results: list[Any] = []
 
     def wait(handle: RequestHandle) -> None:
@@ -641,8 +603,7 @@ def _join_all(waiters: list[threading.Thread]) -> None:
 
 
 def test_pd_stop_cancels_a_request_in_flight_instead_of_failing_it() -> None:
-    """`stop()` sends 'cancelled' after the engine threads exit; the handle
-    must wait for it instead of reporting a dead engine in that window."""
+    """Between thread exit and the 'cancelled' step of `stop()`, the handle must wait."""
     sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
     # Admitted but never prefilled: the request parks in `_prefilling`.
     sched._run_prefill_batch = lambda: None  # type: ignore[method-assign]
@@ -678,9 +639,7 @@ def test_pd_stop_cancels_a_request_that_was_never_admitted() -> None:
 
 
 def test_continuous_stop_cancels_requests_in_flight_and_frees_their_blocks() -> None:
-    """A clean `stop()` is a boundary: every request left running or waiting
-    ends as 'cancelled', the pool gets its blocks back, and a restarted
-    engine starts empty."""
+    """A restart after the `stop()` starts empty and serves new requests."""
     runner = _ScriptedRunner(delay_s=0.002)
     sched = ContinuousScheduler(runner, max_concurrent=1)  # type: ignore[arg-type]
     free_at_start = runner.block_pool.num_free_blocks
@@ -732,7 +691,7 @@ def test_slot_schedulers_stop_cancels_slotted_and_waiting_requests(name: str) ->
     finish = sched._finish
 
     def slow_finish(running: RunningRequest, reason: Any) -> None:
-        time.sleep(4 * _POLL_S)  # the waiters poll a dead thread meanwhile
+        time.sleep(4 * _POLL_S)
         finish(running, reason)
 
     sched.start()
@@ -751,8 +710,7 @@ def test_slot_schedulers_stop_cancels_slotted_and_waiting_requests(name: str) ->
 
 
 def test_tp_stop_cancels_the_requests_still_waiting() -> None:
-    """The real `_serve` finishes the request it serves (the join waits for
-    that generation); `stop()` cancels the ones still waiting."""
+    """The join waits for the served request to finish. `stop()` cancels the others."""
     serving = threading.Event()
     stop_requested = threading.Event()
 
@@ -770,7 +728,7 @@ def test_tp_stop_cancels_the_requests_still_waiting() -> None:
         waiting = sched.submit(_request())
         stopper = threading.Thread(target=sched.stop, daemon=True)
         stopper.start()
-        _wait_until(sched._stop_event.is_set)  # the event that ends the loop
+        _wait_until(sched._stop_event.is_set)  # so the loop exits instead of serving `waiting`
         stop_requested.set()
         stopper.join(_BOUND_S)
         assert not stopper.is_alive()
@@ -783,13 +741,9 @@ def test_tp_stop_cancels_the_requests_still_waiting() -> None:
 
 
 def _crash_with_requests_tracked(name: str) -> tuple[Any, int, Callable[[], None]]:
-    """A scheduler whose engine dies while it still tracks a request.
+    """A scheduler, a request count, and a crash trigger to fire after the submits.
 
-    Returns the scheduler, how many requests to submit, and a trigger to call
-    after the submits. A crash must leave a request where `stop()` looks (a
-    slot, the running batch, or a queue); otherwise `stop()` has nothing to
-    misreport.
-    """
+    The crash must leave a request where `stop()` looks: a slot, the batch, or a queue."""
     go = threading.Event()
     sched: Any
     if name == "continuous":
@@ -816,7 +770,7 @@ def _crash_with_requests_tracked(name: str) -> tuple[Any, int, Callable[[], None
         sched = _tp()[0]
 
         def serve(running: RunningRequest) -> None:
-            go.wait(_BOUND_S)  # the second request is waiting by now
+            go.wait(_BOUND_S)
             raise _InjectedCrashError("injected engine-thread crash")
 
         sched._serve = serve
@@ -855,8 +809,7 @@ def _crash_with_requests_tracked(name: str) -> tuple[Any, int, Callable[[], None
 def test_stop_right_after_a_crash_still_reports_the_crash(
     name: str, crashes: list[type[BaseException]]
 ) -> None:
-    """A `stop()` that lands before the waiters' next liveness poll must not
-    turn the crash into 'cancelled': the outcome may not depend on timing."""
+    """A `stop()` before the next liveness poll must not turn the crash into 'cancelled'."""
     sched, n_requests, trigger = _crash_with_requests_tracked(name)
     sched.start()
     try:
@@ -872,8 +825,7 @@ def test_stop_right_after_a_crash_still_reports_the_crash(
         sched.stop()
 
 
-# What a failing prefill or generation raises. The tests check that this text
-# reaches the log and never the caller.
+# A failure message that must reach the log and never the caller.
 _SECRET = "failed at /srv/models/secret-path, shape (7, 4096)"
 
 
@@ -918,9 +870,8 @@ def test_pd_prefill_failure_fails_the_request_and_keeps_the_engine(
 def test_a_quick_restart_after_a_crash_does_not_revive_its_requests(
     name: str, crashes: list[type[BaseException]]
 ) -> None:
-    """`start()` right after a crash, with no `stop()`: the requests that the
-    dead thread left must not move to the new thread (their handles watch the
-    dead one, and the state can be half-updated). They end with the crash."""
+    """The dead thread's requests stay with it: their handles watch it, and their state
+    can be half-updated."""
     sched, n_requests, trigger = _crash_with_requests_tracked(name)
     sched.start()
     try:
@@ -939,8 +890,7 @@ def test_a_quick_restart_after_a_crash_does_not_revive_its_requests(
 def test_a_crash_inside_the_oom_handler_is_a_crash(
     crashes: list[type[BaseException]],
 ) -> None:
-    """The OOM handler runs inside the engine loop too. If it raises, the
-    thread dies, and `stop()` must treat it like any other crash."""
+    """An exception in the OOM handler kills the thread, and `stop()` must report a crash."""
 
     class _OomRunner(_ScriptedRunner):
         def forward_step_packed(self, cache: PagedKVCache, *args: Any) -> torch.Tensor:
@@ -968,8 +918,7 @@ def test_a_crash_inside_the_oom_handler_is_a_crash(
 
 
 def test_pd_stop_with_a_timed_out_join_drains_nothing() -> None:
-    """A thread that outlives the join can still touch the state, so `stop()`
-    must leave it alone. The handle then fails once the thread exits."""
+    """A thread that outlives the join can still touch the state, so `stop()` leaves it alone."""
     sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
     entered = threading.Event()
     release = threading.Event()
@@ -995,9 +944,8 @@ def test_pd_stop_with_a_timed_out_join_drains_nothing() -> None:
         engine.join(_BOUND_S)
         with pytest.raises(EngineNotRunningError):
             _bounded(handle.wait)
-        # The next start() drains what the timed-out stop left, so the stale
-        # request neither moves to the new thread nor counts toward the
-        # concurrency limit.
+        # The next start() drains the leftover, so it neither moves to the new thread
+        # nor counts toward the concurrency limit.
         sched.start()
         assert sched._prefilling == []
     finally:
@@ -1006,9 +954,8 @@ def test_pd_stop_with_a_timed_out_join_drains_nothing() -> None:
 
 
 def test_pd_second_stop_ends_a_timed_out_stops_leftovers_like_start() -> None:
-    """After a timed-out stop, the leftover request belongs to a thread that
-    its handle watches. A second `stop()` must end it with no terminal step,
-    as `start()` does, whether or not the waiter polls during that stop."""
+    """The leftover belongs to the old thread, which its handle watches. A second `stop()`
+    drains it with no terminal step, so the handle reports the dead engine."""
     sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
     entered = threading.Event()
     release = threading.Event()
@@ -1046,8 +993,7 @@ def test_pd_second_stop_ends_a_timed_out_stops_leftovers_like_start() -> None:
 
 
 def test_pd_parallel_prefill_thread_hands_back_on_a_clean_stop() -> None:
-    """A clean `stop()` that interrupts a blocked handoff still ends the
-    request as 'cancelled': the prefill thread hands it back to `stop()`."""
+    """A request whose blocked handoff `stop()` interrupts still ends as 'cancelled'."""
     sched = PDScheduler(_ScriptedRunner(), mode="parallel", max_concurrent=1)  # type: ignore[arg-type]
     prefilled = threading.Semaphore(0)
 
@@ -1057,7 +1003,6 @@ def test_pd_parallel_prefill_thread_hands_back_on_a_clean_stop() -> None:
         return [object() for _ in requests]
 
     sched._prefill_worker.prefill_batch = prefill_batch  # type: ignore[method-assign]
-    # The decode thread takes no handoff; it only waits for the stop.
     sched._decode_thread_loop = lambda: sched._stop_event.wait(_BOUND_S)  # type: ignore[method-assign]
     sched.start()
     try:
@@ -1078,9 +1023,8 @@ def test_pd_parallel_prefill_thread_hands_back_on_a_clean_stop() -> None:
 def test_pd_parallel_prefill_thread_does_not_cancel_after_a_decode_crash(
     crashes: list[type[BaseException]],
 ) -> None:
-    """The prefill thread can be blocked on a full handoff queue when `stop()`
-    begins. It hands the request back instead of cancelling it, so `stop()`
-    applies the crash rule to it too."""
+    """A prefill thread blocked on a full handoff queue hands its request back without a cancel,
+    so `stop()` reports the crash for it too."""
     sched = PDScheduler(_ScriptedRunner(), mode="parallel", max_concurrent=1)  # type: ignore[arg-type]
     prefilled = threading.Semaphore(0)
 
@@ -1103,7 +1047,7 @@ def test_pd_parallel_prefill_thread_does_not_cancel_after_a_decode_crash(
         second = sched.submit(_request())
         for _ in range(2):
             assert prefilled.acquire(timeout=_BOUND_S)
-        # The first handoff fills the queue (size 1); the second one blocks.
+        # The first handoff fills the queue (size 1). The second one blocks.
         assert sched._handoff_queue is not None
         _wait_until(sched._handoff_queue.full)
         armed.set()
@@ -1120,8 +1064,7 @@ def test_pd_parallel_prefill_thread_does_not_cancel_after_a_decode_crash(
 def test_a_clean_stop_after_a_crash_and_a_restart_cancels(
     crashes: list[type[BaseException]],
 ) -> None:
-    """The crash belongs to the old thread. After `start()`, a clean `stop()`
-    ends the new thread's requests as 'cancelled' again."""
+    """The crash belongs to the old thread only."""
     runner = _ScriptedRunner(crash_on_call=3, delay_s=0.002)
     sched = ContinuousScheduler(runner)  # type: ignore[arg-type]
     sched.start()
@@ -1129,7 +1072,7 @@ def test_a_clean_stop_after_a_crash_and_a_restart_cancels(
         crashed = sched.submit(_request(max_tokens=8))
         with pytest.raises(EngineNotRunningError):
             _bounded(crashed.wait)
-        sched.start()  # forward call 3 is behind us; the new thread does not crash
+        sched.start()  # the runner is past forward call 3, so the new thread does not crash
         running = sched.submit(_request(max_tokens=100_000))
         assert _bounded(running.get_step).finish_reason is None
         sched.stop()
@@ -1141,8 +1084,7 @@ def test_a_clean_stop_after_a_crash_and_a_restart_cancels(
 
 @pytest.mark.parametrize("mode", ["serial", "parallel"])
 def test_pd_prefill_out_of_memory_cancels_the_batch_instead_of_failing_it(mode: str) -> None:
-    """A full KV pool is a resource limit, as for `ContinuousScheduler`'s
-    preemption, not an engine failure."""
+    """A full KV pool is a resource limit, not an engine failure, as in preemption."""
     sched = PDScheduler(_ScriptedRunner(), mode=mode)  # type: ignore[arg-type]
 
     def prefill_batch(_requests: list[Request]) -> list[Any]:
@@ -1174,8 +1116,7 @@ def test_tp_generation_failure_fails_the_request_and_keeps_the_engine() -> None:
 
 
 def test_pd_terminal_step_lands_even_on_a_full_queue(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A dropped terminal step would leave the handle waiting forever on a
-    live engine, which no liveness check can see."""
+    """A lost terminal step leaves the handle waiting forever on a live engine."""
     monkeypatch.setattr(PDScheduler, "TERMINAL_PUT_TIMEOUT_S", 0.01)
     sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
     req = RunningRequest(request=_request(), output_queue=StepQueue(maxsize=2))
@@ -1183,16 +1124,15 @@ def test_pd_terminal_step_lands_even_on_a_full_queue(monkeypatch: pytest.MonkeyP
     req.output_queue.put(_token("b"))
     sched._emit_terminal(req, "length")
     result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
-    # One buffered step made room for the terminal step.
+    # `_emit_terminal` dropped the oldest step ("a") to make room for the terminal step.
     assert (result.text, result.finish_reason) == ("b", "length")
 
 
 def test_a_handle_stays_bound_to_the_thread_that_crashed(
     crashes: list[type[BaseException]],
 ) -> None:
-    """After a crash, a quick `start()` brings up a thread that never saw the
-    request (the StateCache schedulers keep no trace of it). The handle must
-    watch the thread that owned it, or it would wait on the new one forever."""
+    """A quick `start()` after a crash brings up a thread that never saw the request.
+    A handle that watched the new thread would wait forever."""
     sched, _ = _state_cache()  # each prefill emits one step, then crashes
     sched.start()
     try:
@@ -1214,10 +1154,7 @@ def test_a_handle_stays_bound_to_the_thread_that_crashed(
 class _Server:
     """The real `completions` route on a fresh app over one scheduler.
 
-    Every handle the endpoint gets is recorded, so teardown can end it: if a
-    regression leaves the endpoint blocked, `TestClient` cannot exit until the
-    handle's queue gets its terminal step.
-    """
+    It records each handle, so teardown can end it: a blocked endpoint hangs `TestClient` exit."""
 
     def __init__(self, sched: Any, *, start: bool = True) -> None:
         self.sched = sched
@@ -1365,8 +1302,7 @@ def test_http_non_streaming_request_does_not_block_the_event_loop(
     first = threading.Thread(target=lambda: pending.append(_post(client)), daemon=True)
     first.start()
     assert runner.entered.wait(_BOUND_S)
-    # Several liveness slices pass while the engine is stalled: an empty slice
-    # on a live engine must not fail the request.
+    # Empty poll slices on a stalled but live engine must not fail the request.
     time.sleep(6 * _POLL_S)
     assert _bounded(lambda: client.get("/ping"), timeout=2.0).status_code == 200
     assert first.is_alive()
@@ -1381,14 +1317,10 @@ def test_http_non_streaming_request_does_not_block_the_event_loop(
 def test_http_non_streaming_requests_do_not_starve_each_other_of_threads(
     serve: Callable[..., tuple[_Server, TestClient]],
 ) -> None:
-    """With one executor thread and small output queues, two concurrent
-    completions both keep every token. A request that held the thread for its
-    whole generation would leave the other's queue unread, and that queue
-    drops steps once it is full."""
+    """With one executor thread, a reader that holds it for a whole generation leaves the
+    other request's small queue unread, so it overflows and drops steps."""
     gate = threading.Event()
-    # 20 ms per forward gives a stalled event loop about 80 ms of slack before
-    # a 4-step queue overflows. A reader that holds the only thread for a
-    # whole generation still overflows it, whatever the delay.
+    # 20 ms per forward gives a stalled loop about 80 ms before a 4-step queue overflows.
     sched = ContinuousScheduler(_ScriptedRunner(gate=gate, delay_s=0.02))  # type: ignore[arg-type]
     sched.DEFAULT_OUTPUT_QUEUE_SIZE = 4  # type: ignore[misc]
     server, client = serve(sched, gates=(gate,))
@@ -1399,10 +1331,8 @@ def test_http_non_streaming_requests_do_not_starve_each_other_of_threads(
 def test_http_requests_waiting_for_admission_do_not_starve_the_running_one(
     serve: Callable[..., tuple[_Server, TestClient]],
 ) -> None:
-    """Two requests wait in the admission queue while one generates, and the
-    executor has one thread. A reader that holds a thread while it waits, even
-    in short slices, leaves the running request's small queue unread long
-    enough to overflow. Reading on the event loop needs no thread at all."""
+    """Two requests wait for admission while one generates, with one executor thread.
+    A waiter that holds the thread, even in short slices, starves the running queue."""
     gate = threading.Event()
     sched = ContinuousScheduler(  # type: ignore[arg-type]
         _ScriptedRunner(gate=gate, delay_s=0.02), max_concurrent=1
@@ -1414,8 +1344,6 @@ def test_http_requests_waiting_for_admission_do_not_starve_the_running_one(
 
 
 def _one_executor_thread(client: TestClient) -> None:
-    """Shrink the app loop's default executor to one thread."""
-
     async def shrink() -> None:
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
 
@@ -1426,8 +1354,7 @@ def _one_executor_thread(client: TestClient) -> None:
 def _assert_no_text_lost(
     server: _Server, client: TestClient, gate: threading.Event, *, n_requests: int, max_tokens: int
 ) -> None:
-    """Post `n_requests` concurrent completions while the engine is gated,
-    open the gate, and check that each one kept every token's text."""
+    """Post concurrent completions on a gated engine, then check each kept every token."""
     responses: list[Any] = []
     posts = [
         threading.Thread(

@@ -84,14 +84,13 @@ class Tokenizer:
         return [int(t) for t in out]
 
     def render_chat(self, user_message: str, *, enable_thinking: bool | None = None) -> str:
-        """The same single user turn as `encode_chat`, rendered to text, not ids.
+        """Render the same single user turn as `encode_chat`, but as text, not ids.
 
-        For paths that take a prompt as text, such as `Request`, whose
-        admission runs plain `encode()` over it. Whether that round-trip
-        reproduces `encode_chat` depends on the tokenizer (it must parse the
-        template's special-token strings back into the same ids and add no
-        extra BOS), so a caller that relies on the equivalence has to assert
-        it rather than assume it.
+        Use it for a path that takes the prompt as text, such as `Request`. The
+        scheduler runs plain `encode()` on that text when it admits the request.
+        That encoding matches `encode_chat` only if the tokenizer parses the
+        special-token strings of the template back into the same ids and adds
+        no extra BOS. A caller that relies on the match must assert it.
         """
         if not self.has_chat_template():
             raise ValueError("tokenizer has no chat_template; use the raw text instead")

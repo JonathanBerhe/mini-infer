@@ -1,20 +1,14 @@
-"""Inject one `OutOfMemoryError` inside the REAL `append_kv_packed`.
+"""Inject one `OutOfMemoryError` inside the real `append_kv_packed`.
 
-Shared by the scheduler OOM tests. A fake runner that raises before it touches
-the cache cannot reach the state that matters. On layer 0,
-`append_kv_packed` advances each slot's token count and allocates its blocks
-slot by slot, and only afterwards writes any K/V. A pool that runs dry at
-slot j therefore leaves slots 0..j-1 claiming positions that hold no data.
+A fake runner that raises before it touches the cache cannot reach the state
+that matters. On layer 0, `append_kv_packed` takes the slots in order. For each, it
+allocates blocks, then advances the token count. It writes K/V only after this
+loop. So an OOM at slot j leaves slots 0..j-1 claiming positions with no data.
 
-`MidAppendOom` wraps one pool's `allocate` and produces that partial state with
-the production append, in one of two shapes:
-
-- By default it raises at the first allocation made after slot 0's count
-  advanced. Slot 0 then claims positions with nothing written, and the slot
-  that raised holds no new block.
-- With `arm(slot=j)` it raises inside slot j's own allocation loop, after slot
-  j already received at least one new block but before its count advanced.
-  That slot then keeps blocks its unchanged length does not need.
+`MidAppendOom` makes this state in one of two shapes. By default, it raises at
+the first allocation after slot 0 advanced, so the slot that raised holds no new
+block. With `arm(slot=j)`, it raises after slot j got a new block and before its
+count advanced, so slot j keeps blocks that its unchanged length does not need.
 """
 
 from __future__ import annotations
@@ -27,10 +21,9 @@ from mini_infer.exceptions import OutOfMemoryError
 
 
 class MidAppendOom:
-    """One-shot failure injection at the two-phase append's partial state.
+    """Raise one OOM in the middle of an append, at the partial state above.
 
-    `cache` is a getter because the scheduler may replace its cache between
-    steps; the injection reads whichever cache is live at allocation time.
+    `cache` is a getter because the scheduler can replace its cache between steps.
     """
 
     def __init__(self, pool: BlockPool, cache: Callable[[], PagedKVCache | None]) -> None:
@@ -41,20 +34,16 @@ class MidAppendOom:
         self._identity: list[tuple[int, ...]] = []
         self._slot: int | None = None
         self.fired = False
-        # An instance attribute shadows the bound method, so the production
-        # `append_kv_packed` calls this wrapper through `self._pool.allocate()`.
+        # The instance attribute shadows the method, so the production append calls this.
         pool.allocate = self._allocate  # type: ignore[method-assign]
 
     def arm(self, *, slot: int | None = None) -> list[int]:
-        """Arm for the next forward. Returns the slot lengths it starts from.
+        """Arm for the next forward. Return the slot lengths at arm time.
 
-        `slot=None` raises after slot 0 advanced; `slot=j` raises inside slot
-        j's loop once it holds a new block (the slot must need two or more).
-
-        Arm right before a step in which no request finishes or arrives. The
-        baseline is per slot INDEX, so a reap or an admission in the armed step
-        shifts it onto the wrong requests. `_allocate` refuses to fire in that
-        case: it compares the first block of every slot, not only the count.
+        With `slot=j`, slot j must need two or more new blocks. Arm right before a
+        step in which no request finishes or arrives. The baseline is per slot
+        index, so a reap or an admission moves it onto the wrong requests, and
+        `_allocate` then raises an `AssertionError` instead of the OOM.
         """
         cache = self._cache()
         assert cache is not None, "arm only once some request holds a cache slot"
@@ -68,9 +57,8 @@ class MidAppendOom:
         if self._lens is not None:
             cache = self._cache()
             assert cache is not None
-            # A slot's first block never changes while it lives, so it names
-            # the slot. Slots that held no block at arm time get their first
-            # one during this very append, so only held blocks are compared.
+            # The first block of a slot never changes while the slot lives, so it
+            # identifies the slot. A slot with no block at arm time gets one now, so skip it.
             identity = [tuple(ids[:1]) for ids in cache._block_ids]
             assert len(identity) == len(self._identity) and all(
                 now == then for now, then in zip(identity, self._identity, strict=True) if then

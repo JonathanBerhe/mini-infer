@@ -64,7 +64,7 @@ class TensorParallelStateCacheScheduler:
         if self._thread is not None and self._thread.is_alive():
             return
         if self._crashed:
-            # See `ContinuousScheduler.start`: no request moves to a new thread.
+            # Requests of the crashed thread must not move to the new one. See ADR-028.
             self._end_in_flight(crashed=True)
         self._stop_event.clear()
         self._crashed = False
@@ -74,12 +74,10 @@ class TensorParallelStateCacheScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit, join it, and end what is left.
+        """Join the engine thread and end what is left, as `ContinuousScheduler.stop` does.
 
-        The request being served finishes inside `_serve`, so the join waits
-        for its generation. After a clean join, every request still waiting
-        ends with `finish_reason="cancelled"`. After a crash they end with no
-        terminal step, so their handles raise `EngineNotRunningError`.
+        The loop reads the stop signal only between requests, so the join waits for the
+        current generation to finish.
         """
         self._stopping = True
         try:
@@ -94,11 +92,7 @@ class TensorParallelStateCacheScheduler:
             self._stopping = False
 
     def _end_in_flight(self, *, crashed: bool) -> None:
-        """End every request still waiting, after the engine thread exited.
-
-        A clean exit finishes each one as 'cancelled'; a crash sends no
-        terminal step (see `stop()`).
-        """
+        """End every waiting request. Call only after the engine thread exits."""
         while True:
             try:
                 running = self._waiting.get_nowait()
@@ -109,13 +103,14 @@ class TensorParallelStateCacheScheduler:
 
     @property
     def is_running(self) -> bool:
-        """Whether the leader's engine thread is alive. A leader blocked in a
-        collective (for example because a follower died) still counts as alive."""
+        """Whether the leader's engine thread is alive.
+
+        A leader blocked on a dead follower (in a call that waits for every rank) counts as alive.
+        """
         return self._thread is not None and self._thread.is_alive()
 
     def submit(self, request: Request) -> RequestHandle:
-        """Enqueue a request; its handle raises `EngineNotRunningError` if the
-        engine thread dies before the request finishes."""
+        """Enqueue a request. Its handle raises `EngineNotRunningError` if the thread dies."""
         thread = self._thread
         if thread is None or not thread.is_alive():
             raise EngineNotRunningError("scheduler not running; call start() before submit()")
@@ -170,8 +165,7 @@ class TensorParallelStateCacheScheduler:
                 should_cancel=running.cancel_event.is_set,
             )
         except Exception:
-            # The thread survives; the handle raises `RequestFailedError`, so
-            # a client can tell this failure from a cancellation.
+            # The engine keeps running. The handle raises `RequestFailedError`, not a cancellation.
             logger.exception("tensor-parallel generation failed; failing the request")
             self._finish(running, "cancelled", failed=True)
             return

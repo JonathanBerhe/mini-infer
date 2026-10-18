@@ -10,11 +10,9 @@ request). These tests pin both halves:
 - end-to-end recovery: a fake runner whose forward OOMs exactly once, driven
   through the real engine thread, must leave the engine alive and serving.
 
-The fake here raises BEFORE it touches the cache, so it cannot reach the
-partial state a real append leaves behind (slots that claim positions with no
-K/V written). The rollback of that state is tested in
-`test_dspark_scheduler.py`, for the plain path and the speculative path, with
-the failure injected inside the production `append_kv_packed`.
+The fake raises before it touches the cache, so it cannot leave the partial state
+of a real append. `test_dspark_scheduler.py` tests the rollback of that state on
+the plain and speculative paths, with the OOM inside the real `append_kv_packed`.
 
 Model-free (a fake runner over a real `BlockPool`), so it runs in CI.
 """
@@ -52,9 +50,8 @@ class _FakeTokenizer:
 class _FakeRunner:
     """Duck-typed ModelRunner: real BlockPool, fake tokenizer, scriptable forward.
 
-    `oom_on_calls` is the set of 1-based `forward_step_packed` invocation indices
-    that raise `OutOfMemoryError`; every other call returns greedy-argmax-0
-    logits at every packed position, so decode is deterministic.
+    `oom_on_calls` holds the 1-based `forward_step_packed` call numbers that raise
+    `OutOfMemoryError`. Other calls return argmax-0 logits, so decode is deterministic.
     """
 
     def __init__(self, oom_on_calls: set[int]) -> None:
@@ -70,8 +67,7 @@ class _FakeRunner:
         )
         self.tokenizer = _FakeTokenizer()
         self.calls = 0
-        # Packed q-tokens per successful call, so a test can see what a retry
-        # re-fed after a raise.
+        # Packed input ids of each call that did not raise, to show what a retry re-fed.
         self.packed_per_call: list[list[int]] = []
 
     def _forward_impl(
@@ -86,8 +82,7 @@ class _FakeRunner:
         if self.calls in oom_on_calls:
             raise OutOfMemoryError("forced OOM for test")
         self.packed_per_call.append(list(packed_input_ids))
-        # Packed logits over every q position; argmax is token 0 everywhere
-        # (greedy-deterministic), matching `forward_step_packed`'s contract.
+        # One row per packed position, the shape that `forward_step_packed` returns.
         logits = torch.full((1, cu_seqlens_q[-1], _VOCAB), -1.0)
         logits[..., 0] = 1.0
         return logits
@@ -211,11 +206,9 @@ def _enqueue(sched: ContinuousScheduler, prompt: str, max_tokens: int) -> Runnin
 
 
 def _step_with_recovery(sched: ContinuousScheduler) -> None:
-    """One engine iteration with `_engine_loop`'s OOM handling, driven inline.
+    """Run one engine step inline, with the same OOM handler as `_engine_loop`.
 
-    The real loop is a thread, so the interleaving this test needs (a decoder
-    mid-flight while a prefiller is the preemption victim) would be racy through
-    `submit`. This mirrors the handler at `_engine_loop` exactly.
+    Through the engine thread, the order of decoder and prefiller depends on timing.
     """
     try:
         sched._step()
@@ -235,23 +228,17 @@ def _drain(req: RunningRequest) -> list[GenerationStep]:
 def test_oom_retry_does_not_re_emit_an_already_emitted_token() -> None:
     """A decoder that survives a mid-step OOM must not emit its token twice.
 
-    Sampling happens before the forward and emits as it goes, so a retry that
-    re-sampled the same (unchanged) `last_logits` would append and stream a
-    duplicate of a token the client already has. The tokens stay pending across
-    the failed forward and are re-fed instead.
-
-    The existing end-to-end test above cannot reach this: it OOMs the very first
-    forward of a single request that has no `last_logits` yet.
+    Sampling emits the token before the forward, so the retry must re-feed it, not
+    sample `last_logits` again. The end-to-end test above OOMs before any `last_logits` exists.
     """
-    runner = _make_runner({2})  # OOM on the second forward
+    runner = _make_runner({2})
     sched = ContinuousScheduler(runner)
     decoder = _enqueue(sched, "abc", max_tokens=4)
 
     _step_with_recovery(sched)  # forward 1: prefill -> DECODING
     assert decoder.state == RequestState.DECODING
 
-    # A prefiller admitted this step is the preemption victim, so the decoder
-    # survives the OOM (`_preempt_on_oom` prefers prefillers).
+    # `_preempt_on_oom` picks a prefiller before a decoder, so the decoder survives.
     prefiller = _enqueue(sched, "defgh", max_tokens=4)
     _step_with_recovery(sched)  # forward 2: decoder samples + emits, then OOM
 
@@ -259,19 +246,17 @@ def test_oom_retry_does_not_re_emit_an_already_emitted_token() -> None:
     assert prefiller not in sched._running
     emitted = list(decoder.tokens_generated)
     assert len(emitted) == 1
-    # Held for the retry rather than dropped or re-sampled.
     assert decoder.pending_decode_tokens == emitted
 
     _step_with_recovery(sched)  # forward 3: re-feeds the pending token
     assert decoder.tokens_generated == emitted, "the retry emitted a second token"
-    assert decoder.pending_decode_tokens is None  # consumed by a forward that landed
+    assert decoder.pending_decode_tokens is None  # cleared by a forward that did not raise
     assert runner.packed_per_call[-1] == emitted
 
-    _step_with_recovery(sched)  # forward 4: the next token, sampled fresh
+    _step_with_recovery(sched)  # forward 4: samples the next token
     assert len(decoder.tokens_generated) == 2
 
-    # The stream carries exactly one delta per generated token, and the text is
-    # the decode of those tokens with nothing repeated.
+    # One stream delta per token, and the deltas decode to exactly those tokens.
     deltas = [s.text for s in _drain(decoder) if s.finish_reason is None]
     assert len(deltas) == 2
     assert "".join(deltas) == runner.tokenizer.decode(decoder.tokens_generated)

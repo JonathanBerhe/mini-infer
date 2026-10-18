@@ -1,10 +1,11 @@
-"""Micro-config models and doubles shared by the DSpark scheduler tests.
+"""Micro models and test doubles shared by the DSpark scheduler tests.
 
-A real (randomly initialized) Qwen3 target and DSpark drafter, small enough
-for CPU fp32, plus a character tokenizer. Random weights are the right
-fixture: greedy speculative output is drafter-independent, so a drafter that
-proposes mostly wrong tokens still exercises partial acceptance, full
-rejection, and the bonus path, with no checkpoint.
+A real Qwen3 target and DSpark drafter with random weights, small enough for
+CPU fp32, plus a character tokenizer. Random weights are enough because greedy
+speculative output does not depend on the drafter. A drafter that proposes
+mostly wrong tokens still exercises partial acceptance, full rejection, and
+the bonus token (the target's own token after the accepted drafts). No
+checkpoint is necessary.
 """
 
 from __future__ import annotations

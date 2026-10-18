@@ -226,8 +226,11 @@ class DSparkSpeculativeRunner:
         start: int,
         draft_cache: DSparkDraftCache,
     ) -> tuple[list[int], torch.Tensor | None, torch.Tensor]:
-        """One drafter round; the round math lives in `spec.propose_block`,
-        shared with the multi-request scheduler so the two paths cannot fork."""
+        """Run one drafter round with `spec.propose_block`.
+
+        The multi-request scheduler also uses `propose_block` and `verify_block`,
+        so the round math of the batch-1 path and the multi-request path cannot diverge.
+        """
         return propose_block(
             self.drafter,
             anchor=anchor,
@@ -244,8 +247,7 @@ class DSparkSpeculativeRunner:
         offered: list[int],
         draft_probs: torch.Tensor,
     ) -> tuple[int, int]:
-        """Accept a prefix of `offered`; the judgment lives in
-        `spec.verify_block`, shared with the multi-request scheduler."""
+        """Accept a prefix of `offered` and pick the next token with `spec.verify_block`."""
         return verify_block(
             verify_logits,
             offered=offered,

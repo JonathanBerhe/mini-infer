@@ -14,17 +14,12 @@ or on localhost, so these guards are belt-and-suspenders):
   and cancels the request when the client drops the connection.
 - A global exception handler converts uncaught engine errors into a sanitized
   503 instead of letting FastAPI emit a stack trace.
-- If the engine thread died, a request fails instead of hanging: a 503 with
-  error type `engine_unavailable`, or, once a stream has started, an SSE
-  error event followed by `[DONE]`. The process stays up; every later
-  request gets the same 503 until the server restarts.
-- If the engine failed one request and kept running, that request gets a
-  500 with error type `server_error` (or the same SSE error event). Neither
-  error carries the exception text; it stays in the server log.
-
-Every request waits for its output on the event loop
-(`RequestHandle.get_step_async`), never on a worker thread, so the number of
-requests in flight is not bounded by a thread pool.
+- A dead engine thread gives a 503 `engine_unavailable` until the server restarts.
+  A stream that already started gets an SSE error event and then `[DONE]`.
+- If the engine fails one request and keeps running, that request gets a 500
+  `server_error` (or an SSE error event). Only the server log holds the exception text.
+- Requests wait for output on the event loop (`RequestHandle.get_step_async`),
+  so no thread pool limits the requests in flight. See ADR-029.
 """
 
 import asyncio
@@ -228,10 +223,8 @@ async def completions(
             `get_step_async()` so resources (KV blocks, batch slot) are freed
             promptly.
 
-            The 200 status is already sent when the first step is awaited, so
-            a dead engine or a failed request is reported in-band: an error
-            event, then `[DONE]`, as vLLM and SGLang do. The OpenAI client
-            raises on that event.
+            The 200 status goes out before the first step, so errors arrive as an
+            error event, then `[DONE]`, as in vLLM and SGLang. The OpenAI client raises on it.
             """
             watcher = asyncio.create_task(_watch_disconnect(fastapi_req, handle))
             try:
@@ -264,11 +257,9 @@ async def completions(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # Read step by step on the event loop, like the stream. A blocking `wait()`
-    # here would stall every other request, and one in `asyncio.to_thread`
-    # would hold a thread of a small shared pool for the whole generation.
-    # The cancel in `finally` frees the batch slot if this coroutine is
-    # cancelled, for example at shutdown; on a finished request it does nothing.
+    # Read the steps on the event loop, as the stream does (see ADR-029). If this
+    # coroutine is cancelled, the cancel in `finally` frees the batch slot. On a
+    # finished request it does nothing.
     try:
         text_parts: list[str] = []
         while True:
@@ -298,10 +289,8 @@ async def completions(
     )
 
 
-# Fixed messages: the cause is in the server log, and the response must not
-# carry internal state (see `_unhandled_exception_handler`). A 503 means the
-# engine is down for every request; a 500 means it failed this one request
-# and keeps serving others.
+# Fixed messages, because a response must not carry internal state. A 503 means the
+# engine is down for all requests. A 500 means it failed only this request.
 _ENGINE_UNAVAILABLE = {"error": {"type": "engine_unavailable", "message": "engine is not running"}}
 _REQUEST_FAILED = {
     "error": {

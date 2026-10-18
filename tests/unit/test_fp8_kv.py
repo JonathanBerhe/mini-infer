@@ -41,14 +41,9 @@ def test_block_pool_rejects_fp8_without_flashinfer_backend() -> None:
 
 
 def test_prefill_wrapper_key_separates_kv_storage_classes() -> None:
-    """fp8 and bf16 pools must never share a FlashInfer prefill wrapper.
+    """The default (bf16), fp8, and nvfp4 pools get different prefill wrapper keys.
 
-    FlashInfer resolves backend="auto" once per wrapper, from the first
-    plan's dtypes, and writes the choice back onto the wrapper. A shared
-    wrapper therefore pins later pools to the first pool's backend; on
-    Hopper that pinned fa3 onto an fp8 plan, whose sm90 template does not
-    exist, and crashed the engine mid-forward. The key function is the
-    entire mechanism keeping the classes apart, so pin it model-free.
+    Only `_wrapper_key` keeps the classes apart, so the test checks it without a model.
     """
     from mini_infer.cache.flashinfer_backend import _wrapper_key
 
@@ -97,22 +92,13 @@ def test_qwen_05b_fp8_logits_close_to_bf16() -> None:
     cosine sim > 0.99. FP8 e4m3fn is lossy but the loss should be small
     on a 0.5B model with reasonable per-head scales.
 
-    Driven through `runner.prefill`, which is what writes K/V into the paged
-    cache and reads it back through the attention path. A forward that
-    bypassed the cache would compare two identical bf16 runs and pass without
-    touching fp8 storage at all.
+    The test runs `runner.prefill`, which writes K/V into the paged cache and reads it back.
+    A forward that skips the cache compares two bf16 runs and never reads fp8 storage.
 
-    This exact sequence, a bf16 runner and then an fp8 runner in one process,
-    is also a regression test for the wrapper-poisoning bug it once exposed on
-    Hopper: FlashInfer resolves backend="auto" once per wrapper, from the
-    FIRST plan's dtypes, so a prefill wrapper shared across pools got pinned
-    to fa3 by the bf16 half and then JIT-compiled fa3's nonexistent
-    bf16-q x e4m3-kv sm90 template for the fp8 half (cutlass "No eligible
-    GMMA operator", H100, 0.6.16rc4, 2026-07-29). The backend now keys its
-    prefill wrapper by KV storage class so FlashInfer's dtype-aware selection
-    runs per class: fa2 for the fp8 mix, fa3 for bf16. On pre-Hopper parts
-    both resolve to fa2 and the sharing never mattered, which is why the L4
-    GLM validation and the A10 run of this test passed before the fix.
+    On Hopper it also catches a prefill wrapper that bf16 and fp8 pools share. In one pytest
+    process, `test_flashinfer_backend.py` first plans on a bf16 pool. A shared wrapper then
+    gives the fp8 pool fa3, and its JIT build fails. The bf16 runner here uses flash-attn,
+    so it cannot cause the fault alone. See `_prefill_wrappers` in `flashinfer_backend.py`.
     """
     from mini_infer.cache.flashinfer_backend import supports_flashinfer_backend
     from mini_infer.engine.model_runner import ModelRunner

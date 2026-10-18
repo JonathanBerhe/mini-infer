@@ -47,27 +47,21 @@ _FLASHINFER_DISABLED_FOR_BENCH = False
 # imports stay free.
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _workspace_buffer: torch.Tensor | None = None
-# One prefill wrapper PER KV STORAGE CLASS, not one per process. FlashInfer's
-# `plan()` resolves backend="auto" ONCE, from the first plan's dtypes, and
-# writes the choice back onto the wrapper (prefill.py, `self._backend =
-# determine_attention_backend(...)`). Sharing a wrapper across KV dtypes
-# therefore pins every later pool to whatever the first pool needed: a bf16
-# plan on Hopper sticks the wrapper to fa3, and a subsequent fp8 plan then
-# JIT-compiles fa3's sm90 template for bf16-q x e4m3-kv, which does not exist
-# (cutlass "No eligible GMMA operator", measured on H100, 0.6.16rc4,
-# 2026-07-29). The reverse order silently costs bf16 pools fa3. With one
-# wrapper per class, FlashInfer's own dtype-aware selection picks fa2 for the
-# mixed fp8 case and fa3 for bf16, each exactly once.
+# One prefill wrapper for each KV storage class (the pool's `kv_quant`). FlashInfer
+# `plan()` resolves backend="auto" once, from the dtypes of its first plan, and stores
+# the choice on the wrapper. A shared wrapper thus pins every later pool to that backend.
+# On Hopper, a bf16 plan pins fa3 (FlashAttention 3). A later fp8 plan then JIT-builds
+# an fa3 template for bf16 q and e4m3 KV, which does not exist, and fails with cutlass
+# "No eligible GMMA operator" (H100, 0.6.16rc4, 2026-07-29). In the reverse order, bf16
+# pools lose fa3 silently. Per-class wrappers give fa2 for fp8 KV and fa3 for bf16.
 _prefill_wrappers: dict[str, Any] = {}
 _decode_wrapper: Any = None
 
 
 def _wrapper_key(kv_quant: str | None) -> str:
-    """Cache key for the prefill wrapper: the pool's KV storage class.
+    """Return the prefill-wrapper key: the KV storage class of the pool.
 
-    Within one class the (q, kv) dtype pair FlashInfer plans with never
-    changes, so the wrapper's one-shot backend resolution stays valid for
-    its whole lifetime.
+    In one class the (q, kv) dtypes never change, so the first-plan backend stays correct.
     """
     return kv_quant if kv_quant is not None else "default"
 
@@ -90,12 +84,9 @@ def _ensure_wrappers(device: torch.device, kv_quant: str | None) -> tuple[Any, A
     """Lazy-initialize the persistent workspace + wrapper instances.
 
     Returns `(prefill_wrapper, decode_wrapper)` for use in the
-    dispatcher. All wrappers share a single 128 MiB `uint8` buffer: the
-    engine thread runs one forward at a time and exactly one wrapper is
-    planned+run per attention call, so their lifecycles never overlap.
-
-    The prefill wrapper is cached per KV storage class (see
-    `_prefill_wrappers` above for why sharing one across classes breaks).
+    dispatcher. All wrappers share one 128 MiB `uint8` buffer. Their uses never overlap,
+    because the engine runs one forward at a time and each attention call runs one wrapper.
+    Prefill wrappers are cached for each KV storage class (see `_prefill_wrappers`).
     """
     global _workspace_buffer, _decode_wrapper
     if _workspace_buffer is None:

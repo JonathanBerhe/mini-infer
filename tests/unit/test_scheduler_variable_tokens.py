@@ -1,26 +1,11 @@
 """Variable per-request q-length in `ContinuousScheduler._packed_forward`.
 
-Decoders hand each step a token LIST rather than a single token, so requests
-with different q-lengths ride one packed forward. Two properties everything
-built on top of this depends on:
+The q-length of a request is the number of tokens it feeds into one forward.
+The packed inputs and the growth of each cache slot must follow it. Each request
+must take `last_logits` from its own last packed row. A neighbor's row gives a
+wrong token with no error, so the tests assert the row index, not the text.
 
-- the packed inputs a step builds (ids, `cu_seqlens_q`, `position_offsets`)
-  follow each request's own q-length, and the cache slot advances by that many
-  positions;
-- a request's `last_logits` is sliced from ITS OWN last row of the packed
-  result. Reading a neighbour's row yields a plausible wrong token with no
-  error at all, so the offset is asserted on the row index directly rather than
-  through decoded text.
-
-The plain sampling path still contributes exactly one token per decoder per
-step; that is asserted here too, since it is what keeps the golden suite valid.
-The zero-length cases are here as well, on both branches: a slot with no rows of
-its own is what makes the slice read a neighbour, and an empty prompt is how a
-client can reach that state from outside.
-
-Model-free (a fake runner over a real `BlockPool`), so it runs in CI. The fake
-forward performs the real `append_kv_packed`, so slot lengths and block
-allocation are the production ones.
+Model-free (a fake runner over a real `BlockPool`), so it runs in CI.
 """
 
 from __future__ import annotations
@@ -39,15 +24,12 @@ from mini_infer.scheduler.request_state import RequestState, RunningRequest
 _VOCAB = 8
 _HEAD_DIM = 8
 
-# Row-index offset baked into the packed logits. Index 0 of every row carries
-# `row + _ARGMAX_BUMP` so greedy argmax is token 0 at every position (decode
-# stays deterministic), while index 1 carries the bare row index, letting a
-# test read back which packed row a request's `last_logits` came from.
+# Added to vocab index 0 of every packed row, so greedy argmax is always token 0.
 _ARGMAX_BUMP = 1000.0
 
 
 class _FakeTokenizer:
-    """`encode` -> one id per character; `decode` maps ids back to letters."""
+    """`encode` gives one id per character, and `decode` maps ids to letters."""
 
     eos_token_id = -1  # never matches the fake forward's argmax (token 0)
 
@@ -59,13 +41,11 @@ class _FakeTokenizer:
 
 
 class _RecordingRunner:
-    """Duck-typed ModelRunner whose packed logits encode their own row index.
+    """Duck-typed ModelRunner that records the packed inputs of every call.
 
-    Every call's packed inputs are recorded, and the returned
-    `(1, total_q, vocab)` tensor has `logits[0, row, 1] == row`, so
-    `req.last_logits[1].item()` names the packed row the scheduler sliced.
-    The K/V append is the real one (zeros for values), so per-slot lengths and
-    block allocation behave exactly as in production.
+    Its logits hold `logits[0, row, 1] == row`, so `_row_of` names the packed row
+    that the scheduler sliced. It calls the real `append_kv_packed` with zero K/V,
+    so slot lengths and block allocation are real.
     """
 
     def __init__(self) -> None:
@@ -133,11 +113,10 @@ def _row_of(req: RunningRequest) -> int:
 
 
 def test_prefill_slices_each_request_from_its_own_last_row() -> None:
-    """Two prompts of different lengths in one packed forward: each request's
-    logits come from the last row of ITS OWN window, not the packed tail."""
+    """Two prompts of different lengths share a forward, and each reads its own last row."""
     sched, runner = _sched()
-    short = _enqueue(sched, "abc", max_tokens=2)  # 3 prompt tokens
-    long = _enqueue(sched, "abcde", max_tokens=2)  # 5 prompt tokens
+    short = _enqueue(sched, "abc", max_tokens=2)
+    long = _enqueue(sched, "abcde", max_tokens=2)
 
     sched._step()
 
@@ -151,8 +130,7 @@ def test_prefill_slices_each_request_from_its_own_last_row() -> None:
 
 
 def test_plain_decode_contributes_exactly_one_token_per_request() -> None:
-    """The non-speculative path is unchanged: q-length 1 per decoder, and
-    `position_offsets` pick up from the lengths the prefill append left."""
+    """The plain path feeds one token per decoder per step. The golden tests rely on this."""
     sched, runner = _sched()
     short = _enqueue(sched, "abc", max_tokens=2)
     long = _enqueue(sched, "abcde", max_tokens=2)
@@ -164,7 +142,7 @@ def test_plain_decode_contributes_exactly_one_token_per_request() -> None:
     call = runner.calls[0]
     assert call["cu_seqlens_q"] == [0, 1, 2]
     assert call["position_offsets"] == [3, 5]
-    assert call["packed_input_ids"] == [0, 0]  # greedy argmax is token 0
+    assert call["packed_input_ids"] == [0, 0]
     assert short.tokens_generated == [0]
     assert long.tokens_generated == [0]
     assert _row_of(short) == 0
@@ -172,25 +150,23 @@ def test_plain_decode_contributes_exactly_one_token_per_request() -> None:
 
 
 def test_sample_decoders_returns_one_element_lists() -> None:
-    """`_sample_decoders` hands out lists, holding exactly one token on the
-    plain path."""
+    """`_sample_decoders` returns a list per decoder, with one token on the plain path."""
     sched, _ = _sched()
     short = _enqueue(sched, "abc", max_tokens=4)
     long = _enqueue(sched, "abcde", max_tokens=4)
 
-    sched._step()  # prefill both, leaving them DECODING with last_logits
+    sched._step()  # prefill both
     sampled = sched._sample_decoders()
 
     assert sampled == {id(short): [0], id(long): [0]}
 
 
 def test_variable_q_lengths_pack_and_slice_per_request() -> None:
-    """A decoder feeding three tokens and one feeding a single token share the
-    forward: packing, per-slot cache growth, and the logits slice all follow
-    each request's own q-length."""
+    """A one-token decoder and a three-token decoder share one forward. Packing,
+    slot growth, and the logits slice all follow the q-length of each request."""
     sched, runner = _sched()
-    one = _enqueue(sched, "abc", max_tokens=8)  # 3 prompt tokens
-    three = _enqueue(sched, "abcde", max_tokens=8)  # 5 prompt tokens
+    one = _enqueue(sched, "abc", max_tokens=8)
+    three = _enqueue(sched, "abcde", max_tokens=8)
 
     sched._step()  # prefill both
     assert sched._batched_cache is not None
@@ -203,27 +179,23 @@ def test_variable_q_lengths_pack_and_slice_per_request() -> None:
     assert call["packed_input_ids"] == [1, 2, 3, 4]
     assert call["cu_seqlens_q"] == [0, 1, 4]
     assert call["position_offsets"] == [3, 5]
-    # Each request read its own last row: 0 for the single-token slot, 3 for
-    # the three-token slot (rows 1..3).
     assert _row_of(one) == 0
-    assert _row_of(three) == 3
-    # And each slot grew by its own q-length, so the next step's offsets are right.
+    assert _row_of(three) == 3  # last of rows 1..3
     assert sched._batched_cache.seq_lens_list() == [4, 8]
 
 
 def test_prefill_chunk_and_multi_token_decoder_in_one_forward() -> None:
-    """Mixed batch with a chunked prefiller and a multi-token decoder: the
-    prefiller's chunk and the decoder's block are packed back to back."""
+    """A multi-token decoder and a prefill chunk pack back to back in one forward."""
     runner = _RecordingRunner()
     sched = ContinuousScheduler(runner, chunk_size=2)  # type: ignore[arg-type]
     decoder = _enqueue(sched, "abc", max_tokens=8)  # 3 tokens, prefills in 2 chunks
 
-    sched._step()  # chunk 1 of the decoder's prompt (2 of 3 tokens)
+    sched._step()
     assert decoder.state == RequestState.CHUNKED_PREFILLING
-    sched._step()  # chunk 2 completes the prompt
+    sched._step()
     assert decoder.state == RequestState.DECODING
 
-    prefiller = _enqueue(sched, "abcdefg", max_tokens=8)  # 7 tokens, chunked
+    prefiller = _enqueue(sched, "abcdefg", max_tokens=8)
     sched._admit_waiting()
     runner.calls.clear()
 
@@ -239,29 +211,26 @@ def test_prefill_chunk_and_multi_token_decoder_in_one_forward() -> None:
 
 
 def test_zero_token_decoder_is_rejected() -> None:
-    """An empty token list would give a slot no row of its own, silently
-    handing it the previous request's logits. It must not be packable."""
+    """An empty token list gives a slot no row, so the slot silently reads the
+    logits of the previous request. `_packed_forward` must reject it."""
     sched, _ = _sched()
     first = _enqueue(sched, "abc", max_tokens=8)
     second = _enqueue(sched, "abcde", max_tokens=8)
 
-    sched._step()  # prefill both
+    sched._step()
 
     with pytest.raises(AssertionError, match="decoding request contributed no tokens"):
         sched._packed_forward([first, second], {id(first): [1], id(second): []})
 
 
 def test_zero_token_prefiller_is_rejected() -> None:
-    """The prefill branch carries the same guard: a chunk of no tokens would
-    read a neighbour's logits rather than fail."""
+    """The prefill branch has the same guard: an empty chunk also reads a neighbor's row."""
     sched, _ = _sched()
     req = _enqueue(sched, "abc", max_tokens=8)
 
     sched._step()  # the real prefill: counter and slot both reach 3
-    # A prefiller with nothing left to feed cannot arise on its own (the state
-    # machine moves it to DECODING first), so force only the state back. The
-    # counter and the slot stay in agreement, so the prefill-vs-slot assertion
-    # passes and the zero-chunk guard is the one that fires.
+    # The state machine moves a fully fed prefiller to DECODING, so force only the state
+    # back. Counter and slot still agree, so only the zero-chunk guard fires.
     req.state = RequestState.CHUNKED_PREFILLING
 
     with pytest.raises(AssertionError, match="prefilling request contributed no tokens"):
@@ -269,12 +238,10 @@ def test_zero_token_prefiller_is_rejected() -> None:
 
 
 def test_empty_prompt_finishes_at_admission() -> None:
-    """A prompt that tokenizes to nothing never reaches the forward.
+    """A prompt that tokenizes to nothing finishes at admission, before any forward.
 
-    It has no q-tokens, so it would put a zero-length window in the packed
-    batch and the last-position slice would read index -1 of an empty logits
-    tensor. `_engine_loop` only catches `OutOfMemoryError`, so that IndexError
-    would kill the engine thread and every other request in flight.
+    Otherwise it trips the zero-token guard. `_engine_loop` catches only `OutOfMemoryError`,
+    so that `AssertionError` kills the engine thread and fails every request in flight.
     """
     sched, runner = _sched()
     empty = _enqueue(sched, "", max_tokens=4)
@@ -287,15 +254,13 @@ def test_empty_prompt_finishes_at_admission() -> None:
     assert empty.batch_idx is None  # never took a cache slot
     assert empty not in sched._running
     assert empty.output_queue.get_nowait().finish_reason == "stop"
-    # The request admitted alongside it is unaffected and owns slot 0.
     assert other.state == RequestState.DECODING
     assert other.batch_idx == 0
     assert runner.calls[0]["cu_seqlens_q"] == [0, 3]
 
 
 def test_plain_path_runs_to_max_tokens_unchanged() -> None:
-    """End to end over the synchronous step loop: both requests emit exactly
-    `max_tokens` tokens, finish with "length", and free their slots."""
+    """Both requests emit `max_tokens` tokens, finish with "length", and free their slots."""
     sched, runner = _sched()
     short = _enqueue(sched, "abc", max_tokens=2)
     long = _enqueue(sched, "abcde", max_tokens=2)
@@ -309,7 +274,6 @@ def test_plain_path_runs_to_max_tokens_unchanged() -> None:
     assert long.finish_reason == "length"
     assert sched._running == []
     assert sched._batched_cache is None
-    # Every block came back when the slots were reaped.
     assert runner.block_pool.num_free_blocks == runner.block_pool.num_blocks
-    # One prefill forward plus one per emitted token beyond the first.
+    # Prefill, then one decode. The last emitted token is never fed back.
     assert [c["cu_seqlens_q"] for c in runner.calls] == [[0, 3, 8], [0, 1, 2]]

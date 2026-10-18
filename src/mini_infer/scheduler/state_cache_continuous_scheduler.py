@@ -115,7 +115,7 @@ class StateCacheContinuousScheduler:
         if self._thread is not None and self._thread.is_alive():
             return
         if self._crashed:
-            # See `ContinuousScheduler.start`: no request moves to a new thread.
+            # Requests of the crashed thread must not move to the new one. See ADR-028.
             self._end_in_flight(crashed=True)
         self._stop_event.clear()
         self._crashed = False
@@ -132,13 +132,7 @@ class StateCacheContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit, join it, and end what is left.
-
-        After a clean join, every request in a slot or still waiting ends with
-        `finish_reason="cancelled"`. After a crash they end with no terminal
-        step, so their handles raise `EngineNotRunningError`. A timed-out join
-        ends nothing, because the thread can still touch the slots.
-        """
+        """Join the engine thread and end what is left, as `ContinuousScheduler.stop` does."""
         self._stopping = True
         try:
             self._stop_event.set()
@@ -153,13 +147,11 @@ class StateCacheContinuousScheduler:
 
     @property
     def is_running(self) -> bool:
-        """Whether the engine thread is alive: False before `start()`, after
-        `stop()`, and after the thread died on an exception."""
+        """Whether the engine thread is alive, so False after a crash."""
         return self._thread is not None and self._thread.is_alive()
 
     def submit(self, request: Request) -> RequestHandle:
-        """Enqueue a request; its handle raises `EngineNotRunningError` if the
-        engine thread dies before the request finishes."""
+        """Enqueue a request. Its handle raises `EngineNotRunningError` if the thread dies."""
         thread = self._thread
         if thread is None or not thread.is_alive():
             raise EngineNotRunningError("scheduler not running; call start() before submit()")
@@ -172,11 +164,9 @@ class StateCacheContinuousScheduler:
         return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
 
     def _end_in_flight(self, *, crashed: bool) -> None:
-        """End every request in a slot or still waiting.
+        """End every request in a slot or waiting. Call only after the engine thread exits.
 
-        Runs only after the engine thread exited. A clean exit finishes each
-        one as 'cancelled'; a crash sends no terminal step (see `stop()`).
-        `start()` rebuilds the cache, so the rows need no cleanup here.
+        The cache rows need no cleanup, because `start()` builds a new cache.
         """
         leftover = [slot.request for slot in self._slots if slot is not None]
         self._slots = [None] * self._max_batch_size
