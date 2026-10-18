@@ -42,7 +42,7 @@ from collections.abc import Callable
 from typing import Literal
 
 from mini_infer.engine.model_runner import ModelRunner
-from mini_infer.exceptions import EngineNotRunningError
+from mini_infer.exceptions import EngineNotRunningError, OutOfMemoryError
 from mini_infer.scheduler.request_state import (
     GenerationResult,
     GenerationStep,
@@ -111,6 +111,12 @@ class PDScheduler:
         # so handles must keep waiting until then instead of reporting a dead
         # engine (see `submit`).
         self._stopping = False
+        # Set by an engine thread that dies on an exception; `stop()` reads it
+        # after the joins. A crash must not turn into 'cancelled'.
+        self._crashed = False
+        # Threads whose join in `stop()` timed out. `stop()` could not drain
+        # their state; `start()` does it once they have exited.
+        self._undrained: list[threading.Thread] = []
 
         # Engine-thread-only state. In serial mode the single engine thread
         # owns everything below. In parallel mode the prefill thread owns
@@ -149,7 +155,17 @@ class PDScheduler:
         """
         if self._thread is not None and self._thread.is_alive():
             return
+        old_threads = [*self._engine_threads(), *self._undrained]
+        if (self._crashed or self._undrained) and not any(t.is_alive() for t in old_threads):
+            # The old threads died, or a `stop()` timed out on them, and no
+            # one ended their requests. Those must not move to the new
+            # threads: their handles watch the old ones, and the state they
+            # left can be half-updated. The handles already fail through the
+            # liveness check, so no terminal step goes out.
+            self._end_in_flight(crashed=True)
+            self._undrained = []
         self._stop_event.clear()
+        self._crashed = False
         if self._mode == "serial":
             self._thread = threading.Thread(
                 target=self._run_logged,
@@ -187,11 +203,21 @@ class PDScheduler:
         `finish_reason="cancelled"` are pushed to every still-active
         request, including those never admitted, so API consumers don't
         hang on `get_step()`. `_stopping` keeps their handles waiting for
-        those steps after the engine threads are gone.
+        those steps after the engine threads are gone. If an engine thread
+        crashed, no terminal step goes out: the handles then raise
+        `EngineNotRunningError`, as they do when no `stop()` follows. If a
+        join times out, nothing is drained, because that thread can still
+        touch the state; the handles fail through their liveness check, and
+        the next `start()` drains once those threads have exited.
         """
         self._stopping = True
         try:
             self._stop_event.set()
+            # A thread left over from an earlier timed-out stop counts too.
+            # Its requests end with no terminal step, as in `start()`: their
+            # handles watch that thread and fail once it exits.
+            threads = [*self._engine_threads(), *self._undrained]
+            leftover = bool(self._undrained)
             # Wake up any thread blocked on a queue.get(timeout=...). The poll
             # loops in the engine threads will see the stop event and return.
             if self._thread is not None:
@@ -200,45 +226,62 @@ class PDScheduler:
             if self._decode_thread is not None:
                 self._decode_thread.join(timeout=timeout)
                 self._decode_thread = None
-
-            # Drain remaining state in dependency order: free decode slots
-            # first (so the block pool releases), then emit terminal steps
-            # for any still-active handles.
-            if self._session is not None:
-                for slot_id in list(self._decoding.keys()):
-                    if self._session.is_active(slot_id):
-                        self._session.remove_slot(slot_id)
-            for r in list(self._decoding.values()):
-                self._emit_terminal(r, reason="cancelled")
-            self._decoding.clear()
-            self._handoffs.clear()
-            # In parallel mode the handoff queue may hold un-decoded handoffs;
-            # they were prefilled but never reached the decode session. Their
-            # requests still need a terminal step.
-            if self._handoff_queue is not None:
-                while True:
-                    try:
-                        r, _handoff = self._handoff_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    self._emit_terminal(r, reason="cancelled")
-            for r in self._prefilling:
-                self._emit_terminal(r, reason="cancelled")
-            self._prefilling.clear()
-            # Submitted but never admitted. `submit` rejects new requests once
-            # the stop event is set. A `submit` on another thread that passed
-            # its check just before can still land here after this drain; its
-            # handle then fails through the liveness check.
-            while True:
-                try:
-                    r = self._waiting.get_nowait()
-                except queue.Empty:
-                    break
-                self._emit_terminal(r, reason="cancelled")
-            self._session = None
-            self._handoff_queue = None
+            if any(t.is_alive() for t in threads):
+                self._undrained = threads
+            else:
+                self._end_in_flight(crashed=self._crashed or leftover)
+                self._undrained = []
         finally:
             self._stopping = False
+
+    def _end_in_flight(self, *, crashed: bool) -> None:
+        """Release every slot and end every request, after the threads exited.
+
+        A clean exit finishes each request as 'cancelled'; a crash sends no
+        terminal step (see `stop()`). Slots are released either way, so the
+        block pool returns to fully free.
+        """
+
+        def end(r: RunningRequest) -> None:
+            if not crashed:
+                self._emit_terminal(r, reason="cancelled")
+
+        # Drain remaining state in dependency order: free decode slots
+        # first (so the block pool releases), then end the requests of
+        # any still-active handles.
+        if self._session is not None:
+            for slot_id in list(self._decoding.keys()):
+                if self._session.is_active(slot_id):
+                    self._session.remove_slot(slot_id)
+        for r in list(self._decoding.values()):
+            end(r)
+        self._decoding.clear()
+        self._handoffs.clear()
+        # In parallel mode the handoff queue may hold un-decoded handoffs;
+        # they were prefilled but never reached the decode session. Their
+        # requests still need ending.
+        if self._handoff_queue is not None:
+            while True:
+                try:
+                    r, _handoff = self._handoff_queue.get_nowait()
+                except queue.Empty:
+                    break
+                end(r)
+        for r in self._prefilling:
+            end(r)
+        self._prefilling.clear()
+        # Submitted but never admitted. `submit` rejects new requests once
+        # the stop event is set. A `submit` on another thread that passed
+        # its check just before can still land here after this drain; its
+        # handle then fails through the liveness check.
+        while True:
+            try:
+                r = self._waiting.get_nowait()
+            except queue.Empty:
+                break
+            end(r)
+        self._session = None
+        self._handoff_queue = None
 
     @property
     def is_running(self) -> bool:
@@ -263,6 +306,7 @@ class PDScheduler:
             loop()
         except Exception:
             logger.exception("PDScheduler: %s thread crashed", threading.current_thread().name)
+            self._crashed = True
             raise
 
     # ── API surface ──────────────────────────────────────────────────
@@ -354,6 +398,14 @@ class PDScheduler:
         requests = [r.request for r in prefilling]
         try:
             handoffs = self._prefill_worker.prefill_batch(requests)
+        except OutOfMemoryError:
+            # The batch does not fit in the KV pool: a resource limit, not an
+            # engine failure, so it ends as 'cancelled', like the preemption
+            # of `ContinuousScheduler`.
+            logger.warning("PDScheduler: KV pool full during prefill; cancelling the batch")
+            for r in prefilling:
+                self._emit_terminal(r, reason="cancelled")
+            return
         except Exception:
             logger.exception("PDScheduler: prefill_batch failed; failing the batch")
             for r in prefilling:
@@ -442,6 +494,14 @@ class PDScheduler:
             requests = [r.request for r in prefilling]
             try:
                 handoffs = self._prefill_worker.prefill_batch(requests)
+            except OutOfMemoryError:
+                # A resource limit, not an engine failure (see `_run_prefill_batch`).
+                logger.warning(
+                    "PDScheduler (parallel): KV pool full during prefill; cancelling the batch"
+                )
+                for r in prefilling:
+                    self._emit_terminal(r, reason="cancelled")
+                continue
             except Exception:
                 logger.exception("PDScheduler (parallel): prefill_batch failed; failing the batch")
                 for r in prefilling:
@@ -464,9 +524,13 @@ class PDScheduler:
                     except queue.Full:
                         continue
                 else:
-                    # Stop requested while the put was blocked; terminal
-                    # for this handoff (the decode thread won't see it).
-                    self._emit_terminal(r, reason="cancelled")
+                    # Stop requested while the put was blocked; the decode
+                    # thread will not see this handoff. Hand the request back
+                    # to `_prefilling`, so that `stop()` ends it after the
+                    # joins, where it knows whether a thread crashed. (The
+                    # handoff holds no pool blocks: `prefill_batch` frees its
+                    # slots before it returns.)
+                    self._prefilling.append(r)
 
     def _decode_thread_loop(self) -> None:
         """Decode thread main loop (parallel mode).

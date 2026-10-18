@@ -22,7 +22,7 @@ in its text while `usage.completion_tokens` stays correct. `PDScheduler`
 instead blocks its engine thread for 10 s on the full queue and then
 cancels the request.
 
-Short timed reads ([ADR-028](ADR-028-engine-liveness.md) used 0.25 s) only
+Short timed reads (an earlier draft of this change read in 0.25 s slices) only
 spread the damage. A probe sent 40 concurrent non-streaming requests of 300
 tokens each to the real endpoint. The scheduler admitted 16 at a time, with
 a 2 ms engine step on a 10-core machine. With 0.25 s thread reads, 16 of the 40
@@ -36,9 +36,9 @@ The queue wakes the event loop, and the server waits on the loop with no
 thread.
 
 1. `StepQueue`, a `queue.Queue` subclass in `scheduler/request_state.py`,
-   calls a listener after each put. The engine thread keeps the ordinary
-   `put` calls, so the schedulers change only the class of the queue that
-   they build.
+   calls a listener after each put, outside the lock of the queue. The
+   engine thread keeps the ordinary `put` calls, so the schedulers change
+   only the class of the queue that they build.
 2. `RequestHandle.get_step_async()` sets the listener to
    `loop.call_soon_threadsafe(ready.set)`, the one asyncio call that is safe
    from another thread. It clears `ready` and reads the queue without
@@ -59,8 +59,14 @@ thread.
 - A dedicated thread pool, sized above the maximum concurrency. It needs a
   size, and the number of requests in flight has no fixed bound. Some apps
   mount the `completions` route without the server's lifespan: the
-  tensor-parallel Modal scripts and two test modules. Each of them must then
+  tensor-parallel Modal scripts and three test modules. Each of them must then
   set the pool up too.
+- Batch the wakeups: one `call_soon_threadsafe` per burst of puts, through a
+  shared waker per event loop. On the stdlib loop it cut the cost of 128
+  streams from 18 to about 3 percent (see Consequences). It adds a lock and
+  a registry of event loops. The production server runs on uvloop, where the
+  plain listener costs nothing measurable, so the batching is not worth its
+  complexity yet.
 - Poll the queue from the loop with `asyncio.sleep`. It needs no listener,
   but every step then waits for the next poll. A short poll interval wakes
   the loop for every idle request all the time.
@@ -76,8 +82,17 @@ thread.
   waiting requests. Every response keeps all its text.
 - A step reaches the reader as soon as the engine puts it. Before, a read
   first had to wait for a free thread.
-- The listener runs on the engine thread while the queue's lock is held. It
-  must stay a single `call_soon_threadsafe` call.
+- The listener runs on the engine thread, so it must stay a single
+  `call_soon_threadsafe` call. On the stdlib asyncio loop that call writes to
+  a socket and releases the GIL, so each put costs the engine thread a
+  little time. A probe on a 10-core machine measured it: an engine thread
+  with a 10 ms forward, 200 steps, and one put per stream per step. With 16
+  streams, a step took about 0.2 ms longer than with thread reads (13.5
+  against 13.3 ms, within the noise of the wall time). With 128 streams,
+  the wall time grew from 2.8 to 3.3 s. On uvloop, which `uvicorn[standard]`
+  installs and `uvicorn.run` picks, the wall time with 128 streams stayed at
+  2.8 to 2.9 s for both reads. The stdlib loop runs in the test client and
+  in the Modal scripts that drive the route through it.
 - One reader per handle. Two concurrent `get_step_async()` calls on the same
   handle replace each other's listener.
 - A slow client can still fill its own stream's queue, because the

@@ -84,10 +84,14 @@ class StepQueue(queue.Queue[GenerationStep]):
     loop sets a listener, and every put calls it, so the reader can wait on
     the loop instead of on a thread (see `RequestHandle.get_step_async`).
 
-    The listener runs on the engine thread while the queue's lock is held, so
-    it must return at once and must not touch the queue. A listener that
-    raises `RuntimeError` (the reader's event loop closed under it) does not
-    fail the put: the step stays in the queue, and the engine keeps running.
+    The listener runs on the engine thread after each put, outside the
+    queue's lock, so it must return at once. A listener that raises
+    `RuntimeError` (the reader's event loop closed under it) does not fail
+    the put: the step stays in the queue, and the engine keeps running.
+
+    No wakeup is lost. The listener is read after the step is in the queue,
+    and a reader sets it before it reads the queue. So a put either sees the
+    new listener or lands before the reader's read.
     """
 
     def __init__(self, maxsize: int = 0) -> None:
@@ -98,11 +102,13 @@ class StepQueue(queue.Queue[GenerationStep]):
         with self.mutex:
             self._listener = listener
 
-    def _put(self, item: GenerationStep) -> None:
-        super()._put(item)
-        if self._listener is not None:
+    def put(self, item: GenerationStep, block: bool = True, timeout: float | None = None) -> None:
+        # `put_nowait` calls this too.
+        super().put(item, block, timeout)
+        listener = self._listener
+        if listener is not None:
             with contextlib.suppress(RuntimeError):
-                self._listener()
+                listener()
 
 
 class RequestState(enum.StrEnum):

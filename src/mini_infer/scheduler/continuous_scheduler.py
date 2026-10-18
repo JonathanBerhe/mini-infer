@@ -177,6 +177,9 @@ class ContinuousScheduler:
         # flight after the engine thread exits, so handles must keep waiting
         # for those terminal steps instead of reporting a dead engine.
         self._stopping = False
+        # Set by the engine thread when it dies on an exception; `stop()`
+        # reads it after the join. A crash must not turn into 'cancelled'.
+        self._crashed = False
         # Chrome Trace Event recording. When `trace_out` is set, each engine
         # step that runs a forward appends a duration event to `_trace_events`;
         # `stop()` writes them out as JSON. `_trace_t0` anchors `ts` at zero
@@ -200,20 +203,29 @@ class ContinuousScheduler:
         """Spawn the engine thread. Idempotent if the thread is already running."""
         if self._thread is not None and self._thread.is_alive():
             return
+        if self._crashed:
+            # The old thread died and no `stop()` ended its requests. They
+            # must not move to the new thread: their handles watch the dead
+            # one, and the state they left can be half-updated.
+            self._end_in_flight(crashed=True)
         self._stop_event.clear()
+        self._crashed = False
         self._thread = threading.Thread(
             target=self._engine_loop, name="mini-infer-engine", daemon=True
         )
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit, join it, and cancel what is left.
+        """Signal the engine thread to exit, join it, and end what is left.
 
         After a clean join, every request still running or waiting ends with
-        `finish_reason="cancelled"` and its KV blocks go back to the pool, so
-        a later `start()` begins with an empty batch. If the join times out,
-        the thread can still touch that state, so nothing is cancelled; the
-        handles then fail through their liveness check once it exits.
+        `finish_reason="cancelled"`. If the thread crashed, they end with no
+        terminal step, so their handles raise `EngineNotRunningError`, the
+        same as when no `stop()` follows the crash. Either way the KV blocks
+        go back to the pool, so a later `start()` begins with an empty batch.
+        If the join times out, the thread can still touch that state, so
+        nothing is ended; the handles fail through their liveness check once
+        it exits.
         """
         self._stopping = True
         try:
@@ -223,7 +235,7 @@ class ContinuousScheduler:
                 thread.join(timeout=timeout)
                 self._thread = None
                 if not thread.is_alive():
-                    self._cancel_in_flight()
+                    self._end_in_flight(crashed=self._crashed)
         finally:
             self._stopping = False
         if self._trace_events is not None and self._trace_out is not None:
@@ -250,30 +262,35 @@ class ContinuousScheduler:
         thread_alive = thread.is_alive
         return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
 
-    def _cancel_in_flight(self) -> None:
-        """Finish every request still running or waiting as 'cancelled'.
+    def _end_in_flight(self, *, crashed: bool) -> None:
+        """End every request still running or waiting, and free their blocks.
 
         `stop()` calls this only after the engine thread exited, so no other
-        thread touches this state. A `submit()` on another thread that races
-        `stop()` can still enqueue after the drain; its handle then fails
-        through the liveness check.
+        thread touches this state. After a clean exit each request finishes as
+        'cancelled'. After a crash it gets no terminal step (see `stop()`). A
+        `submit()` on another thread that races `stop()` can still enqueue
+        after the drain; its handle then fails through the liveness check.
         """
-        for req in self._running:
-            if req.state != RequestState.DONE:
-                self._finish(req, "cancelled")
+        leftover = [r for r in self._running if r.state != RequestState.DONE]
         while True:
             try:
-                req = self._waiting.get_nowait()
+                leftover.append(self._waiting.get_nowait())
             except queue.Empty:
                 break
-            self._finish(req, "cancelled")
+        for req in leftover:
+            if crashed:
+                req.state = RequestState.DONE
+            else:
+                self._finish(req, "cancelled")
+        if not crashed:
+            self._reap_done()
+            return
         try:
             self._reap_done()
         except Exception:
-            # The thread can have died in the middle of a step and left the
-            # cache half-updated. The terminal steps above went out anyway;
-            # only the blocks of those requests are lost.
-            logger.exception("stop(): could not free the KV blocks of cancelled requests")
+            # The thread died in the middle of a step and can have left the
+            # cache half-updated; only the blocks of these requests are lost.
+            logger.exception("stop(): could not free the KV blocks after the crash")
             self._running.clear()
             self._batched_cache = None
 
@@ -296,19 +313,24 @@ class ContinuousScheduler:
         request and let the loop retry; the cancelled request returns
         `finish_reason="cancelled"` to its client. Other exceptions still
         crash the thread loudly, because they signal real bugs.
+
+        The crash handler wraps the whole loop, so an exception raised inside
+        the OOM handler itself also counts as a crash.
         """
-        while not self._stop_event.is_set():
-            try:
-                self._step()
-            except OutOfMemoryError:
-                logger.warning("engine OOM during step; preempting youngest in-flight request")
-                self._preempt_on_oom()
-            except Exception:
-                logger.exception("engine thread crashed")
-                raise
-            # When fully idle, wait briefly so we don't spin the CPU.
-            if not self._running and self._waiting.empty():
-                self._stop_event.wait(timeout=self.IDLE_SLEEP_SECONDS)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self._step()
+                except OutOfMemoryError:
+                    logger.warning("engine OOM during step; preempting youngest in-flight request")
+                    self._preempt_on_oom()
+                # When fully idle, wait briefly so we don't spin the CPU.
+                if not self._running and self._waiting.empty():
+                    self._stop_event.wait(timeout=self.IDLE_SLEEP_SECONDS)
+        except Exception:
+            logger.exception("engine thread crashed")
+            self._crashed = True
+            raise
 
     def _preempt_on_oom(self) -> None:
         """Cancel the youngest in-flight request and reap so the loop can retry.

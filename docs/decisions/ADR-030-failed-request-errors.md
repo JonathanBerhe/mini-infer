@@ -39,6 +39,13 @@ forever.
 4. `PDScheduler._emit_terminal` still waits up to `TERMINAL_PUT_TIMEOUT_S`
    (5 s) for a full queue. After that, it drops one buffered step and puts
    the last step, as `ContinuousScheduler._finish` does.
+5. A full KV pool in prefill is not a failure. `PDScheduler` has no memory
+   check at admission, so `prefill_batch` can raise `OutOfMemoryError`. Both
+   prefill handlers catch it first and end the batch as `cancelled`, with no
+   `failed` flag, as the OOM preemption of `ContinuousScheduler` does. An
+   OOM in decode (`DecodeSession.step` or `add_handoff`) has no handler. It
+   still kills the engine thread, and the requests end with
+   `EngineNotRunningError`.
 
 ## Alternatives Considered
 
@@ -62,6 +69,9 @@ forever.
   in the repository depended on the old result.
 - A slow reader on `PDScheduler` can lose one buffered step, but its request
   always ends.
-- `ContinuousScheduler` preempts a request on OOM and still ends it as
-  `cancelled` ([ADR-024](ADR-024-engine-oom-preemption.md)). That is a
-  resource decision of the engine, not a failure.
+- An OOM ends as `cancelled` where the engine handles it:
+  `ContinuousScheduler` preempts one request
+  ([ADR-024](ADR-024-engine-oom-preemption.md)), and `PDScheduler` cancels
+  the prefill batch that did not fit. That is a resource decision of the
+  engine, not a failure. A decode-side OOM on `PDScheduler` is not handled
+  and still kills its engine thread.

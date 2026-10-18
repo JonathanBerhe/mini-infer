@@ -59,7 +59,24 @@ its own death.
    crash or a finished stop. In both cases the queue already holds every step
    that will come. If the join times out, `stop()` cancels nothing, because
    the thread can still touch the state.
-5. The endpoint maps the error. If `submit()` raises, the response is a 503
+5. A crash stays a crash. A handler around the whole engine loop sets a
+   `_crashed` flag before it re-raises, so an error inside the OOM handler
+   counts too. A `stop()` after a crash still frees the state, but it sends
+   no terminal step. So the handles raise `EngineNotRunningError`, the same
+   result as without a `stop()`. Without the flag, a `stop()` inside the
+   waiters' poll slice turned the crash into `cancelled`, and a later
+   `stop()` did not. A `start()` after a crash with no `stop()` ends the
+   leftover requests the same way before it clears the flag. Otherwise the
+   new thread resumed them on state that the crash can have left
+   half-updated, while their handles watched the dead thread.
+   If `stop()` interrupts a handoff of `PDScheduler`'s prefill thread, the
+   thread gives the request back to `stop()`. It does not cancel it, so the
+   crash rule covers that request too. If a join of `PDScheduler.stop()`
+   times out, it records those threads. After they exit, the next `stop()`
+   or `start()` ends what they left, with no terminal step in both cases.
+   Otherwise a restart in parallel mode leaked the KV blocks of
+   the old decode session, and stale entries blocked admission.
+6. The endpoint maps the error. If `submit()` raises, the response is a 503
    with the error type `engine_unavailable`. After a stream starts, the 200
    status is already sent. So the stream ends with an SSE error event and
    then `[DONE]`, as vLLM and SGLang do. The non-streaming path reads step by
@@ -101,14 +118,26 @@ its own death.
   the output that the engine produced before it died. A non-streaming
   request and a caller of `wait()` get only the error.
 - On every scheduler, a request that a clean `stop()` ends finishes as
-  `cancelled`. Before this change, only `PDScheduler.stop()` sent terminal
-  steps, and a waiter on any other scheduler blocked forever.
+  `cancelled`, and a request in flight at a crash ends with
+  `EngineNotRunningError`, whenever `stop()` runs. Before this change, only
+  `PDScheduler.stop()` sent terminal steps (also after a crash), and a
+  waiter on any other scheduler blocked forever.
+- `TensorParallelStateCacheScheduler.stop()` waits for the generation that
+  it serves, because `_serve` does not check the stop event. That request
+  ends normally. If its generation outlasts the join timeout, the requests
+  still waiting end with `EngineNotRunningError` instead of `cancelled`.
 - A `submit()` on another thread that races `stop()` can still land after
   the drain. Its handle then fails through the liveness check. The HTTP
   server calls both on its one event-loop thread, so it never races them.
 - The check covers a thread that exited, not one that is stuck. A
   tensor-parallel leader blocked in a collective whose follower died still
   looks alive. The process-group timeout bounds that case.
+- A `start()` while a thread from a timed-out `stop()` still runs puts a new
+  thread beside the old one, on every scheduler. `stop()` sets the thread
+  attribute to `None` after a timed-out join, and `start()` clears the stop
+  event, so the old thread keeps running its loop. That was true before this
+  change too, and this change does not guard it. A caller must not restart a
+  scheduler until its old thread exits.
 - The process stays up after its engine dies, and every later request gets
   the 503 until the server restarts. No health endpoint exists.
 - Concurrent non-streaming requests now overlap. Before, the blocked event loop

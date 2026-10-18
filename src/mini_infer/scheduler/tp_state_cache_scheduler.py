@@ -56,23 +56,30 @@ class TensorParallelStateCacheScheduler:
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        # True while `stop()` runs; see `ContinuousScheduler._stopping`.
+        # See `ContinuousScheduler._stopping` and `ContinuousScheduler._crashed`.
         self._stopping = False
+        self._crashed = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        if self._crashed:
+            # See `ContinuousScheduler.start`: no request moves to a new thread.
+            self._end_in_flight(crashed=True)
         self._stop_event.clear()
+        self._crashed = False
         self._thread = threading.Thread(
             target=self._engine_loop, name="mini-infer-tp-engine", daemon=True
         )
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        """Signal the engine thread to exit, join it, and cancel what is left.
+        """Signal the engine thread to exit, join it, and end what is left.
 
-        The request being served finishes inside `_serve`. After a clean join,
-        every request still waiting ends with `finish_reason="cancelled"`.
+        The request being served finishes inside `_serve`, so the join waits
+        for its generation. After a clean join, every request still waiting
+        ends with `finish_reason="cancelled"`. After a crash they end with no
+        terminal step, so their handles raise `EngineNotRunningError`.
         """
         self._stopping = True
         try:
@@ -82,14 +89,23 @@ class TensorParallelStateCacheScheduler:
                 thread.join(timeout=timeout)
                 self._thread = None
                 if not thread.is_alive():
-                    while True:
-                        try:
-                            running = self._waiting.get_nowait()
-                        except queue.Empty:
-                            break
-                        self._finish(running, "cancelled")
+                    self._end_in_flight(crashed=self._crashed)
         finally:
             self._stopping = False
+
+    def _end_in_flight(self, *, crashed: bool) -> None:
+        """End every request still waiting, after the engine thread exited.
+
+        A clean exit finishes each one as 'cancelled'; a crash sends no
+        terminal step (see `stop()`).
+        """
+        while True:
+            try:
+                running = self._waiting.get_nowait()
+            except queue.Empty:
+                break
+            if not crashed:
+                self._finish(running, "cancelled")
 
     @property
     def is_running(self) -> bool:
@@ -127,6 +143,7 @@ class TensorParallelStateCacheScheduler:
                 self._serve(running)
         except Exception:
             logger.exception("tensor-parallel engine thread crashed")
+            self._crashed = True
             raise
 
     def _serve(self, running: RunningRequest) -> None:
