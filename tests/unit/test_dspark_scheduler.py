@@ -19,6 +19,12 @@ The scripted target maps input token t to argmax f(t), so a proposal that
 follows f is accepted in full and any deviation is rejected at exactly the
 deviating position. Tap sinks carry each row's POSITION as its value, so a
 context buffer's provenance (which rows, in which order) is assertable.
+
+The mid-append OOM tests also cover the plain path (no dspark), because they
+need this file's real micro model. They inject the failure inside the
+production `append_kv_packed` (`_oom_injection.py`), assert the partial state
+was really reached, and then assert recovery with exact slot lengths, since
+token equality alone cannot see a hole of unwritten K/V in a random model.
 """
 
 from __future__ import annotations
@@ -39,9 +45,11 @@ from mini_infer.engine.dspark import (
 )
 from mini_infer.engine.dspark.draft_cache import DSparkDraftCache
 from mini_infer.engine.sampler import SamplingParams
+from mini_infer.exceptions import OutOfMemoryError
 from mini_infer.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from mini_infer.scheduler import ContinuousScheduler, Request
 from mini_infer.scheduler.request_state import RequestState, RunningRequest
+from tests.unit._oom_injection import MidAppendOom
 
 _VOCAB = 64
 _HIDDEN = 32
@@ -138,10 +146,12 @@ class _ScriptedRunner:
     # scheduler refuses dspark without.
     supports_hidden_state_taps = True
 
-    def __init__(self, f: Callable[[int], int], *, num_blocks: int = 64) -> None:
+    def __init__(
+        self, f: Callable[[int], int], *, num_blocks: int = 64, block_size: int = 16
+    ) -> None:
         self.block_pool = BlockPool(
             num_blocks=num_blocks,
-            block_size=16,
+            block_size=block_size,
             num_layers=1,
             num_kv_heads=1,
             head_dim=8,
@@ -240,10 +250,11 @@ def _spec_sched(
     script: list[list[int]],
     *,
     num_blocks: int = 64,
+    block_size: int = 16,
     chunk_size: int = 256,
     max_concurrent: int = 4,
 ) -> tuple[ContinuousScheduler, _ScriptedRunner, _ScriptedSpec]:
-    runner = _ScriptedRunner(f, num_blocks=num_blocks)
+    runner = _ScriptedRunner(f, num_blocks=num_blocks, block_size=block_size)
     spec = _ScriptedSpec(script)
     sched = ContinuousScheduler(
         runner,  # type: ignore[arg-type]
@@ -664,6 +675,86 @@ def test_chunked_prefill_accumulates_full_prompt_context() -> None:
     assert spec_state.context[0, 0, 0].item() >= 5.0
 
 
+def _drain_text(req: RunningRequest) -> str:
+    """Everything streamed to the client so far, terminal step excluded."""
+    parts: list[str] = []
+    while True:
+        try:
+            step = req.output_queue.get_nowait()
+        except queue.Empty:
+            return "".join(parts)
+        if step.finish_reason is None:
+            parts.append(step.text)
+
+
+def test_speculators_survive_a_mid_append_oom() -> None:
+    """Two speculators survive an allocation failure inside the verify append.
+
+    The pool runs dry after slot 0 (speculator A) has advanced its token count
+    for the new verify window but before any K/V is written, and while slot 1
+    (speculator B) is still unallocated. That partial state used to be fatal:
+    the retry read A's inflated length, failed the start-vs-slot assertion,
+    and the AssertionError killed the engine thread.
+
+    With the rollback the step replays exactly: A and B keep their rounds
+    (no second draft, no second emission), the prefiller C absorbs the
+    preemption, and both streams come out as if nothing happened.
+    """
+    # block_size 2 makes every verify window allocate; chunk_size 2 keeps
+    # the long prompt C prefilling long enough to be the preemption victim.
+    # Script order is A r1, B r1, A r2, B r2: each follows f, so all accept.
+    sched, runner, spec = _spec_sched(
+        _next_token,
+        [[42, 43, 44], [44, 45, 46], [46, 47, 48], [48, 49, 50]],
+        block_size=2,
+        chunk_size=2,
+    )
+    inj = MidAppendOom(runner.block_pool, lambda: sched._batched_cache)
+    a = _enqueue(sched, "ab", 16)  # slot 0, ids [39, 40], anchor f(40) = 41
+    b = _enqueue(sched, "cd", 16)  # slot 1, ids [41, 42], anchor f(42) = 43
+    sched._step()  # A and B prefill
+    c = _enqueue(sched, "efghijklmnop", 4)  # slot 2, 6 chunks of 2
+    sched._step()  # A and B: anchor + round 1; C: chunk 1
+
+    assert a.spec is not None and b.spec is not None
+    assert (a.spec.start, b.spec.start) == (6, 6)
+    baseline = inj.arm()
+    assert baseline == [6, 6, 2]
+
+    with pytest.raises(OutOfMemoryError):
+        sched._step()  # A and B draft round 2; the append fails at B
+
+    # Not vacuous: the production append really left A claiming its window
+    # (6 + 4 positions) with nothing written, while B and C never advanced.
+    assert inj.fired
+    assert sched._batched_cache is not None
+    assert sched._batched_cache.seq_lens_list() == [10, 6, 2]
+    calls_after_draft = spec.propose_calls
+    assert calls_after_draft == 4
+
+    sched._preempt_on_oom()
+
+    assert c.finish_reason == "cancelled"  # the youngest prefiller absorbs it
+    assert c not in sched._running
+    assert sched._batched_cache.seq_lens_list() == [6, 6]  # A rolled back
+
+    sched._step()  # the retry replays the failed step
+
+    assert spec.propose_calls == calls_after_draft  # proposals reused, not redrafted
+    _run_to_done(sched, [a, b])
+
+    # The greedy chain f(t) = t + 1 from each anchor, max_tokens long, with
+    # no token lost or doubled across the failed step.
+    assert a.tokens_generated == list(range(41, 41 + 16))
+    assert b.tokens_generated == list(range(43, 43 + 16))
+    tokenizer = runner.tokenizer
+    assert _drain_text(a) == tokenizer.decode(a.tokens_generated)
+    assert _drain_text(b) == tokenizer.decode(b.tokens_generated)
+    sched._step()  # finished requests free their slots at the next reap
+    pool = runner.block_pool
+    assert pool.num_free_blocks == pool.num_blocks  # nothing leaked
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Numerics, exact: real micro Qwen3 target + real random micro drafter
 # ─────────────────────────────────────────────────────────────────────
@@ -724,13 +815,13 @@ class _MicroRunner:
 
 
 def _micro_setup(
-    seed: int = 0, *, confidence: bool = False
+    seed: int = 0, *, confidence: bool = False, block_size: int = 8
 ) -> tuple[_MicroRunner, Qwen3DSparkDrafter]:
     torch.manual_seed(seed)
     model = Qwen3ForCausalLM(_target_config()).eval()
     pool = BlockPool(
         num_blocks=128,
-        block_size=8,
+        block_size=block_size,
         num_layers=4,
         num_kv_heads=2,
         head_dim=8,
@@ -818,3 +909,210 @@ def test_temperature_sampling_smoke() -> None:
 
     assert req.finish_reason in ("stop", "length")
     assert 0 < len(req.tokens_generated) <= 8
+
+
+def _oom_mid_run(
+    sched: ContinuousScheduler,
+    runner: _MicroRunner,
+    survivors: list[RunningRequest],
+    victim_prompt: str,
+) -> RunningRequest:
+    """Drive `sched` into one mid-append OOM and recover, like `_engine_loop`.
+
+    Steps until every survivor decodes, admits a long-prompt victim, then
+    arms the injection and runs the step that fails inside the append.
+    Asserts the partial state was really reached before recovering, so a
+    test built on this cannot pass vacuously.
+    """
+    inj = MidAppendOom(runner.block_pool, lambda: sched._batched_cache)
+    for _ in range(20):
+        if all(r.state == RequestState.DECODING for r in survivors):
+            break
+        sched._step()
+    victim = _enqueue(sched, victim_prompt, 4)
+    sched._step()  # victim admitted and starts its chunked prefill
+    assert all(r.state == RequestState.DECODING for r in survivors), "survivor finished early"
+    assert victim.state == RequestState.CHUNKED_PREFILLING
+
+    baseline = inj.arm()
+    slot_of = {id(r): r.batch_idx for r in survivors}
+    with pytest.raises(OutOfMemoryError):
+        sched._step()
+    assert inj.fired
+    assert sched._batched_cache is not None
+    lens = sched._batched_cache.seq_lens_list()
+    assert lens[0] > baseline[0], "the append never left slot 0 advanced"
+
+    sched._preempt_on_oom()
+    assert victim.finish_reason == "cancelled"
+    # The exact check. Token equality alone cannot carry this on the plain
+    # path: a micro model with random weights can attend over a hole of
+    # unwritten K/V and still pick the same argmax (measured: a missing
+    # rollback passed the token assertion). Every survivor must be back at
+    # precisely the length it had before the failed forward.
+    after = sched._batched_cache.seq_lens_list()
+    for r in survivors:
+        pre = slot_of[id(r)]
+        assert pre is not None and r.batch_idx is not None
+        assert after[r.batch_idx] == baseline[pre], (
+            f"survivor in slot {r.batch_idx} resumed at length {after[r.batch_idx]}, "
+            f"expected {baseline[pre]}"
+        )
+    return victim
+
+
+def test_two_speculators_survive_mid_append_oom_token_for_token() -> None:
+    """End to end on a real micro model: speculators that live through an
+    allocation failure inside the verify append produce exactly what each
+    produces alone.
+
+    The token comparison is NOT what catches a missing rollback. The exact
+    slot-length assertion in `_oom_mid_run` fails first, and behind it the
+    start-vs-slot assertion in `_draft_speculators` fails before attention
+    ever runs. The tokens then confirm the second half of the claim: that
+    replaying the step with the reused proposals changes no output."""
+    runner, drafter = _micro_setup(seed=4, block_size=2)
+
+    def fresh() -> ContinuousScheduler:
+        return ContinuousScheduler(
+            runner,  # type: ignore[arg-type]
+            max_concurrent=3,
+            chunk_size=4,
+            dspark=DSparkSpec(drafter=drafter),
+        )
+
+    alone_a = _generate(fresh(), ["hello world"], max_tokens=12)[0]
+    alone_b = _generate(fresh(), ["qrstu"], max_tokens=12)[0]
+
+    sched = fresh()
+    a = _enqueue(sched, "hello world", 12)
+    b = _enqueue(sched, "qrstu", 12)
+    _oom_mid_run(sched, runner, [a, b], "a much longer prompt that keeps prefilling")
+    _run_to_done(sched, [a, b])
+
+    assert [a.tokens_generated, b.tokens_generated] == [alone_a, alone_b]
+
+
+def test_plain_decoders_survive_mid_append_oom_token_for_token() -> None:
+    """The same guarantee on the path every model family uses (no dspark).
+
+    Before the rollback existed, a plain decoder in slot 0 resumed at its
+    inflated length after the OOM: its next token's K/V landed past a hole of
+    never-written positions, silently, with no assertion to catch it.
+    """
+    runner, _ = _micro_setup(seed=5, block_size=2)
+
+    def fresh() -> ContinuousScheduler:
+        return ContinuousScheduler(runner, max_concurrent=3, chunk_size=4)  # type: ignore[arg-type]
+
+    alone_a = _generate(fresh(), ["hello world"], max_tokens=12)[0]
+    alone_b = _generate(fresh(), ["qrstu"], max_tokens=12)[0]
+
+    sched = fresh()
+    a = _enqueue(sched, "hello world", 12)
+    b = _enqueue(sched, "qrstu", 12)
+    _oom_mid_run(sched, runner, [a, b], "a much longer prompt that keeps prefilling")
+    _run_to_done(sched, [a, b])
+
+    assert [a.tokens_generated, b.tokens_generated] == [alone_a, alone_b]
+
+
+def test_preemption_after_a_successful_forward_undoes_nothing() -> None:
+    """The saved lengths live only while a forward is in flight.
+
+    `_preempt_on_oom` also serves callers that did not just fail an append.
+    If the snapshot outlived a forward that landed, a later rollback would
+    truncate K/V that really was written. Here a step completes, then a
+    preemption runs: the survivor's length must be untouched.
+    """
+    sched, _runner, _spec = _spec_sched(_next_token, [], block_size=2)
+    a = _enqueue(sched, "ab", 8)
+    b = _enqueue(sched, "cd", 8)
+    sched._step()  # both prefill
+    sched._step()  # both decode a round
+    assert sched._batched_cache is not None
+    before = sched._batched_cache.seq_lens_list()
+    assert sched._pre_forward_seq_lens is None
+
+    sched._preempt_on_oom()  # cancels b, the youngest (no prefillers left)
+
+    assert b.finish_reason == "cancelled"
+    assert a.batch_idx == 0
+    assert sched._batched_cache.seq_lens_list() == before[:1]
+
+
+def _plain_prefill_pair(
+    block_size: int = 2, chunk_size: int = 4
+) -> tuple[ContinuousScheduler, _ScriptedRunner, RunningRequest, RunningRequest]:
+    """Two plain prefillers mid-prompt: an older survivor in slot 0 and a
+    younger victim in slot 1. Each chunk of 4 needs 2 blocks of size 2."""
+    runner = _ScriptedRunner(_next_token, block_size=block_size)
+    sched = ContinuousScheduler(runner, chunk_size=chunk_size)  # type: ignore[arg-type]
+    old = _enqueue(sched, "abcdefghij", 6)  # 10 prompt tokens: chunks 4, 4, 2
+    young = _enqueue(sched, "klmnopqrstuvwxyz", 6)  # 16 prompt tokens
+    sched._step()  # both prefill chunk 1
+    assert old.state == young.state == RequestState.CHUNKED_PREFILLING
+    return sched, runner, old, young
+
+
+def test_surviving_prefiller_is_rolled_back_after_mid_append_oom() -> None:
+    """A request still reading its prompt survives a failure in a later slot.
+
+    Its count advanced over the chunk it was given, with nothing written.
+    Every earlier OOM test had only the victim prefilling, so a rollback that
+    skipped prefilling slots passed them all. Without the rollback, the retry
+    stores the chunk past a hole; the prefill-vs-slot assertion now makes
+    that loud instead of silent.
+    """
+    sched, runner, old, young = _plain_prefill_pair()
+    inj = MidAppendOom(runner.block_pool, lambda: sched._batched_cache)
+    assert inj.arm() == [4, 4]
+
+    with pytest.raises(OutOfMemoryError):
+        sched._step()  # old's chunk 2 claims positions 4..7; young's alloc raises
+
+    assert inj.fired
+    assert sched._batched_cache is not None
+    assert sched._batched_cache.seq_lens_list() == [8, 4]  # old claims, holds nothing
+
+    sched._preempt_on_oom()
+
+    assert young.finish_reason == "cancelled"  # the youngest prefiller
+    assert sched._batched_cache.seq_lens_list() == [4]
+    assert old.tokens_prefilled == 4  # counter and slot agree again
+
+    _run_to_done(sched, [old])
+    # "j" encodes to (106 % 59) + 1 = 48, so greedy follows f from 49.
+    assert old.tokens_generated == list(range(49, 49 + 6))
+
+
+def test_slot_that_raised_keeps_its_claimed_blocks_without_leaking() -> None:
+    """The slot whose allocation fails can keep blocks its length does not need.
+
+    `append_kv_packed` adds each new block to the slot before it advances the
+    slot's count. A raise on the slot's SECOND allocation leaves it with one
+    extra block and an unchanged length, which `truncate_to` does not touch.
+    The retry feeds the same chunk, so it reuses that block, and once the
+    request finishes every block is back in the pool.
+    """
+    sched, runner, old, young = _plain_prefill_pair()
+    inj = MidAppendOom(runner.block_pool, lambda: sched._batched_cache)
+    inj.arm(slot=0)
+    assert sched._batched_cache is not None
+    blocks_before = len(sched._batched_cache._block_ids[0])
+
+    with pytest.raises(OutOfMemoryError):
+        sched._step()  # old's chunk 2 needs 2 blocks; the second one raises
+
+    assert inj.fired
+    assert sched._batched_cache.seq_lens_list() == [4, 4]  # nobody advanced
+    assert len(sched._batched_cache._block_ids[0]) == blocks_before + 1  # the kept claim
+
+    sched._preempt_on_oom()
+    assert young.finish_reason == "cancelled"
+
+    _run_to_done(sched, [old])
+    assert old.tokens_generated == list(range(49, 49 + 6))
+    sched._step()  # the reap frees the finished request's slot
+    pool = runner.block_pool
+    assert pool.num_free_blocks == pool.num_blocks

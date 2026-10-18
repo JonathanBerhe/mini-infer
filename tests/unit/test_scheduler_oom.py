@@ -10,6 +10,12 @@ request). These tests pin both halves:
 - end-to-end recovery: a fake runner whose forward OOMs exactly once, driven
   through the real engine thread, must leave the engine alive and serving.
 
+The fake here raises BEFORE it touches the cache, so it cannot reach the
+partial state a real append leaves behind (slots that claim positions with no
+K/V written). The rollback of that state is tested in
+`test_dspark_scheduler.py`, for the plain path and the speculative path, with
+the failure injected inside the production `append_kv_packed`.
+
 Model-free (a fake runner over a real `BlockPool`), so it runs in CI.
 """
 

@@ -165,6 +165,11 @@ class ContinuousScheduler:
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._running: list[RunningRequest] = []
         self._batched_cache: PagedKVCache | None = None
+        # Per-slot cache lengths saved right before the packed forward and
+        # cleared the moment it returns. Non-None only while a forward is in
+        # flight or after one raised, which is exactly when
+        # `_roll_back_partial_append` needs it.
+        self._pre_forward_seq_lens: list[int] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         # Chrome Trace Event recording. When `trace_out` is set, each engine
@@ -248,12 +253,17 @@ class ContinuousScheduler:
         (FILO), matching the intuition that the most recent admission is
         what pushed us past the watermark.
 
-        Surviving decoders keep the tokens they already sampled and emitted in
-        `pending_decode_tokens`; the retry feeds those instead of sampling
-        again, so the client never sees the same token twice. Their KV slots are
-        NOT rolled back, so K/V that a partially applied append advanced the
-        slot past stays stale.
+        Survivors resume the failed step exactly. Every slot's cache length is
+        first rolled back to what it was before the forward
+        (`_roll_back_partial_append`). Plain decoders keep the tokens they
+        already sampled and emitted in `pending_decode_tokens`, and speculators
+        keep their whole round (anchor, proposal, and drafter cache), so the
+        retry re-feeds the same inputs at the same positions and the client
+        never sees a token twice.
         """
+        # Before the reap: the saved lengths are indexed by the batch_idx
+        # values the failed forward used, and the reap shifts them.
+        self._roll_back_partial_append()
         candidates = [
             r
             for r in self._running
@@ -267,6 +277,51 @@ class ContinuousScheduler:
         victim = candidates[-1]
         self._finish(victim, "cancelled")
         self._reap_done()
+
+    def _roll_back_partial_append(self) -> None:
+        """Return every slot to the length it had before the forward that raised.
+
+        `append_kv_packed` works in two phases. On layer 0 it first advances
+        each slot's token count and allocates its blocks, slot by slot, and
+        only then writes any K/V. When the pool runs dry at slot j, slots
+        0..j-1 already claim positions that hold no data. The retry takes its
+        position offsets from those counts, so without this a plain decoder
+        writes its token at the wrong position (silent corruption) and a
+        speculator fails its start-vs-slot assertion (a dead engine thread,
+        because only `OutOfMemoryError` is caught).
+
+        Speculator state needs no undo here. Drafting finishes before the
+        forward starts, so each speculator's drafter cache and proposal are
+        complete and consistent at `spec.start`, and the retry reuses them
+        through the `drafted_for_start` guard. Rolling the drafter cache back
+        as well would break (INV) on that reuse path.
+
+        Safe to apply to every slot unconditionally. `truncate_to` only
+        shrinks and is a no-op at the current length, and it cannot land inside
+        a published prefix block: publication happens on the last layer, after
+        every write, so a layer-0 failure publishes nothing new.
+
+        Blocks: every slot whose count advanced gets the blocks it claimed past
+        the boundary freed. The slot whose `allocate` raised is different. It
+        adds blocks to its list before it advances its count, so it can keep
+        blocks it received before the raise while its count stays put, and
+        `truncate_to` leaves them alone. They do not leak: the retry feeds that
+        slot the same q-length, so the append reuses exactly those blocks, and
+        `remove_request` frees them if the slot is the victim or is cancelled.
+        Between this rollback and the retry, that one slot holds more blocks
+        than its length needs.
+        """
+        snapshot = self._pre_forward_seq_lens
+        self._pre_forward_seq_lens = None
+        if snapshot is None or self._batched_cache is None:
+            return
+        cache = self._batched_cache
+        assert len(snapshot) == cache.batch_size, (
+            f"saved {len(snapshot)} slot lengths for a batch of {cache.batch_size}; "
+            "a slot was added or removed between the forward and the rollback"
+        )
+        for batch_idx, length in enumerate(snapshot):
+            cache.truncate_to(batch_idx, length)
 
     def _step(self) -> None:
         """One scheduler iteration: admit, sample/draft, reap, forward, verify."""
@@ -675,6 +730,16 @@ class ContinuousScheduler:
             assert req.batch_idx is not None and req.batch_idx == index
             if req.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING):
                 chunk_start = req.tokens_prefilled
+                # A prefiller's slot length and its prefill counter advance
+                # together, chunk by chunk (and a prefix-cache hit sets both at
+                # admission). A slot ahead of its counter means an append that
+                # claimed positions without writing them; feeding the chunk
+                # anyway would store its K/V past a hole, silently. The
+                # speculators' start-vs-slot assertion guards the same failure.
+                assert chunk_start == cache_seq_lens[req.batch_idx], (
+                    f"prefill at {chunk_start} disagrees with slot length "
+                    f"{cache_seq_lens[req.batch_idx]}"
+                )
                 chunk_end = min(chunk_start + self._chunk_size, len(req.prompt_token_ids))
                 chunk_tokens = req.prompt_token_ids[chunk_start:chunk_end]
                 # Same hazard as the decode branch below: no rows of its own
@@ -701,6 +766,9 @@ class ContinuousScheduler:
         # batch with no speculators skips the tap kwargs entirely, which is
         # also what keeps non-Qwen3 models working when dspark is off.
         sink: dict[int, torch.Tensor] | None = None
+        # Saved for `_roll_back_partial_append`: if the forward raises
+        # mid-append, these are the lengths every slot must return to.
+        self._pre_forward_seq_lens = cache_seq_lens
         if self._dspark is not None and any(r.spec is not None for r in alive):
             sink = {}
             packed_logits = self._runner.forward_step_packed(
@@ -715,6 +783,10 @@ class ContinuousScheduler:
             packed_logits = self._runner.forward_step_packed(
                 self._batched_cache, packed_input_ids, cu_seqlens_q, position_offsets
             )
+        # The forward landed, so every slot now legitimately holds the K/V it
+        # appended. Clear the snapshot BEFORE anything else can fail: a stale
+        # one would let a later rollback undo writes that really happened.
+        self._pre_forward_seq_lens = None
 
         # Distribute logits and advance prefill state.
         for index, req in enumerate(alive):

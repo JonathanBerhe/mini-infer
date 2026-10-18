@@ -257,10 +257,12 @@ def test_zero_token_prefiller_is_rejected() -> None:
     sched, _ = _sched()
     req = _enqueue(sched, "abc", max_tokens=8)
 
-    sched._admit_waiting()
+    sched._step()  # the real prefill: counter and slot both reach 3
     # A prefiller with nothing left to feed cannot arise on its own (the state
-    # machine moves it to DECODING first), so force it.
-    req.tokens_prefilled = len(req.prompt_token_ids)
+    # machine moves it to DECODING first), so force only the state back. The
+    # counter and the slot stay in agreement, so the prefill-vs-slot assertion
+    # passes and the zero-chunk guard is the one that fires.
+    req.state = RequestState.CHUNKED_PREFILLING
 
     with pytest.raises(AssertionError, match="prefilling request contributed no tokens"):
         sched._packed_forward([req], {})
