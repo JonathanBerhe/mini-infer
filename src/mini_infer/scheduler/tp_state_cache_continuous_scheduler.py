@@ -36,6 +36,7 @@ from mini_infer.scheduler.request_state import (
     Request,
     RequestHandle,
     RunningRequest,
+    StepQueue,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ class TensorParallelStateCacheContinuousScheduler:
             raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
-            output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
+            output_queue=StepQueue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
         thread_alive = thread.is_alive

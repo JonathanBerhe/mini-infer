@@ -52,6 +52,7 @@ from mini_infer.scheduler.request_state import (
     Request,
     RequestHandle,
     RunningRequest,
+    StepQueue,
 )
 from mini_infer.workers import PDScheduler
 
@@ -125,7 +126,7 @@ def _request(max_tokens: int = 4, prompt: str = "abc") -> Request:
 
 
 def _bare(*steps: GenerationStep) -> RunningRequest:
-    req = RunningRequest(request=_request(), output_queue=queue.Queue())
+    req = RunningRequest(request=_request(), output_queue=StepQueue())
     for step in steps:
         req.output_queue.put(step)
     return req
@@ -274,6 +275,81 @@ def test_build_result_ignores_the_terminal_step_text() -> None:
     req = _bare(_token("a"), GenerationStep(text="engine error: boom", finish_reason="cancelled"))
     result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
     assert (result.text, result.finish_reason) == ("a", "cancelled")
+
+
+# ---- RequestHandle.get_step_async ------------------------------------------
+
+
+def _run_async(fn: Callable[[], Any]) -> Any:
+    """Run a coroutine function on a fresh event loop, under `_bounded`."""
+    return _bounded(lambda: asyncio.run(fn()))
+
+
+def test_get_step_async_wakes_on_a_put_without_waiting_for_a_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine's put wakes the loop at once; the poll slice is only for
+    liveness. A slice this long would show up in the latency otherwise."""
+    monkeypatch.setattr(RequestHandle, "LIVENESS_POLL_SECONDS", 5.0)
+    req = _bare()
+    handle = RequestHandle(req, engine_alive=lambda: True)
+    threading.Timer(0.05, lambda: req.output_queue.put(_token("now"))).start()
+    start = time.monotonic()
+    assert _run_async(handle.get_step_async).text == "now"
+    assert time.monotonic() - start < 1.0
+
+
+def test_get_step_async_hands_out_buffered_steps_then_reports_a_dead_engine() -> None:
+    req = _bare(_token("a"), _token("b"))
+    handle = RequestHandle(req, engine_alive=_dead)
+    seen: list[str] = []
+
+    async def drain() -> None:
+        while True:
+            seen.append((await handle.get_step_async()).text)
+
+    with pytest.raises(EngineNotRunningError):
+        _run_async(drain)
+    assert seen == ["a", "b"]
+    assert req.cancel_event.is_set()
+    # The listener does not outlive the wait: a later put must not call into
+    # a loop that is gone.
+    assert req.output_queue._listener is None  # type: ignore[attr-defined]
+
+
+def test_get_step_async_returns_a_last_step_put_just_before_the_thread_exited() -> None:
+    req = _bare()
+
+    def exits_after_its_last_put() -> bool:
+        req.output_queue.put_nowait(GenerationStep(text="", finish_reason="length"))
+        return False
+
+    handle = RequestHandle(req, engine_alive=exits_after_its_last_put)
+    assert _run_async(handle.get_step_async).finish_reason == "length"
+
+
+def test_get_step_async_waits_through_empty_slices_while_the_engine_lives() -> None:
+    req = _bare()
+    threading.Timer(4 * _POLL_S, lambda: req.output_queue.put(_token("late"))).start()
+    handle = RequestHandle(req, engine_alive=lambda: True)
+    assert _run_async(handle.get_step_async).text == "late"
+
+
+def test_get_step_async_needs_a_step_queue() -> None:
+    req = RunningRequest(request=_request(), output_queue=queue.Queue())
+    with pytest.raises(TypeError, match="StepQueue"):
+        _run_async(RequestHandle(req, engine_alive=lambda: True).get_step_async)
+
+
+def test_step_queue_put_survives_a_reader_whose_loop_closed() -> None:
+    """The listener runs on the engine thread. A reader's loop that closed
+    under it must not turn the engine's put into a crash."""
+    loop = asyncio.new_event_loop()
+    loop.close()
+    out = StepQueue()
+    out.set_listener(lambda: loop.call_soon_threadsafe(lambda: None))
+    out.put_nowait(_token("kept"))
+    assert out.get_nowait().text == "kept"
 
 
 # ---- model-free engines ---------------------------------------------------
@@ -819,19 +895,48 @@ def test_http_non_streaming_requests_do_not_starve_each_other_of_threads(
     sched = ContinuousScheduler(_ScriptedRunner(gate=gate, delay_s=0.005))  # type: ignore[arg-type]
     sched.DEFAULT_OUTPUT_QUEUE_SIZE = 4  # type: ignore[misc]
     server, client = serve(sched, gates=(gate,))
+    _one_executor_thread(client)
+    _assert_no_text_lost(server, client, gate, n_requests=2, max_tokens=12)
 
-    async def one_executor_thread() -> None:
+
+def test_http_requests_waiting_for_admission_do_not_starve_the_running_one(
+    serve: Callable[..., tuple[_Server, TestClient]],
+) -> None:
+    """Two requests wait in the admission queue while one generates, and the
+    executor has one thread. A reader that holds a thread while it waits, even
+    in short slices, leaves the running request's small queue unread long
+    enough to overflow. Reading on the event loop needs no thread at all."""
+    gate = threading.Event()
+    sched = ContinuousScheduler(  # type: ignore[arg-type]
+        _ScriptedRunner(gate=gate, delay_s=0.02), max_concurrent=1
+    )
+    sched.DEFAULT_OUTPUT_QUEUE_SIZE = 4  # type: ignore[misc]
+    server, client = serve(sched, gates=(gate,))
+    _one_executor_thread(client)
+    _assert_no_text_lost(server, client, gate, n_requests=3, max_tokens=12)
+
+
+def _one_executor_thread(client: TestClient) -> None:
+    """Shrink the app loop's default executor to one thread."""
+
+    async def shrink() -> None:
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
 
     assert client.portal is not None
-    client.portal.call(one_executor_thread)
-    max_tokens = 12
+    client.portal.call(shrink)
+
+
+def _assert_no_text_lost(
+    server: _Server, client: TestClient, gate: threading.Event, *, n_requests: int, max_tokens: int
+) -> None:
+    """Post `n_requests` concurrent completions while the engine is gated,
+    open the gate, and check that each one kept every token's text."""
     responses: list[Any] = []
     posts = [
         threading.Thread(
             target=lambda: responses.append(_post(client, max_tokens=max_tokens)), daemon=True
         )
-        for _ in range(2)
+        for _ in range(n_requests)
     ]
     for post in posts:
         post.start()
@@ -841,6 +946,7 @@ def test_http_non_streaming_requests_do_not_starve_each_other_of_threads(
     for post in posts:
         post.join(_BOUND_S)
         assert not post.is_alive()
+    assert len(responses) == n_requests
     for response in responses:
         assert response.status_code == 200
         assert response.json()["choices"][0]["text"] == "a" * max_tokens

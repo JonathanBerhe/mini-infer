@@ -63,9 +63,9 @@ its own death.
    with the error type `engine_unavailable`. After a stream starts, the 200
    status is already sent. So the stream ends with an SSE error event and
    then `[DONE]`, as vLLM and SGLang do. The non-streaming path reads step by
-   step, like the stream, through `asyncio.to_thread(handle.get_step, 0.25)`.
-   It never blocks the event loop. The error message is fixed, and the cause
-   stays in the server log.
+   step, like the stream, and never blocks the event loop. Both paths wait on
+   the event loop itself ([ADR-029](ADR-029-event-loop-output-reads.md)). The
+   error message is fixed, and the cause stays in the server log.
 
 ## Alternatives Considered
 
@@ -109,11 +109,6 @@ its own death.
 - The check covers a thread that exited, not one that is stuck. A
   tensor-parallel leader blocked in a collective whose follower died still
   looks alive. The process-group timeout bounds that case.
-- The executor pool is still shared by every request in flight. When more
-  requests are in flight than the pool has threads, unread output queues can
-  still fill and drop steps. Streaming requests had this limit before this
-  change. A dedicated executor, or a read of every buffered step per thread
-  hop, is the follow-up.
 - The process stays up after its engine dies, and every later request gets
   the 503 until the server restarts. No health endpoint exists.
 - Concurrent non-streaming requests now overlap. Before, the blocked event loop

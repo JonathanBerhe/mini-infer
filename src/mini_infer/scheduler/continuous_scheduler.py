@@ -75,6 +75,7 @@ from mini_infer.scheduler.request_state import (
     RequestHandle,
     RequestState,
     RunningRequest,
+    StepQueue,
 )
 
 logger = logging.getLogger(__name__)
@@ -241,7 +242,7 @@ class ContinuousScheduler:
             raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
-            output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
+            output_queue=StepQueue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
         # The thread is read first: a dead thread plus `_stopping` False means

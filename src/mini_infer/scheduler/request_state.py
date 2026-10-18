@@ -1,5 +1,7 @@
 """Request-related types: input Request, output Result/Step, internal scheduler state."""
 
+import asyncio
+import contextlib
 import dataclasses
 import enum
 import queue
@@ -66,6 +68,34 @@ class GenerationStep:
     text: str
     finish_reason: FinishReason | None = None
     num_tokens: int = 0
+
+
+class StepQueue(queue.Queue[GenerationStep]):
+    """The output queue of one request: a `queue.Queue` that can wake an asyncio reader.
+
+    The engine thread puts steps with the ordinary calls. A reader on an event
+    loop sets a listener, and every put calls it, so the reader can wait on
+    the loop instead of on a thread (see `RequestHandle.get_step_async`).
+
+    The listener runs on the engine thread while the queue's lock is held, so
+    it must return at once and must not touch the queue. A listener that
+    raises `RuntimeError` (the reader's event loop closed under it) does not
+    fail the put: the step stays in the queue, and the engine keeps running.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        self._listener: Callable[[], object] | None = None
+
+    def set_listener(self, listener: Callable[[], object] | None) -> None:
+        with self.mutex:
+            self._listener = listener
+
+    def _put(self, item: GenerationStep) -> None:
+        super()._put(item)
+        if self._listener is not None:
+            with contextlib.suppress(RuntimeError):
+                self._listener()
 
 
 class RequestState(enum.StrEnum):
@@ -238,15 +268,50 @@ class RequestHandle:
         deadline = None if timeout is None else time.monotonic() + timeout
         return self._next_step(deadline)
 
+    async def get_step_async(self) -> GenerationStep:
+        """`get_step()` for a caller on an asyncio event loop, without a thread.
+
+        The output queue (a `StepQueue`) wakes the loop on every put, so this
+        wait holds no worker thread, however many requests are in flight. A
+        blocking `get_step()` in `asyncio.to_thread` holds one thread of a
+        small shared pool per waiting request, and the queues of requests
+        that get no thread fill up and drop steps. Liveness is polled on the
+        same slices, with the same checks, as in `get_step()`.
+        """
+        out = self._req.output_queue
+        if not isinstance(out, StepQueue):
+            raise TypeError("get_step_async() needs a StepQueue as the output queue")
+        loop = asyncio.get_running_loop()
+        ready = asyncio.Event()
+        # Runs on the engine thread: `call_soon_threadsafe` is the one
+        # asyncio call that is safe from another thread.
+        out.set_listener(lambda: loop.call_soon_threadsafe(ready.set))
+        try:
+            while True:
+                # Clear before reading: a put after the read sets it again.
+                ready.clear()
+                try:
+                    return out.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    async with asyncio.timeout(self.LIVENESS_POLL_SECONDS):
+                        await ready.wait()
+                    continue
+                except TimeoutError:
+                    pass
+                step = self._after_empty_poll()
+                if step is not None:
+                    return step
+        finally:
+            out.set_listener(None)
+
     def _next_step(self, deadline: float | None) -> GenerationStep:
         """Return the next step, polling engine liveness while the queue is empty.
 
         The order of the checks matters. The queue comes first, so buffered
         steps always reach the caller before an error. Liveness comes before
         the deadline, so a dead engine is reported as dead and not as slow.
-        After liveness reads False, one more non-blocking read is needed: the
-        thread can put its last step between the timed-out `get` and the
-        liveness read, and a thread that exited made all its puts visible.
         """
         while True:
             timeout: float | None = None
@@ -259,17 +324,31 @@ class RequestHandle:
                 return self._req.output_queue.get(timeout=timeout)
             except queue.Empty:
                 pass
-            if self._engine_alive is not None and not self._engine_alive():
-                try:
-                    return self._req.output_queue.get_nowait()
-                except queue.Empty:
-                    # A restarted scheduler or a surviving PD prefill thread
-                    # can still hold this request; cancel it so that the
-                    # engine does not spend work on output nobody reads.
-                    self.cancel()
-                    raise EngineNotRunningError(
-                        "engine not running: the engine thread exited before this request "
-                        "finished (it was stopped or it crashed; see the log)"
-                    ) from None
+            step = self._after_empty_poll()
+            if step is not None:
+                return step
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("request did not finish within the timeout")
+
+    def _after_empty_poll(self) -> GenerationStep | None:
+        """Decide what a poll slice that found the queue empty means.
+
+        Returns None to keep waiting while the engine can still send a step.
+        Once liveness reads False, one more non-blocking read is needed: the
+        thread can put its last step between the empty read and the liveness
+        read, and a thread that exited made all its puts visible. If that
+        read is empty too, no step will ever come.
+        """
+        if self._engine_alive is None or self._engine_alive():
+            return None
+        try:
+            return self._req.output_queue.get_nowait()
+        except queue.Empty:
+            # A restarted scheduler or a surviving PD prefill thread can still
+            # hold this request; cancel it so that the engine does not spend
+            # work on output nobody reads.
+            self.cancel()
+            raise EngineNotRunningError(
+                "engine not running: the engine thread exited before this request "
+                "finished (see the log)"
+            ) from None

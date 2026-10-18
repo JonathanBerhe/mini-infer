@@ -49,6 +49,7 @@ from mini_infer.scheduler.request_state import (
     RequestHandle,
     RequestState,
     RunningRequest,
+    StepQueue,
 )
 from mini_infer.workers.decode_worker import DecodeSession, DecodeWorker
 from mini_infer.workers.kv_handoff import KVHandoff
@@ -283,7 +284,7 @@ class PDScheduler:
         running = RunningRequest(
             request=request,
             prompt_token_ids=prompt_token_ids,
-            output_queue=queue.Queue(maxsize=256),
+            output_queue=StepQueue(maxsize=256),
             cancel_event=threading.Event(),
             state=RequestState.WAITING,
         )

@@ -1,7 +1,7 @@
 """OpenAI-compatible HTTP API for mini-infer.
 
 Security posture (the server is meant to run behind a trusted reverse proxy
-or on localhost — these guards are belt-and-suspenders):
+or on localhost, so these guards are belt-and-suspenders):
 
 - Defaults to binding `127.0.0.1`. Set `MINI_INFER_HOST=0.0.0.0` to expose.
 - Optional bearer-token auth: set `MINI_INFER_API_KEY=<secret>` and clients
@@ -14,11 +14,14 @@ or on localhost — these guards are belt-and-suspenders):
   and cancels the request when the client drops the connection.
 - A global exception handler converts uncaught engine errors into a sanitized
   503 instead of letting FastAPI emit a stack trace.
-- If the engine thread is not running (it crashed, or the server is shutting
-  down), a request fails instead of hanging: a 503 with error type
-  `engine_unavailable`, or, once a stream has started, an SSE error event
-  followed by `[DONE]`. The process stays up; every later request gets the
-  same 503 until the server restarts.
+- If the engine thread died, a request fails instead of hanging: a 503 with
+  error type `engine_unavailable`, or, once a stream has started, an SSE
+  error event followed by `[DONE]`. The process stays up; every later
+  request gets the same 503 until the server restarts.
+
+Every request waits for its output on the event loop
+(`RequestHandle.get_step_async`), never on a worker thread, so the number of
+requests in flight is not bounded by a thread pool.
 """
 
 import asyncio
@@ -54,7 +57,6 @@ from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.models import architecture_uses_state_cache
 from mini_infer.scheduler import (
     ContinuousScheduler,
-    GenerationStep,
     Request,
     RequestHandle,
     StateCacheContinuousScheduler,
@@ -95,14 +97,6 @@ DEFAULT_PORT = 8000
 # the per-step overhead negligible while still cancelling within a typical
 # token's wall-clock budget.
 _DISCONNECT_POLL_SECONDS = 0.1
-
-# Longest time one read of the next step holds a worker thread of the event
-# loop's default executor (min(32, cpus + 4) threads, shared by every request
-# in flight). A request that waits long for its next step, for example in the
-# admission queue, gives the worker back this often, so that requests with
-# steps to read get a turn. It does not make the pool large enough for every
-# request: past that point, unread output queues still fill and drop steps.
-_STEP_POLL_SECONDS = 0.25
 
 logger = logging.getLogger(__name__)
 _API_KEY = os.environ.get("MINI_INFER_API_KEY")
@@ -227,8 +221,8 @@ async def completions(
 
             A background watcher polls `fastapi_req.is_disconnected` every
             100 ms; on client drop it calls `handle.cancel()`, which makes
-            the engine emit a terminal step and unblocks the consumer's
-            `get_step()` so resources (KV blocks, batch slot) are freed
+            the engine emit a terminal step and wakes the consumer's
+            `get_step_async()` so resources (KV blocks, batch slot) are freed
             promptly.
 
             The 200 status is already sent when the first step is awaited, so
@@ -239,7 +233,7 @@ async def completions(
             try:
                 while True:
                     try:
-                        step = await _next_step(handle)
+                        step = await handle.get_step_async()
                     except EngineNotRunningError:
                         logger.error("%s: the engine stopped mid-stream", completion_id)
                         yield f"data: {json.dumps(_ENGINE_UNAVAILABLE)}\n\n"
@@ -262,15 +256,15 @@ async def completions(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # Read step by step like the stream. One blocking `wait()` would hold a
-    # worker thread for the whole generation, and the output queues of other
-    # requests would go unread meanwhile. The cancel in `finally` frees the
-    # batch slot if this coroutine is cancelled, for example at shutdown; on a
-    # finished request it does nothing.
+    # Read step by step on the event loop, like the stream. A blocking `wait()`
+    # here would stall every other request, and one in `asyncio.to_thread`
+    # would hold a thread of a small shared pool for the whole generation.
+    # The cancel in `finally` frees the batch slot if this coroutine is
+    # cancelled, for example at shutdown; on a finished request it does nothing.
     try:
         text_parts: list[str] = []
         while True:
-            step = await _next_step(handle)
+            step = await handle.get_step_async()
             if step.finish_reason is not None:
                 break
             text_parts.append(step.text)
@@ -302,28 +296,14 @@ def _engine_unavailable_response() -> JSONResponse:
     return JSONResponse(status_code=503, content=_ENGINE_UNAVAILABLE)
 
 
-async def _next_step(handle: RequestHandle) -> GenerationStep:
-    """Await the next step without holding a worker thread for long.
-
-    Each read blocks a worker of the default executor for at most
-    `_STEP_POLL_SECONDS`, then gives it back and tries again. The handle
-    raises `EngineNotRunningError` when the engine thread is gone.
-    """
-    while True:
-        try:
-            return await asyncio.to_thread(handle.get_step, _STEP_POLL_SECONDS)
-        except TimeoutError:
-            continue
-
-
 async def _watch_disconnect(fastapi_req: FastAPIRequest, handle: RequestHandle) -> None:
     """Poll the client's connection; cancel the request when it drops.
 
     Runs as a background task during streaming. When the client closes
     the SSE connection, calling `handle.cancel()` makes the engine emit a
-    terminal step at its next safe point, which unblocks the main stream
-    loop's `get_step()` call so the response generator returns and FastAPI
-    cleans up.
+    terminal step at its next safe point, which wakes the main stream
+    loop's `get_step_async()` call so the response generator returns and
+    FastAPI cleans up.
     """
     try:
         while True:
