@@ -153,8 +153,10 @@ class TensorParallelStateCacheScheduler:
                 should_cancel=running.cancel_event.is_set,
             )
         except Exception:
-            logger.exception("tensor-parallel generation failed; finishing as cancelled")
-            self._finish(running, "cancelled")
+            # The thread survives; the handle raises `RequestFailedError`, so
+            # a client can tell this failure from a cancellation.
+            logger.exception("tensor-parallel generation failed; failing the request")
+            self._finish(running, "cancelled", failed=True)
             return
 
         if running.cancel_event.is_set():
@@ -174,9 +176,11 @@ class TensorParallelStateCacheScheduler:
             with contextlib.suppress(queue.Full):
                 running.output_queue.put_nowait(step)
 
-    def _finish(self, running: RunningRequest, reason: FinishReason) -> None:
+    def _finish(
+        self, running: RunningRequest, reason: FinishReason, *, failed: bool = False
+    ) -> None:
         running.finish_reason = reason
-        terminal = GenerationStep(text="", finish_reason=reason)
+        terminal = GenerationStep(text="", finish_reason=reason, failed=failed)
         try:
             running.output_queue.put_nowait(terminal)
         except queue.Full:

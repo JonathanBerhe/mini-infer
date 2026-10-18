@@ -15,3 +15,13 @@ class EngineNotRunningError(RuntimeError):
     raised a plain `RuntimeError` from `submit()` for the same condition
     before this type existed.
     """
+
+
+class RequestFailedError(RuntimeError):
+    """Raised by a `RequestHandle` when the engine failed this one request.
+
+    The engine thread caught the error, logged it, and keeps serving other
+    requests. The message is fixed on purpose: the cause can hold internal
+    state (paths, shapes, device details), so it goes only to the log, never
+    to the client.
+    """

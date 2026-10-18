@@ -1,20 +1,25 @@
-"""A dead engine thread fails its requests instead of hanging them.
+"""Engine problems reach the caller as errors, and output is never lost.
 
 Every scheduler runs its engine on a thread that dies on an unexpected
 exception, and after that no request in flight ever receives its terminal
-step. These tests pin the three layers that turn that into an error:
+step. These tests pin the layers that turn engine problems into errors
+(ADR-028, ADR-030) and the event-loop reads of the server (ADR-029):
 
 - `RequestHandle` polls the liveness of the thread that owns its request
   whenever its queue stays empty, hands out every buffered step first, and
-  then raises `EngineNotRunningError`.
-- Each of the five schedulers binds its handles to its engine thread(s) and
-  rejects `submit()` once that thread is gone.
-- The HTTP endpoint answers a dead engine with a 503 (or an SSE error event
-  once a stream has started), and never blocks the event loop while it waits.
+  then raises `EngineNotRunningError`. A step marked `failed` raises
+  `RequestFailedError`. `get_step_async` waits on the event loop with the
+  same rules.
+- Each of the five schedulers binds its handles to its engine thread(s),
+  rejects `submit()` once that thread is gone, and cancels what is left in a
+  clean `stop()`.
+- The HTTP endpoint answers a dead engine with a 503, a failed request with
+  a 500 (or an SSE error event once a stream has started), never blocks the
+  event loop, and keeps every token's text with one executor thread.
 
 All engines here are model-free doubles on CPU. Every blocking call runs
-under `_bounded`, so a regression fails within seconds instead of hanging the
-suite (no pytest-timeout plugin is installed).
+under `_bounded` or `_wait_until`, so a regression fails within seconds
+instead of hanging the suite (no pytest-timeout plugin is installed).
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ from mini_infer.api.server import _unhandled_exception_handler, completions
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.sampler import SamplingParams
-from mini_infer.exceptions import EngineNotRunningError
+from mini_infer.exceptions import EngineNotRunningError, RequestFailedError
 from mini_infer.scheduler import (
     ContinuousScheduler,
     StateCacheContinuousScheduler,
@@ -270,11 +275,47 @@ def test_handle_without_a_liveness_check_keeps_blocking() -> None:
 
 
 def test_build_result_ignores_the_terminal_step_text() -> None:
-    """`PDScheduler` puts an error string into its terminal step; that text is
-    not completion output."""
-    req = _bare(_token("a"), GenerationStep(text="engine error: boom", finish_reason="cancelled"))
+    """The text of a terminal step is not completion output."""
+    req = _bare(_token("a"), GenerationStep(text="not output", finish_reason="cancelled"))
     result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
     assert (result.text, result.finish_reason) == ("a", "cancelled")
+
+
+def _failed_terminal() -> GenerationStep:
+    return GenerationStep(text="", finish_reason="cancelled", failed=True)
+
+
+@pytest.mark.parametrize("call", ["get_step", "steps", "wait", "get_step_async"])
+def test_a_failed_request_raises_after_its_buffered_steps(call: str) -> None:
+    """A failed request ends with `RequestFailedError`, never with a step that
+    looks like a cancellation. Output produced before the failure comes first."""
+    handle = RequestHandle(_bare(_token("a"), _failed_terminal()), engine_alive=lambda: True)
+    seen: list[str] = []
+
+    def drain() -> None:
+        if call == "wait":
+            handle.wait()
+        elif call == "steps":
+            seen.extend(s.text for s in handle.steps())
+        else:
+            while True:
+                if call == "get_step":
+                    step = handle.get_step()
+                else:
+                    step = asyncio.run(handle.get_step_async())
+                seen.append(step.text)
+
+    with pytest.raises(RequestFailedError):
+        _bounded(drain)
+    if call != "wait":
+        assert seen == ["a"]
+
+
+def test_a_failed_terminal_step_is_reported_after_the_engine_exits() -> None:
+    """The last-chance read after a dead engine also checks for failure."""
+    handle = RequestHandle(_bare(_failed_terminal()), engine_alive=_dead)
+    with pytest.raises(RequestFailedError):
+        _bounded(handle.get_step)
 
 
 # ---- RequestHandle.get_step_async ------------------------------------------
@@ -415,6 +456,10 @@ class _ScriptedRunner:
             self._gate.wait(_BOUND_S)
         if self._delay_s:
             time.sleep(self._delay_s)
+        # Append K/V like a one-layer model, so that the cache really holds
+        # blocks from the pool and a test can see them come back.
+        kv = torch.zeros(cu_seqlens_q[-1], 1, 8)
+        cache.append_kv_packed(kv, kv, torch.tensor(cu_seqlens_q, dtype=torch.int32), 0)
         logits = torch.full((1, cu_seqlens_q[-1], _VOCAB), -1.0)
         logits[..., 0] = 1.0
         return logits
@@ -594,9 +639,9 @@ def test_pd_stop_cancels_a_request_in_flight_instead_of_failing_it() -> None:
     sched._run_prefill_batch = lambda: None  # type: ignore[method-assign]
     emit_terminal = sched._emit_terminal
 
-    def slow_emit_terminal(r: RunningRequest, reason: str, *, error: str | None = None) -> None:
+    def slow_emit_terminal(r: RunningRequest, reason: str, *, failed: bool = False) -> None:
         time.sleep(4 * _POLL_S)  # several liveness polls see dead threads here
-        emit_terminal(r, reason, error=error)
+        emit_terminal(r, reason, failed=failed)
 
     sched._emit_terminal = slow_emit_terminal  # type: ignore[method-assign]
     sched.start()
@@ -675,11 +720,18 @@ def test_slot_schedulers_stop_cancels_slotted_and_waiting_requests(name: str) ->
         )
         sched = TensorParallelStateCacheContinuousScheduler(server)  # type: ignore[arg-type]
     _occupy_slots(sched)
+    finish = sched._finish
+
+    def slow_finish(running: RunningRequest, reason: Any) -> None:
+        time.sleep(4 * _POLL_S)  # the waiters poll a dead thread meanwhile
+        finish(running, reason)
+
     sched.start()
     try:
         slotted = sched.submit(_request())
         _wait_until(lambda: any(sched._slots))
         waiting = sched.submit(_request())  # the only slot is taken
+        sched._finish = slow_finish
         results, waiters = _wait_concurrently([slotted, waiting])
         sched.stop()
         _join_all(waiters)
@@ -712,6 +764,69 @@ def test_tp_stop_cancels_the_requests_still_waiting() -> None:
         assert _bounded(waiting.wait).finish_reason == "cancelled"
     finally:
         sched.stop()
+
+
+# What a failing prefill or generation raises. The tests check that this text
+# reaches the log and never the caller.
+_SECRET = "failed at /srv/models/secret-path, shape (7, 4096)"
+
+
+def _pd_with_failing_prefill(mode: str) -> PDScheduler:
+    sched = PDScheduler(_ScriptedRunner(), mode=mode)  # type: ignore[arg-type]
+
+    def prefill_batch(_requests: list[Request]) -> list[Any]:
+        raise RuntimeError(_SECRET)
+
+    sched._prefill_worker.prefill_batch = prefill_batch  # type: ignore[method-assign]
+    return sched
+
+
+@pytest.mark.parametrize("mode", ["serial", "parallel"])
+def test_pd_prefill_failure_fails_the_request_and_keeps_the_engine(
+    mode: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    sched = _pd_with_failing_prefill(mode)
+    sched.start()
+    try:
+        for _ in range(2):  # the engine keeps serving after a failure
+            handle = sched.submit(_request())
+            with pytest.raises(RequestFailedError) as failure:
+                _bounded(handle.wait)
+            assert _SECRET not in str(failure.value)
+        assert sched.is_running
+        assert any(r.exc_info and _SECRET in str(r.exc_info[1]) for r in caplog.records)
+    finally:
+        sched.stop()
+
+
+def test_tp_generation_failure_fails_the_request_and_keeps_the_engine() -> None:
+    def generate_ids(*_: object, **__: object) -> None:
+        raise RuntimeError(_SECRET)
+
+    server = SimpleNamespace(is_leader=True, tokenizer=_CharTokenizer(), generate_ids=generate_ids)
+    sched = TensorParallelStateCacheScheduler(server)  # type: ignore[arg-type]
+    sched.start()
+    try:
+        with pytest.raises(RequestFailedError) as failure:
+            _bounded(sched.submit(_request()).wait)
+        assert _SECRET not in str(failure.value)
+        assert sched.is_running
+    finally:
+        sched.stop()
+
+
+def test_pd_terminal_step_lands_even_on_a_full_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dropped terminal step would leave the handle waiting forever on a
+    live engine, which no liveness check can see."""
+    monkeypatch.setattr(PDScheduler, "TERMINAL_PUT_TIMEOUT_S", 0.01)
+    sched = PDScheduler(_ScriptedRunner(), mode="serial")  # type: ignore[arg-type]
+    req = RunningRequest(request=_request(), output_queue=StepQueue(maxsize=2))
+    req.output_queue.put(_token("a"))
+    req.output_queue.put(_token("b"))
+    sched._emit_terminal(req, "length")
+    result = _bounded(RequestHandle(req, engine_alive=lambda: True).wait)
+    # One buffered step made room for the terminal step.
+    assert (result.text, result.finish_reason) == ("b", "length")
 
 
 def test_a_handle_stays_bound_to_the_thread_that_crashed(
@@ -858,6 +973,27 @@ def test_http_stream_reports_a_mid_stream_death_in_band(
     assert json.loads(error)["error"]["type"] == "engine_unavailable"
     assert done == "[DONE]"
     assert crashes == [_InjectedCrashError]
+
+
+def test_http_non_streaming_request_failure_is_a_500_without_the_cause(
+    serve: Callable[..., tuple[_Server, TestClient]],
+) -> None:
+    _, client = serve(_pd_with_failing_prefill("serial"))
+    response = _bounded(lambda: _post(client))
+    assert response.status_code == 500
+    assert response.json()["error"]["type"] == "server_error"
+    assert _SECRET not in response.text
+
+
+def test_http_stream_failure_is_an_error_event_without_the_cause(
+    serve: Callable[..., tuple[_Server, TestClient]],
+) -> None:
+    _, client = serve(_pd_with_failing_prefill("serial"))
+    status, events = _bounded(lambda: _sse_events(client))
+    assert status == 200
+    assert [json.loads(e)["error"]["type"] for e in events[:-1]] == ["server_error"]
+    assert events[-1] == "[DONE]"
+    assert not any(_SECRET in e for e in events)
 
 
 def test_http_non_streaming_request_does_not_block_the_event_loop(

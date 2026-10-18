@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from mini_infer.engine.sampler import SamplingParams
-from mini_infer.exceptions import EngineNotRunningError
+from mini_infer.exceptions import EngineNotRunningError, RequestFailedError
 
 if TYPE_CHECKING:
     from mini_infer.engine.dspark.spec import SpecDecodeState, SpecSummary
@@ -63,11 +63,18 @@ class GenerationStep:
     ordinary one-token step before its terminal step. A consumer that counts
     steps instead of summing this field undercounts speculative output by the
     accepted length.
+
+    `failed` marks a terminal step for a request that the engine failed (an
+    exception it caught and logged). Such a step carries
+    `finish_reason="cancelled"` for the engine's own bookkeeping, but a
+    `RequestHandle` never hands it out: it raises `RequestFailedError`
+    instead, so a client can tell a failure from a cancellation.
     """
 
     text: str
     finish_reason: FinishReason | None = None
     num_tokens: int = 0
+    failed: bool = False
 
 
 class StepQueue(queue.Queue[GenerationStep]):
@@ -235,8 +242,8 @@ class RequestHandle:
         """Aggregate a finished request: the caller's text plus the engine's counts.
 
         `text` is the concatenation of the non-terminal steps the caller read.
-        A terminal step's text is not part of it: `PDScheduler` puts an error
-        string there. Call this only after the terminal step arrived, because
+        A terminal step's text is not part of it. Call this only after the
+        terminal step arrived, because
         the queue put of that step is what makes the engine-side fields
         (`tokens_generated`, `spec_summary`) safe to read from this thread.
         """
@@ -291,7 +298,7 @@ class RequestHandle:
                 # Clear before reading: a put after the read sets it again.
                 ready.clear()
                 try:
-                    return out.get_nowait()
+                    return self._take(out.get_nowait())
                 except queue.Empty:
                     pass
                 try:
@@ -321,7 +328,7 @@ class RequestHandle:
                 remaining = max(0.0, deadline - time.monotonic())
                 timeout = remaining if timeout is None else min(timeout, remaining)
             try:
-                return self._req.output_queue.get(timeout=timeout)
+                return self._take(self._req.output_queue.get(timeout=timeout))
             except queue.Empty:
                 pass
             step = self._after_empty_poll()
@@ -342,7 +349,7 @@ class RequestHandle:
         if self._engine_alive is None or self._engine_alive():
             return None
         try:
-            return self._req.output_queue.get_nowait()
+            return self._take(self._req.output_queue.get_nowait())
         except queue.Empty:
             # A restarted scheduler or a surviving PD prefill thread can still
             # hold this request; cancel it so that the engine does not spend
@@ -352,3 +359,16 @@ class RequestHandle:
                 "engine not running: the engine thread exited before this request "
                 "finished (see the log)"
             ) from None
+
+    @staticmethod
+    def _take(step: GenerationStep) -> GenerationStep:
+        """Hand out a step, or raise if it reports a failed request.
+
+        Every read of the queue goes through here, so no caller can receive a
+        failed request's terminal step as if it were a cancellation.
+        """
+        if step.failed:
+            raise RequestFailedError(
+                "the engine failed while processing this request (see the log)"
+            )
+        return step

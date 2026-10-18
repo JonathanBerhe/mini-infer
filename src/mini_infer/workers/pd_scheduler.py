@@ -16,11 +16,11 @@ requests through:
 Two threading modes, selected by the `mode` constructor parameter:
 
 - **`mode="serial"`** (default): one engine thread runs both phases
-  in sequence — admit + batched prefill + batched decode step + reap.
+  in sequence: admit + batched prefill + batched decode step + reap.
   Simple correctness story; bit-equivalent test surface. Prefill and
   decode share the same thread, so on a 2-GPU host they don't
   overlap (the prefill GPU idles while decode runs and vice versa).
-- **`mode="parallel"`**: two engine threads — a prefill thread admits
+- **`mode="parallel"`**: two engine threads. A prefill thread admits
   + runs `prefill_batch`, a decode thread reads handoffs and drives
   the session. The threads are connected by a bounded handoff queue;
   the queue's `maxsize=max_concurrent` provides backpressure. On a
@@ -34,6 +34,7 @@ multi-GPU hardware where the two phases run on different devices.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import threading
@@ -82,6 +83,9 @@ class PDScheduler:
     """
 
     DEFAULT_MAX_CONCURRENT = 16
+    # How long `_emit_terminal` waits for a full output queue to drain before
+    # it drops a buffered step to make room for the terminal step.
+    TERMINAL_PUT_TIMEOUT_S = 5.0
 
     def __init__(
         self,
@@ -350,10 +354,10 @@ class PDScheduler:
         requests = [r.request for r in prefilling]
         try:
             handoffs = self._prefill_worker.prefill_batch(requests)
-        except Exception as exc:
-            logger.exception("PDScheduler: prefill_batch failed; terminating batch")
+        except Exception:
+            logger.exception("PDScheduler: prefill_batch failed; failing the batch")
             for r in prefilling:
-                self._emit_terminal(r, reason="cancelled", error=str(exc))
+                self._emit_terminal(r, reason="cancelled", failed=True)
             return
 
         if self._session is None:
@@ -438,10 +442,10 @@ class PDScheduler:
             requests = [r.request for r in prefilling]
             try:
                 handoffs = self._prefill_worker.prefill_batch(requests)
-            except Exception as exc:
-                logger.exception("PDScheduler (parallel): prefill_batch failed; terminating batch")
+            except Exception:
+                logger.exception("PDScheduler (parallel): prefill_batch failed; failing the batch")
                 for r in prefilling:
-                    self._emit_terminal(r, reason="cancelled", error=str(exc))
+                    self._emit_terminal(r, reason="cancelled", failed=True)
                 continue
             for r, handoff in zip(prefilling, handoffs, strict=True):
                 if r.cancel_event.is_set():
@@ -449,7 +453,7 @@ class PDScheduler:
                     # terminal without enqueuing for decode.
                     self._emit_terminal(r, reason="cancelled")
                     continue
-                # Block on put if the handoff queue is full — this is the
+                # Block on put if the handoff queue is full: this is the
                 # backpressure mechanism that bounds total in-flight to
                 # roughly `2 * max_concurrent` worst case (in-prefill +
                 # in-decode). Poll the stop event so we can exit cleanly.
@@ -566,18 +570,31 @@ class PDScheduler:
         self._handoffs.pop(slot_id, None)
         self._emit_terminal(r, reason=reason)
 
-    def _emit_terminal(self, r: RunningRequest, reason: str, *, error: str | None = None) -> None:
-        """Push the final `GenerationStep` with a `finish_reason`."""
+    def _emit_terminal(self, r: RunningRequest, reason: str, *, failed: bool = False) -> None:
+        """Push the final `GenerationStep` with a `finish_reason`.
+
+        `failed` marks a request that the engine failed; the handle turns that
+        step into `RequestFailedError`. The step carries no text: the cause is
+        in the log, and step text goes to the client as completion output.
+
+        The terminal step must arrive, or the handle waits forever on a live
+        engine. So after `TERMINAL_PUT_TIMEOUT_S` on a full queue, one
+        buffered intermediate step makes room for it, as in
+        `ContinuousScheduler._finish`.
+        """
         if r.state == RequestState.DONE:
             # Already terminated; idempotent.
             return
-        text = f"engine error: {error}" if error else ""
         r.state = RequestState.DONE
         r.finish_reason = reason  # type: ignore[assignment]
+        terminal = GenerationStep(text="", finish_reason=reason, failed=failed)  # type: ignore[arg-type]
         try:
-            r.output_queue.put(
-                GenerationStep(text=text, finish_reason=reason),  # type: ignore[arg-type]
-                timeout=5.0,
-            )
+            r.output_queue.put(terminal, timeout=self.TERMINAL_PUT_TIMEOUT_S)
         except queue.Full:
-            logger.warning("PDScheduler terminal step dropped: output_queue full")
+            logger.warning("PDScheduler: output_queue full; dropping one step for the terminal")
+            with contextlib.suppress(queue.Empty):
+                r.output_queue.get_nowait()
+            try:
+                r.output_queue.put_nowait(terminal)
+            except queue.Full:
+                logger.error("PDScheduler: terminal step lost; the output_queue stays full")

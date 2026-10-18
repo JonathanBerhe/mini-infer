@@ -18,6 +18,9 @@ or on localhost, so these guards are belt-and-suspenders):
   error type `engine_unavailable`, or, once a stream has started, an SSE
   error event followed by `[DONE]`. The process stays up; every later
   request gets the same 503 until the server restarts.
+- If the engine failed one request and kept running, that request gets a
+  500 with error type `server_error` (or the same SSE error event). Neither
+  error carries the exception text; it stays in the server log.
 
 Every request waits for its output on the event loop
 (`RequestHandle.get_step_async`), never on a worker thread, so the number of
@@ -53,7 +56,7 @@ from mini_infer.engine.model_runner import (
 )
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
-from mini_infer.exceptions import EngineNotRunningError
+from mini_infer.exceptions import EngineNotRunningError, RequestFailedError
 from mini_infer.models import architecture_uses_state_cache
 from mini_infer.scheduler import (
     ContinuousScheduler,
@@ -226,8 +229,9 @@ async def completions(
             promptly.
 
             The 200 status is already sent when the first step is awaited, so
-            a dead engine is reported in-band: an error event, then `[DONE]`,
-            as vLLM and SGLang do. The OpenAI client raises on that event.
+            a dead engine or a failed request is reported in-band: an error
+            event, then `[DONE]`, as vLLM and SGLang do. The OpenAI client
+            raises on that event.
             """
             watcher = asyncio.create_task(_watch_disconnect(fastapi_req, handle))
             try:
@@ -237,6 +241,10 @@ async def completions(
                     except EngineNotRunningError:
                         logger.error("%s: the engine stopped mid-stream", completion_id)
                         yield f"data: {json.dumps(_ENGINE_UNAVAILABLE)}\n\n"
+                        break
+                    except RequestFailedError:
+                        logger.error("%s: the engine failed the request mid-stream", completion_id)
+                        yield f"data: {json.dumps(_REQUEST_FAILED)}\n\n"
                         break
                     chunk = CompletionChunk(
                         id=completion_id,
@@ -271,6 +279,9 @@ async def completions(
     except EngineNotRunningError:
         logger.error("%s: the engine stopped before the request finished", completion_id)
         return _engine_unavailable_response()
+    except RequestFailedError:
+        logger.error("%s: the engine failed the request", completion_id)
+        return JSONResponse(status_code=500, content=_REQUEST_FAILED)
     finally:
         handle.cancel()
     result = handle.build_result("".join(text_parts), step.finish_reason)
@@ -287,9 +298,17 @@ async def completions(
     )
 
 
-# A fixed message: the cause is in the server log, and the response must not
-# carry internal state (see `_unhandled_exception_handler`).
+# Fixed messages: the cause is in the server log, and the response must not
+# carry internal state (see `_unhandled_exception_handler`). A 503 means the
+# engine is down for every request; a 500 means it failed this one request
+# and keeps serving others.
 _ENGINE_UNAVAILABLE = {"error": {"type": "engine_unavailable", "message": "engine is not running"}}
+_REQUEST_FAILED = {
+    "error": {
+        "type": "server_error",
+        "message": "the engine failed while processing this request",
+    }
+}
 
 
 def _engine_unavailable_response() -> JSONResponse:
