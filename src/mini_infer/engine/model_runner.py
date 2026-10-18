@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Any
 
@@ -142,6 +143,18 @@ class ModelRunner:
     @property
     def block_pool(self) -> BlockPool:
         return self._block_pool
+
+    @property
+    def supports_hidden_state_taps(self) -> bool:
+        """Whether this model's forward accepts `tap_layers` / `hidden_state_sink`.
+
+        Only a model that records per-layer hidden states can feed the DSpark
+        drafter its injected context (Qwen3 today). Introspecting the signature
+        beats keeping a list of family names here: a model that grows tap
+        support starts reporting True with no edit to this file, and one that
+        never had it can't be silently handed the kwargs and die mid-forward.
+        """
+        return "tap_layers" in inspect.signature(self._model.forward).parameters
 
     def forward_step(
         self,

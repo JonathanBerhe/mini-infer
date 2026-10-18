@@ -36,78 +36,16 @@ Stage D.
 
 from __future__ import annotations
 
-import dataclasses
-
 import torch
 
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.dspark.draft_cache import DSparkDraftCache
 from mini_infer.engine.dspark.drafter import Qwen3DSparkDrafter
 from mini_infer.engine.dspark.proposal import confident_prefix_length
-from mini_infer.engine.dspark.sampling import (
-    accepted_prefix_length,
-    logits_to_probs,
-    sample_from_probs,
-    sample_residual,
-)
+from mini_infer.engine.dspark.spec import DSparkStats, propose_block, verify_block
 from mini_infer.engine.model_runner import ModelRunner
 
-
-@dataclasses.dataclass
-class DSparkStats:
-    """Per-run counters, named to match `deepspec`'s evaluator metrics.
-
-    `acceptance_lengths[i]` is round i's committed token count INCLUDING the
-    bonus (`accepted + 1`), which is what the reference calls acceptance
-    length and reports as tau. `proposal_lengths[i]` is how many draft tokens
-    that round actually offered for verification, i.e. after confidence
-    truncation, so the two together show what truncation traded away.
-    `confidence_observations` pairs each offered token's raw confidence logit
-    with whether it survived, which is the raw material for a calibration
-    curve.
-    """
-
-    acceptance_lengths: list[int] = dataclasses.field(default_factory=list)
-    proposal_lengths: list[int] = dataclasses.field(default_factory=list)
-    accepted_draft_lengths: list[int] = dataclasses.field(default_factory=list)
-    n_target_forwards: int = 0
-    n_drafter_forwards: int = 0
-    confidence_observations: list[tuple[float, bool]] = dataclasses.field(default_factory=list)
-
-    @property
-    def mean_acceptance_length(self) -> float:
-        """Mean committed tokens per verification round (tau), bonus included."""
-        if not self.acceptance_lengths:
-            return 0.0
-        return sum(self.acceptance_lengths) / len(self.acceptance_lengths)
-
-    @property
-    def mean_proposal_length(self) -> float:
-        if not self.proposal_lengths:
-            return 0.0
-        return sum(self.proposal_lengths) / len(self.proposal_lengths)
-
-    def accept_rates_by_position(self, block_size: int) -> list[float | None]:
-        """Cumulative survival per draft position, `deepspec`'s definition.
-
-        Entry `i` is (rounds whose accepted prefix reached past position `i`) /
-        (rounds that offered a token at position `i`). Because acceptance is a
-        prefix count, this is the probability that positions `0..i` ALL
-        survived, not the conditional probability that `i` survived given
-        `i-1` did. `None` where no round offered that position (which
-        truncation makes common at deep positions).
-        """
-        offered = [0] * block_size
-        survived = [0] * block_size
-        for proposal_len, accepted in zip(
-            self.proposal_lengths, self.accepted_draft_lengths, strict=True
-        ):
-            for pos in range(block_size):
-                if proposal_len > pos:
-                    offered[pos] += 1
-                if accepted > pos:
-                    survived[pos] += 1
-        return [(survived[p] / offered[p]) if offered[p] else None for p in range(block_size)]
+__all__ = ["DSparkSpeculativeRunner", "DSparkStats"]
 
 
 class DSparkSpeculativeRunner:
@@ -288,54 +226,16 @@ class DSparkSpeculativeRunner:
         start: int,
         draft_cache: DSparkDraftCache,
     ) -> tuple[list[int], torch.Tensor | None, torch.Tensor]:
-        """One drafter round: candidate tokens, confidence logits, and draft probs.
-
-        The probabilities are the Markov-CORRECTED ones, not the backbone's raw
-        base logits, because those are the distribution the tokens were
-        actually drawn from. Rejection sampling compares the target against
-        the proposal distribution, so using the uncorrected logits here would
-        silently break losslessness.
-        """
-        cfg = self.drafter.cfg
-        device = context.device
-        draft_input_ids = torch.full(
-            (1, self.block_size), cfg.mask_token_id, dtype=torch.long, device=device
+        """One drafter round; the round math lives in `spec.propose_block`,
+        shared with the multi-request scheduler so the two paths cannot fork."""
+        return propose_block(
+            self.drafter,
+            anchor=anchor,
+            context=context,
+            start=start,
+            draft_cache=draft_cache,
+            temperature=self.temperature,
         )
-        draft_input_ids[0, 0] = anchor
-
-        # One contiguous position span covering the injected context and then
-        # the block. The drafter's RoPE rotates keys over the whole span and
-        # queries over just its tail, so this slice has to cover both segments
-        # (ADR-027 point 4); its length is always ctx_len + block_size.
-        cache_len = draft_cache.get_seq_length()
-        position_ids = torch.arange(
-            cache_len, start + self.block_size, device=device, dtype=torch.long
-        ).unsqueeze(0)
-
-        with torch.inference_mode():
-            block_hidden = self.drafter.forward_backbone(
-                noise_embedding=self.drafter.embed_tokens(draft_input_ids),
-                target_hidden_states=context,
-                position_ids=position_ids,
-                past_key_values=draft_cache,
-            )
-            # Drop this round's block K/V, keep the accumulated context
-            # projections. Unconditional, before we know the outcome.
-            draft_cache.truncate_to(start)
-
-            hidden = block_hidden[:, : self.block_size, :]
-            base_logits = self.drafter.compute_logits(hidden)
-            sampled, corrected_logits = self.drafter.sample_draft_tokens(
-                base_logits,
-                first_prev_token_ids=draft_input_ids[:, 0],
-                temperature=self.temperature,
-            )
-            draft_probs = logits_to_probs(corrected_logits, self.temperature)
-            confidence = self.drafter.predict_confidence_step(
-                hidden,
-                prev_token_ids=torch.cat([draft_input_ids[:, :1], sampled[:, :-1]], dim=1),
-            )
-        return sampled[0].tolist(), confidence, draft_probs
 
     def _verify(
         self,
@@ -344,40 +244,11 @@ class DSparkSpeculativeRunner:
         offered: list[int],
         draft_probs: torch.Tensor,
     ) -> tuple[int, int]:
-        """Accept a prefix of `offered` and pick the token that follows it.
-
-        Greedy and temperature > 0 are the same algorithm at different
-        temperatures (`logits_to_probs` emits one-hots when greedy, which
-        collapses the ratio test to argmax equality), but greedy is kept on an
-        explicit integer-comparison path: it is the temperature-0 bit-parity
-        contract Stage B and C rest on, and routing it through multinomial
-        draws would make a provable property depend on an RNG.
-        """
-        if self.temperature < 1e-5:
-            target_argmax = verify_logits[0].argmax(dim=-1).tolist()
-            accepted = 0
-            for i, tok in enumerate(offered):
-                if target_argmax[i] == tok:
-                    accepted += 1
-                else:
-                    break
-            return accepted, int(target_argmax[accepted])
-
-        target_probs = logits_to_probs(verify_logits, self.temperature)
-        if not offered:
-            return 0, int(sample_from_probs(target_probs[:, -1:, :])[0, 0].item())
-
-        proposed = torch.tensor([offered], device=verify_logits.device, dtype=torch.long)
-        # verify_logits has one position per input token; position i predicts
-        # what follows input i, so the draft positions are all but the last.
-        accepted = accepted_prefix_length(
-            target_probs[:, :-1, :], draft_probs[:, : len(offered), :], proposed
+        """Accept a prefix of `offered`; the judgment lives in
+        `spec.verify_block`, shared with the multi-request scheduler."""
+        return verify_block(
+            verify_logits,
+            offered=offered,
+            draft_probs=draft_probs,
+            temperature=self.temperature,
         )
-        if accepted < len(offered):
-            # Rejected at `accepted`: emit from the residual so the overall
-            # distribution stays exactly the target's.
-            bonus_t = sample_residual(target_probs[:, accepted, :], draft_probs[:, accepted, :])
-            return accepted, int(bonus_t[0].item())
-        # Everything accepted: the bonus is a free draw from the target's
-        # distribution at the position after the last draft token.
-        return accepted, int(sample_from_probs(target_probs[:, -1:, :])[0, 0].item())

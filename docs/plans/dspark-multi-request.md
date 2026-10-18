@@ -272,7 +272,8 @@ cancel path, which cancels its victim outright, not as a drain rate.
    `_sample_decoders` and `_packed_forward`, switch to `forward_step_packed`.
    Gate: plain path unchanged, including the golden suite.
 2. **Drafter state and the draft/verify phases**, with the slices of point 5
-   and the emission rules of point 8.
+   and the emission rules of point 8. DONE, see the step 2 findings below;
+   gates 1 and 2 live in `tests/unit/test_dspark_scheduler.py`.
 3. **OOM rollback and idempotence.** Both tests in
    `tests/unit/test_scheduler_oom.py` raise from the fake runner BEFORE it
    touches the cache, so neither reaches the partial-append state and a test
@@ -325,6 +326,49 @@ unchanged. Regression test:
 which needs two requests (a prefiller absorbs the preemption so the decoder
 survives) and drives `_step` inline, since the interleaving is racy through the
 engine thread.
+
+## Findings from staging step 2
+
+Step 2 landed: `DSparkSpec` / `SpecDecodeState` and the shared round functions
+in `engine/dspark/spec.py` (the batch-1 runner now delegates to them, so its
+fp32-exact tests keep gating the same math), the draft/verify phases in
+`ContinuousScheduler`, eligibility at admission, and the point-5 slices and
+point-8 emission rules as designed. Two corrections to the design as written:
+
+**(INV) is a precondition of PROPOSING, not of the draft phase.** The plan
+said to assert it "at the top of the draft call". `propose_block` folds the
+injected context into the drafter cache and truncates back to `start`, so
+after a proposal exists, `draft_cache_len + context_rows` legitimately
+exceeds the slot length. Asserted at the top, the OOM-retry reuse path (point
+7) trips it with a false positive. The assert lives inside the
+draft-if-not-reusing branch.
+
+**Speculation must never turn a servable request away.** The headroom of point
+9 was added to `required_blocks` before the permanent-rejection check, so a
+prompt that fits the pool on the plain path was cancelled outright once dspark
+was configured. Enabling an optimization cannot be allowed to fail work the
+engine would otherwise serve: the request now DOWNGRADES to the plain path
+(joining the top-k/top-p and long-prompt downgrades) and only a request that
+does not fit plainly is rejected. The first version of the headroom test
+asserted the cancellation, so it encoded the bug as expected behaviour; it now
+pins the constant from both sides, admit and downgrade.
+
+**A non-Qwen3 target with dspark configured killed the engine thread.** Only
+Qwen3's forward accepts the tap kwargs, so any other family raised TypeError
+inside the first forward carrying a speculator, which `_engine_loop` does not
+catch. `ModelRunner.supports_hidden_state_taps` introspects the signature and
+the scheduler refuses the combination at construction, next to the prefix-cache
+refusal.
+
+**The numerics gate cannot see context-provenance bugs.** Greedy correctness
+is drafter-independent: a context sliced from ANOTHER request's rows changes
+what gets proposed, never what gets committed, so token-equality tests pass
+with a fully corrupted context buffer (a mutation of the refresh slice
+survived every token assertion). Only value assertions catch it; the
+bookkeeping suite scripts the tap sink to carry row POSITIONS and pins the
+buffer's contents with a speculator sitting behind another request. The same
+blindness applies to step 4: a provenance regression would surface as tau
+degradation, not wrong output.
 
 ## Gate, split three ways
 

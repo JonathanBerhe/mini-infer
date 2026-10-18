@@ -24,9 +24,22 @@ Each step does:
 
 A decoding request's contribution is a LIST, not a single token, so requests
 with different q-lengths ride one forward. Plain sampling fills it with exactly
-one token, which is why step 4's packing is per-request rather than a uniform
-stride of 1: a caller that has several positions to feed for one request needs
-logits at all of them (`engine/dspark/speculative.py` does this at batch 1).
+one token; DSpark speculative decoding (opt-in via the `dspark` constructor
+argument) fills it with `[anchor, *offered]`, the drafted block the same
+forward then verifies. The speculative phases wrap steps 2 and 5:
+
+2b. `_draft_speculators`: for each speculating DECODING request, draft a block
+    off the last committed token (the anchor) and the injected target context.
+    Requests whose forward failed last step reuse their pending proposal.
+5b. `_verify_speculators`: slice each speculator's window out of the packed
+    logits, accept the longest matching prefix plus the target's own bonus
+    token, emit, roll the KV slot back to the committed length, and refresh
+    the drafter's context from this forward's tapped hidden states.
+
+A request speculates only if it was eligible at admission (greedy or plain
+temperature sampling, prompt under the configured cap); everything else in
+the same batch runs the plain path, so mixed batches are the normal case,
+not a special one.
 
 Throughput-wise this is "Approach 2": prefill chunks and decode tokens share
 the same forward pass. The matmul cost amortizes across all in-flight q-tokens.
@@ -41,7 +54,16 @@ import threading
 import time
 from collections.abc import Iterator
 
+import torch
+
 from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.engine.dspark.spec import (
+    DSparkSpec,
+    DSparkStats,
+    SpecDecodeState,
+    context_window,
+    verify_block,
+)
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample
 from mini_infer.exceptions import OutOfMemoryError
@@ -108,8 +130,35 @@ class ContinuousScheduler:
         decode_headroom_blocks: int = DEFAULT_DECODE_HEADROOM_BLOCKS,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         trace_out: str | None = None,
+        dspark: DSparkSpec | None = None,
     ) -> None:
+        # A prefix-cache hit pre-populates a slot with positions that never
+        # pass through a forward, so those positions produce no tapped hidden
+        # states and the drafter's injected context comes up short of the
+        # target slot length. That violates the RoPE invariant the drafter
+        # rotates against and kills the engine thread. Refusing the
+        # combination at construction is the loudest failure available;
+        # injecting only the post-prefix suffix would feed the drafter less
+        # context than it trained on, which is a measurement, not a fallback.
+        if dspark is not None and runner.block_pool.prefix_cache is not None:
+            raise ValueError(
+                "DSpark speculative decoding cannot run with a prefix cache: "
+                "cached prompt positions never produce the tapped hidden states "
+                "the drafter needs. Construct the runner with prefix_cache=False."
+            )
+        # The drafter is fed the target's hidden states at tapped layers, which
+        # only a model whose forward accepts the tap kwargs can produce. Without
+        # this check the mismatch surfaces as a TypeError inside the first
+        # forward that carries a speculator, which `_engine_loop` does not catch
+        # and which therefore kills every in-flight request rather than one.
+        if dspark is not None and not runner.supports_hidden_state_taps:
+            raise ValueError(
+                f"DSpark speculative decoding needs a target whose forward accepts "
+                f"tap_layers/hidden_state_sink; {type(runner).__name__}'s model does not. "
+                "Qwen3 is the family that supports it today."
+            )
         self._runner = runner
+        self._dspark = dspark
         self._max_concurrent = max_concurrent
         self._decode_headroom = decode_headroom_blocks
         self._chunk_size = chunk_size
@@ -220,12 +269,13 @@ class ContinuousScheduler:
         self._reap_done()
 
     def _step(self) -> None:
-        """One scheduler iteration: admit, sample decoders, reap, packed forward."""
+        """One scheduler iteration: admit, sample/draft, reap, forward, verify."""
         step_start = time.perf_counter() if self._trace_events is not None else 0.0
 
         self._cancel_pending()
         self._admit_waiting()
         sampled_decode_tokens = self._sample_decoders()
+        sampled_decode_tokens.update(self._draft_speculators())
         self._reap_done()
         alive = [
             r
@@ -245,7 +295,8 @@ class ContinuousScheduler:
             trace_phase = self._classify_phase(alive)
 
         if alive:
-            self._packed_forward(alive, sampled_decode_tokens)
+            packed_logits, cu_seqlens_q, sink = self._packed_forward(alive, sampled_decode_tokens)
+            self._verify_speculators(alive, packed_logits, cu_seqlens_q, sink)
 
         if alive and self._trace_events is not None:
             if self._trace_t0 is None:
@@ -324,10 +375,38 @@ class ContinuousScheduler:
                 self._running.append(running)
                 continue
 
+            running.spec = self._spec_state_for(running)
+
             block_size = block_pool.block_size
-            required_blocks = (
+            plain_blocks = (
                 math.ceil(len(running.prompt_token_ids) / block_size) + self._decode_headroom
             )
+            required_blocks = plain_blocks
+            if running.spec is not None:
+                assert self._dspark is not None
+                # A round appends `1 + len(offered)` positions but commits only
+                # `accepted + 1`, and truncation returns the difference, so
+                # steady-state blocks per EMITTED token are unchanged by
+                # speculation. What is new is only the intra-step transient of
+                # the in-flight verify window; multiplying the whole headroom
+                # by the block length would throttle achievable concurrency.
+                spec_blocks = math.ceil((self._dspark.block_size + 1) / block_size) + 1
+                if plain_blocks + spec_blocks > block_pool.num_blocks:
+                    # Speculation is an optimization, never a reason to refuse
+                    # work the plain path could serve. Downgrade instead of
+                    # falling through to the permanent rejection below: turning
+                    # a servable request into finish_reason="cancelled" purely
+                    # because dspark is configured would be a regression from
+                    # the non-speculative engine.
+                    logger.info(
+                        "request not speculating: pool capacity %d cannot hold its prompt "
+                        "plus %d blocks of verify-window headroom",
+                        block_pool.num_blocks,
+                        spec_blocks,
+                    )
+                    running.spec = None
+                else:
+                    required_blocks = plain_blocks + spec_blocks
 
             # Permanent rejection: if the request needs more blocks than the
             # pool can EVER provide, no amount of waiting helps. Reject with
@@ -370,6 +449,41 @@ class ContinuousScheduler:
             running.state = RequestState.PREFILLING
             self._running.append(running)
 
+    def _spec_state_for(self, running: RunningRequest) -> SpecDecodeState | None:
+        """Decide at admission whether this request speculates; None runs plain.
+
+        Decided once, here, so the rest of the engine never re-evaluates
+        eligibility mid-request. Two downgrades, both logged at INFO because
+        they silently change latency, not output:
+
+        - top-k / top-p sampling: the spec path builds distributions through
+          `logits_to_probs`, which applies temperature only. Silently ignoring
+          the caller's filtering would change sampling semantics, so those
+          requests run the plain path instead (mixed batches are the normal
+          case). Threading top-k/top-p through both sides is deferred.
+        - prompts over `max_spec_prompt_tokens`: the injected context buffers
+          tapped hidden states per prompt token outside the block pool's
+          accounting (see `DSparkSpec`).
+        """
+        if self._dspark is None:
+            return None
+        params = running.request.sampling_params
+        if params.top_k > 0 or params.top_p < 1.0:
+            logger.info(
+                "request not speculating: top_k=%d top_p=%.3f need the plain sampling path",
+                params.top_k,
+                params.top_p,
+            )
+            return None
+        if len(running.prompt_token_ids) > self._dspark.max_spec_prompt_tokens:
+            logger.info(
+                "request not speculating: prompt length %d exceeds max_spec_prompt_tokens=%d",
+                len(running.prompt_token_ids),
+                self._dspark.max_spec_prompt_tokens,
+            )
+            return None
+        return SpecDecodeState(draft_cache=self._dspark.new_draft_cache(), stats=DSparkStats())
+
     def _sample_decoders(self) -> dict[int, list[int]]:
         """Sample the next token for each DECODING request and emit it.
 
@@ -390,7 +504,9 @@ class ContinuousScheduler:
         """
         sampled: dict[int, list[int]] = {}
         tokenizer = self._runner.tokenizer
-        for req in [r for r in self._running if r.state == RequestState.DECODING]:
+        for req in [
+            r for r in self._running if r.state == RequestState.DECODING and r.spec is None
+        ]:
             if req.pending_decode_tokens is not None:
                 sampled[id(req)] = req.pending_decode_tokens
                 continue
@@ -400,13 +516,7 @@ class ContinuousScheduler:
                 self._finish(req, "stop")
                 continue
             req.tokens_generated.append(next_token)
-            # Decode-and-diff: re-decode all tokens so far and emit the new suffix.
-            # Handles multi-byte UTF-8 sequences correctly at the cost of O(n) work
-            # per step (one tokenizer call, one string slice).
-            current_text = tokenizer.decode(req.tokens_generated)
-            delta = current_text[len(req.last_text) :]
-            req.last_text = current_text
-            self._emit(req, GenerationStep(text=delta))
+            self._emit_new_text(req)
             if len(req.tokens_generated) >= req.request.max_tokens:
                 self._finish(req, "length")
                 continue
@@ -414,9 +524,123 @@ class ContinuousScheduler:
             sampled[id(req)] = req.pending_decode_tokens
         return sampled
 
+    def _emit_new_text(self, req: RunningRequest) -> None:
+        """Decode-and-diff: re-decode all tokens so far and emit the new suffix.
+
+        Handles multi-byte UTF-8 sequences correctly at the cost of O(n) work
+        per call (one tokenizer call, one string slice). A call covering
+        several newly appended tokens emits ONE step carrying their whole
+        delta, which is how the speculative path streams a committed block.
+        """
+        current_text = self._runner.tokenizer.decode(req.tokens_generated)
+        delta = current_text[len(req.last_text) :]
+        req.last_text = current_text
+        self._emit(req, GenerationStep(text=delta))
+
+    def _draft_speculators(self) -> dict[int, list[int]]:
+        """Draft one block per speculating DECODING request; return verify inputs.
+
+        Each entry is `[anchor, *offered]`: the last committed token plus the
+        drafted block after confidence truncation and `max_tokens` clamping.
+        The packed forward appends K/V for exactly those positions, and
+        `_verify_speculators` judges them after it runs.
+
+        Three cases per request, in order:
+
+        - No anchor yet (the request finished prefill last step): sample it
+          from `last_logits` like any plain decoder, emit it, run the finish
+          checks, and finalize the injected context accumulated across the
+          prompt's chunks. The draft then hangs off that anchor in the same
+          step, so speculation starts without a wasted round.
+        - A proposal already exists for this exact `start` (the previous
+          forward raised recoverably and the engine retried): reuse it. The
+          proposal is a pure function of `(anchor, context, start)`, and
+          re-drafting would double-mutate the draft cache.
+        - Otherwise draft, clamping the proposal so a fully accepted block
+          plus its bonus can never overshoot `max_tokens`.
+        """
+        if self._dspark is None:
+            return {}
+        out: dict[int, list[int]] = {}
+        tokenizer = self._runner.tokenizer
+        for req in [
+            r for r in self._running if r.state == RequestState.DECODING and r.spec is not None
+        ]:
+            spec = req.spec
+            assert spec is not None and self._batched_cache is not None
+            assert req.batch_idx is not None
+
+            if spec.anchor is None:
+                # The prompt's tapped hidden states, accumulated chunk by
+                # chunk, become round 1's injected context.
+                assert spec.context_parts, "spec request reached DECODING with no tapped context"
+                spec.context = (
+                    torch.cat(spec.context_parts, dim=1)
+                    if len(spec.context_parts) > 1
+                    else spec.context_parts[0]
+                )
+                spec.context_parts.clear()
+
+                assert req.last_logits is not None
+                anchor = sample(req.last_logits, req.request.sampling_params)
+                if anchor == tokenizer.eos_token_id:
+                    self._finish(req, "stop")
+                    continue
+                req.tokens_generated.append(anchor)
+                self._emit_new_text(req)
+                if len(req.tokens_generated) >= req.request.max_tokens:
+                    self._finish(req, "length")
+                    continue
+                spec.anchor = anchor
+                spec.start = self._batched_cache.seq_lens_list()[req.batch_idx]
+
+            assert spec.start is not None and spec.context is not None
+            assert spec.anchor is not None
+            target_len = self._batched_cache.seq_lens_list()[req.batch_idx]
+            assert spec.start == target_len, (
+                f"spec.start={spec.start} disagrees with target slot length {target_len}"
+            )
+
+            if not (spec.drafted_for_start == spec.start and spec.offered is not None):
+                # The invariant everything hinges on: the drafter's RoPE
+                # rotates keys against an unsliced cos/sin table, so the
+                # injected context plus the drafter's own cache must land
+                # exactly at the target slot length. It is a PREcondition of
+                # proposing (the forward folds the context into the cache and
+                # truncates back to `start`), which is why it sits inside the
+                # draft branch: on the reuse path the fold already happened.
+                # Asserted rather than trusted, because every known violation
+                # route fails unrecoverably later (INV).
+                assert target_len == spec.draft_cache.get_seq_length() + spec.context.shape[1], (
+                    f"(INV) target_slot_seq_len={target_len} != "
+                    f"draft_cache_len={spec.draft_cache.get_seq_length()} + "
+                    f"context_rows={spec.context.shape[1]}"
+                )
+                room = req.request.max_tokens - len(req.tokens_generated)
+                offered, confidence, draft_probs = self._dspark.propose(
+                    anchor=spec.anchor,
+                    context=spec.context,
+                    start=spec.start,
+                    draft_cache=spec.draft_cache,
+                    temperature=req.request.sampling_params.temperature,
+                )
+                # Clamp at draft time so the verify forward does not append
+                # K/V for positions that can never commit: the bonus token
+                # occupies one slot of the remaining room, so at most
+                # `room - 1` draft tokens are worth verifying.
+                spec.offered = offered[: max(0, room - 1)]
+                spec.confidence = confidence
+                spec.draft_probs = draft_probs
+                spec.drafted_for_start = spec.start
+                spec.stats.n_drafter_forwards += 1
+
+            assert spec.offered is not None
+            out[id(req)] = [spec.anchor, *spec.offered]
+        return out
+
     def _packed_forward(
         self, alive: list[RunningRequest], sampled_decode_tokens: dict[int, list[int]]
-    ) -> None:
+    ) -> tuple[torch.Tensor, list[int], dict[int, torch.Tensor] | None]:
         """Build packed inputs over the alive in-flight set and run ONE forward.
 
         Order in `alive` matches the cache's slot order (both are derived from
@@ -427,6 +651,10 @@ class ContinuousScheduler:
         advances by that instead of by 1. The forward returns one packed
         `(1, total_q, vocab)` tensor and each request's last-position logits
         are sliced out of it at `cu_seqlens_q[index + 1] - 1`.
+
+        Returns `(packed_logits, cu_seqlens_q, sink)` so `_verify_speculators`
+        can slice each speculator's window out of the same forward; `sink` is
+        None when nothing speculated.
 
         Reaching the end of this method is what marks a decoder's tokens as
         consumed. A forward that raises leaves `pending_decode_tokens` set, and
@@ -467,9 +695,26 @@ class ContinuousScheduler:
                 cu_seqlens_q.append(cu_seqlens_q[-1] + len(next_tokens))
                 position_offsets.append(cache_seq_lens[req.batch_idx])
 
-        packed_logits = self._runner.forward_step_packed(
-            self._batched_cache, packed_input_ids, cu_seqlens_q, position_offsets
-        )
+        # Tapped hidden states are collected only when some request in this
+        # batch speculates: the sink covers EVERY request's rows, and each
+        # speculator later slices its own window out by `cu_seqlens_q`. A
+        # batch with no speculators skips the tap kwargs entirely, which is
+        # also what keeps non-Qwen3 models working when dspark is off.
+        sink: dict[int, torch.Tensor] | None = None
+        if self._dspark is not None and any(r.spec is not None for r in alive):
+            sink = {}
+            packed_logits = self._runner.forward_step_packed(
+                self._batched_cache,
+                packed_input_ids,
+                cu_seqlens_q,
+                position_offsets,
+                tap_layers=self._dspark.tap_layers,
+                hidden_state_sink=sink,
+            )
+        else:
+            packed_logits = self._runner.forward_step_packed(
+                self._batched_cache, packed_input_ids, cu_seqlens_q, position_offsets
+            )
 
         # Distribute logits and advance prefill state.
         for index, req in enumerate(alive):
@@ -477,14 +722,131 @@ class ContinuousScheduler:
             if req.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING):
                 tokens_added = cu_seqlens_q[index + 1] - cu_seqlens_q[index]
                 req.tokens_prefilled += tokens_added
+                if req.spec is not None:
+                    # This chunk's tapped hidden states become part of round
+                    # 1's injected context; cloned so the buffer does not pin
+                    # the whole packed activation.
+                    assert sink is not None and self._dspark is not None
+                    req.spec.context_parts.append(
+                        context_window(
+                            sink,
+                            self._dspark.ordered_taps,
+                            cu_seqlens_q[index],
+                            cu_seqlens_q[index + 1],
+                        )
+                    )
                 if req.tokens_prefilled == len(req.prompt_token_ids):
                     req.state = RequestState.DECODING
                     req.last_logits = packed_logits[0, last_pos, :]
                 else:
                     req.state = RequestState.CHUNKED_PREFILLING
+            elif req.spec is not None:
+                # A speculator's last row is the logits after its last OFFERED
+                # token, which may be rejected; the verify phase derives the
+                # real continuation, so leave nothing tempting behind.
+                req.last_logits = None
             else:
                 req.last_logits = packed_logits[0, last_pos, :]
                 req.pending_decode_tokens = None
+        return packed_logits, cu_seqlens_q, sink
+
+    def _verify_speculators(
+        self,
+        alive: list[RunningRequest],
+        packed_logits: torch.Tensor,
+        cu_seqlens_q: list[int],
+        sink: dict[int, torch.Tensor] | None,
+    ) -> None:
+        """Judge each in-flight proposal against the forward that just ran.
+
+        Membership is keyed off `spec.offered is not None`, never off
+        `RequestState`: `_packed_forward` flips PREFILLING -> DECODING
+        mid-iteration, so a request that just finished prefill is DECODING by
+        now while having no proposal, and reading a verify window for it would
+        take the argmax at its chunk's first position and emit garbage.
+
+        Emission follows the scheduler's conventions, which differ from the
+        batch-1 runner's in two deliberate ways: EOS is dropped, not emitted
+        (`run_greedy` appends it), and the commit is clamped so
+        `len(tokens_generated)` can never overshoot `max_tokens`.
+        """
+        if self._dspark is None:
+            return
+        tokenizer = self._runner.tokenizer
+        for index, req in enumerate(alive):
+            spec = req.spec
+            if spec is None or spec.offered is None:
+                continue
+            assert spec.start is not None and spec.draft_probs is not None
+            assert req.batch_idx is not None and self._batched_cache is not None
+
+            lo = cu_seqlens_q[index]
+            width = 1 + len(spec.offered)
+            # A wrong offset here reads ANOTHER request's logits and emits
+            # plausible wrong tokens with no error at all, so the window is
+            # pinned to the request's own packed extent.
+            assert cu_seqlens_q[index + 1] - lo == width, (
+                f"verify window mismatch: cu_seqlens_q spans "
+                f"{cu_seqlens_q[index + 1] - lo} rows, expected {width}"
+            )
+            window = packed_logits[:, lo : lo + width, :]
+
+            accepted, bonus = verify_block(
+                window,
+                offered=spec.offered,
+                draft_probs=spec.draft_probs,
+                temperature=req.request.sampling_params.temperature,
+            )
+
+            if spec.confidence is not None:
+                conf_probs = spec.confidence[0].sigmoid().tolist()
+                for i in range(len(spec.offered)):
+                    spec.stats.confidence_observations.append((float(conf_probs[i]), i < accepted))
+            spec.stats.proposal_lengths.append(len(spec.offered))
+            spec.stats.accepted_draft_lengths.append(accepted)
+            spec.stats.acceptance_lengths.append(accepted + 1)
+
+            committed = [*spec.offered[:accepted], bonus]
+            room = req.request.max_tokens - len(req.tokens_generated)
+            emitted: list[int] = []
+            hit_eos = False
+            for tok in committed[:room]:
+                # The scheduler's convention: stop BEFORE the first EOS and do
+                # not emit it. The opposite of `run_greedy`, which appends it.
+                if tok == tokenizer.eos_token_id:
+                    hit_eos = True
+                    break
+                emitted.append(tok)
+            if emitted:
+                req.tokens_generated.extend(emitted)
+                self._emit_new_text(req)
+
+            if hit_eos:
+                self._finish(req, "stop")
+                continue
+            if len(req.tokens_generated) >= req.request.max_tokens:
+                self._finish(req, "length")
+                continue
+            # A finished request skips the rollback: its blocks are about to
+            # be freed wholesale by the reaper. A continuing one rolls its
+            # slot back to exactly the committed prefix; the verify forward
+            # wrote K/V for every offered token and the rejected tail is
+            # wrong, so the next round rewrites those positions.
+            new_start = spec.start + len(emitted)
+            self._batched_cache.truncate_to(req.batch_idx, new_start)
+
+            # Next round's context is the target's hidden states for the
+            # committed window only: rows 0..accepted of this request's verify
+            # window, i.e. the anchor plus the accepted tokens. REPLACES the
+            # previous context rather than appending, mirroring `deepspec`.
+            assert sink is not None and self._dspark is not None
+            spec.context = context_window(sink, self._dspark.ordered_taps, lo, lo + accepted + 1)
+            spec.anchor = bonus
+            spec.start = new_start
+            spec.offered = None
+            spec.draft_probs = None
+            spec.confidence = None
+            spec.drafted_for_start = None
 
     def _reap_done(self) -> None:
         """Free blocks for finished requests; shift batch_idx for survivors."""
@@ -506,6 +868,10 @@ class ContinuousScheduler:
                         and surviving.batch_idx > finished.batch_idx
                     ):
                         surviving.batch_idx -= 1
+            # Drop speculative state with the request: the API handle keeps
+            # the RunningRequest alive after completion, and the drafter
+            # cache plus injected context must not outlive the generation.
+            finished.spec = None
             self._running.remove(finished)
 
         if not self._running and self._batched_cache is not None:

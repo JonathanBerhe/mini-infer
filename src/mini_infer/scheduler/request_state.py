@@ -5,11 +5,14 @@ import enum
 import queue
 import threading
 from collections.abc import Iterator
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from mini_infer.engine.sampler import SamplingParams
+
+if TYPE_CHECKING:
+    from mini_infer.engine.dspark.spec import SpecDecodeState
 
 # `cancelled` covers both API-side cancellation (client disconnect on a
 # streaming request) and engine-side rejection (admission can't be satisfied
@@ -85,6 +88,12 @@ class RunningRequest:
     step has to be idempotent: without this, the retry would sample the same
     `last_logits` again and emit a duplicate of a token the client already has.
     Cleared by the forward that consumes them.
+
+    `spec` is the DSpark speculative-decoding state, present only on requests
+    the scheduler decided to speculate for at admission. Kept as one optional
+    field so a type every scheduler shares carries no technique-specific
+    members; the reaper clears it when the request finishes, since the API
+    handle keeps the `RunningRequest` itself alive.
     """
 
     request: Request
@@ -98,6 +107,7 @@ class RunningRequest:
     last_logits: torch.Tensor | None = None
     last_text: str = ""
     pending_decode_tokens: list[int] | None = None
+    spec: "SpecDecodeState | None" = None
     finish_reason: FinishReason | None = None
 
 

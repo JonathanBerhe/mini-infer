@@ -15,15 +15,28 @@ from mini_infer.engine.dspark.draft_cache import DSparkDraftCache
 from mini_infer.engine.dspark.drafter import Qwen3DSparkConfig, Qwen3DSparkDrafter
 from mini_infer.engine.dspark.markov_head import VanillaMarkovHead
 from mini_infer.engine.dspark.proposal import confident_prefix_length
-from mini_infer.engine.dspark.speculative import DSparkSpeculativeRunner, DSparkStats
+from mini_infer.engine.dspark.spec import (
+    DSparkSpec,
+    DSparkStats,
+    SpecDecodeState,
+    context_window,
+    propose_block,
+    verify_block,
+)
+from mini_infer.engine.dspark.speculative import DSparkSpeculativeRunner
 
 __all__ = [
     "ConfidenceHead",
     "DSparkDraftCache",
+    "DSparkSpec",
     "DSparkSpeculativeRunner",
     "DSparkStats",
     "Qwen3DSparkConfig",
     "Qwen3DSparkDrafter",
+    "SpecDecodeState",
     "VanillaMarkovHead",
     "confident_prefix_length",
+    "context_window",
+    "propose_block",
+    "verify_block",
 ]
