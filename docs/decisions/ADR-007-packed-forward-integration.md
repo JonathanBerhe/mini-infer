@@ -57,3 +57,26 @@ This slice (B) collapses both into a single packed forward per step using FlashA
 - Scheduler: `src/mini_infer/scheduler/continuous_scheduler.py` (`_step`, `_sample_decoders`, `_packed_forward`)
 - Tests: `tests/unit/test_packed_attention.py`, `tests/unit/test_scheduler.py`, `tests/stress/test_chunked_prefill_load.py`
 - Earlier ADRs: ADR-005 (continuous batching), ADR-006 (chunked prefill).
+
+## Update: variable q-length per decoder (2026-07-29)
+
+Two statements above are no longer literally true of the scheduler, though the
+decision they express (one forward per step, one unified packed primitive) is
+unchanged.
+
+- Point 1 says "a decoding request contributes 1" token. It now contributes a
+  LIST of tokens, and `cu_seqlens_q` advances by that length. Plain sampling
+  still produces exactly one, so the shape of a non-speculative step is
+  identical; a step that verifies a drafted block feeds the whole block at once.
+- Point 5 says `runner.forward_step(...)` is the entry point the scheduler flows
+  through. It was the primitive when this ADR was written; `0d5f4d4` split the
+  packed-logits body out into `forward_step_packed` and left `forward_step` as a
+  last-position slice over it. `_packed_forward` now calls the primitive and
+  slices each request's last position itself at `cu_seqlens_q[index + 1] - 1`,
+  because verification needs logits at every position of a request's window, not
+  just the last. `forward_step` is unchanged and still serves every other caller
+  (`prefill`, `decode`, `decode_batch`, `prefill_chunk`, the prefill worker, and
+  the draft model in `engine/speculative.py`).
+
+Model-free coverage of the packing and per-request slicing lives in
+`tests/unit/test_scheduler_variable_tokens.py`.

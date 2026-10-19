@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Any
 
@@ -44,11 +45,14 @@ def _dtype_for(device: str) -> torch.dtype:
 class ModelRunner:
     """Loads a HF causal LM and runs packed-varlen forwards against a paged KV cache.
 
-    All forwards (prefill, decode, chunked-prefill) flow through `forward_step`,
-    which packs per-request q-tokens into a single sequence and dispatches the
-    patched attention layer's varlen path. The convenience wrappers (`prefill`,
-    `decode`, `decode_batch`, `prefill_chunk`) build the right packed inputs
-    for their single-request / uniform-q-len cases and call `forward_step`.
+    All forwards (prefill, decode, chunked prefill) go through
+    `forward_step_packed`. It packs the new tokens (q-tokens) of all requests
+    into one sequence, runs the varlen (variable-length) path of the patched
+    attention layer, and returns logits at every packed position.
+    `forward_step` takes the last position of each request from that result.
+    The wrappers `prefill`, `decode`, `decode_batch`, and `prefill_chunk` build
+    the packed inputs for one request, or for requests with the same q-length,
+    and call `forward_step`.
     """
 
     def __init__(
@@ -141,6 +145,19 @@ class ModelRunner:
     def block_pool(self) -> BlockPool:
         return self._block_pool
 
+    @property
+    def supports_hidden_state_taps(self) -> bool:
+        """True if the forward of the model accepts `tap_layers` and `hidden_state_sink`.
+
+        The DSpark drafter takes per-layer hidden states of the target as its
+        context. Only a model that accepts these kwargs can record them (Qwen3
+        today). This property reads the signature, not a list of family names.
+        Thus a model that adds tap support reports True with no edit to this
+        file. A caller can refuse a model without it before the first forward.
+        Without that refusal, the first forward with the kwargs raises a `TypeError`.
+        """
+        return "tap_layers" in inspect.signature(self._model.forward).parameters
+
     def forward_step(
         self,
         cache: PagedKVCache,
@@ -150,9 +167,11 @@ class ModelRunner:
     ) -> list[torch.Tensor]:
         """Run ONE packed-varlen forward; return last-position logits per request.
 
-        See `forward_step_packed` for the underlying packed-logits path. This
-        helper slices the last position per request and is the standard entry
-        point for the scheduler.
+        This is a wrapper over `forward_step_packed`. For request `i`, it takes
+        row `cu_seqlens_q[i + 1] - 1`, at any q-length. The wrappers below and
+        the prefill worker use it. A caller that reads other positions, or that
+        slices the packed tensor itself (the scheduler), calls
+        `forward_step_packed`.
         """
         packed_logits = self.forward_step_packed(
             cache, packed_input_ids, cu_seqlens_q, position_offsets

@@ -28,6 +28,7 @@ from mini_infer.engine.sampler import sample
 from mini_infer.engine.tp_state_cache_continuous_server import (
     TensorParallelStateCacheContinuousServer,
 )
+from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -35,6 +36,7 @@ from mini_infer.scheduler.request_state import (
     Request,
     RequestHandle,
     RunningRequest,
+    StepQueue,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,11 +69,18 @@ class TensorParallelStateCacheContinuousScheduler:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._slots: list[_Slot | None] = [None] * server.max_batch_size
+        # See `ContinuousScheduler._stopping` and `ContinuousScheduler._crashed`.
+        self._stopping = False
+        self._crashed = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        if self._crashed:
+            # Requests of the crashed thread must not move to the new one. See ADR-028.
+            self._end_in_flight(crashed=True)
         self._stop_event.clear()
+        self._crashed = False
         self._slots = [None] * self._max_batch_size
         self._thread = threading.Thread(
             target=self._engine_loop, name="mini-infer-tp-continuous-engine", daemon=True
@@ -79,23 +88,58 @@ class TensorParallelStateCacheContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        """Join the engine thread, end what is left, and release the followers.
+
+        Leftovers end as `ContinuousScheduler.stop` describes.
+        """
+        self._stopping = True
+        try:
+            self._stop_event.set()
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=timeout)
+                self._thread = None
+                if not thread.is_alive():
+                    self._end_in_flight(crashed=self._crashed)
+        finally:
+            self._stopping = False
         # The engine thread has exited, so no broadcast is in flight; tell the
         # followers to leave run_follower_loop (else they block on the next op).
         self._server.shutdown()
 
+    @property
+    def is_running(self) -> bool:
+        """Whether the leader's engine thread is alive.
+
+        A leader blocked on a dead follower (in a call that waits for every rank) counts as alive.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
     def submit(self, request: Request) -> RequestHandle:
-        if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError("scheduler not running; call start() before submit()")
+        """Enqueue a request. Its handle raises `EngineNotRunningError` if the thread dies."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
-            output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
+            output_queue=StepQueue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
-        return RequestHandle(running)
+        thread_alive = thread.is_alive
+        return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
+
+    def _end_in_flight(self, *, crashed: bool) -> None:
+        """End every request in a slot or waiting. Call only after the engine thread exits."""
+        leftover = [slot.request for slot in self._slots if slot is not None]
+        self._slots = [None] * self._max_batch_size
+        while True:
+            try:
+                leftover.append(self._waiting.get_nowait())
+            except queue.Empty:
+                break
+        if not crashed:
+            for running in leftover:
+                self._finish(running, "cancelled")
 
     def run(self, request: Request) -> GenerationResult:
         return self.submit(request).wait()
@@ -119,6 +163,7 @@ class TensorParallelStateCacheContinuousScheduler:
                 self._decode_step()
         except Exception:
             logger.exception("tp continuous engine thread crashed")
+            self._crashed = True
             raise
 
     def _admit(self) -> None:
@@ -171,7 +216,7 @@ class TensorParallelStateCacheContinuousScheduler:
             current_text = tokenizer.decode(request.tokens_generated)
             delta = current_text[len(request.last_text) :]
             request.last_text = current_text
-            self._emit(request, GenerationStep(text=delta))
+            self._emit(request, GenerationStep(text=delta, num_tokens=1))
             if len(request.tokens_generated) >= request.request.max_tokens:
                 self._finish(request, "length")
                 self._slots[slot_idx] = None

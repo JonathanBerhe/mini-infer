@@ -47,8 +47,23 @@ _FLASHINFER_DISABLED_FOR_BENCH = False
 # imports stay free.
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _workspace_buffer: torch.Tensor | None = None
-_prefill_wrapper: Any = None
+# One prefill wrapper for each KV storage class (the pool's `kv_quant`). FlashInfer
+# `plan()` resolves backend="auto" once, from the dtypes of its first plan, and stores
+# the choice on the wrapper. A shared wrapper thus pins every later pool to that backend.
+# On Hopper, a bf16 plan pins fa3 (FlashAttention 3). A later fp8 plan then JIT-builds
+# an fa3 template for bf16 q and e4m3 KV, which does not exist, and fails with cutlass
+# "No eligible GMMA operator" (H100, 0.6.16rc4, 2026-07-29). In the reverse order, bf16
+# pools lose fa3 silently. Per-class wrappers give fa2 for fp8 KV and fa3 for bf16.
+_prefill_wrappers: dict[str, Any] = {}
 _decode_wrapper: Any = None
+
+
+def _wrapper_key(kv_quant: str | None) -> str:
+    """Return the prefill-wrapper key: the KV storage class of the pool.
+
+    In one class the (q, kv) dtypes never change, so the first-plan backend stays correct.
+    """
+    return kv_quant if kv_quant is not None else "default"
 
 
 def supports_flashinfer_backend(device: torch.device | str) -> bool:
@@ -65,27 +80,28 @@ def supports_flashinfer_backend(device: torch.device | str) -> bool:
     return is_cuda_device(device)
 
 
-def _ensure_wrappers(device: torch.device) -> tuple[Any, Any]:
+def _ensure_wrappers(device: torch.device, kv_quant: str | None) -> tuple[Any, Any]:
     """Lazy-initialize the persistent workspace + wrapper instances.
 
     Returns `(prefill_wrapper, decode_wrapper)` for use in the
-    dispatcher. Both share a single 128 MiB `uint8` buffer because their
-    plan/run lifecycles don't overlap — only one is "current" per
-    forward pass.
+    dispatcher. All wrappers share one 128 MiB `uint8` buffer. Their uses never overlap,
+    because the engine runs one forward at a time and each attention call runs one wrapper.
+    Prefill wrappers are cached for each KV storage class (see `_prefill_wrappers`).
     """
-    global _workspace_buffer, _prefill_wrapper, _decode_wrapper
+    global _workspace_buffer, _decode_wrapper
     if _workspace_buffer is None:
         _workspace_buffer = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     assert flashinfer is not None  # _FLASHINFER_AVAILABLE checked at call site
-    if _prefill_wrapper is None:
-        _prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    key = _wrapper_key(kv_quant)
+    if key not in _prefill_wrappers:
+        _prefill_wrappers[key] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             _workspace_buffer, kv_layout="NHD"
         )
     if _decode_wrapper is None:
         _decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             _workspace_buffer, kv_layout="NHD"
         )
-    return _prefill_wrapper, _decode_wrapper
+    return _prefill_wrappers[key], _decode_wrapper
 
 
 def flashinfer_attention_forward(
@@ -140,7 +156,7 @@ def flashinfer_attention_forward(
     num_kv_heads = cache._pool.num_kv_heads_for_layer(layer_idx)
     page_size = cache._pool.block_size
 
-    prefill_wrapper, decode_wrapper = _ensure_wrappers(device)
+    prefill_wrapper, decode_wrapper = _ensure_wrappers(device, cache._pool.kv_quant)
 
     # CSR-style page index triple. FlashInfer wants:
     #   paged_kv_indptr     (B+1,) int32 — cumulative pages per request

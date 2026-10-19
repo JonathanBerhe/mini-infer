@@ -10,6 +10,10 @@ request). These tests pin both halves:
 - end-to-end recovery: a fake runner whose forward OOMs exactly once, driven
   through the real engine thread, must leave the engine alive and serving.
 
+The fake raises before it touches the cache, so it cannot leave the partial state
+of a real append. `test_dspark_scheduler.py` tests the rollback of that state on
+the plain and speculative paths, with the OOM inside the real `append_kv_packed`.
+
 Model-free (a fake runner over a real `BlockPool`), so it runs in CI.
 """
 
@@ -46,9 +50,8 @@ class _FakeTokenizer:
 class _FakeRunner:
     """Duck-typed ModelRunner: real BlockPool, fake tokenizer, scriptable forward.
 
-    `oom_on_calls` is the set of 1-based `forward_step` invocation indices that
-    raise `OutOfMemoryError`; every other call returns greedy-argmax-0 logits
-    for each request in the batch, so decode is deterministic.
+    `oom_on_calls` holds the 1-based `forward_step_packed` call numbers that raise
+    `OutOfMemoryError`. Other calls return argmax-0 logits, so decode is deterministic.
     """
 
     def __init__(self, oom_on_calls: set[int]) -> None:
@@ -64,6 +67,8 @@ class _FakeRunner:
         )
         self.tokenizer = _FakeTokenizer()
         self.calls = 0
+        # Packed input ids of each call that did not raise, to show what a retry re-fed.
+        self.packed_per_call: list[list[int]] = []
 
     def _forward_impl(
         self,
@@ -72,19 +77,20 @@ class _FakeRunner:
         cu_seqlens_q: list[int],
         position_offsets: list[int],
         oom_on_calls: set[int],
-    ) -> list[torch.Tensor]:
+    ) -> torch.Tensor:
         self.calls += 1
         if self.calls in oom_on_calls:
             raise OutOfMemoryError("forced OOM for test")
-        # One logits vector per request; argmax is token 0 (greedy-deterministic).
-        logits = torch.full((_VOCAB,), -1.0)
-        logits[0] = 1.0
-        return [logits.clone() for _ in range(cache.batch_size)]
+        self.packed_per_call.append(list(packed_input_ids))
+        # One row per packed position, the shape that `forward_step_packed` returns.
+        logits = torch.full((1, cu_seqlens_q[-1], _VOCAB), -1.0)
+        logits[..., 0] = 1.0
+        return logits
 
 
 def _make_runner(oom_on_calls: set[int]) -> _FakeRunner:
     runner = _FakeRunner(oom_on_calls)
-    runner.forward_step = (  # type: ignore[attr-defined]
+    runner.forward_step_packed = (  # type: ignore[attr-defined]
         lambda cache, ids, cu, pos: runner._forward_impl(cache, ids, cu, pos, oom_on_calls)
     )
     return runner
@@ -183,3 +189,74 @@ def test_engine_survives_mid_step_oom_and_keeps_serving() -> None:
             assert len(survivor.tokens) == 2
         finally:
             sched.stop()
+
+
+def _enqueue(sched: ContinuousScheduler, prompt: str, max_tokens: int) -> RunningRequest:
+    """Put a request straight on the waiting queue (no engine thread involved)."""
+    running = RunningRequest(
+        request=Request(
+            prompt=prompt,
+            sampling_params=SamplingParams(temperature=0.0),
+            max_tokens=max_tokens,
+        ),
+        output_queue=queue.Queue(maxsize=64),
+    )
+    sched._waiting.put(running)
+    return running
+
+
+def _step_with_recovery(sched: ContinuousScheduler) -> None:
+    """Run one engine step inline, with the same OOM handler as `_engine_loop`.
+
+    Through the engine thread, the order of decoder and prefiller depends on timing.
+    """
+    try:
+        sched._step()
+    except OutOfMemoryError:
+        sched._preempt_on_oom()
+
+
+def _drain(req: RunningRequest) -> list[GenerationStep]:
+    steps: list[GenerationStep] = []
+    while True:
+        try:
+            steps.append(req.output_queue.get_nowait())
+        except queue.Empty:
+            return steps
+
+
+def test_oom_retry_does_not_re_emit_an_already_emitted_token() -> None:
+    """A decoder that survives a mid-step OOM must not emit its token twice.
+
+    Sampling emits the token before the forward, so the retry must re-feed it, not
+    sample `last_logits` again. The end-to-end test above OOMs before any `last_logits` exists.
+    """
+    runner = _make_runner({2})
+    sched = ContinuousScheduler(runner)
+    decoder = _enqueue(sched, "abc", max_tokens=4)
+
+    _step_with_recovery(sched)  # forward 1: prefill -> DECODING
+    assert decoder.state == RequestState.DECODING
+
+    # `_preempt_on_oom` picks a prefiller before a decoder, so the decoder survives.
+    prefiller = _enqueue(sched, "defgh", max_tokens=4)
+    _step_with_recovery(sched)  # forward 2: decoder samples + emits, then OOM
+
+    assert prefiller.finish_reason == "cancelled"
+    assert prefiller not in sched._running
+    emitted = list(decoder.tokens_generated)
+    assert len(emitted) == 1
+    assert decoder.pending_decode_tokens == emitted
+
+    _step_with_recovery(sched)  # forward 3: re-feeds the pending token
+    assert decoder.tokens_generated == emitted, "the retry emitted a second token"
+    assert decoder.pending_decode_tokens is None  # cleared by a forward that did not raise
+    assert runner.packed_per_call[-1] == emitted
+
+    _step_with_recovery(sched)  # forward 4: samples the next token
+    assert len(decoder.tokens_generated) == 2
+
+    # One stream delta per token, and the deltas decode to exactly those tokens.
+    deltas = [s.text for s in _drain(decoder) if s.finish_reason is None]
+    assert len(deltas) == 2
+    assert "".join(deltas) == runner.tokenizer.decode(decoder.tokens_generated)

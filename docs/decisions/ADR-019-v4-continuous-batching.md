@@ -223,6 +223,15 @@ served with continuous batching over `/v1/completions` on 2x B200, 6 concurrent
 requests, all HTTP 200, coherent output, clean follower teardown
 (`scripts/modal_v4_flash_cb_serve.py`), clean first run on real NCCL.
 
+Correction (2026-10-18): that HTTP gate served its 6 requests one at a time.
+The endpoint then ran the blocking `scheduler.run()` inside the async handler.
+That call held the one event loop of the test client for each whole request
+(see [ADR-028](ADR-028-engine-liveness.md)). So the gate did not exercise
+multi-slot admission through `TensorParallelStateCacheContinuousScheduler` on
+the real checkpoint. Ragged batched decode itself ran on the real checkpoint
+through `generate_cohort` (`scripts/modal_v4_flash_cb_bench.py`). A rerun of
+`scripts/modal_v4_flash_cb_serve.py` is the pending gate for that path.
+
 ## Alternatives Considered
 
 - **Status quo (keep `StateCache`, one at a time):** zero risk, no throughput.

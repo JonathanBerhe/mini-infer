@@ -129,8 +129,15 @@ def _run_one_rank(
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
                     responses = list(pool.map(fire, prompts))
                 elapsed = time.perf_counter() - started
+            # A non-200 body (for example the 503 for a dead engine thread) has
+            # no `choices`. Keep its `error` instead.
             completions_out = [
-                {"prompt": p, "text": r["body"]["choices"][0]["text"], "status": r["status"]}
+                {
+                    "prompt": p,
+                    "text": r["body"]["choices"][0]["text"] if r["status"] == 200 else None,
+                    "error": r["body"].get("error") if r["status"] != 200 else None,
+                    "status": r["status"],
+                }
                 for p, r in zip(prompts, responses, strict=True)
             ]
             print(f"[rank 0] all requests done in {elapsed:.2f}s.", flush=True)

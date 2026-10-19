@@ -2,7 +2,8 @@
 
 Date: 2026-07-26
 Status: Accepted (drafter ported and validated against the reference;
-confidence scheduling and multi-request batching remain deferred)
+confidence scheduling remains deferred, and multi-request batching landed
+in [ADR-031](ADR-031-multi-request-dspark.md))
 
 ## Context
 
@@ -354,4 +355,7 @@ tests already own, rather than about this port.
 - Stage D (deferred): temperature > 0 rejection sampling, multi-request
   batching, and the batch-global confidence scheduler (Algorithm 1),
   which also needs to decide its relationship to `ContinuousScheduler`'s
-  ADR-024 OOM preemption and to `PDScheduler`.
+  ADR-024 OOM preemption and to `PDScheduler`. Multi-request batching and
+  temperature > 0 in `ContinuousScheduler` landed in
+  [ADR-031](ADR-031-multi-request-dspark.md). The confidence scheduler and
+  `PDScheduler` support remain deferred.
