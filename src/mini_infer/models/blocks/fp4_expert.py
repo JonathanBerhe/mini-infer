@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from mini_infer.models.blocks.activations import expert_swiglu
 from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16
 
 if TYPE_CHECKING:
@@ -52,6 +53,8 @@ class FP4Expert(nn.Module):
 
     `act_quant` with `fp8_gemm_inputs` set round-trips each GEMM input
     through FP8 (block 128), like the reference's `fp4_gemm` path.
+    `swiglu_limit > 0` clamps the gate and up projections before the SiLU,
+    like DeepSeek-V4's experts (see `activations.clamped_swiglu`).
     """
 
     def __init__(
@@ -61,11 +64,14 @@ class FP4Expert(nn.Module):
         *,
         block_size: int = _FP4_BLOCK_SIZE,
         act_quant: SimulatedActQuant | None = None,
+        swiglu_limit: float = 0.0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.block_size = block_size
+        self.swiglu_limit = swiglu_limit
+        self._activation = expert_swiglu(swiglu_limit)
         if act_quant is not None and act_quant.fp8_gemm_inputs:
             act_quant.check_gemm_input_dim(hidden_size, "FP4Expert w1/w3")
             act_quant.check_gemm_input_dim(intermediate_size, "FP4Expert w2")
@@ -108,7 +114,7 @@ class FP4Expert(nn.Module):
         # Identity unless the FP8 GEMM-input round trip is enabled.
         gemm_input = self.act_quant.gemm_input if self.act_quant is not None else _identity
         x_in = gemm_input(x)
-        hidden = functional.silu(functional.linear(x_in, w1)) * functional.linear(x_in, w3)
+        hidden = self._activation(functional.linear(x_in, w1), functional.linear(x_in, w3))
         if routing_weights is not None:
             hidden = hidden * routing_weights
         out: torch.Tensor = functional.linear(gemm_input(hidden), w2)

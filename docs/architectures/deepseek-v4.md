@@ -269,6 +269,14 @@ same shape. Routed experts use the standard Mixtral-shape expert MLP
 (`blocks/mixtral_moe.py::MixtralExpert`); the shared experts are
 collapsed into one MLP whose intermediate_size is `n_shared * shared_intermediate`.
 
+Every expert, routed and shared, clamps its two projections before the
+SiLU when `swiglu_limit` is positive. The gate projection is capped at
+`swiglu_limit`, and the up projection is clamped to `[-swiglu_limit,
+swiglu_limit]`. Released V4 configs set 10. The port reads the value
+from the HF config into `DeepseekV4Config.moe_swiglu_limit` and applies
+it through `activations.clamped_swiglu`. A value of 0 keeps plain
+SwiGLU.
+
 ## §2.5 — Hyper-Connections
 
 V4's most novel residual scheme. Each block has `hc_mult` (= 4 in
@@ -520,8 +528,6 @@ Some limits apply:
   order. A value that falls exactly on an FP4 rounding boundary can
   then round the other way, so bit equality with a GPU run is not
   guaranteed.
-- The reference's experts clamp their activations at `swiglu_limit`
-  (10 in the V4 configs). The port has no such clamp, in every mode.
 
 ## Where we diverged + why
 

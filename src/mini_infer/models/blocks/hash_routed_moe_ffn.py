@@ -38,6 +38,7 @@ from torch import nn
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.activations import expert_swiglu
 from mini_infer.models.blocks.fp4_expert import FP4Expert
 from mini_infer.models.blocks.hash_routed_gate import (
     HashRoutedGate,
@@ -68,6 +69,7 @@ class HashRoutedMoEFFN(nn.Module):
         shared_intermediate_size: int | None = None,
         expert_dtype: str = "bf16",
         act_quant: SimulatedActQuant | None = None,
+        swiglu_limit: float = 0.0,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -108,14 +110,23 @@ class HashRoutedMoEFFN(nn.Module):
         if expert_dtype not in ("bf16", "fp4"):
             raise ValueError(f"expert_dtype must be 'bf16' or 'fp4'; got {expert_dtype!r}")
         self.expert_dtype = expert_dtype
+        # V4's `swiglu_limit`: every expert (routed and shared) clamps its gate
+        # and up projections before the SiLU. 0 keeps plain SwiGLU.
+        self.swiglu_limit = swiglu_limit
+        activation = expert_swiglu(swiglu_limit)
         routed_experts: list[nn.Module] = []
         for _ in range(num_experts_per_rank):
             if expert_dtype == "fp4":
                 routed_experts.append(
-                    FP4Expert(hidden_size, intermediate_size, act_quant=act_quant)
+                    FP4Expert(
+                        hidden_size,
+                        intermediate_size,
+                        act_quant=act_quant,
+                        swiglu_limit=swiglu_limit,
+                    )
                 )
             else:
-                expert = MixtralExpert(hidden_size, intermediate_size)
+                expert = MixtralExpert(hidden_size, intermediate_size, activation=activation)
                 if act_quant is not None:
                     act_quant.quantize_gemm_inputs(expert.w1, expert.w2, expert.w3)
                 routed_experts.append(expert)
@@ -138,7 +149,7 @@ class HashRoutedMoEFFN(nn.Module):
                 else intermediate_size
             )
             self.shared_experts: MixtralExpert | None = MixtralExpert(
-                hidden_size, shared_intermediate * n_shared_experts
+                hidden_size, shared_intermediate * n_shared_experts, activation=activation
             )
             if act_quant is not None:
                 act_quant.quantize_gemm_inputs(
