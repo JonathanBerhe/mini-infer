@@ -53,6 +53,7 @@ from mini_infer.models.blocks.hyper_connections import HyperConnections
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.swa import SWAAttention
 from mini_infer.models.blocks.swiglu import SwiGLU
+from mini_infer.models.blocks.v4 import SimulatedActQuant
 
 if TYPE_CHECKING:
     from mini_infer.cache.state_cache import StateCache
@@ -103,12 +104,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         moe_vocab_size: int | None = None,
         n_shared_experts: int = 0,
         expert_dtype: str = "bf16",
+        # V4 `swiglu_limit`: clamp every expert's gate/up projections (0 = off).
+        moe_swiglu_limit: float = 0.0,
         # Hyper-Connections knobs. Defaults disable HC -> vanilla pre-norm
         # residuals are used.
         use_hyper_connections: bool = False,
         hc_mult: int = 0,
         hc_sinkhorn_iters: int = 20,
         hc_eps: float = 1e-6,
+        # Reference QAT round trips on the attention activations; `None`
+        # (default) keeps them at full precision. See `v4/act_quant.py`.
+        act_quant: SimulatedActQuant | None = None,
     ) -> None:
         super().__init__()
         self.compression_ratio = compression_ratio
@@ -134,6 +140,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 o_lora_rank=o_lora_rank,
                 window_size=window_size,
                 rms_norm_eps=rms_norm_eps,
+                act_quant=act_quant,
             )
         elif self.is_csa_layer:
             if index_num_heads <= 0 or index_head_dim <= 0 or index_top_k <= 0:
@@ -156,6 +163,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 index_num_heads=index_num_heads,
                 index_head_dim=index_head_dim,
                 index_top_k=index_top_k,
+                act_quant=act_quant,
             )
         else:
             self.self_attn = HCAAttention(
@@ -169,6 +177,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 window_size=window_size,
                 compression_ratio=compression_ratio,
                 rms_norm_eps=rms_norm_eps,
+                act_quant=act_quant,
             )
 
         self.mlp: SwiGLU | HashRoutedMoEFFN
@@ -201,6 +210,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 vocab_size=moe_vocab_size,
                 n_shared_experts=n_shared_experts,
                 expert_dtype=expert_dtype,
+                act_quant=act_quant,
+                swiglu_limit=moe_swiglu_limit,
             )
         else:  # pragma: no cover — Literal already constrains this
             raise ValueError(f"unknown ffn_type={ffn_type!r}")
