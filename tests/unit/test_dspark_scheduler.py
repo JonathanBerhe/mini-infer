@@ -23,6 +23,7 @@ from __future__ import annotations
 import queue
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -227,6 +228,30 @@ def test_init_refuses_prefix_cache() -> None:
     )
     with pytest.raises(ValueError, match="prefix cache"):
         ContinuousScheduler(runner, dspark=_ScriptedSpec([]))  # type: ignore[arg-type]
+
+
+def test_a_slot_freed_in_verify_is_refilled_in_the_next_forward() -> None:
+    """While a prompt waits, every forward runs a full batch.
+
+    With no draft tokens, each round commits only the bonus token, so every
+    request finishes inside verify, after the forward. The reap runs before the
+    next admission, so a waiting prompt takes that slot in the next forward.
+    """
+    sched, runner, _ = _spec_sched(_next_token, script=[], max_concurrent=2)
+    reqs = [_enqueue(sched, p, n) for p, n in (("ab", 2), ("abc", 5), ("abcd", 3), ("a", 6))]
+    forward = runner.forward_step_packed
+    seen: list[tuple[int, int]] = []
+
+    def recording_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
+        seen.append((len(args[2]) - 1, sched._waiting.qsize()))  # (batch, waiting)
+        return forward(*args, **kwargs)
+
+    runner.forward_step_packed = recording_forward  # type: ignore[method-assign]
+    _run_to_done(sched, reqs)
+    assert [len(r.tokens_generated) for r in reqs] == [2, 5, 3, 6]
+    assert all(r.spec_summary is not None for r in reqs)  # every request speculated
+    assert any(waiting for _, waiting in seen)
+    assert all(batch == 2 for batch, waiting in seen if waiting)
 
 
 def test_init_refuses_a_target_without_hidden_state_taps() -> None:

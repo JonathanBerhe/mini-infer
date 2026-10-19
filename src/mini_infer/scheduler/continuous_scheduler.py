@@ -6,17 +6,18 @@ each completes. A single engine thread owns the model and the running batch;
 API threads only enqueue requests and drain per-request output queues.
 
 Each step does:
-1. Admit any newly arrived requests that fit in the block pool. New requests
-   get a slot in the shared `_batched_cache` immediately (no per-request temp
-   cache); their first chunk lands in the next forward.
-2. For DECODING requests, sample the next token from prior `last_logits`,
-   emit it, and check finish conditions. Some requests transition to DONE here.
-   After a recoverable OOM, a request feeds its already emitted tokens again.
-3. Reap any DONE requests (free blocks, shift batch indices). This happens
-   BEFORE the forward so the forward only runs over the alive set.
+1. Mark cancelled requests DONE. For DECODING requests, sample the next token
+   from prior `last_logits`, emit it, and check finish conditions. Some
+   requests transition to DONE here. After a recoverable OOM, a request feeds
+   its already emitted tokens again.
+2. Reap any DONE requests (free blocks, shift batch indices): those that
+   finished in the last verify, by a cancel, or in step 1.
+3. Admit waiting requests into the freed slots while the block pool has room.
+   New requests get a slot in the shared `_batched_cache` immediately (no
+   per-request temp cache); their first chunk lands in this step's forward.
 4. Build packed inputs over the alive in-flight set: each prefilling request
    contributes its next chunk's tokens, each decoding request contributes the
-   tokens from step 2. ONE `runner.forward_step_packed(...)` call per step.
+   tokens from step 1. ONE `runner.forward_step_packed(...)` call per step.
 5. Distribute per-request last-position logits and advance prefill state.
 
 With `dspark` set, admission decides once whether a request speculates. A
@@ -24,7 +25,7 @@ speculator feeds `[anchor, *offered]`: its last committed token, then a drafted
 block that the same forward verifies. Plain requests share the batch.
 Speculators add two phases:
 
-2b. `_draft_speculators`: draft a block from the anchor and the injected
+1b. `_draft_speculators`: draft a block from the anchor and the injected
     context (target hidden states at the tap layers).
 5b. `_verify_speculators`: accept a prefix of the draft plus one bonus token,
     emit them, roll the slot back to the committed length, and take the next
@@ -78,9 +79,9 @@ class ContinuousScheduler:
 
     A single engine thread owns the model and one shared `PagedKVCache`. The
     cache holds a slot for every in-flight request (prefilling or decoding).
-    Each engine step admits new requests if the pool has capacity, samples
-    decoders, reaps any that just finished, then runs ONE batched forward over
-    the alive set via `runner.forward_step_packed(...)`.
+    Each engine step samples decoders, reaps the requests that finished, admits
+    new requests into the freed slots if the pool has capacity, then runs ONE
+    batched forward over the alive set via `runner.forward_step_packed(...)`.
 
     Lifecycle: call `start()` once before `submit()`; call `stop()` at shutdown
     to join the engine thread. The FastAPI lifespan does this for the HTTP
@@ -362,13 +363,22 @@ class ContinuousScheduler:
             cache.truncate_to(batch_idx, length)
 
     def _step(self) -> None:
-        """One scheduler iteration: admit, sample/draft, reap, forward, verify."""
+        """One scheduler iteration: sample/draft, reap, admit, forward, verify.
+
+        The reap comes before admission, so that a request that finished (in
+        the last verify, by a cancel, or in this step's sampling) frees its
+        slot and blocks for a waiting request in this same forward.
+        """
         step_start = time.perf_counter() if self._trace_events is not None else 0.0
 
         self._cancel_pending()
-        self._admit_waiting()
         sampled_decode_tokens = self._sample_decoders()
         sampled_decode_tokens.update(self._draft_speculators())
+        self._reap_done()
+        self._admit_waiting()
+        # Admission ends rejected, empty, and already-cancelled requests on the
+        # spot. Reap them now, so `_running` holds only requests in flight after
+        # the step and a rejected speculator's state goes at once.
         self._reap_done()
         alive = [
             r
@@ -453,7 +463,11 @@ class ContinuousScheduler:
         """
         block_pool = self._runner.block_pool
         prefix_cache = block_pool.prefix_cache
-        while len(self._running) < self._max_concurrent:
+        # Count seated requests only. A request that admission ends on the spot
+        # (cancelled, empty, or rejected) holds no slot and must not block the
+        # waiter behind it.
+        seated = sum(1 for r in self._running if r.state != RequestState.DONE)
+        while seated < self._max_concurrent:
             try:
                 running = self._waiting.get_nowait()
             except queue.Empty:
@@ -540,6 +554,7 @@ class ContinuousScheduler:
             running.tokens_prefilled = self._batched_cache.seq_lens_list()[running.batch_idx]
             running.state = RequestState.PREFILLING
             self._running.append(running)
+            seated += 1
 
     def _spec_state_for(self, running: RunningRequest) -> SpecDecodeState | None:
         """Decide at admission whether this request speculates. None means plain.

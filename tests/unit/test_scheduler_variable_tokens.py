@@ -11,6 +11,7 @@ Model-free (a fake runner over a real `BlockPool`), so it runs in CI.
 from __future__ import annotations
 
 import queue
+from typing import Any
 
 import pytest
 import torch
@@ -257,6 +258,61 @@ def test_empty_prompt_finishes_at_admission() -> None:
     assert other.state == RequestState.DECODING
     assert other.batch_idx == 0
     assert runner.calls[0]["cu_seqlens_q"] == [0, 3]
+
+
+def test_a_freed_slot_is_refilled_in_the_same_step() -> None:
+    """While a prompt waits, every forward runs a full batch.
+
+    A decoder that reaches `max_tokens` finishes when it samples, before the
+    forward. The reap runs before admission, so a waiting prompt takes the
+    slot in that same forward instead of one step later.
+    """
+    runner = _RecordingRunner()
+    sched = ContinuousScheduler(runner, max_concurrent=2)  # type: ignore[arg-type]
+    reqs = [
+        _enqueue(sched, p, max_tokens=n) for p, n in (("ab", 1), ("abc", 3), ("abcd", 2), ("a", 4))
+    ]
+    forward = runner.forward_step_packed
+    seen: list[tuple[int, int]] = []
+
+    def recording_forward(*args: Any) -> torch.Tensor:
+        seen.append((len(args[2]) - 1, sched._waiting.qsize()))  # (batch, waiting)
+        return forward(*args)
+
+    runner.forward_step_packed = recording_forward  # type: ignore[method-assign]
+    for _ in range(50):
+        if all(r.state == RequestState.DONE for r in reqs):
+            break
+        sched._step()
+    assert all(r.state == RequestState.DONE for r in reqs)
+    assert [len(r.tokens_generated) for r in reqs] == [1, 3, 2, 4]
+    assert any(waiting for _, waiting in seen)
+    assert all(batch == 2 for batch, waiting in seen if waiting)
+
+
+def test_requests_ended_at_admission_do_not_block_a_waiter() -> None:
+    """A request that admission ends on the spot (cancelled while queued, or
+    an empty prompt) takes no seat, so the waiter behind it joins this forward."""
+    runner = _RecordingRunner()
+    sched = ContinuousScheduler(runner, max_concurrent=2)  # type: ignore[arg-type]
+    first = _enqueue(sched, "ab", max_tokens=1)
+    second = _enqueue(sched, "abc", max_tokens=3)
+    cancelled = _enqueue(sched, "abcd", max_tokens=2)
+    cancelled.cancel_event.set()
+    empty = _enqueue(sched, "", max_tokens=2)
+    waiter = _enqueue(sched, "abcde", max_tokens=2)
+
+    sched._step()  # prefill `first` and `second`
+    sched._step()  # `first` finishes when it samples; its seat goes to `waiter`
+
+    assert first.finish_reason == "length"
+    assert cancelled.finish_reason == "cancelled"
+    assert empty.finish_reason == "stop"
+    assert second.state == RequestState.DECODING
+    # The second forward: one decode token for `second`, five prompt tokens for `waiter`.
+    assert runner.calls[1]["cu_seqlens_q"] == [0, 1, 6]
+    assert waiter.state == RequestState.DECODING
+    assert all(r.state != RequestState.DONE for r in sched._running)
 
 
 def test_plain_path_runs_to_max_tokens_unchanged() -> None:

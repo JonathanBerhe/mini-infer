@@ -48,10 +48,18 @@ cache.
    prompt over `max_spec_prompt_tokens`, and one with no room for the extra
    headroom. Speculation never turns away a
    request that the plain path can serve.
-4. The step order: cancel, admit, draft (or sample plain decoders), reap, one
-   packed forward with all-position logits, then verify. The verify phase
-   selects requests by `spec.offered is not None`, never by state, because a
-   request that just finished prefill is DECODING with no proposal.
+4. The step order: cancel, draft (or sample plain decoders), reap, admit,
+   reap what admission ended, one packed forward with all-position logits,
+   then verify. The verify phase selects requests by `spec.offered is not
+   None`, never by state, because a request that just finished prefill is
+   DECODING with no proposal. The reap comes before admission, so a
+   finished request frees its slot in time for the next forward. That holds
+   for a finish in the last verify, by a cancel, or in sampling. With admission
+   first, that slot stayed empty for one forward. At 16 requests, DSpark
+   then ran 18 to 30 percent of its steady time short
+   ([benchmark](../benchmarks/2026-10-19-dspark-concurrency.md)). A request
+   that admission ends on the spot (cancelled, empty, or rejected) holds no
+   seat, so it does not block the waiter behind it.
 5. Each request takes its own slice of the packed forward: its tap rows and
    its verify logits, at its `cu_seqlens_q` offset. The tap rows follow the
    configured layer order and are cloned, so they do not pin the whole packed
