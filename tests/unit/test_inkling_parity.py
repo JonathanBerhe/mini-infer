@@ -15,11 +15,14 @@ Beyond one-shot prefill parity, the decode tests pin the serving path: greedy
 and batched ragged decode step through the PagedKVCache, where the SConv tails
 are gathered from the conv_* streams, token-equal with HF's incremental
 decode (which carries its own per-layer conv states). Chunked prefill crosses
-a conv/window boundary mid-prompt.
+a conv/window boundary mid-prompt. A separate test loads a checkpoint written
+in the released on-disk layout (Thinking Machines' tensor names) through
+`load_model`.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -66,7 +69,12 @@ def _tiny_hf_config():
     # n_floor 4 so log scaling is active from position 4 on. Sliding layers
     # have MORE KV heads (4) than global ones (2), like the real config
     # (16 vs 8), which pins the per-layer heterogeneous pool shapes.
+    # initializer_range 0.1, not HF's 0.02: at 0.02 the muP logit divide
+    # leaves logits near 2e-2, and swapping a routed expert's gate and up
+    # moved them only 3e-5, inside atol=1e-3 with the argmax unchanged. At
+    # 0.1 that bug moves them 5e-2 and flips the argmax.
     return InklingTextConfig(
+        initializer_range=0.1,
         vocab_size=128,
         unpadded_vocab_size=120,
         hidden_size=64,
@@ -155,6 +163,77 @@ def test_full_model_parity_vs_hf() -> None:
         torch.nn.functional.cosine_similarity(hf_logits.flatten(), my_logits.flatten(), dim=0)
     )
     assert cs > 0.999, f"full-model logit parity failed: cos_sim={cs:.6f}"
+    assert torch.equal(hf_logits.argmax(dim=-1), my_logits.argmax(dim=-1))
+    assert torch.allclose(hf_logits, my_logits, atol=1e-3), (
+        f"max_abs_diff={(hf_logits - my_logits).abs().max().item():.6f}"
+    )
+
+
+def test_released_checkpoint_layout_loads_with_hf_parity(tmp_path: Path) -> None:
+    """A checkpoint in the released on-disk layout loads through `load_model`.
+
+    The released weights keep Thinking Machines' tensor names (`model.llm.*`,
+    fused `w13` gate/up tensors with interleaved rows, `mlp.gate.bias`) that
+    transformers renames at load. HF's `save_pretrained` reverses that rename,
+    so it writes the released layout, and this test checks our loader against
+    transformers' own conversion instead of against a mapping from this repo.
+    The vision config (patch 2, temporal patch 2, 3 layers) keeps the vision
+    tower init free of its scipy-only branch.
+    """
+    pytest.importorskip("transformers.models.inkling.modeling_inkling")
+    from safetensors import safe_open
+    from transformers.models.inkling.configuration_inkling import (
+        InklingConfig as HFInklingConfig,
+    )
+    from transformers.models.inkling.modeling_inkling import InklingForConditionalGeneration
+
+    from mini_infer.models import load_model
+
+    torch.manual_seed(0)
+    hf_cfg = HFInklingConfig(
+        text_config=_tiny_hf_config(),
+        vision_config={
+            "hidden_size": 32,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 2,
+            "patch_size": 2,
+            "temporal_patch_size": 2,
+        },
+        audio_config={"n_mel_bins": 4, "mel_vocab_size": 8},
+    )
+    hf_cfg._attn_implementation = "eager"
+    hf_model = InklingForConditionalGeneration(hf_cfg).to(torch.float32).eval()
+    _randomize_scales_and_biases(hf_model)
+    hf_model.save_pretrained(tmp_path)
+
+    names: set[str] = set()
+    for shard in tmp_path.glob("*.safetensors"):
+        with safe_open(shard, "pt") as f:
+            names.update(f.keys())
+    # Guard: the file really is in the released layout, not HF's in-memory one.
+    assert "model.llm.layers.2.mlp.experts.w13_weight" in names
+    assert "model.llm.layers.0.mlp.w13_dn.weight" in names
+    assert not any(name.startswith("model.language_model.") for name in names)
+
+    my_model = load_model(str(tmp_path), dtype=torch.float32, device="cpu")
+    assert isinstance(my_model, InklingForCausalLM)
+
+    total_q = 12
+    input_ids = torch.randint(0, my_model.cfg.vocab_size, (1, total_q), dtype=torch.long)
+    with torch.inference_mode():
+        hf_logits = hf_model(input_ids=input_ids, use_cache=False).logits
+        my_logits = my_model(
+            input_ids=input_ids,
+            position_ids=torch.arange(total_q, dtype=torch.long).unsqueeze(0),
+            past_key_values=_make_cache(my_model),
+            cu_seqlens_q=torch.tensor([0, total_q], dtype=torch.int32),
+        )
+
+    assert hf_logits.shape == my_logits.shape, f"{hf_logits.shape} vs {my_logits.shape}"
+    cs = float(
+        torch.nn.functional.cosine_similarity(hf_logits.flatten(), my_logits.flatten(), dim=0)
+    )
+    assert cs > 0.999, f"released-layout logit parity failed: cos_sim={cs:.6f}"
     assert torch.equal(hf_logits.argmax(dim=-1), my_logits.argmax(dim=-1))
     assert torch.allclose(hf_logits, my_logits, atol=1e-3), (
         f"max_abs_diff={(hf_logits - my_logits).abs().max().item():.6f}"
