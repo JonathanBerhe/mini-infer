@@ -49,7 +49,7 @@ against the reference at FP32 with cosine-sim 1.0000 and max abs diff
 | Hash-routed MoE FFN | `class MoE` (L609) | `HashRoutedMoEFFN` in `blocks/hash_routed_moe_ffn.py` |
 | Hyper-Connections | `Block.forward` mixing (L676-700) | `HyperConnections` in `blocks/hyper_connections.py` (L137); core kernel `hc_split_sinkhorn` (L56) |
 | HC head reduction | `Transformer.forward` final mix (L800-820) | `HCHeadReduction` in `blocks/hyper_connections.py` (L265) |
-| YaRN long-context RoPE | `precompute_freqs_cis` (L200) | `RotaryEmbedding` in `blocks/rotary.py` |
+| YaRN long-context RoPE | `precompute_freqs_cis` (L200) | `RotaryEmbedding` in `blocks/rope.py`, two tables per model (see §3.1) |
 | Per-request state | `Attention` mutable buffers (single-request) | `StateCache` in `cache/state_cache.py` + `build_state_cache_layer_specs` |
 
 Bit-parity validation is live in `tests/unit/` for every primitive in
@@ -343,10 +343,24 @@ short-range fidelity of standard RoPE while extending the context.
 inv-freq table with a linear ramp between `beta_fast` and `beta_slow`
 that interpolates between extrapolation and linear-scaling.
 
-**Our code (`blocks/rotary.py`, `RotaryEmbedding`)**: same primitive.
+**Our code (`blocks/rope.py`, `RotaryEmbedding`)**: same primitive.
 YaRN kicks in when the requested `seq_len > yarn_original_seq_len`.
 The same `RotaryEmbedding` block serves V2 / V3 / V4 (V2 / V3 don't
 use YaRN by default; V4 does).
+
+**Two tables per model.** The reference builds the table per attention
+layer (`Attention.__init__`). A compressed layer (CSA or HCA) rotates
+with `compress_rope_theta` and YaRN. A pure sliding-window layer
+rotates with `rope_theta` and no YaRN. V4-Flash sets 160000 and 10000.
+`DeepseekV4ForCausalLM` holds `window_rotary_emb` and
+`compress_rotary_emb` (built by `build_rotary_tables`), and
+`rotary_for_layer` picks one per layer. The compressed entries and the
+Lightning Indexer of a compressed layer use that layer's table. An
+earlier version used one `rope_theta` table with YaRN for every layer.
+On an 8,192-token prompt that version scored a perplexity of 247
+instead of 4.4 (`docs/benchmarks/2026-10-19-v4-projection-dtype.md`).
+`tests/unit/test_v4_rope_tables.py` compares each layer's table with
+the reference's `precompute_freqs_cis`.
 
 ## Decoder-layer assembly
 

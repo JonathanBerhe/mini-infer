@@ -6,14 +6,13 @@ Model: `deepseek-ai/DeepSeek-V4-Flash` (43 layers: 21 CSA, 20 HCA, 2 SWA)
 Prompt: 8,192 tokens of technical prose from this repository
 (`docs/architectures/deepseek-v4.md`, then `deepseek-v2-mla.md`, cut at 8,192
 tokens), followed by 32 greedy tokens
-Engine: run 1 used the first version of the probe (one comparison, no
-reference quantization). Run 2 ran at `ee8d465`, with the reference's FP8 and
-FP4 round trips on (`--simulate-act-quant --simulate-fp8-gemm-inputs`) and the
-expert clamp at `swiglu_limit`.
+Engine: mini-infer at `ecd31c6`, with the reference's FP8 and FP4 round trips
+on (`--simulate-act-quant --simulate-fp8-gemm-inputs`) and the expert clamp
+at `swiglu_limit`
 Upstream code compared: vLLM `main` at `b965ee5`, `vllm/models/deepseek_v4/attention.py`
 Script: `scripts/modal_v4_projection_dtype_probe.py`
-Data: `docs/benchmarks/data/v4-projection-dtype-probe.json` (run 1),
-`docs/benchmarks/data/v4-projection-dtype-probe-qat.json` (run 2)
+Data: `docs/benchmarks/data/v4-projection-dtype-probe-fixed-rope.json`
+(main run), plus two earlier runs (see "Earlier runs")
 
 ## Question
 
@@ -26,10 +25,26 @@ whether two GEMMs of DeepSeek-V4 can emit bf16 instead of fp32. In
 The issue calls this an fp32 accumulate. A bf16 GEMM accumulates in fp32 in
 both cases. The output dtype decides one thing only: whether each projected kv
 and score entry is rounded to bf16 once, before the compression softmax pools
-it. This report measures that rounding and the time that bf16 output saves.
+it. This report measures that rounding, its effect on the model's predictions,
+and the time that bf16 output saves.
 
 ## Result
 
+- bf16 output does not change the quality of the model's predictions. On the
+  8,192-token prompt, the negative log-likelihood (NLL) of the real next token
+  rises by 0.0007 nats per token. Computing the same fp32 GEMM in a different
+  reduction order raises it by 0.0005. Perplexity goes from 4.417 to 4.420
+  and 4.419, and top-1 accuracy stays at 65.4 to 65.5 percent.
+- End to end, bf16 output moves the outputs as far as a reordered fp32 GEMM
+  does, and not further. The argmax next token agrees at 96.0 percent of the
+  prompt positions in both comparisons. The same setting twice gives
+  identical outputs, so the forward is deterministic.
+- Per layer, the rounding does change some choices. A small difference
+  before an FP8 or FP4 rounding can move a value into the next quantization
+  bin. Compressed entries move by 1.0 percent (main) and 3.0 percent
+  (indexer). On every CSA layer, 72 percent of the queries change at least
+  one of their up to 512 selected blocks, on average 2.5 blocks. These are
+  near-ties, and the end-to-end numbers show that they do not cost quality.
 - On B200, bf16 output makes each of these GEMMs 5 to 8 percent faster at
   8,192 tokens. That is 2.2 to 5.3 µs per GEMM, or 0.21 ms per 8,192-token
   forward over all 41 compressed layers.
@@ -37,51 +52,12 @@ it. This report measures that rounding and the time that bf16 output saves.
   `fused_wqa_wkv` GEMM, for batches of up to 1,024 tokens. That limit is the
   default of `VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD`. In those batches the
   saving is hidden.
-- Without the reference's FP8 and FP4 round trips (run 1), the rounding moves
-  each compressed entry by about 0.3 percent, one bf16 rounding step. The
-  indexer selects up to 512 blocks per query. On every CSA layer, the
-  rounding changes at least one of them for 40 to 51 percent of the queries.
-- With the round trips (run 2), the rounding changes more, not less. A small
-  difference before an FP8 or FP4 rounding can move a value into the next
-  quantization bin, which is a full quantization step. Compressed entries then
-  move by 1.0 percent (main) and 3.0 percent (indexer), and 73 percent of the
-  queries change at least one selected block.
-- End to end, bf16 output drifts as far as a reordered fp32 GEMM. The same
-  setting twice gives identical outputs, so the forward is deterministic. An
-  fp32 GEMM over upcast inputs changes values by about 1e-7, and it moves the
-  outputs as far as bf16 output does. The argmax agreement over the prompt is
-  74.9 and 73.7 percent, and the attention outputs drift by the same amount at
-  every layer.
-- So the end-to-end drift comes from the model's discrete choices: FP8 and FP4
-  bins, top-k selection, and expert routing. Any small change triggers it. A
-  different GEMM kernel also reorders the reduction, and vLLM is not batch
-  invariant by default (see its batch-invariance work in
-  [#27433](https://github.com/vllm-project/vllm/issues/27433)).
-- Next-token quality does not separate the two options. With bf16 output, the
-  negative log-likelihood (NLL) of the real next token rises by 0.19 nats per
-  token. With the reordered GEMM, it rises by 0.10. A change early in the
-  prompt carries into every later position, so the one prompt gives two
-  samples, not a measured gap.
-- Keeping fp32 is still the better choice for vLLM, for the speed reason
-  alone. The change saves at most 0.2 ms per 8,192-token forward on B200, and
-  nothing in batches that use the side streams. It also needs new warmup
-  specializations. vLLM warms its `save_partial_states` Triton kernel only for
-  fp32 kv and score inputs. With bf16 inputs, a new kernel compiles while the
-  server runs.
-
-## Open issue: absolute quality
-
-Run 2 measured the quality of the fp32 setting on the prompt itself. The
-model predicts the next prompt token with a perplexity of 247 and a top-1
-accuracy of 21.5 percent. That is far below
-what a model of this size usually reaches on technical prose. Run 1 did not
-record these numbers. Until the cause is known, quality numbers from this port
-at 8,192 tokens are not trustworthy. The drift comparisons above are relative
-and stay valid, but a weak model has more near-ties, so it can also drift more.
-
-The probe now records the NLL of each run per block of 256 positions. That
-curve shows whether the quality falls along the prompt. A fall along the
-prompt points at the long-context path.
+- The change also needs new warmup specializations. vLLM warms its
+  `save_partial_states` Triton kernel only for fp32 kv and score inputs. With
+  bf16 inputs, a new kernel compiles while the server runs.
+- So bf16 output is safe for accuracy, and its gain is small. It saves at
+  most 0.2 ms per 8,192-token forward on B200, and nothing in batches that use
+  the side streams.
 
 ## How it is measured
 
@@ -94,14 +70,14 @@ The probe measures three things:
 2. End-to-end drift. Two full prefills of the same prompt run, one per
    setting, and each one decodes 32 greedy tokens. The comparison covers the
    logits at every position and the generated tokens. It also covers every
-   attention block's output at 380 positions: every 64th token and the last 256.
-   It also scores the real next token at every prompt position, as an NLL and
-   a top-1 accuracy (run 2 only).
+   attention block's output at 380 positions: every 64th token and the last
+   256. It also scores the real next token at every prompt position, as an
+   NLL and a top-1 accuracy.
 3. GEMM time. `torch.mm` runs with and without `out_dtype=torch.float32` on
    random bf16 inputs at the real shapes (8,192 tokens, K = 4,096). Each
    variant gets 10 warmup and 50 timed calls, with TF32 off.
 
-Run 2 compares three pairs of settings on one model load:
+The main run compares three pairs of settings on one model load:
 
 - fp32 output against bf16 output, the question itself.
 - fp32 output against fp32 output, which shows whether the forward is
@@ -110,33 +86,70 @@ Run 2 compares three pairs of settings on one model load:
   inputs. The math is the same and only the reduction order differs, so this
   pair is the noise floor.
 
-In both runs, both ranks produced the same tokens and the same argmax flips.
-The fp32 setting ran the same `torch.mm(..., out_dtype=torch.float32)` call as
-vLLM. Peak memory was 110 GB per GPU.
+Both ranks produced the same tokens and the same argmax flips. The fp32
+setting ran the same `torch.mm(..., out_dtype=torch.float32)` call as vLLM.
+Peak memory was 110 GB per GPU.
+
+## End-to-end drift
+
+Logits and tokens over the 8,192 prompt positions:
+
+| pair | argmax agreement | mean KL at 380 positions | NLL change | top-1 accuracy | greedy tokens kept |
+|---|---:|---:|---:|---:|---:|
+| fp32 twice | 100% | 0 | 0 | 65.41% / 65.41% | 32 of 32 |
+| reordered fp32 GEMM | 96.0% | 0.011 nats | +0.0005 nats | 65.41% / 65.51% | 23 of 32 |
+| bf16 output | 96.0% | 0.012 nats | +0.0007 nats | 65.41% / 65.51% | 23 of 32 |
+
+The NLL change is the mean over 8,191 scored positions. The probe also reports
+a standard error from blocks of 256 positions (0.0016 and 0.0019 nats). That
+error assumes that blocks are independent, but a change early in the prompt
+reaches every later block, so it understates the real uncertainty. Both
+changes are far below it anyway.
+
+Relative RMS change of the attention-block output between the two runs of a
+pair:
+
+| layer | type | fp32 twice | reordered fp32 GEMM | bf16 output |
+|---:|---|---:|---:|---:|
+| 2 | CSA | 0 | 0.6% | 1.5% |
+| 5 | HCA | 0 | 5.8% | 5.9% |
+| 9 | HCA | 0 | 7.6% | 7.6% |
+| 14 | CSA | 0 | 14.9% | 14.1% |
+| 22 | CSA | 0 | 19.2% | 20.1% |
+| 34 | CSA | 0 | 19.6% | 18.8% |
+| 42 | CSA | 0 | 4.8% | 4.9% |
+
+At the first CSA layer, bf16 output moves the output more than the reordered
+GEMM does. From layer 5 on, the two are the same size. The model makes
+discrete choices (FP8 and FP4 bins, top-k selection, expert routing), so any
+small change spreads through the layers. A different GEMM kernel also
+reorders the reduction, and vLLM is not batch invariant by default (see its
+batch-invariance work in
+[#27433](https://github.com/vllm-project/vllm/issues/27433)).
+
+The probe also records the NLL of the fp32 run per block of 256 positions.
+It stays between 0.74 and 2.53 nats over the whole prompt, with no rise
+toward the end. So quality does not fall with distance.
 
 ## Isolated drift per layer
 
 Change of the compressed entries when only that layer's projection output is
 rounded to bf16:
 
-| projection | layers | run 1, relative RMS change | run 2, relative RMS change |
-|---|---:|---:|---:|
-| CSA main compressor | 21 | 0.31% | 1.01% |
-| CSA indexer compressor | 21 | 0.30% | 2.97% |
-| HCA compressor | 20 | 0.16% | 0.30% |
+| projection | layers | relative RMS change |
+|---|---:|---:|
+| CSA main compressor | 21 | 1.02% |
+| CSA indexer compressor | 21 | 2.96% |
+| HCA compressor | 20 | 0.47% |
 
 Indexer top-k selection, 8,192 queries per CSA layer, up to 512 blocks each,
 as the mean over the 21 CSA layers:
 
-| measure | run 1 | run 2 |
-|---|---:|---:|
-| selected blocks that stay selected | 99.890% | 99.338% |
-| queries with the same selected set | 54.8% | 26.8% |
-| changed blocks per query | 0.56 | 3.39 |
-
-The share of changed blocks is small. The share of queries with any change is
-large, because each query selects up to 512 blocks. One near-tie at the edge
-of the top-k is enough.
+| measure | value |
+|---|---:|
+| selected blocks that stay selected | 99.503% |
+| queries with the same selected set | 27.6% |
+| changed blocks per query | 2.54 |
 
 ## GEMM time on B200
 
@@ -151,44 +164,37 @@ by the output write. Over 21 CSA and 20 HCA layers, bf16 output saves 0.21 ms
 per 8,192-token forward. The largest error against an fp32 reference GEMM is
 4.9e-5 with fp32 output and 1.6e-2 with bf16 output. At decode batch sizes
 the output is small. With 64 tokens, the CSA GEMM writes 0.5 MB of fp32
-output and reads 16 MB of weights. Decode batches were not timed.
+output and reads 16 MB of weights. Decode batches were not timed. The GEMM
+times come from the first run (`v4-projection-dtype-probe.json`).
 
-## End-to-end drift
+## Earlier runs and the RoPE fix
 
-Relative RMS change of the attention-block output between the two runs of a
-pair, run 2:
+Two earlier runs used a version of the port with a RoPE bug. It rotated every
+layer with `rope_theta` (10000) and YaRN. The reference rotates compressed
+layers with `compress_rope_theta` (160000) and YaRN, and sliding-window layers
+with `rope_theta` and no YaRN. With the bug, the fp32 setting scored a
+perplexity of 247 and a top-1 accuracy of 21.5 percent on this prompt. The
+fix (commit `009555e`) brings these to 4.4 and 65.4 percent. A test now
+compares each layer's table with the reference.
 
-| layer | type | fp32 twice | reordered fp32 GEMM | bf16 output |
-|---:|---|---:|---:|---:|
-| 2 | CSA | 0 | 0.6% | 1.5% |
-| 5 | HCA | 0 | 7.5% | 7.9% |
-| 9 | HCA | 0 | 13.8% | 14.1% |
-| 14 | CSA | 0 | 29.2% | 29.2% |
-| 22 | CSA | 0 | 28.5% | 28.9% |
-| 34 | CSA | 0 | 30.4% | 30.8% |
-| 42 | CSA | 0 | 10.1% | 10.8% |
+The earlier runs answered the same question on that weaker model:
 
-At the first CSA layer, bf16 output moves the output more than the reordered
-GEMM does. By layer 5 the two are the same size.
+- Run 1 (`v4-projection-dtype-probe.json`) had no FP8 or FP4 round trips. It
+  recorded the GEMM times above, an isolated change of 0.3 percent in the
+  compressed entries, and 78.9 percent argmax agreement with bf16 output.
+- Run 2 (`v4-projection-dtype-probe-qat.json`) had the round trips on. bf16
+  output and the reordered GEMM gave 73.7 and 74.9 percent argmax agreement,
+  with NLL changes of +0.19 and +0.10 nats. A model with flat predictions has
+  many near-ties, so it drifts much more.
 
-Logits and tokens over the 8,192 prompt positions:
-
-| pair | argmax agreement | mean KL at 380 positions | NLL change | top-1 accuracy | greedy tokens kept |
-|---|---:|---:|---:|---:|---:|
-| run 2, fp32 twice | 100% | 0 | 0 | 21.5% / 21.5% | 32 of 32 |
-| run 2, reordered fp32 GEMM | 74.9% | 0.226 nats | +0.10 nats | 21.5% / 20.8% | 32 of 32 |
-| run 2, bf16 output | 73.7% | 0.234 nats | +0.19 nats | 21.5% / 20.0% | 3 of 32 |
-| run 1, bf16 output | 78.9% | 0.145 nats | not recorded | not recorded | 18 of 32 |
-
-The NLL change is the mean over 8,191 scored positions. The probe also reports
-a standard error from blocks of 256 positions (0.016 and 0.017 nats). That
-error assumes that blocks are independent, but a change early in the prompt
-reaches every later block, so it understates the real uncertainty.
+Both runs agree with the main run on the direction: bf16 output drifts about
+as far as a reordered fp32 GEMM.
 
 ## Limits
 
 - The run used one prompt of 8,192 tokens, one model (V4-Flash), and one GPU
   type (B200). vLLM itself was not run.
-- The absolute quality of the port on this prompt is unexplained (see "Open
-  issue: absolute quality").
+- The port simulates the reference's FP8 and FP4 round trips in PyTorch.
+  vLLM's kernels quantize with their own layouts (for example MXFP4 for the
+  indexer), so its exact bin edges differ.
 - The GEMM times use random inputs at one batch size.
