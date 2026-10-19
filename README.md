@@ -140,7 +140,7 @@ uv run pytest tests/golden/ -q
 uv run pytest -m requires_model -v
 ```
 
-The unit tests run on the CPU on each push. The golden tests compare the output token by token with Hugging Face. The `requires_model` tests download models and compare them bit for bit. A weekly workflow runs them against pinned Hugging Face revisions.
+The unit tests run on the CPU on each push. The golden tests compare the output token by token with Hugging Face. The `requires_model` tests download models and compare them bit for bit. A weekly workflow runs them against pinned Hugging Face revisions. Tests marked `large_model` download several GB, so they run only when you add `--run-large-models`.
 
 ## Out of scope
 

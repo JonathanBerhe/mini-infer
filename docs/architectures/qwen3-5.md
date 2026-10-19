@@ -137,6 +137,16 @@ Only the full-attention layers grow with context, so `max_seq_len` bounds
 admission and `check_capacity` fails loudly before a write would run past
 the buffers.
 
+## Loading
+
+`StateCacheGenerator.from_pretrained` calls
+`Qwen35ForConditionalGeneration.from_checkpoint`. It builds the model
+directly in the target dtype on the target device, then copies the
+checkpoint in one safetensors shard at a time. Peak memory is the model plus
+the largest shard: for the 4B, about 8.5 GB of fp16 weights plus a 5.3 GB
+shard. The generic `load_model` builds in fp32 first, which for the 4B alone
+is about 17 GB.
+
 ## Validation contract
 
 Bit-parity runs against the pinned transformers implementation of this exact
@@ -150,9 +160,14 @@ Covered: one-shot prefill, greedy decode across the chunk boundary, chunked
 prefill split mid-conv-kernel, ragged batched decode after `copy_row_from`,
 the mrope collapse, and the weight-drop path. See `tests/unit/`.
 
-No test runs real weights yet. The 27B is 55.6 GB and does not fit the local
-development box. `Qwen/Qwen3.5-4B` is the smallest checkpoint with this
-architecture, so it is the natural real-weight smoke.
+Real weights: `tests/unit/test_qwen3_5_real_weights.py` loads
+`Qwen/Qwen3.5-4B` at a pinned revision, the smallest checkpoint with this
+architecture. It goes through `StateCacheGenerator.from_pretrained` and the
+state-cache scheduler, and checks the layout and a greedy "Paris" completion.
+It passed on an M1 Pro (16 GB, MPS, fp16) in about 4 minutes, mostly
+loading. The download is 9.3 GB, so the test carries the `large_model`
+marker and skips unless you pass `--run-large-models`. The 27B is 55.6 GB
+and does not fit the local development box.
 
 ## Where we diverged and why
 
@@ -179,6 +194,7 @@ rope on purpose, and staying single-rank for this port.
 - `Qwen3.8-Flash-Next` is NOT this architecture. It declares
   `Qwen4ExpForConditionalGeneration` / `qwen4_exp` and is a 512-expert MoE,
   so it needs its own port.
-- A real-weight smoke on `Qwen/Qwen3.5-4B`, and live GPU validation on the
-  real 27B weights.
+- Live GPU validation on the real 27B weights, and a real-weight logit
+  comparison with transformers (the 4B smoke checks a greedy completion only,
+  because two copies of the 4B do not fit the 16 GB box).
 - Cross-request prefix sharing for the recurrent state.

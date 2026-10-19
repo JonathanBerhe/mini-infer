@@ -123,5 +123,6 @@ markers = [
     "gpu: requires a GPU",
     "slow: marked slow",
     "requires_model: requires downloading a real HF model (~1GB); runs locally, skipped in CI",
+    "large_model: needs a multi-GB checkpoint and as much RAM; skipped unless --run-large-models is passed",
     "requires_cuda: requires a CUDA GPU (e.g. for Triton kernels); skipped in CI and on MPS/CPU",
 ]

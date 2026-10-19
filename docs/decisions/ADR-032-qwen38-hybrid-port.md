@@ -86,6 +86,16 @@ faithful oracle for this checkpoint.
    Tensor parallelism would have to shard the fused conv channels and the
    per-head recurrent state, which is a separate piece of work; this follows
    the same staging the Kimi Linear port used.
+6. **Build the model in place and stream the weights in.** The generic
+   `load_model` builds the model in fp32 on the host first, then holds the
+   whole checkpoint next to the converted model. The peak is about twice the
+   half-precision weights: around 17 GB for the 4B and around 110 GB of host
+   RAM for the 27B. `from_checkpoint` builds the model directly in the
+   target dtype on the target device, and `load_weights_streaming` copies the
+   checkpoint in one shard at a time. The peak is the model plus the
+   largest shard: for the 4B, about 8.5 GB of weights plus a 5.3 GB shard. `StateCacheGenerator.from_pretrained` takes this
+   route. One side effect: the rotary `inv_freq` table stays fp32, as it does
+   in transformers, where `load_model` casts it to the model dtype.
 
 ## Alternatives Considered
 
@@ -96,7 +106,7 @@ faithful oracle for this checkpoint.
   Considered at planning time and declined, because the branch decision
   (same arch vs new model_type) was the port's dominant unknown and guessing
   it wrong meant rework. Waiting cost nothing: the answer turned out to be
-  "same arch", so Qwen3.5-4B can serve as the small real-weight vehicle.
+  "same arch", and Qwen3.5-4B now serves as the small real-weight vehicle.
 - **Generalize `KimiStateCache` to cover both families.** Rejected per
   decision 2; the shared surface is the lifecycle, not the tensors.
 - **Bump transformers.** Not needed. 5.14 parses the released config and
@@ -110,9 +120,11 @@ faithful oracle for this checkpoint.
 - `blocks/gdn.py` is small because the expensive math was already in
   `blocks/kda.py`. The cost of the Kimi Linear port is partly recovered here.
 - The 27B cannot run on the local Apple Silicon box at 55.6 GB. Its 3x
-  GDN ratio is covered by synthetic parity against the reference. No test
-  loads real weights yet; `Qwen/Qwen3.5-4B` (same architecture, 2x GDN
-  ratio) is the smallest checkpoint for that smoke.
+  GDN ratio is covered by synthetic parity against the reference. Real
+  weights are covered by a local-only smoke on `Qwen/Qwen3.5-4B` (same
+  architecture, 2x GDN ratio). It is marked `large_model` and runs only
+  with `--run-large-models`, because its 9.3 GB download does not fit the
+  bit-parity runner or its 10 GB cache.
 - `Qwen3.8-Flash-Next` is explicitly NOT covered. It is a different
   architecture (`Qwen4ExpForConditionalGeneration`, model_type `qwen4_exp`,
   512-expert MoE) and remains a separate port.

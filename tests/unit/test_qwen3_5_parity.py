@@ -210,3 +210,81 @@ def test_load_weights_drops_vision_tower_and_mtp_head(pair):
     ids = torch.randint(0, VOCAB, (1, 6))
     with torch.no_grad():
         assert torch.allclose(fresh(ids), hf_model(input_ids=ids).logits, atol=1e-4)
+
+
+def _write_checkpoint(directory, text_config, state: dict[str, torch.Tensor]) -> None:
+    """Write `state` as two safetensors shards plus the multimodal config.json."""
+    import json
+
+    from safetensors.torch import save_file
+
+    config = transformers.Qwen3_5Config(
+        text_config=text_config.to_dict(), tie_word_embeddings=text_config.tie_word_embeddings
+    )
+    config.architectures = ["Qwen3_5ForConditionalGeneration"]
+    config.save_pretrained(directory)
+    keys = sorted(state)
+    shard_names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    weight_map = {key: shard_names[i % 2] for i, key in enumerate(keys)}
+    for shard in shard_names:
+        save_file(
+            {key: state[key].contiguous() for key in keys if weight_map[key] == shard},
+            str(directory / shard),
+        )
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_from_checkpoint_matches_in_memory_load(tmp_path, tie_word_embeddings):
+    """The streaming, built-on-device load gives the same model as `load_weights`.
+
+    The checkpoint has two shards and carries vision and MTP tensors, as the
+    released ones do. The 4B ties its embeddings and the 27B does not, so both
+    layouts are covered.
+    """
+    torch.manual_seed(0)
+    text_config = _hf_config()
+    text_config.tie_word_embeddings = tie_word_embeddings
+    hf_model = Qwen3_5ForCausalLM(text_config).eval().float()
+    for param in hf_model.parameters():
+        with torch.no_grad():
+            param.uniform_(-0.08, 0.08)
+    state = _checkpoint_state(hf_model)
+    if tie_word_embeddings:
+        # Tied checkpoints store the embedding only.
+        state.pop("lm_head.weight", None)
+    state["model.visual.blocks.0.attn.qkv.weight"] = torch.zeros(3, 3)
+    state["mtp.fc.weight"] = torch.zeros(2, 2)
+    _write_checkpoint(tmp_path, text_config, state)
+
+    in_memory = Qwen35ForConditionalGeneration(Qwen35Config.from_hf(text_config)).eval().float()
+    Qwen35ForConditionalGeneration.load_weights(in_memory, state)
+    streamed = Qwen35ForConditionalGeneration.from_checkpoint(
+        str(tmp_path), device="cpu", dtype=torch.float32
+    )
+
+    assert streamed.cfg.tie_word_embeddings is tie_word_embeddings
+    if tie_word_embeddings:
+        assert streamed.lm_head.weight is streamed.model.embed_tokens.weight
+    ids = torch.randint(0, VOCAB, (1, 9))
+    with torch.no_grad():
+        assert torch.equal(streamed(ids), in_memory(ids))
+        assert torch.allclose(streamed(ids), hf_model(input_ids=ids).logits, atol=1e-4)
+
+
+def test_from_checkpoint_builds_in_the_requested_dtype(tmp_path):
+    """Parameters come out in `dtype`; the rotary table stays fp32."""
+    torch.manual_seed(0)
+    text_config = _hf_config()
+    hf_model = Qwen3_5ForCausalLM(text_config).eval()
+    _write_checkpoint(tmp_path, text_config, _checkpoint_state(hf_model))
+
+    model = Qwen35ForConditionalGeneration.from_checkpoint(
+        str(tmp_path), device="cpu", dtype=torch.bfloat16
+    )
+
+    assert {param.dtype for param in model.parameters()} == {torch.bfloat16}
+    rotary_tables = [buf for name, buf in model.named_buffers() if name.endswith("inv_freq")]
+    assert rotary_tables
+    assert all(table.dtype == torch.float32 for table in rotary_tables)
+    assert torch.get_default_dtype() == torch.float32

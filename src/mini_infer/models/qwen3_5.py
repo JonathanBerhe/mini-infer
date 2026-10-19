@@ -639,6 +639,37 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
     def expected_missing_state_keys(self) -> set[str]:
         return {"lm_head.weight"} if self.cfg.tie_word_embeddings else set()
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        name_or_path: str,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> Qwen35ForConditionalGeneration:
+        """Build the model in `dtype` on `device`, then stream the weights in.
+
+        The generic `load_model` builds the model in fp32 on the host and then
+        holds the whole checkpoint next to it, about 4x the bf16 weights. For
+        the 4B that is more than a 16 GB machine has. Here the model is built
+        directly in `dtype` on `device` and the checkpoint is copied in one
+        shard at a time, so peak memory is the model plus one shard.
+        `StateCacheGenerator.from_pretrained` calls this method.
+        """
+        from transformers import AutoConfig
+
+        cfg = Qwen35Config.from_hf(AutoConfig.from_pretrained(name_or_path))
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            with torch.device(device):
+                model = cls(cfg)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        model.eval()
+        cls.load_weights_streaming(model, name_or_path)
+        return model
+
     @staticmethod
     def load_weights(model: BaseCausalLM, hf_state_dict: dict[str, torch.Tensor]) -> None:
         if not isinstance(model, Qwen35ForConditionalGeneration):
@@ -646,14 +677,7 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
                 f"Qwen35ForConditionalGeneration.load_weights expects a "
                 f"Qwen35ForConditionalGeneration, got {type(model).__name__}"
             )
-        from mini_infer.distributed.group import get_world_size
-
-        if get_world_size() != 1:
-            raise NotImplementedError(
-                "Qwen35ForConditionalGeneration is single-rank only for now: TP would "
-                "shard the fused Gated DeltaNet conv channels and the per-head matrix "
-                "state. A follow-up, like Kimi Linear."
-            )
+        _require_single_rank()
         remapped = _remap_qwen35_state(hf_state_dict)
         missing, unexpected = model.load_state_dict(remapped, strict=False)
         missing_set = set(missing) - model.expected_missing_state_keys()
@@ -662,6 +686,58 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
                 f"weight load mismatch for Qwen35ForConditionalGeneration: "
                 f"missing={sorted(missing_set)}, unexpected={sorted(unexpected)}"
             )
+
+    @staticmethod
+    def load_weights_streaming(model: BaseCausalLM, name_or_path: str) -> None:
+        """Copy a safetensors checkpoint into `model` one shard at a time.
+
+        Same key handling and coverage check as `load_weights`. Each shard is
+        read on the host in the model's dtype, copied into the existing
+        parameters (which keep their device), and released before the next
+        shard loads.
+        """
+        if not isinstance(model, Qwen35ForConditionalGeneration):
+            raise TypeError(
+                f"Qwen35ForConditionalGeneration.load_weights_streaming expects a "
+                f"Qwen35ForConditionalGeneration, got {type(model).__name__}"
+            )
+        _require_single_rank()
+        from mini_infer.models.loader import iter_safetensors_shards
+
+        dtype = next(model.parameters()).dtype
+        model_keys = set(model.state_dict().keys())
+        consumed: set[str] = set()
+        for shard in iter_safetensors_shards(name_or_path, device="cpu", dtype=dtype):
+            remapped = _remap_qwen35_state(shard)
+            # Drop this loop's references before the next shard loads, or two
+            # shards are alive at once.
+            del shard
+            if remapped:
+                missing, unexpected = model.load_state_dict(remapped, strict=False)
+                if unexpected:
+                    raise ValueError(
+                        f"weight load mismatch for Qwen35ForConditionalGeneration: "
+                        f"unexpected={sorted(unexpected)}"
+                    )
+                consumed |= model_keys - set(missing)
+            del remapped
+        leftover = model_keys - consumed - model.expected_missing_state_keys()
+        if leftover:
+            raise ValueError(
+                f"weight load mismatch for Qwen35ForConditionalGeneration: "
+                f"missing={sorted(leftover)}"
+            )
+
+
+def _require_single_rank() -> None:
+    from mini_infer.distributed.group import get_world_size
+
+    if get_world_size() != 1:
+        raise NotImplementedError(
+            "Qwen35ForConditionalGeneration is single-rank only for now: TP would "
+            "shard the fused Gated DeltaNet conv channels and the per-head matrix "
+            "state. A follow-up, like Kimi Linear."
+        )
 
 
 def _remap_qwen35_state(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
