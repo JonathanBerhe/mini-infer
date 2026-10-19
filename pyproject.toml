@@ -5,8 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "mini-infer"
 version = "0.0.1"
-description = "A from-scratch, bit-parity-validated inference engine for newly-published LLM architectures, across GPU, TPU, and Trainium."
+description = "An LLM inference engine, written from scratch for GPU, TPU, and Trainium. It ports new model architectures and matches each reference implementation bit for bit."
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "torch>=2.4",
     "transformers>=4.40",
