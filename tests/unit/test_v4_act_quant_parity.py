@@ -409,15 +409,21 @@ def _sync_moe(our_moe: HashRoutedMoEFFN, ref_moe: Any) -> None:
                     getattr(ours, name).weight.copy_(dense_weight(ref_linear))
 
 
+@pytest.mark.parametrize("swiglu_limit", [0.0, 0.5], ids=["no_clamp", "swiglu_limit"])
 @pytest.mark.parametrize("routed_expert_dtype", ["fp8", "fp4"])
 def test_fp8_gemm_inputs_match_fp8_weight_reference_moe(
-    reference_module: Any, monkeypatch: pytest.MonkeyPatch, routed_expert_dtype: str
+    reference_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    routed_expert_dtype: str,
+    swiglu_limit: float,
 ) -> None:
     """MoE with an FP8 shared expert and FP8 or FP4 routed experts, as in a release.
 
     Also pins why the routing weight must scale the activation before `w2`:
     applying it after `w2` (the full-precision order) misses the reference
-    once `w2`'s input is quantized.
+    once `w2`'s input is quantized. `swiglu_limit=0.5` clamps a share of the
+    synthetic pre-activations (~0.4 std), between the GEMMs and the FP8
+    round trip of `w2`'s input.
     """
     install_real_quant_stubs(reference_module, monkeypatch, fp8_weights=True)
     args = reference_module.ModelArgs(
@@ -429,7 +435,7 @@ def test_fp8_gemm_inputs_match_fp8_weight_reference_moe(
         n_hash_layers=0,
         score_func="softmax",
         route_scale=1.0,
-        swiglu_limit=0,
+        swiglu_limit=swiglu_limit,
         expert_dtype="fp4" if routed_expert_dtype == "fp4" else None,
     )
     ref_moe = reference_module.MoE(0, args)
@@ -440,6 +446,10 @@ def test_fp8_gemm_inputs_match_fp8_weight_reference_moe(
 
     outputs: dict[str, torch.Tensor] = {}
     with torch.no_grad():
+        if swiglu_limit:
+            gate = ref_moe.shared_experts.w1(hidden_states)
+            up = ref_moe.shared_experts.w3(hidden_states)
+            assert (gate > swiglu_limit).any() and (up < -swiglu_limit).any(), "clamp idle"
         theirs = ref_moe(hidden_states, input_ids)
         for label, act_quant, weights_before_w2 in (
             ("gemm", _GEMM_ACT_QUANT, True),
@@ -457,6 +467,7 @@ def test_fp8_gemm_inputs_match_fp8_weight_reference_moe(
                 n_shared_experts=args.n_shared_experts,
                 expert_dtype="fp4" if routed_expert_dtype == "fp4" else "bf16",
                 act_quant=act_quant,
+                swiglu_limit=swiglu_limit,
             )
             _sync_moe(our_moe, ref_moe)
             our_moe.routing_weights_before_down_proj = weights_before_w2

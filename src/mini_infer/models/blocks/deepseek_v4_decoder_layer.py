@@ -104,6 +104,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         moe_vocab_size: int | None = None,
         n_shared_experts: int = 0,
         expert_dtype: str = "bf16",
+        # V4 `swiglu_limit`: clamp every expert's gate/up projections (0 = off).
+        moe_swiglu_limit: float = 0.0,
         # Hyper-Connections knobs. Defaults disable HC -> vanilla pre-norm
         # residuals are used.
         use_hyper_connections: bool = False,
@@ -209,6 +211,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 n_shared_experts=n_shared_experts,
                 expert_dtype=expert_dtype,
                 act_quant=act_quant,
+                swiglu_limit=moe_swiglu_limit,
             )
         else:  # pragma: no cover — Literal already constrains this
             raise ValueError(f"unknown ffn_type={ffn_type!r}")

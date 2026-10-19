@@ -384,6 +384,11 @@ class DeepseekV4Config:
     # HBM (see scripts/profile_v4_dequant.py). Shared experts are
     # unaffected (they ship FP8 and dequantize to BF16 regardless).
     expert_dtype: str = "bf16"
+    # HF / reference `swiglu_limit`: every expert (routed and shared) clamps
+    # its gate projection to `<= limit` and its up projection to
+    # `[-limit, limit]` before the SiLU. 0 disables the clamp. Released V4
+    # configs set 10.
+    moe_swiglu_limit: float = 0.0
     # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
     # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
     # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
@@ -443,6 +448,8 @@ class DeepseekV4Config:
                     "use_moe_ffn=True requires expert_dtype in ('bf16', 'fp4'); "
                     f"got {self.expert_dtype!r}"
                 )
+        if self.moe_swiglu_limit < 0:
+            raise ValueError(f"moe_swiglu_limit must be >= 0; got {self.moe_swiglu_limit}")
         if self.use_hyper_connections and self.hc_mult <= 0:
             raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {self.hc_mult}")
         if self.act_quant_scale_fmt not in ("ue8m0", None):
@@ -605,6 +612,7 @@ class DeepseekV4Config:
             ),
             n_shared_experts=int(_pick("n_shared_experts", default_value=0)),
             expert_dtype=_detect_expert_dtype(cfg_dict, _pick("expert_dtype", default_value=None)),
+            moe_swiglu_limit=float(_pick("moe_swiglu_limit", "swiglu_limit", default_value=0.0)),
             # Hyper-Connections. V4-Flash sets `hc_mult=4`.
             use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
             hc_mult=int(_pick("hc_mult", default_value=0)),
@@ -716,6 +724,7 @@ class _DeepseekV4InnerModel(nn.Module):
                 moe_vocab_size=cfg.vocab_size if routing_mode == "hash" else None,
                 n_shared_experts=cfg.n_shared_experts,
                 expert_dtype=cfg.expert_dtype,
+                moe_swiglu_limit=cfg.moe_swiglu_limit,
             )
         if cfg.use_hyper_connections:
             layer_kwargs.update(

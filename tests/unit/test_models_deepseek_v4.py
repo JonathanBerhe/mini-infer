@@ -18,6 +18,8 @@ mixed FP8 / FP4-resident checkpoint. What we ship + test on CPU:
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -649,6 +651,45 @@ def test_moe_fp4_expert_dtype_builds_fp4_routed_experts() -> None:
             )
             assert sum(p.numel() for p in expert.parameters()) == 0
         assert isinstance(layer.mlp.shared_experts, MixtralExpert)
+
+
+@pytest.mark.parametrize("expert_dtype", ["bf16", "fp4"])
+def test_moe_swiglu_limit_reaches_every_expert(expert_dtype: str) -> None:
+    """`moe_swiglu_limit` clamps routed and shared experts alike; 0 keeps plain SwiGLU."""
+    from mini_infer.models.blocks.activations import swiglu
+
+    base = _make_moe_hybrid_config(expert_dtype=expert_dtype)
+    clamped = DeepseekV4ForCausalLM(dataclasses.replace(base, moe_swiglu_limit=10.0))
+    plain = DeepseekV4ForCausalLM(base)
+    gate, up = torch.tensor([50.0]), torch.tensor([-50.0])
+    expected = torch.nn.functional.silu(torch.tensor([10.0])) * -10.0
+    for layer in clamped.model.layers:
+        assert layer.mlp.swiglu_limit == 10.0
+        for expert in [*layer.mlp.experts, layer.mlp.shared_experts]:
+            torch.testing.assert_close(expert._activation(gate, up), expected)
+    for layer in plain.model.layers:
+        for expert in [*layer.mlp.experts, layer.mlp.shared_experts]:
+            assert expert._activation is swiglu
+
+
+def test_from_hf_reads_swiglu_limit() -> None:
+    hf = {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "compress_ratios": [0, 4],
+        "head_dim": 32,
+        "qk_rope_head_dim": 8,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "n_shared_experts": 1,
+    }
+    assert DeepseekV4Config.from_hf(hf).moe_swiglu_limit == 0.0
+    assert DeepseekV4Config.from_hf({**hf, "swiglu_limit": 10.0}).moe_swiglu_limit == 10.0
+    with pytest.raises(ValueError, match="moe_swiglu_limit"):
+        DeepseekV4Config.from_hf({**hf, "swiglu_limit": -1.0})
 
 
 def test_moe_fp4_resident_experts_load_into_buffers_and_run() -> None:
