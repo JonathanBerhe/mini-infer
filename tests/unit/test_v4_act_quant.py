@@ -16,6 +16,9 @@ import torch
 import mini_infer.models.blocks.v4.act_quant as act_quant_module
 from mini_infer.cache.state_cache import StateCache
 from mini_infer.models.blocks import CSAAttention, HCAAttention
+from mini_infer.models.blocks.activations import swiglu
+from mini_infer.models.blocks.fp4_expert import FP4Expert
+from mini_infer.models.blocks.mixtral_moe import MixtralExpert
 from mini_infer.models.blocks.swa import SWAAttention
 from mini_infer.models.blocks.v4.act_quant import (
     SimulatedActQuant,
@@ -240,22 +243,99 @@ def test_dimension_checks_fail_early() -> None:
         )
 
 
+# ---------- FP8 GEMM inputs ----------
+
+_GEMM_ACT_QUANT = SimulatedActQuant(fp8_gemm_inputs=True)
+
+
+def test_gemm_input_is_a_block_128_fp8_round_trip_only_when_enabled() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(3, 256) * torch.logspace(-2, 2, 256)
+    expected = fp8_e4m3_roundtrip(x, block_size=128, scale_fmt="ue8m0")
+    assert torch.equal(_GEMM_ACT_QUANT.gemm_input(x), expected)
+    assert SimulatedActQuant().gemm_input(x) is x
+
+
+def test_quantize_gemm_inputs_hooks_the_linear_input() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(4, 256)
+    hooked = torch.nn.Linear(256, 16, bias=False)
+    _GEMM_ACT_QUANT.quantize_gemm_inputs(hooked)
+    expected = torch.nn.functional.linear(_GEMM_ACT_QUANT.gemm_input(x), hooked.weight)
+    assert torch.equal(hooked(x), expected)
+
+    untouched = torch.nn.Linear(256, 16, bias=False)
+    SimulatedActQuant().quantize_gemm_inputs(untouched)  # QAT only: no hook
+    assert not untouched._forward_pre_hooks
+    with pytest.raises(ValueError, match="multiple of 128"):
+        _GEMM_ACT_QUANT.quantize_gemm_inputs(torch.nn.Linear(64, 16))
+
+
+def test_routing_weights_scale_the_activation_before_w2() -> None:
+    """Same math as scaling the output; with quantized GEMM inputs, `w2` sees the scaled input."""
+    torch.manual_seed(0)
+    expert = MixtralExpert(128, 128)
+    x = torch.randn(5, 128)
+    weights = torch.rand(5, 1)
+    torch.testing.assert_close(expert(x, routing_weights=weights), expert(x) * weights)
+
+    _GEMM_ACT_QUANT.quantize_gemm_inputs(expert.w1, expert.w2, expert.w3)
+    hidden = swiglu(expert.w1(x), expert.w3(x)) * weights
+    expected = torch.nn.functional.linear(_GEMM_ACT_QUANT.gemm_input(hidden), expert.w2.weight)
+    assert torch.equal(expert(x, routing_weights=weights), expected)
+
+
+def test_fp4_expert_quantizes_every_gemm_input() -> None:
+    torch.manual_seed(0)
+    plain = FP4Expert(128, 256)
+    quantized = FP4Expert(128, 256, act_quant=_GEMM_ACT_QUANT)
+    generator = torch.Generator().manual_seed(1)
+    for name in ("w1", "w2", "w3"):
+        packed = getattr(plain, f"{name}_packed")
+        packed.copy_(torch.randint(-128, 128, packed.shape, generator=generator, dtype=torch.int8))
+        scale = getattr(plain, f"{name}_scale")
+        scale.copy_(2.0 ** torch.randint(-6, -2, scale.shape, generator=generator).float())
+    quantized.load_state_dict(plain.state_dict())
+    x = torch.randn(5, 128)
+    weights = torch.rand(5, 1)
+
+    w1, w2, w3 = (plain._dequant(name, x.dtype) for name in ("w1", "w2", "w3"))
+    x_q = _GEMM_ACT_QUANT.gemm_input(x)
+    hidden = swiglu(x_q @ w1.T, x_q @ w3.T) * weights
+    expected = _GEMM_ACT_QUANT.gemm_input(hidden) @ w2.T
+    torch.testing.assert_close(
+        quantized(x, routing_weights=weights), expected, rtol=1e-6, atol=1e-6
+    )
+    assert not torch.equal(quantized(x), plain(x))
+    with pytest.raises(ValueError, match="multiple of 128"):
+        FP4Expert(128, 96, act_quant=_GEMM_ACT_QUANT)
+
+
 # ---------- Model config wiring ----------
 
 
-def _config(*, simulate_act_quant: bool, scale_fmt: str | None = "ue8m0") -> DeepseekV4Config:
-    """SWA, CSA, HCA, CSA; dims wide enough for the quantizers' block sizes."""
+def _config(
+    *,
+    simulate_act_quant: bool,
+    scale_fmt: str | None = "ue8m0",
+    gemm_dims: bool = False,
+    fp8_gemm_inputs: bool = False,
+) -> DeepseekV4Config:
+    """SWA, CSA, HCA, CSA; dims wide enough for the quantizers' block sizes.
+
+    `gemm_dims`: a MoE backbone whose GEMM input widths are multiples of 128.
+    """
     return DeepseekV4Config(
         vocab_size=128,
-        hidden_size=64,
+        hidden_size=128 if gemm_dims else 64,
         intermediate_size=128,
         num_hidden_layers=4,
         num_attention_heads=4,
-        q_lora_rank=32,
+        q_lora_rank=128 if gemm_dims else 32,
         kv_head_dim=72,
         rope_head_dim=8,
         o_num_groups=2,
-        o_lora_rank=32,
+        o_lora_rank=64 if gemm_dims else 32,
         window_size=8,
         compress_ratios=(0, 4, 8, 4),
         index_num_heads=2,
@@ -264,8 +344,14 @@ def _config(*, simulate_act_quant: bool, scale_fmt: str | None = "ue8m0") -> Dee
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
         tie_word_embeddings=False,
+        use_moe_ffn=gemm_dims,
+        moe_intermediate_size=128 if gemm_dims else 0,
+        num_routed_experts=4 if gemm_dims else 0,
+        num_activated_experts=2 if gemm_dims else 0,
+        n_shared_experts=1 if gemm_dims else 0,
         simulate_act_quant=simulate_act_quant,
         act_quant_scale_fmt=scale_fmt,
+        simulate_fp8_gemm_inputs=fp8_gemm_inputs,
     )
 
 
@@ -303,6 +389,35 @@ def test_config_validation_and_from_hf() -> None:
     opted_in = DeepseekV4Config.from_hf({**hf, "simulate_act_quant": True})
     assert opted_in.simulate_act_quant
     assert opted_in.act_quant() == SimulatedActQuant(fp8_scale_fmt="ue8m0")
+    with_gemm = DeepseekV4Config.from_hf(
+        {**hf, "simulate_act_quant": True, "simulate_fp8_gemm_inputs": True}
+    )
+    assert with_gemm.act_quant() == _GEMM_ACT_QUANT
+    with pytest.raises(ValueError, match="requires simulate_act_quant"):
+        _config(simulate_act_quant=False, gemm_dims=True, fp8_gemm_inputs=True)
+
+
+def test_config_hooks_exactly_the_reference_fp8_weight_linears() -> None:
+    """Attention wq_a/wq_b/wkv/wo_b, indexer wq_b, every expert's w1/w2/w3: nothing else."""
+    model = DeepseekV4ForCausalLM(
+        _config(simulate_act_quant=True, gemm_dims=True, fp8_gemm_inputs=True)
+    )
+    hooked = {name for name, module in model.named_modules() if module._forward_pre_hooks}
+    expected: set[str] = set()
+    for layer_idx, layer in enumerate(model.model.layers):
+        prefix = f"model.layers.{layer_idx}"
+        attention = ("q_a_proj", "q_b_proj", "swa_kv_proj", "grouped_output.wo_b")
+        expected.update(f"{prefix}.self_attn.{name}" for name in attention)
+        if isinstance(layer.self_attn, CSAAttention):
+            expected.add(f"{prefix}.self_attn.indexer.wq_b")
+        experts = [f"mlp.experts.{index}" for index in range(4)] + ["mlp.shared_experts"]
+        expected.update(f"{prefix}.{expert}.{w}" for expert in experts for w in ("w1", "w2", "w3"))
+    assert hooked == expected
+    assert all(layer.mlp.routing_weights_before_down_proj for layer in model.model.layers)
+
+    qat_only = DeepseekV4ForCausalLM(_config(simulate_act_quant=True, gemm_dims=True))
+    assert not any(module._forward_pre_hooks for module in qat_only.modules())
+    assert not any(layer.mlp.routing_weights_before_down_proj for layer in qat_only.model.layers)
 
 
 def _run_every_path(model: DeepseekV4ForCausalLM, cfg: DeepseekV4Config) -> list[torch.Tensor]:
@@ -359,3 +474,18 @@ def test_flag_on_changes_the_numerics_of_every_path() -> None:
     ):
         assert torch.isfinite(on).all()
         assert not torch.equal(off, on)
+
+
+def test_fp8_gemm_inputs_change_the_numerics_of_every_path() -> None:
+    """MoE backbone, QAT round trips on, GEMM-input round trips off vs on."""
+    cfg_qat = _config(simulate_act_quant=True, gemm_dims=True)
+    cfg_gemm = _config(simulate_act_quant=True, gemm_dims=True, fp8_gemm_inputs=True)
+    torch.manual_seed(0)
+    model_qat = DeepseekV4ForCausalLM(cfg_qat).eval()
+    model_gemm = DeepseekV4ForCausalLM(cfg_gemm).eval()
+    model_gemm.load_state_dict(model_qat.state_dict())
+    for qat, gemm in zip(
+        _run_every_path(model_qat, cfg_qat), _run_every_path(model_gemm, cfg_gemm), strict=True
+    ):
+        assert torch.isfinite(gemm).all()
+        assert not torch.equal(qat, gemm)

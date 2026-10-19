@@ -28,6 +28,8 @@ import pytest
 import torch
 from torch.nn.functional import linear
 
+from mini_infer.quant.nvfp4 import dequantize_block_fp8_to_bf16_partial
+
 REFERENCE_DIR = Path(__file__).resolve().parents[2] / "third_party" / "deepseek_v4_reference"
 
 
@@ -166,19 +168,19 @@ def real_act_quant(
     scale_fmt: Any = None,
     scale_dtype: Any = torch.float32,
     inplace: bool = False,
-) -> torch.Tensor:
-    """PyTorch mirror of the tilelang `act_quant(..., inplace=True)` FP8 round trip.
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch mirror of the tilelang `act_quant` FP8 block quantizer.
 
     Per block of `block_size` values along the last dim: `amax = max(max|x|,
     1e-4)`, `scale = amax * fp32(1/448)` (rounded up to a power of two when
-    `scale_fmt` is set), `x = e4m3(clamp(x / scale, -448, 448)) * scale`,
-    written back into `x` (a view, at the reference's call sites). The e4m3
-    cast is PyTorch's native `float8_e4m3fn` conversion. `scale_dtype` only
-    affects the scale tensor the non-inplace kernel returns, unused here.
+    `scale_fmt` is set), `codes = e4m3(clamp(x / scale, -448, 448))`. The
+    e4m3 cast is PyTorch's native `float8_e4m3fn` conversion.
+
+    `inplace=True` (the QAT round trip) writes `codes * scale` back into `x`
+    (a view, at the reference's call sites). `inplace=False` (the input of
+    `fp8_gemm` / `fp4_gemm`) returns the FP8 codes and the per-block scales
+    stored as `scale_dtype`, like the kernel.
     """
-    del scale_dtype
-    if not inplace:
-        raise NotImplementedError("act_quant(inplace=False) feeds fp8_gemm, unused on this path")
     n = x.size(-1)
     assert n % block_size == 0
     blocks = x.float().reshape(-1, n // block_size, block_size)
@@ -186,9 +188,145 @@ def real_act_quant(
     scale = amax * torch.tensor(1.0 / 448.0, dtype=torch.float32)
     if scale_fmt is not None:
         scale = _pow2_ceil_via_frexp(scale)
-    codes = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
-    x.copy_((codes * scale).reshape(x.shape).to(x.dtype))
+    codes = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    if not inplace:
+        return codes.reshape(x.shape), scale.reshape(*x.shape[:-1], -1).to(scale_dtype)
+    x.copy_((codes.float() * scale).reshape(x.shape).to(x.dtype))
     return x
+
+
+def real_fp8_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    scale_dtype: Any = torch.float32,
+) -> torch.Tensor:
+    """PyTorch mirror of the tilelang `fp8_gemm`: `C = A @ B^T`, per-128 scales on both.
+
+    `a`: FP8 codes `(..., K)` with `a_s` `(..., K / 128)`; `b`: FP8 codes
+    `(N, K)` with `b_s` `(ceil(N / 128), K / 128)`. Like the kernel, each
+    128-wide K tile's code product is summed in FP32, multiplied by
+    `scale_a * scale_b`, and accumulated in FP32; the output is in the
+    default dtype.
+    """
+    del scale_dtype
+    k = a.size(-1)
+    m, n = a.numel() // k, b.size(0)
+    a_codes = a.float().reshape(m, k)
+    a_scale = a_s.float().reshape(m, k // 128)
+    b_codes = b.float()
+    b_scale_rows = b_s.float().repeat_interleave(128, dim=0)[:n]  # (N, K / 128)
+    out = torch.zeros(m, n)
+    for tile in range(k // 128):
+        cols = slice(tile * 128, (tile + 1) * 128)
+        partial = a_codes[:, cols] @ b_codes[:, cols].T  # (M, N)
+        out += partial * (a_scale[:, tile, None] * b_scale_rows[None, :, tile])
+    return out.reshape(*a.shape[:-1], n).to(torch.get_default_dtype())
+
+
+def _unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """`float4_e2m1fn_x2` `(N, K / 2)` -> FP32 values `(N, K)`; low nibble first."""
+    as_bytes = packed.view(torch.uint8)
+    nibbles = torch.stack([as_bytes & 0x0F, as_bytes >> 4], dim=-1).flatten(-2).long()
+    magnitude = _E2M1_GRID[nibbles & 0x7]
+    return torch.where(nibbles & 0x8 != 0, -magnitude, magnitude)
+
+
+def real_fp4_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    scale_dtype: Any = torch.float32,
+) -> torch.Tensor:
+    """PyTorch mirror of the tilelang `fp4_gemm`: FP8 activation x FP4 weight.
+
+    `a`: FP8 codes `(..., K)` with per-128 scales `a_s`; `b`: packed e2m1
+    `(N, K / 2)` with per-32 E8M0 scales `b_s` `(N, K / 32)`. Like the
+    kernel, each 32-wide K tile's code product is summed in FP32, scaled by
+    `scale_a` (of its 128 group) then `scale_b`, and accumulated in FP32.
+    """
+    del scale_dtype
+    k = a.size(-1)
+    m, n = a.numel() // k, b.size(0)
+    a_codes = a.float().reshape(m, k)
+    a_scale = a_s.float().reshape(m, k // 128)
+    b_values = _unpack_e2m1(b)  # (N, K)
+    b_scale = b_s.float()  # (N, K / 32)
+    out = torch.zeros(m, n)
+    for tile in range(k // 32):
+        cols = slice(tile * 32, (tile + 1) * 32)
+        partial = a_codes[:, cols] @ b_values[:, cols].T  # (M, N)
+        out += partial * a_scale[:, tile // 4, None] * b_scale[None, :, tile]
+    return out.reshape(*a.shape[:-1], n).to(torch.get_default_dtype())
+
+
+def _quantize_fp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 `(N, K)` -> FP8 codes `(N, K)` + E8M0 scales per 128x128 tile (ue8m0)."""
+    n, k = weight.shape
+    tiles_n, tiles_k = -(-n // 128), -(-k // 128)
+    padded = torch.zeros(tiles_n * 128, tiles_k * 128)
+    padded[:n, :k] = weight
+    tiles = padded.view(tiles_n, 128, tiles_k, 128)
+    amax = tiles.abs().amax(dim=(1, 3)).clamp_min(1e-4)  # (tiles_n, tiles_k)
+    scale = _pow2_ceil_via_frexp(amax * torch.tensor(1.0 / 448.0, dtype=torch.float32))
+    codes = (tiles / scale[:, None, :, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return codes.view(tiles_n * 128, tiles_k * 128)[:n, :k].contiguous(), scale.to(
+        torch.float8_e8m0fnu
+    )
+
+
+def _quantize_fp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 `(N, K)` -> packed e2m1 `(N, K / 2)` + E8M0 scales per 32 along K."""
+    n, k = weight.shape
+    blocks = weight.reshape(n, k // 32, 32)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
+    scale = _pow2_ceil_via_frexp(amax * torch.tensor(1.0 / 6.0, dtype=torch.float32))
+    values = _cast_to_e2m1((blocks / scale).clamp(-6.0, 6.0)).reshape(n, k)
+    magnitude_code = (values.abs().unsqueeze(-1) == _E2M1_GRID).int().argmax(dim=-1)
+    nibbles = (magnitude_code + 8 * (values < 0).long()).to(torch.uint8).view(n, k // 2, 2)
+    packed = nibbles[..., 0] | (nibbles[..., 1] << 4)
+    return packed.view(torch.float4_e2m1fn_x2), scale.reshape(n, k // 32).to(torch.float8_e8m0fnu)
+
+
+def init_reference_weights(reference: Any, module: Any, seed: int, std: float = 0.02) -> None:
+    """Seed-fill a reference module; FP8 / FP4 `Linear`s get quantized random weights.
+
+    Plain floating parameters get `randn * std` in `parameters()` order (FP32,
+    as the identity-stub tests always did). An FP8 or FP4 `Linear` gets an
+    FP32 draw quantized the checkpoint's way: FP8 e4m3 per 128x128 tile, or
+    packed FP4 e2m1 per 32 along K, both with power-of-two E8M0 scales.
+    Floating buffers (KV caches, compressor state) are zeroed.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    handled: set[int] = set()
+    with torch.no_grad():
+        for sub in module.modules():
+            if not isinstance(sub, reference.Linear) or sub.scale is None:
+                continue
+            dense = torch.randn(sub.out_features, sub.in_features, generator=generator) * std
+            if sub.weight.dtype == torch.float8_e4m3fn:
+                sub.weight.data, sub.scale.data = _quantize_fp8_weight(dense)
+            else:
+                sub.weight.data, sub.scale.data = _quantize_fp4_weight(dense)
+            handled.update((id(sub.weight), id(sub.scale)))
+        for parameter in module.parameters():
+            if id(parameter) not in handled and parameter.dtype.is_floating_point:
+                parameter.data = (
+                    torch.randn(parameter.shape, generator=generator, dtype=torch.float32) * std
+                )
+        for buffer in module.buffers():
+            if buffer.dtype.is_floating_point:
+                buffer.zero_()
+
+
+def dense_weight(linear: Any) -> torch.Tensor:
+    """FP32 weight of a reference `Linear`, dequantized the loader's way if FP8."""
+    if linear.weight.dtype == torch.float8_e4m3fn:
+        return dequantize_block_fp8_to_bf16_partial(linear.weight, linear.scale).float()
+    weight: torch.Tensor = linear.weight
+    return weight
 
 
 def real_fp4_act_quant(
@@ -227,21 +365,36 @@ def real_rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 def install_real_quant_stubs(
-    reference: Any, monkeypatch: pytest.MonkeyPatch, *, scale_fmt: str | None = "ue8m0"
+    reference: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scale_fmt: str | None = "ue8m0",
+    fp8_weights: bool = False,
 ) -> None:
     """Swap the reference's identity quant stubs for the real round trips (test scope).
 
-    `model.py` binds `act_quant` / `fp4_act_quant` / `rotate_activation` and
-    the `scale_fmt` global at module level, so patching the module attributes
+    `model.py` binds `act_quant` / `fp4_act_quant` / `rotate_activation` /
+    `fp8_gemm` / `fp4_gemm` and the `scale_fmt` / `default_dtype` /
+    `scale_dtype` globals at module level, so patching the module attributes
     reaches every call site. `monkeypatch` restores the identity stubs after
     the test, so the module-scoped `reference_module` stays clean.
     `scale_fmt="ue8m0"` is what the reference's `Transformer` sets for every
     released V4 config.
+
+    `fp8_weights=True` makes modules built afterwards use FP8 `Linear`
+    weights with E8M0 scales, what `Transformer` sets for a released
+    checkpoint (`dtype="fp8"`): their GEMMs then take FP8 inputs. Fill them
+    with `init_reference_weights`.
     """
     monkeypatch.setattr(reference, "act_quant", real_act_quant)
     monkeypatch.setattr(reference, "fp4_act_quant", real_fp4_act_quant)
     monkeypatch.setattr(reference, "rotate_activation", real_rotate_activation)
+    monkeypatch.setattr(reference, "fp8_gemm", real_fp8_gemm)
+    monkeypatch.setattr(reference, "fp4_gemm", real_fp4_gemm)
     monkeypatch.setattr(reference, "scale_fmt", scale_fmt)
+    if fp8_weights:
+        monkeypatch.setattr(reference, "default_dtype", torch.float8_e4m3fn)
+        monkeypatch.setattr(reference, "scale_dtype", torch.float8_e8m0fnu)
 
 
 @pytest.fixture(scope="module")

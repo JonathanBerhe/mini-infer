@@ -404,6 +404,12 @@ class DeepseekV4Config:
     # (power-of-two FP8 scales, every released V4 config) or None.
     simulate_act_quant: bool = False
     act_quant_scale_fmt: str | None = "ue8m0"
+    # On top of `simulate_act_quant`: also round-trip the inputs of the
+    # linears whose weights are FP8 or FP4 in the released checkpoints
+    # through FP8 (block 128), as the reference's `fp8_gemm` / `fp4_gemm`
+    # path does (attention `wq_a`/`wq_b`/`wkv`/`wo_b`, indexer `wq_b`, the
+    # shared and routed experts). Needs those input widths divisible by 128.
+    simulate_fp8_gemm_inputs: bool = False
 
     def __post_init__(self) -> None:
         if len(self.compress_ratios) != self.num_hidden_layers:
@@ -443,13 +449,20 @@ class DeepseekV4Config:
             raise ValueError(
                 f"act_quant_scale_fmt must be 'ue8m0' or None; got {self.act_quant_scale_fmt!r}"
             )
+        if self.simulate_fp8_gemm_inputs and not self.simulate_act_quant:
+            raise ValueError(
+                "simulate_fp8_gemm_inputs=True requires simulate_act_quant=True: the "
+                "reference applies the QAT round trips whenever its GEMMs take FP8 inputs"
+            )
 
     def act_quant(self) -> SimulatedActQuant | None:
         """The per-layer QAT round-trip setting, or None when `simulate_act_quant` is off."""
         if not self.simulate_act_quant:
             return None
         scale_fmt: ScaleFormat = "ue8m0" if self.act_quant_scale_fmt == "ue8m0" else None
-        return SimulatedActQuant(fp8_scale_fmt=scale_fmt)
+        return SimulatedActQuant(
+            fp8_scale_fmt=scale_fmt, fp8_gemm_inputs=self.simulate_fp8_gemm_inputs
+        )
 
     def is_csa_layer(self, layer_idx: int) -> bool:
         """CSA layers have compression_ratio == 4 (paper §4.2.1)."""
@@ -600,6 +613,7 @@ class DeepseekV4Config:
             # Not part of the HF schema: off unless a caller's config dict opts in.
             simulate_act_quant=bool(_pick("simulate_act_quant", default_value=False)),
             act_quant_scale_fmt=_pick("act_quant_scale_fmt", default_value="ue8m0"),
+            simulate_fp8_gemm_inputs=bool(_pick("simulate_fp8_gemm_inputs", default_value=False)),
         )
 
 

@@ -249,25 +249,28 @@ def _model_config(
     use_moe_ffn: bool = False,
     use_hyper_connections: bool = False,
     simulate_act_quant: bool = False,
+    simulate_fp8_gemm_inputs: bool = False,
 ) -> DeepseekV4Config:
     """Full hybrid stack: layer ratios (0, 4, 8, 4) = SWA, CSA, HCA, CSA.
 
     Exercises every V4 attention mode in the ragged decode, including the CSA
     LightningIndexer (ratio 4) with its per-row masked top-k. With
     `simulate_act_quant`, the KV and indexer dims widen to whole quantizer
-    blocks (non-RoPE KV width 64, indexer head dim 32).
+    blocks (non-RoPE KV width 64, indexer head dim 32); with
+    `simulate_fp8_gemm_inputs`, the GEMM input widths widen to 128.
     """
+    gemm = simulate_fp8_gemm_inputs
     return DeepseekV4Config(
         vocab_size=128,
-        hidden_size=64,
+        hidden_size=128 if gemm else 64,
         intermediate_size=128,
         num_hidden_layers=4,
         num_attention_heads=4,
-        q_lora_rank=32,
+        q_lora_rank=128 if gemm else 32,
         kv_head_dim=72 if simulate_act_quant else 32,
         rope_head_dim=8,
         o_num_groups=2,
-        o_lora_rank=32,
+        o_lora_rank=64 if gemm else 32,
         window_size=8,
         compress_ratios=(0, 4, 8, 4),
         index_num_heads=2,
@@ -277,7 +280,7 @@ def _model_config(
         rope_theta=10000.0,
         tie_word_embeddings=False,
         use_moe_ffn=use_moe_ffn,
-        moe_intermediate_size=64 if use_moe_ffn else 0,
+        moe_intermediate_size=(128 if gemm else 64) if use_moe_ffn else 0,
         num_routed_experts=4 if use_moe_ffn else 0,
         num_activated_experts=2 if use_moe_ffn else 0,
         num_hash_routed_layers=2 if use_moe_ffn else 0,
@@ -289,6 +292,7 @@ def _model_config(
         hc_sinkhorn_iters=20,
         hc_eps=1e-6,
         simulate_act_quant=simulate_act_quant,
+        simulate_fp8_gemm_inputs=simulate_fp8_gemm_inputs,
     )
 
 
@@ -313,12 +317,21 @@ def _clone_all_layers(cache: StateCache) -> list[dict[str, torch.Tensor]]:
 
 
 @pytest.mark.parametrize(
-    "use_moe_ffn,use_hyper_connections,simulate_act_quant",
-    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
-    ids=["vanilla", "moe", "hyper_connections", "simulated_act_quant"],
+    "use_moe_ffn,use_hyper_connections,simulate_act_quant,simulate_fp8_gemm_inputs",
+    [
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+        (True, False, True, True),
+    ],
+    ids=["vanilla", "moe", "hyper_connections", "simulated_act_quant", "moe_fp8_gemm_inputs"],
 )
 def test_model_forward_decode_ragged_matches_per_request_scalar(
-    use_moe_ffn: bool, use_hyper_connections: bool, simulate_act_quant: bool
+    use_moe_ffn: bool,
+    use_hyper_connections: bool,
+    simulate_act_quant: bool,
+    simulate_fp8_gemm_inputs: bool,
 ) -> None:
     """Ragged batched decode == per-request scalar decode, end to end.
 
@@ -332,6 +345,7 @@ def test_model_forward_decode_ragged_matches_per_request_scalar(
         use_moe_ffn=use_moe_ffn,
         use_hyper_connections=use_hyper_connections,
         simulate_act_quant=simulate_act_quant,
+        simulate_fp8_gemm_inputs=simulate_fp8_gemm_inputs,
     )
     torch.manual_seed(0)
     model = DeepseekV4ForCausalLM(cfg).eval()
