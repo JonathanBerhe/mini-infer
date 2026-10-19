@@ -380,8 +380,9 @@ def test_v4_config_yarn_defaults_disable_correction() -> None:
 
 
 def test_v4_model_threads_yarn_into_rotary_embedding() -> None:
-    """When YaRN is configured, the model's `inv_freq` table reflects the
-    correction (low-frequency components scaled by `1/factor`)."""
+    """When YaRN is configured, the compressed layers' `inv_freq` table reflects
+    the correction (low-frequency components scaled by `1/factor`), and the
+    sliding-window table stays uncorrected, as in the reference."""
     head_dim = 8  # rope_head_dim in the demo config
     factor = 4.0
     cfg = DeepseekV4Config(
@@ -410,8 +411,9 @@ def test_v4_model_threads_yarn_into_rotary_embedding() -> None:
     standard_inv_freq = 1.0 / (
         cfg.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
     )
+    torch.testing.assert_close(model.window_rotary_emb.inv_freq, standard_inv_freq)
     # The lowest-frequency component (largest index) should be scaled by ~1/factor.
-    yarn_lowest = model.rotary_emb.inv_freq[-1].item()
+    yarn_lowest = model.compress_rotary_emb.inv_freq[-1].item()
     standard_lowest = standard_inv_freq[-1].item()
     assert abs(yarn_lowest * factor - standard_lowest) < 0.01 * standard_lowest, (
         f"YaRN should scale lowest-freq by 1/factor; "

@@ -330,6 +330,7 @@ class DeepseekV4Config:
         index_top_k           <- HF index_top_k (paper: index_topk)
         rms_norm_eps          <- HF rms_norm_eps  (paper: norm_eps)
         rope_theta            <- HF rope_theta
+        compress_rope_theta   <- HF compress_rope_theta (None: same as rope_theta)
         tie_word_embeddings   <- HF tie_word_embeddings (default False)
     """
 
@@ -360,6 +361,12 @@ class DeepseekV4Config:
     yarn_scaling_factor: float = 1.0
     yarn_beta_fast: int = 32
     yarn_beta_slow: int = 1
+    # RoPE base of the compressed (CSA / HCA) layers. As in the reference's
+    # `Attention.__init__`, compressed layers rotate with
+    # `compress_rope_theta` plus the YaRN settings above, while pure
+    # sliding-window layers rotate with `rope_theta` and no YaRN. None uses
+    # `rope_theta` (V4-Flash ships 160000 here and 10000 as `rope_theta`).
+    compress_rope_theta: float | None = None
     # MoE FFN (V4 paper §2.2). Defaults to "off" (every layer uses SwiGLU)
     # for backward compatibility — existing tests built before MoE landed
     # leave `use_moe_ffn=False`. When enabled, every decoder layer uses
@@ -521,6 +528,7 @@ class DeepseekV4Config:
         rope_theta_raw = rope_scaling.get("rope_theta") or _pick(
             "rope_theta", default_value=10000.0
         )
+        compress_rope_theta_raw = _pick("compress_rope_theta", default_value=None)
 
         compress_ratios_raw = _pick("compress_ratios", default_value=None)
         if compress_ratios_raw is None:
@@ -556,6 +564,9 @@ class DeepseekV4Config:
             index_top_k=int(_pick("index_top_k", "index_topk", default_value=0)),
             rms_norm_eps=float(_pick("rms_norm_eps", "norm_eps", default_value=1e-6)),
             rope_theta=float(rope_theta_raw),
+            compress_rope_theta=(
+                None if compress_rope_theta_raw is None else float(compress_rope_theta_raw)
+            ),
             tie_word_embeddings=bool(_pick("tie_word_embeddings", default_value=False)),
             yarn_original_seq_len=int(
                 _pick(
@@ -674,6 +685,29 @@ def build_state_cache_layer_specs(
     return layer_specs
 
 
+def build_rotary_tables(cfg: DeepseekV4Config) -> tuple[RotaryEmbedding, RotaryEmbedding]:
+    """`(window_table, compressed_table)` RoPE tables, as the reference builds them.
+
+    The reference's `Attention.__init__` picks per layer: a compressed layer
+    (`compress_ratio > 0`) rotates with `compress_rope_theta` and YaRN; a pure
+    sliding-window layer rotates with `rope_theta` and no YaRN. With the
+    defaults (`compress_rope_theta=None`, no YaRN) the two tables are equal.
+    """
+    window_table = RotaryEmbedding(cfg.rope_head_dim, base=cfg.rope_theta)
+    compressed_base = (
+        cfg.compress_rope_theta if cfg.compress_rope_theta is not None else cfg.rope_theta
+    )
+    compressed_table = RotaryEmbedding(
+        cfg.rope_head_dim,
+        base=compressed_base,
+        yarn_original_seq_len=cfg.yarn_original_seq_len,
+        yarn_scaling_factor=cfg.yarn_scaling_factor,
+        yarn_beta_fast=cfg.yarn_beta_fast,
+        yarn_beta_slow=cfg.yarn_beta_slow,
+    )
+    return window_table, compressed_table
+
+
 class _DeepseekV4InnerModel(nn.Module):
     """Embed + N decoder layers + final RMSNorm (HF-aligned attribute names)."""
 
@@ -750,19 +784,11 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         super().__init__()
         self.cfg = cfg
         self.model = _DeepseekV4InnerModel(cfg)
-        # Single rotary table for all layers (same `rope_theta`). Per-layer
-        # `compressed_position_embeddings` are sliced from this table at
-        # block positions — see `forward` below.
-        # Single rotary table for all layers — YaRN parameters are no-ops
-        # when `yarn_original_seq_len == 0` (the default).
-        self.rotary_emb = RotaryEmbedding(
-            cfg.rope_head_dim,
-            base=cfg.rope_theta,
-            yarn_original_seq_len=cfg.yarn_original_seq_len,
-            yarn_scaling_factor=cfg.yarn_scaling_factor,
-            yarn_beta_fast=cfg.yarn_beta_fast,
-            yarn_beta_slow=cfg.yarn_beta_slow,
-        )
+        # Two RoPE tables, chosen per layer by `rotary_for_layer`, as in the
+        # reference: pure sliding-window layers use `window_rotary_emb`,
+        # compressed layers (and their compressed entries and indexer) use
+        # `compress_rotary_emb`.
+        self.window_rotary_emb, self.compress_rotary_emb = build_rotary_tables(cfg)
         self.lm_head = ColumnParallelLinear(
             cfg.hidden_size, cfg.vocab_size, bias=False, gather_output=True
         )
@@ -782,6 +808,25 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             )
         else:
             self.hc_head_reduction = None
+
+    def rotary_for_layer(self, layer_idx: int) -> RotaryEmbedding:
+        """The RoPE table of `layer_idx`: compressed layers get `compress_rotary_emb`."""
+        if self.cfg.compress_ratios[layer_idx] > 0:
+            return self.compress_rotary_emb
+        return self.window_rotary_emb
+
+    def _token_rope_tables(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        """`(window, compressed)` `(cos, sin)` pairs for token `positions` `(B, T)`.
+
+        Each `cos` / `sin` is `(B, T, rope_head_dim)` in the dtype of
+        `hidden_states` `(B, T, ...)`; the caller picks one pair per layer.
+        """
+        return (
+            self.window_rotary_emb(hidden_states, positions),
+            self.compress_rotary_emb(hidden_states, positions),
+        )
 
     def forward(
         self,
@@ -812,8 +857,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         hidden_states = self.model.embed_tokens(input_ids)
         # RoPE tables computed BEFORE expanding to hc_mult copies — they only
         # depend on the per-token shape (B, T, ...), not on the residual fan-out.
-        cos_for_tokens, sin_for_tokens = self.rotary_emb(hidden_states, position_ids)
-        token_position_embeddings = (cos_for_tokens, sin_for_tokens)
+        window_token_pe, compressed_token_pe = self._token_rope_tables(
+            hidden_states, position_ids
+        )  # each (cos, sin), (B, T, rope_head_dim)
 
         if self.cfg.use_hyper_connections:
             # Expand `(B, T, dim)` -> `(B, T, hc_mult, dim)` by replicating the
@@ -832,11 +878,13 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             # position embeddings are empty-shaped placeholders that the
             # SWAAttention forward ignores.
             if compression_ratio == 0:
+                token_position_embeddings = window_token_pe
                 empty_block_table = torch.zeros(
                     batch_size, 0, self.cfg.rope_head_dim, device=input_ids.device
                 )
                 compressed_position_embeddings = (empty_block_table, empty_block_table)
             else:
+                token_position_embeddings = compressed_token_pe
                 num_compressed_blocks = seqlen // compression_ratio
                 block_positions = (
                     (
@@ -845,11 +893,11 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                     )
                     .unsqueeze(0)
                     .expand(batch_size, -1)
-                )
-                cos_for_blocks, sin_for_blocks = self.rotary_emb(
+                )  # (B, T // m)
+                cos_for_blocks, sin_for_blocks = self.compress_rotary_emb(
                     torch.zeros(batch_size, num_compressed_blocks, device=input_ids.device),
                     block_positions,
-                )
+                )  # each (B, T // m, rope_head_dim)
                 compressed_position_embeddings = (cos_for_blocks, sin_for_blocks)
             hidden_states = layer(
                 hidden_states,
@@ -931,8 +979,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         )
 
         hidden_states = self.model.embed_tokens(input_ids)
-        cos_for_tokens, sin_for_tokens = self.rotary_emb(hidden_states, token_positions)
-        token_position_embeddings = (cos_for_tokens, sin_for_tokens)
+        window_token_pe, compressed_token_pe = self._token_rope_tables(
+            hidden_states, token_positions
+        )  # each (cos, sin), (B, T, rope_head_dim)
 
         if self.cfg.use_hyper_connections:
             hidden_states = (
@@ -949,11 +998,13 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             # the count the cache-aware compressor emits; the remainder rides
             # in the in-flight accumulator with no compressed entry.
             if compression_ratio == 0:
+                token_position_embeddings = window_token_pe
                 empty_block_table = torch.zeros(
                     batch_size, 0, self.cfg.rope_head_dim, device=input_ids.device
                 )
                 compressed_position_embeddings = (empty_block_table, empty_block_table)
             else:
+                token_position_embeddings = compressed_token_pe
                 num_compressed_blocks = seqlen // compression_ratio
                 block_positions = (
                     (
@@ -962,11 +1013,11 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                     )
                     .unsqueeze(0)
                     .expand(batch_size, -1)
-                )
-                cos_for_blocks, sin_for_blocks = self.rotary_emb(
+                )  # (B, T // m)
+                cos_for_blocks, sin_for_blocks = self.compress_rotary_emb(
                     torch.zeros(batch_size, num_compressed_blocks, device=input_ids.device),
                     block_positions,
-                )
+                )  # each (B, T // m, rope_head_dim)
                 compressed_position_embeddings = (cos_for_blocks, sin_for_blocks)
             hidden_states = layer.forward_prefill_with_cache(
                 hidden_states,
@@ -1017,8 +1068,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         batch_size = input_id.shape[0]
         hidden_state = self.model.embed_tokens(input_id)  # (B, 1, hidden_size)
         token_position = torch.tensor([[start_pos]], device=input_id.device).expand(batch_size, -1)
-        cos_for_token, sin_for_token = self.rotary_emb(hidden_state, token_position)
-        token_position_embeddings = (cos_for_token, sin_for_token)
+        window_token_pe, compressed_token_pe = self._token_rope_tables(
+            hidden_state, token_position
+        )  # each (cos, sin), (B, 1, rope_head_dim)
 
         if self.cfg.use_hyper_connections:
             hidden_state = (
@@ -1032,6 +1084,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             # `forward_decode` resolves on the concrete subclass.
             layer = cast(DeepseekV4DecoderLayer, layer_module)
             compression_ratio = self.cfg.compress_ratios[layer_idx]
+            token_position_embeddings = (
+                compressed_token_pe if compression_ratio != 0 else window_token_pe
+            )
             block_position_embeddings = None
             # ratio 0 (SWA) has no compressor and never flushes a block.
             if compression_ratio != 0 and (start_pos + 1) % compression_ratio == 0:
@@ -1040,10 +1095,10 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 flushed_block_position_value = (start_pos // compression_ratio) * compression_ratio
                 flushed_block_position = torch.tensor(
                     [[flushed_block_position_value]], device=input_id.device
-                ).expand(batch_size, -1)
-                cos_for_block, sin_for_block = self.rotary_emb(
+                ).expand(batch_size, -1)  # (B, 1)
+                cos_for_block, sin_for_block = self.compress_rotary_emb(
                     torch.zeros(batch_size, 1, device=input_id.device), flushed_block_position
-                )
+                )  # each (B, 1, rope_head_dim)
                 block_position_embeddings = (cos_for_block, sin_for_block)
 
             hidden_state = layer.forward_decode(
@@ -1100,8 +1155,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         positions = positions.to(torch.int64)
 
         hidden_state = self.model.embed_tokens(input_id)  # (B, 1, hidden_size)
-        cos_for_token, sin_for_token = self.rotary_emb(hidden_state, positions.unsqueeze(1))
-        token_position_embeddings = (cos_for_token, sin_for_token)
+        window_token_pe, compressed_token_pe = self._token_rope_tables(
+            hidden_state, positions.unsqueeze(1)
+        )  # each (cos, sin), (B, 1, rope_head_dim)
 
         # max over rows; (pos + 1) // m is monotonic in pos, so the widest valid
         # compressed prefix for any layer is (positions_max + 1) // m. One sync.
@@ -1117,16 +1173,19 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         for layer_idx, layer_module in enumerate(self.model.layers):
             layer = cast(DeepseekV4DecoderLayer, layer_module)
             compression_ratio = self.cfg.compress_ratios[layer_idx]
+            token_position_embeddings = (
+                compressed_token_pe if compression_ratio != 0 else window_token_pe
+            )
             block_position_embeddings = None
             n_compressed_max = 0
             if compression_ratio != 0:
                 # Every row gets RoPE for its own block position `(pos // m) * m`;
                 # rows that do not flush this step ignore it.
-                block_position = (positions // compression_ratio) * compression_ratio
-                cos_for_block, sin_for_block = self.rotary_emb(
+                block_position = (positions // compression_ratio) * compression_ratio  # (B,)
+                cos_for_block, sin_for_block = self.compress_rotary_emb(
                     torch.zeros(batch_size, 1, device=input_id.device),
                     block_position.unsqueeze(1),
-                )
+                )  # each (B, 1, rope_head_dim)
                 block_position_embeddings = (cos_for_block, sin_for_block)
                 n_compressed_max = (positions_max + 1) // compression_ratio
 
@@ -1409,14 +1468,16 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         cls.load_weights(model, state_dict, target_device=device)
         del state_dict
 
-        # Rebuild the rotary `inv_freq` off-meta (config-derived, not loaded).
-        rebuilt_rotary = RotaryEmbedding(
-            cfg.rope_head_dim,
-            base=cfg.rope_theta,
-            yarn_original_seq_len=cfg.yarn_original_seq_len,
-            yarn_scaling_factor=cfg.yarn_scaling_factor,
-            yarn_beta_fast=cfg.yarn_beta_fast,
-            yarn_beta_slow=cfg.yarn_beta_slow,
-        )
-        model.rotary_emb.inv_freq = rebuilt_rotary.inv_freq.to(device=device)
+        # Rebuild both rotary `inv_freq` tables off-meta (config-derived, not loaded).
+        model.rematerialize_rotary_tables(device)
         return model
+
+    def rematerialize_rotary_tables(self, device: torch.device | str) -> None:
+        """Recompute both RoPE `inv_freq` buffers from the config on `device`.
+
+        They are non-persistent buffers that no checkpoint carries, so meta
+        construction leaves them as meta tensors.
+        """
+        window_table, compressed_table = build_rotary_tables(self.cfg)
+        self.window_rotary_emb.inv_freq = window_table.inv_freq.to(device=device)
+        self.compress_rotary_emb.inv_freq = compressed_table.inv_freq.to(device=device)

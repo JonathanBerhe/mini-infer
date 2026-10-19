@@ -403,8 +403,9 @@ def test_from_checkpoint_round_trips_a_synthetic_v4_checkpoint(tmp_path) -> None
     loaded = DeepseekV4ForCausalLM.from_checkpoint(str(tmp_path), device="cpu", dtype=torch.float32)
 
     # inv_freq is a non-persistent buffer (absent from the checkpoint); meta
-    # construction left it meta, so from_checkpoint must have rebuilt it.
-    assert not loaded.rotary_emb.inv_freq.is_meta
+    # construction left both tables meta, so from_checkpoint must have rebuilt them.
+    assert not loaded.window_rotary_emb.inv_freq.is_meta
+    assert not loaded.compress_rotary_emb.inv_freq.is_meta
 
     # Weights loaded correctly: logits match the source model.
     input_ids = torch.tensor([list(range(8))], dtype=torch.long)
