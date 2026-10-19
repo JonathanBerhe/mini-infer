@@ -136,6 +136,10 @@ class LightningIndexer(nn.Module):
             act_quant=act_quant,
             indexer_keys=True,
         )
+        # `wq_b` is an FP8-weight linear in the reference (`weights_proj` is BF16
+        # there): its input gets the FP8 GEMM-input round trip when enabled.
+        if act_quant is not None:
+            act_quant.quantize_gemm_inputs(self.wq_b)
         # Score scaling: 1/sqrt(d) AND a 1/sqrt(n_h_idx) factor pre-applied to the weights.
         # Reference: `weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)`.
         self._weight_scale = (head_dim**-0.5) * (num_heads**-0.5)

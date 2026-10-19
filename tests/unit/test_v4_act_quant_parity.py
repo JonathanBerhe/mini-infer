@@ -18,6 +18,14 @@ dims widened so the real kernels accept them (they assert the quantized
 width splits into whole blocks): `head_dim=72`, so the non-RoPE width is
 64 (one FP8 block), and `index_head_dim=32` (one FP4 block, a power of two
 for the Hadamard transform).
+
+The FP8 GEMM-input tests also build the reference with FP8 `Linear`
+weights (and FP4 routed experts), as a released checkpoint loads, so its
+`linear()` quantizes each GEMM input to FP8 and calls `fp8_gemm` /
+`fp4_gemm` (PyTorch mirrors here). Our side gets the same weights
+dequantized, as the loader does, and `fp8_gemm_inputs=True`. Those tests
+widen `dim`, `q_lora_rank` and `o_groups * o_lora_rank` to 256: two GEMM
+input blocks of 128 each.
 """
 
 from __future__ import annotations
@@ -30,10 +38,15 @@ from torch.nn.functional import cosine_similarity
 
 from mini_infer.cache.state_cache import IndexerStateSpec, StateCache, StateLayerSpec
 from mini_infer.models.blocks import CSAAttention, HCAAttention
+from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 from mini_infer.models.blocks.rope import RotaryEmbedding
 from mini_infer.models.blocks.swa import SWAAttention
 from mini_infer.models.blocks.v4 import SimulatedActQuant
-from tests.unit._v4_reference_helpers import install_real_quant_stubs
+from tests.unit._v4_reference_helpers import (
+    dense_weight,
+    init_reference_weights,
+    install_real_quant_stubs,
+)
 
 _T_PREFILL = 16
 _N_DECODE = 8
@@ -51,19 +64,23 @@ _NOPE_DIM = 64
 _LAYER_KINDS = {"swa": 0, "csa": 4, "hca": 8}
 
 
-def _build_args(reference_module: Any, compress_ratio: int) -> Any:
+def _build_args(reference_module: Any, compress_ratio: int, *, gemm_dims: bool = False) -> Any:
+    """`gemm_dims`: GEMM input widths (dim, q_lora_rank, o_groups * o_lora_rank) of 256.
+
+    Two FP8 blocks of 128 per GEMM input, so per-block scales are exercised.
+    """
     return reference_module.ModelArgs(
         max_batch_size=_BATCH,
         max_seq_len=64,
         dtype="bf16",
-        dim=64,
+        dim=256 if gemm_dims else 64,
         n_layers=1,
         n_heads=4,
-        q_lora_rank=32,
+        q_lora_rank=256 if gemm_dims else 32,
         head_dim=72,
         rope_head_dim=8,
         o_groups=2,
-        o_lora_rank=32,
+        o_lora_rank=128 if gemm_dims else 32,
         window_size=8,
         compress_ratios=(compress_ratio,),
         original_seq_len=0,
@@ -77,18 +94,6 @@ def _build_args(reference_module: Any, compress_ratio: int) -> Any:
         index_head_dim=32,
         index_topk=2,
     )
-
-
-def _init_reference_attention(ref_attn: Any, seed: int) -> None:
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    for parameter in ref_attn.parameters():
-        with torch.no_grad():
-            parameter.data = (
-                torch.randn(parameter.shape, generator=generator, dtype=torch.float32) * 0.02
-            )
-    for buffer in ref_attn.buffers():
-        if buffer.dtype.is_floating_point:
-            buffer.zero_()
 
 
 def _build_our_block(
@@ -121,20 +126,21 @@ def _build_our_block(
 
 
 def _sync_weights(our_block: Any, ref_attn: Any) -> None:
+    """Copy reference weights in; FP8 ones arrive dequantized, as the loader does."""
     with torch.no_grad():
-        our_block.q_a_proj.weight.copy_(ref_attn.wq_a.weight)
+        our_block.q_a_proj.weight.copy_(dense_weight(ref_attn.wq_a))
         our_block.q_a_layernorm.weight.copy_(ref_attn.q_norm.weight)
-        our_block.q_b_proj.weight.copy_(ref_attn.wq_b.weight)
-        our_block.swa_kv_proj.weight.copy_(ref_attn.wkv.weight)
+        our_block.q_b_proj.weight.copy_(dense_weight(ref_attn.wq_b))
+        our_block.swa_kv_proj.weight.copy_(dense_weight(ref_attn.wkv))
         our_block.kv_norm.weight.copy_(ref_attn.kv_norm.weight)
         our_block.sink.sink_logits.copy_(ref_attn.attn_sink)
         our_block.grouped_output.wo_a.copy_(ref_attn.wo_a.weight)
-        our_block.grouped_output.wo_b.weight.copy_(ref_attn.wo_b.weight)
+        our_block.grouped_output.wo_b.weight.copy_(dense_weight(ref_attn.wo_b))
         compressor_pairs = []
         if ref_attn.compress_ratio:
             compressor_pairs.append((our_block.compressor, ref_attn.compressor))
         if getattr(ref_attn, "indexer", None) is not None:
-            our_block.indexer.wq_b.weight.copy_(ref_attn.indexer.wq_b.weight)
+            our_block.indexer.wq_b.weight.copy_(dense_weight(ref_attn.indexer.wq_b))
             our_block.indexer.weights_proj.weight.copy_(ref_attn.indexer.weights_proj.weight)
             compressor_pairs.append((our_block.indexer.compressor, ref_attn.indexer.compressor))
         for ours, theirs in compressor_pairs:
@@ -192,15 +198,19 @@ def _assert_stored_kv_matches(name: str, ours: torch.Tensor, theirs: torch.Tenso
 
 
 def _run_case(
-    reference_module: Any, layer_kind: str, act_quant: SimulatedActQuant | None
+    reference_module: Any,
+    layer_kind: str,
+    act_quant: SimulatedActQuant | None,
+    *,
+    gemm_dims: bool = False,
 ) -> dict[str, Any]:
     """Prefill + decode on the reference and on our block; collect everything to compare."""
     torch.manual_seed(0)
-    args = _build_args(reference_module, _LAYER_KINDS[layer_kind])
+    args = _build_args(reference_module, _LAYER_KINDS[layer_kind], gemm_dims=gemm_dims)
     ratio = args.compress_ratios[0]
     n_win = args.window_size
     ref_attn = reference_module.Attention(0, args)
-    _init_reference_attention(ref_attn, seed=42)
+    init_reference_weights(reference_module, ref_attn, seed=42)
     our_block = _build_our_block(args, act_quant)
     _sync_weights(our_block, ref_attn)
     state_cache = _make_state_cache(args)
@@ -326,7 +336,7 @@ def test_indexer_top_k_matches_quantized_reference(
     ratio = args.compress_ratios[0]
     seqlen = args.max_seq_len
     ref_attn = reference_module.Attention(0, args)
-    _init_reference_attention(ref_attn, seed=7)
+    init_reference_weights(reference_module, ref_attn, seed=7)
     our_block = _build_our_block(args, SimulatedActQuant(fp8_scale_fmt="ue8m0"))
     assert isinstance(our_block, CSAAttention)
     _sync_weights(our_block, ref_attn)
@@ -348,3 +358,110 @@ def test_indexer_top_k_matches_quantized_reference(
         )
     # Same set per query; order among equal scores is not part of the contract.
     assert torch.equal(ours.sort(dim=-1).values, theirs.long().sort(dim=-1).values)
+
+
+# ---------- FP8 GEMM inputs: reference built with FP8 / FP4 weights ----------
+
+_GEMM_ACT_QUANT = SimulatedActQuant(fp8_scale_fmt="ue8m0", fp8_gemm_inputs=True)
+
+
+@pytest.mark.parametrize("layer_kind", list(_LAYER_KINDS))
+def test_fp8_gemm_inputs_match_fp8_weight_reference(
+    reference_module: Any, monkeypatch: pytest.MonkeyPatch, layer_kind: str
+) -> None:
+    """FP8-weight reference vs `fp8_gemm_inputs`: prefill, stored KV, every decode step."""
+    install_real_quant_stubs(reference_module, monkeypatch, fp8_weights=True)
+    result = _run_case(reference_module, layer_kind, _GEMM_ACT_QUANT, gemm_dims=True)
+
+    _assert_matches(result["our_forward"], result["ref_prefill"], "standalone forward")
+    _assert_matches(result["our_prefill"], result["ref_prefill"], "cache-aware prefill")
+    for name, ours, theirs in result["kv_after_prefill"]:
+        _assert_stored_kv_matches(name, ours, theirs)
+    for position, ours, theirs in result["decode"]:
+        _assert_matches(ours, theirs, f"decode start_pos={position}")
+
+
+@pytest.mark.parametrize("layer_kind", list(_LAYER_KINDS))
+def test_qat_round_trips_alone_miss_the_fp8_weight_reference(
+    reference_module: Any, monkeypatch: pytest.MonkeyPatch, layer_kind: str
+) -> None:
+    """Without `fp8_gemm_inputs`, the FP8-weight reference is out of the tight bound."""
+    install_real_quant_stubs(reference_module, monkeypatch, fp8_weights=True)
+    result = _run_case(reference_module, layer_kind, SimulatedActQuant(), gemm_dims=True)
+    assert _relative_error(result["our_prefill"], result["ref_prefill"]) > _RELATIVE_ERROR_MAX
+
+
+def _sync_moe(our_moe: HashRoutedMoEFFN, ref_moe: Any) -> None:
+    """Gate as is; FP8 experts dequantized, FP4 experts copied packed (the loader's way)."""
+    with torch.no_grad():
+        our_moe.gate.weight.copy_(ref_moe.gate.weight)
+        assert our_moe.gate.bias is not None
+        our_moe.gate.bias.copy_(ref_moe.gate.bias)
+        pairs = [*zip(our_moe.experts, ref_moe.experts, strict=True)]
+        pairs.append((our_moe.shared_experts, ref_moe.shared_experts))
+        for ours, theirs in pairs:
+            for name in ("w1", "w2", "w3"):
+                ref_linear = getattr(theirs, name)
+                if ref_linear.weight.dtype == torch.float4_e2m1fn_x2:
+                    getattr(ours, f"{name}_packed").copy_(ref_linear.weight.view(torch.int8))
+                    getattr(ours, f"{name}_scale").copy_(ref_linear.scale.float())
+                else:
+                    getattr(ours, name).weight.copy_(dense_weight(ref_linear))
+
+
+@pytest.mark.parametrize("routed_expert_dtype", ["fp8", "fp4"])
+def test_fp8_gemm_inputs_match_fp8_weight_reference_moe(
+    reference_module: Any, monkeypatch: pytest.MonkeyPatch, routed_expert_dtype: str
+) -> None:
+    """MoE with an FP8 shared expert and FP8 or FP4 routed experts, as in a release.
+
+    Also pins why the routing weight must scale the activation before `w2`:
+    applying it after `w2` (the full-precision order) misses the reference
+    once `w2`'s input is quantized.
+    """
+    install_real_quant_stubs(reference_module, monkeypatch, fp8_weights=True)
+    args = reference_module.ModelArgs(
+        dim=256,
+        moe_inter_dim=256,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        n_shared_experts=1,
+        n_hash_layers=0,
+        score_func="softmax",
+        route_scale=1.0,
+        swiglu_limit=0,
+        expert_dtype="fp4" if routed_expert_dtype == "fp4" else None,
+    )
+    ref_moe = reference_module.MoE(0, args)
+    init_reference_weights(reference_module, ref_moe, seed=42, std=0.05)
+    torch.manual_seed(0)
+    hidden_states = torch.randn(_BATCH, 6, args.dim) * 0.5
+    input_ids = torch.zeros(_BATCH, 6, dtype=torch.long)  # score routing ignores them
+
+    outputs: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        theirs = ref_moe(hidden_states, input_ids)
+        for label, act_quant, weights_before_w2 in (
+            ("gemm", _GEMM_ACT_QUANT, True),
+            ("routing weight after w2", _GEMM_ACT_QUANT, False),
+            ("qat only", SimulatedActQuant(), False),
+        ):
+            our_moe = HashRoutedMoEFFN(
+                hidden_size=args.dim,
+                intermediate_size=args.moe_inter_dim,
+                num_routed_experts=args.n_routed_experts,
+                num_activated_experts=args.n_activated_experts,
+                routing_mode="score_topk",
+                score_func="softmax",
+                route_scale=args.route_scale,
+                n_shared_experts=args.n_shared_experts,
+                expert_dtype="fp4" if routed_expert_dtype == "fp4" else "bf16",
+                act_quant=act_quant,
+            )
+            _sync_moe(our_moe, ref_moe)
+            our_moe.routing_weights_before_down_proj = weights_before_w2
+            outputs[label] = our_moe(hidden_states, input_ids)
+
+    _assert_matches(outputs["gemm"], theirs, "MoE with FP8 GEMM inputs")
+    for label in ("routing weight after w2", "qat only"):
+        assert _relative_error(outputs[label], theirs) > _RELATIVE_ERROR_MAX, label

@@ -403,7 +403,7 @@ V4-Pro inference reference) sit alongside the unit tests under the
 same `tests/unit/` directory; the V4 model-level test is the
 end-to-end gate.
 
-## Activation quantization: two modes
+## Activation quantization modes
 
 DeepSeek trained V4 with quantization-aware training (QAT): training
 rounded some attention activations to low-precision formats. The
@@ -421,53 +421,107 @@ The RoPE dims of the KV stay unquantized. With `scale_fmt="ue8m0"`,
 which every released V4 config sets, each FP8 scale is rounded up to a
 power of two. FP4 scales are always powers of two.
 
-`DeepseekV4Config.simulate_act_quant` selects one of two modes:
+A released checkpoint adds a second kind of rounding. Its linear
+weights are FP8 (one scale per 128x128 tile), and its routed experts
+are FP4 (one scale per 32 values). For these weights, the reference's
+`linear()` quantizes the GEMM input to FP8 with one scale per 128
+values. It then calls `fp8_gemm` or `fp4_gemm`. These kernels multiply
+the dequantized input by the dequantized weight and sum in FP32. The
+GEMMs that take an FP8 input are:
 
-- Off (the default). The port skips the round trips. Window KV,
-  compressed KV and the Lightning Indexer run at the working precision
-  (FP32 on CPU, BF16 on GPU). This is more precise than the reference's
-  real inference path. The identity-stub parity tests pin this mode:
-  they replace the reference quantizers with functions that return
-  their input.
-- On. The port applies the same round trips at the same points. This
-  covers prefill, cache-aware prefill, decode and ragged decode, in SWA,
-  CSA and HCA layers. `act_quant_scale_fmt` mirrors the reference's
-  `scale_fmt` (`"ue8m0"` or `None`).
+| Reference linear | Port module | Weight in a release |
+|---|---|---|
+| Attention `wq_a`, `wq_b`, `wkv`, `wo_b` | `q_a_proj`, `q_b_proj`, `swa_kv_proj`, `grouped_output.wo_b` | FP8 |
+| Indexer `wq_b` | `indexer.wq_b` | FP8 |
+| Shared expert `w1`, `w2`, `w3` | `mlp.shared_experts.w1` / `w2` / `w3` | FP8 |
+| Routed experts `w1`, `w2`, `w3` | `mlp.experts.N.w1` / `w2` / `w3` (`FP4Expert`) | FP4 |
+
+The gate, the compressors, the indexer `weights_proj` and `wo_a` hold
+BF16 or FP32 weights in the reference. Their inputs stay unquantized.
+
+Two config flags select one of three modes:
+
+- Both off (the default). The port skips all of this. Window KV,
+  compressed KV, the Lightning Indexer and every GEMM input run at the
+  working precision (FP32 on CPU, BF16 on GPU). This is more precise
+  than the reference's real inference path. The identity-stub parity
+  tests pin this mode: they replace the reference quantizers with
+  functions that return their input.
+- `simulate_act_quant=True`. The port applies the QAT round trips at
+  the same points as the reference. This covers prefill, cache-aware
+  prefill, decode and ragged decode, in SWA, CSA and HCA layers. This
+  mode matches a reference run on a BF16 checkpoint.
+  `act_quant_scale_fmt` mirrors the reference's `scale_fmt` (`"ue8m0"`
+  or `None`).
+- `simulate_act_quant=True` and `simulate_fp8_gemm_inputs=True`. The
+  port also gives each GEMM in the table an FP8 round trip of its input,
+  one scale per 128 values. This mode matches a reference run on a
+  released FP8 / FP4 checkpoint. The port dequantizes the weights at
+  load, so the round trip followed by the normal matmul multiplies the
+  same numbers as the kernels. The second flag needs the first, because
+  the reference never quantizes GEMM inputs without the QAT round trips.
 
 The code is in `blocks/v4/act_quant.py`. It transcribes the tilelang
 kernels and the Hadamard transform into PyTorch. Like the kernels, it
 computes in FP32 and casts back to the input dtype. Each attention
-block takes `act_quant: SimulatedActQuant | None`, and `None` means off.
-On mode needs `kv_head_dim - rope_head_dim` to be a multiple of 64 and
-`index_head_dim` to be a power of two and a multiple of 32. V4 meets
-both (448 and 128). The block constructors check this.
+block, the indexer and the MoE FFN take `act_quant: SimulatedActQuant
+| None`, and `None` means off. For the GEMM inputs, the constructors
+register a forward pre-hook on each linear in the table, so the forward
+code does not change. `FP4Expert` has no linear modules and applies
+the round trip in its `forward`.
 
-The mode matters most for the indexer. FP8 moves each KV value by a
-small relative amount, because e4m3 keeps 3 mantissa bits. FP4 is
-coarse: each e2m1 value is 0, 0.5, 1, 1.5, 2, 3, 4 or 6 times its
-block scale. That rounding changes the indexer scores enough to change
-which compressed blocks the top-k selects. On the synthetic parity
-config, the off mode against the quantized reference fell to cosine
-0.955 on one CSA decode step. The on mode stayed within a relative
-error of 2e-7.
+With GEMM inputs quantized, the routed experts also change their order
+of operations. The port normally scales each expert's output by its
+routing weight. The reference scales the activation before `w2`
+instead. Without quantization the two orders give the same result. With
+quantization they do not, because `w2` then rounds the scaled input. So
+in this mode the port scales before `w2`, like the reference.
+
+The modes need some dimensions to split into whole blocks.
+`kv_head_dim - rope_head_dim` must be a multiple of 64, and
+`index_head_dim` must be a power of two and a multiple of 32. V4 meets
+both (448 and 128). Each GEMM input width in the table must be a
+multiple of 128. The reference's `act_quant` asserts this itself, so
+every released config meets it. The block constructors check all of
+these.
+
+The QAT round trips matter most for the indexer. FP8 moves each KV
+value by a small relative amount, because e4m3 keeps 3 mantissa bits.
+FP4 is coarse: each e2m1 value is 0, 0.5, 1, 1.5, 2, 3, 4 or 6 times
+its block scale. That rounding changes the indexer scores enough to
+change which compressed blocks the top-k selects. On the synthetic
+parity config, the default mode against the quantized reference fell
+to cosine 0.955 on one CSA decode step. With the QAT round trips on,
+the port stayed within a relative error of 2e-7.
+
+The GEMM-input round trips matter as much. Against a reference built
+with FP8 weights, the QAT-only mode missed by a relative error of 3e-2
+to 3.6e-1, and CSA fell to cosine 0.951. With both flags on, the port
+stayed within 9e-8 for attention and 1.1e-7 for the MoE. Scaling the
+routed experts after `w2` instead missed by 1.6e-2.
 
 The quantized-mode parity tests (`pytest tests/unit -k act_quant`) run
-the reference with real PyTorch mirrors of its quantizer kernels in
-place of the identity stubs. On mode then matches the reference's
-quantized dims and indexer keys bit for bit, and its indexer top-k
-picks exactly. The RoPE dims differ only by last-bit RoPE rounding.
+the reference with real PyTorch mirrors of its quantizer and GEMM
+kernels in place of the identity stubs. The GEMM tests build the
+reference with FP8 linears and FP8 or FP4 experts, and load the same
+weights into the port the loader's way. In both quantized modes, the
+port matches the reference's quantized KV dims and indexer keys bit for
+bit, and its indexer top-k picks exactly. The RoPE dims differ only by
+last-bit RoPE rounding.
 
-Two limits apply:
+Some limits apply:
 
-- On mode simulates the QAT round trips only. The reference also
-  quantizes the inputs of its FP8 and FP4 weight GEMMs to FP8 (in
-  `linear()`). The port dequantizes those weights and runs plain
-  matmuls, so it does not simulate that rounding.
+- The kernels sum each 128-wide K tile (32-wide for FP4), then scale
+  and add the tiles. The port runs one matmul on the dequantized values.
+  When an input spans several tiles, the two sums agree to FP32
+  rounding but not bit for bit.
 - The CPU tests compare against PyTorch mirrors of the kernels, not
   against a GPU run. The CUDA Hadamard kernel sums in a different
   order. A value that falls exactly on an FP4 rounding boundary can
   then round the other way, so bit equality with a GPU run is not
   guaranteed.
+- The reference's experts clamp their activations at `swiglu_limit`
+  (10 in the V4 configs). The port has no such clamp, in every mode.
 
 ## Where we diverged + why
 

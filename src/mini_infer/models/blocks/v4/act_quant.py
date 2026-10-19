@@ -23,10 +23,19 @@ for FP4, every scale is a power of two, so the dequantized values are
 exactly representable in BF16 and the result is the same at FP32 and
 BF16 working precision.
 
+With a released (FP8 / FP4 weight) checkpoint, the reference also
+quantizes the INPUT of every GEMM whose weight is FP8 or FP4: its
+`linear()` calls `act_quant(x, 128, scale_fmt, scale_dtype)` and feeds
+the FP8 codes and per-128 scales to `fp8_gemm` / `fp4_gemm`. Those
+kernels compute dequantized-input times dequantized-weight with FP32
+accumulation. The port dequantizes the weights at load, so the same
+numbers come out of an FP8 round trip on the GEMM input (block 128 along
+the reduction dim) followed by the port's normal matmul.
+
 `SimulatedActQuant` is the switch the V4 blocks take: `None` (the
 default everywhere) skips all of this and keeps the port's full
-precision; an instance applies the round trips at the reference's
-call sites.
+precision; an instance applies the QAT round trips at the reference's
+call sites, plus the GEMM-input round trips when `fp8_gemm_inputs` is set.
 """
 
 from __future__ import annotations
@@ -35,6 +44,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+from torch import nn
 
 ScaleFormat = Literal["ue8m0"] | None
 
@@ -43,6 +53,7 @@ FP4_E2M1_MAX = 6.0
 # Block sizes the reference passes at its call sites.
 KV_FP8_BLOCK_SIZE = 64
 FP4_BLOCK_SIZE = 32
+GEMM_INPUT_FP8_BLOCK_SIZE = 128
 # Floors on a block's absolute max, copied from the kernels: they keep the
 # scale a normal FP32 number when a block is all zeros.
 _FP8_AMAX_FLOOR = 1e-4
@@ -202,13 +213,57 @@ class SimulatedActQuant:
     Blocks take `act_quant: SimulatedActQuant | None`; `None` skips every
     round trip. `fp8_scale_fmt` mirrors the reference's module-level
     `scale_fmt`, which every released V4 config sets to `"ue8m0"`.
+    `fp8_gemm_inputs` adds the FP8 round trip on the inputs of the linears
+    whose reference weights are FP8 or FP4 (see `quantize_gemm_inputs`).
     """
 
     fp8_scale_fmt: ScaleFormat = "ue8m0"
+    fp8_gemm_inputs: bool = False
 
     def __post_init__(self) -> None:
         if self.fp8_scale_fmt not in ("ue8m0", None):
             raise ValueError(f"fp8_scale_fmt must be 'ue8m0' or None, got {self.fp8_scale_fmt!r}")
+
+    @staticmethod
+    def check_gemm_input_dim(width: int, name: str) -> None:
+        """Fail early when a GEMM input width does not split into FP8 blocks of 128."""
+        if width % GEMM_INPUT_FP8_BLOCK_SIZE != 0:
+            raise ValueError(
+                f"simulated FP8 GEMM-input quant needs the input width of {name} ({width}) "
+                f"to be a multiple of {GEMM_INPUT_FP8_BLOCK_SIZE}"
+            )
+
+    def gemm_input(self, x: torch.Tensor) -> torch.Tensor:
+        """FP8 round trip of a GEMM input, block 128 along the last (reduction) dim.
+
+        Identity unless `fp8_gemm_inputs`. `x`: `(..., in_features)`; returns
+        the same shape and dtype.
+        """
+        if not self.fp8_gemm_inputs:
+            return x
+        return fp8_e4m3_roundtrip(
+            x, block_size=GEMM_INPUT_FP8_BLOCK_SIZE, scale_fmt=self.fp8_scale_fmt
+        )
+
+    def quantize_gemm_inputs(self, *linears: nn.Linear) -> None:
+        """Round-trip each linear's input through FP8 before its matmul.
+
+        For the linears that hold FP8 or FP4 weights in the reference
+        checkpoint. Registers a forward pre-hook, so the calling forward
+        code stays unchanged; does nothing unless `fp8_gemm_inputs`.
+        """
+        if not self.fp8_gemm_inputs:
+            return
+        for linear in linears:
+            # `weight.shape[-1]` is the per-rank input width (row-parallel shards it).
+            self.check_gemm_input_dim(linear.weight.shape[-1], type(linear).__name__)
+            linear.register_forward_pre_hook(self._gemm_input_hook)
+
+    def _gemm_input_hook(
+        self, module: nn.Module, args: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        del module
+        return (self.gemm_input(args[0]), *args[1:])
 
     @staticmethod
     def check_kv_dims(kv_head_dim: int, rope_head_dim: int) -> None:

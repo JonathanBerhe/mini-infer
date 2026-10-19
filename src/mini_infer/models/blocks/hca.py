@@ -336,6 +336,12 @@ class HCAAttention(nn.Module):
             o_lora_rank=o_lora_rank,
             hidden_size=hidden_size,
         )
+        # The reference's FP8-weight linears (`wq_a`, `wq_b`, `wkv`, `wo_b`):
+        # their inputs get the FP8 GEMM-input round trip when enabled.
+        if act_quant is not None:
+            act_quant.quantize_gemm_inputs(
+                self.q_a_proj, self.q_b_proj, self.swa_kv_proj, self.grouped_output.wo_b
+            )
 
         self.softmax_scale = kv_head_dim**-0.5
 

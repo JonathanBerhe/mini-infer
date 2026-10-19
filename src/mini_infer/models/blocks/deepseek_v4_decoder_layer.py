@@ -208,6 +208,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 vocab_size=moe_vocab_size,
                 n_shared_experts=n_shared_experts,
                 expert_dtype=expert_dtype,
+                act_quant=act_quant,
             )
         else:  # pragma: no cover — Literal already constrains this
             raise ValueError(f"unknown ffn_type={ffn_type!r}")

@@ -25,13 +25,22 @@ Math is identical to `MixtralExpert` once dequantized: matching
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 from torch.nn import functional
 
 from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16
 
+if TYPE_CHECKING:
+    from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
+
 _FP4_BLOCK_SIZE = 32
+
+
+def _identity(x: torch.Tensor) -> torch.Tensor:
+    return x
 
 
 class FP4Expert(nn.Module):
@@ -40,6 +49,9 @@ class FP4Expert(nn.Module):
     Drop-in for `MixtralExpert` at the `forward(x) -> x` interface; differs
     only in storage (packed FP4 buffers vs BF16 `nn.Linear` weights). Weight
     names mirror Mixtral's `w1` (gate), `w2` (down), `w3` (up).
+
+    `act_quant` with `fp8_gemm_inputs` set round-trips each GEMM input
+    through FP8 (block 128), like the reference's `fp4_gemm` path.
     """
 
     def __init__(
@@ -48,11 +60,16 @@ class FP4Expert(nn.Module):
         intermediate_size: int,
         *,
         block_size: int = _FP4_BLOCK_SIZE,
+        act_quant: SimulatedActQuant | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.block_size = block_size
+        if act_quant is not None and act_quant.fp8_gemm_inputs:
+            act_quant.check_gemm_input_dim(hidden_size, "FP4Expert w1/w3")
+            act_quant.check_gemm_input_dim(intermediate_size, "FP4Expert w2")
+        self.act_quant = act_quant
         # w1 (gate) and w3 (up): (intermediate, hidden). w2 (down): (hidden, intermediate).
         self._register_packed("w1", intermediate_size, hidden_size)
         self._register_packed("w3", intermediate_size, hidden_size)
@@ -81,13 +98,18 @@ class FP4Expert(nn.Module):
         scale: torch.Tensor = getattr(self, f"{name}_scale")
         return dequantize_nvfp4_to_bf16(packed, scale, block_size=self.block_size).to(dtype)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
+        """`(N, hidden)` -> `(N, hidden)`; `routing_weights` as in `MixtralExpert`."""
         # Dequant cast to x.dtype so CPU fp32 tests and GPU bf16 both work
         # (dequantize_nvfp4_to_bf16 always returns bf16).
         w1 = self._dequant("w1", x.dtype)
         w3 = self._dequant("w3", x.dtype)
         w2 = self._dequant("w2", x.dtype)
-        out: torch.Tensor = functional.linear(
-            functional.silu(functional.linear(x, w1)) * functional.linear(x, w3), w2
-        )
+        # Identity unless the FP8 GEMM-input round trip is enabled.
+        gemm_input = self.act_quant.gemm_input if self.act_quant is not None else _identity
+        x_in = gemm_input(x)
+        hidden = functional.silu(functional.linear(x_in, w1)) * functional.linear(x_in, w3)
+        if routing_weights is not None:
+            hidden = hidden * routing_weights
+        out: torch.Tensor = functional.linear(gemm_input(hidden), w2)
         return out
