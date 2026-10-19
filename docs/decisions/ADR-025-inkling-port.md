@@ -100,3 +100,23 @@ The distinctive components, and where each lives:
   budget for now, same posture as GLM's 753B: needs `load_weights_streaming`
   plus a multi-GPU staging script. The tiny-config parity suite is the
   correctness gate.
+
+## Amendment (2026-10-19): released checkpoint layout
+
+The original loader read only HF's in-memory tensor names
+(`model.language_model.*`), and the parity tests fed it only those names. The
+released files use Thinking Machines' names under `model.llm.*` (for example
+`attn.wq_du`, `attn_norm`, `mlp.gate.bias`). They also fuse gate and up into
+`w13` tensors whose rows alternate gate and up. So `ModelRunner.from_pretrained`
+failed on a real checkpoint with a weight-load mismatch.
+
+`load_weights` now applies the renames that transformers applies at load
+(`conversion_mapping.py`, entry `inkling_mm_model`) before the existing remap.
+A test loads a checkpoint written by transformers' `save_pretrained`, which
+reverses the renames and so produces the released layout. The tensor names
+match the real checkpoint's `model.safetensors.index.json`. The same test
+showed that the tiny parity config was too weak: at HF's init scale (0.02), a
+swapped expert gate and up stayed inside the logit tolerance. The suite now
+uses init scale 0.1. At that scale, each of these bugs fails the test: a
+swapped gate and up in the routed experts, the dense MLP, or the shared
+experts, and a zeroed router bias.

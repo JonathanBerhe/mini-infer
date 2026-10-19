@@ -13,9 +13,18 @@ plus three blocks:
 Inkling is a 975B-total / 41B-active decoder-only MoE (66 layers, hidden
 6144, vocab 201024 padded / 200058 real, 1M-token context). Inkling-Small
 (276B/12B) shares the architecture. The released checkpoints are multimodal
-(`InklingForConditionalGeneration`, `model.language_model.*` weight prefix);
-we port the text path only and drop the vision/audio towers and MTP draft
-weights at load.
+(`InklingForConditionalGeneration`). We port the text path only and drop the
+vision/audio towers and MTP draft weights at load.
+
+The released files keep Thinking Machines' tensor names under `model.llm.*`.
+For example, `attn.wq_du` is the query projection, `attn_norm` is the
+pre-attention norm, and `mlp.gate.bias` is the router's selection bias. The
+gate and up projections are fused into one `w13` tensor whose rows alternate
+gate, up, gate, up. transformers renames and de-interleaves these at load
+(its `conversion_mapping.py`, entry `inkling_mm_model`). Our loader applies
+the same renames in `_RELEASED_RENAMES` and `_released_to_hf`
+(`models/inkling.py`). Thus it reads the released files and HF's in-memory
+names (`model.language_model.*`) alike.
 
 ## The decoder layer
 
@@ -129,6 +138,12 @@ vs 8):
   boundary;
 - component parity: gate (indices, weights, gammas) vs `InklingTopkRouter`;
   SConv full-sequence vs stepped-with-tails.
+
+A separate test writes a tiny checkpoint with transformers' `save_pretrained`,
+which produces the released on-disk layout. It loads that checkpoint through
+`load_model` and compares the logits with HF. The tiny weights use init scale
+0.1, not HF's 0.02. At 0.02 the logits are near 2e-2, so a swapped gate and up
+moves them less than the 1e-3 tolerance.
 
 Known HF quirk: transformers 5.14 crashes on prompts shorter than the conv
 kernel (4 tokens) in its cached path; our port handles them (zero left-pad),

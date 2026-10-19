@@ -44,8 +44,10 @@ additive mask consumed by `packed_attention_torch`'s `block_mask` path
 (the MiniMax-M3 MSA precedent); no flash/FlashInfer kernel takes a
 per-head additive bias, so the model pins the `torch` attention backend,
 exactly as HF disables flash-attn for this family. Multi-token-prediction
-(MTP) draft weights are dropped at load. Single-rank only for now (the
-SConv channel dim would shard with TP's KV split; deferred).
+(MTP) draft weights are dropped at load. `load_weights` reads both the
+released checkpoint's tensor names (`model.llm.*`) and HF's in-memory ones.
+Single-rank only for now (the SConv channel dim would shard with TP's KV
+split; deferred).
 """
 
 from __future__ import annotations
@@ -416,8 +418,33 @@ _SHARED_STACKED_RE = re.compile(r"^(model\.layers\.\d+)\.mlp\.shared_experts\.(g
 _SHARED_W = {"gate": "w1", "up": "w3", "down": "w2"}
 # HF wraps each SConv weight in an nn.Conv1d: (C, 1, K) -> our (C, K).
 _SCONV_RE = re.compile(r"^(.*\.(?:k|v|attn|mlp)_sconv)\.conv1d\.weight$")
-# Drop: vision / audio towers and MTP draft layers.
-_DROP_RE = re.compile(r"(^|\.)(vision_tower|audio_tower|mtp)\.")
+# Drop: vision / audio towers and MTP draft layers, under both the HF names
+# (`vision_tower`, `audio_tower`) and the released ones (`visual`, `audio`).
+_DROP_RE = re.compile(r"(^|\.)(vision_tower|audio_tower|visual|audio|mtp)\.")
+# The released checkpoints keep Thinking Machines' tensor names (`model.llm.*`);
+# transformers renames them at load (`conversion_mapping.py`, entry
+# "inkling_mm_model"). These are the same renames, applied in order, so the
+# HF-name remap below serves both layouts. The fused gate/up tensors are
+# handled separately in `_released_to_hf`.
+_RELEASED_RENAMES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^model\.llm\.embed\."), "model.language_model.embed_tokens."),
+    (re.compile(r"^model\.llm\.unembed\."), "lm_head."),
+    (re.compile(r"^model\.llm\."), "model.language_model."),
+    (re.compile(r"\.attn\.wq_du\."), ".self_attn.q_proj."),
+    (re.compile(r"\.attn\.wk_dv\."), ".self_attn.k_proj."),
+    (re.compile(r"\.attn\.wv_dv\."), ".self_attn.v_proj."),
+    (re.compile(r"\.attn\.wr_du\."), ".self_attn.r_proj."),
+    (re.compile(r"\.attn\.wo_ud\."), ".self_attn.o_proj."),
+    # The rest of the attention block (q/k norms, k/v SConvs, rel_logits_proj).
+    (re.compile(r"\.attn\."), ".self_attn."),
+    (re.compile(r"_sconv\.weight$"), "_sconv.conv1d.weight"),
+    (re.compile(r"\.attn_norm\."), ".input_layernorm."),
+    (re.compile(r"\.mlp_norm\."), ".post_attention_layernorm."),
+    (re.compile(r"\.mlp\.w2_md\."), ".mlp.down_proj."),
+    (re.compile(r"\.mlp\.experts\.w2_weight$"), ".mlp.experts.down_proj"),
+    (re.compile(r"\.mlp\.shared_experts\.shared_w2_weight$"), ".mlp.shared_experts.down_proj"),
+    (re.compile(r"\.mlp\.gate\.bias$"), ".mlp.gate.e_score_correction_bias"),
+]
 
 
 @register_model
@@ -521,22 +548,53 @@ class InklingForCausalLM(BaseCausalLM):
             )
 
 
-def _remap_inkling_state(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """HF tensors -> our module keys.
+def _released_to_hf(key: str, tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+    """One released-checkpoint tensor -> its HF in-memory name(s) and value(s).
 
-    Handles both the text-only `InklingForCausalLM` layout (`model.*`) and
-    the multimodal `InklingForConditionalGeneration` one
-    (`model.language_model.*` + dropped vision/audio towers). Stacked-3D
+    The fused gate/up tensors (`w13`) store gate and up rows interleaved,
+    `[g0, u0, g1, u1, ...]`, along their output dim. transformers
+    de-interleaves them with its `Interleave` op, so even rows are gate and
+    odd rows are up. The routed experts become HF's stacked `gate_up_proj`
+    (gate half first); the dense MLP and the shared experts split in two.
+    """
+    for pattern, replacement in _RELEASED_RENAMES:
+        key = pattern.sub(replacement, key, count=1)
+    if key.endswith(".mlp.w13_dn.weight"):  # (2*I, H)
+        prefix = key.removesuffix("w13_dn.weight")
+        return {prefix + "gate_proj.weight": tensor[0::2], prefix + "up_proj.weight": tensor[1::2]}
+    if key.endswith(".mlp.experts.w13_weight"):  # (E, 2*I, H)
+        prefix = key.removesuffix("w13_weight")
+        return {prefix + "gate_up_proj": torch.cat([tensor[:, 0::2], tensor[:, 1::2]], dim=1)}
+    if key.endswith(".mlp.shared_experts.shared_w13_weight"):  # (S, 2*I, H)
+        prefix = key.removesuffix("shared_w13_weight")
+        return {prefix + "gate_proj": tensor[:, 0::2], prefix + "up_proj": tensor[:, 1::2]}
+    return {key: tensor}
+
+
+def _remap_inkling_state(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Checkpoint tensors -> our module keys.
+
+    Accepts three layouts: the released checkpoint (`model.llm.*`, translated
+    to HF names by `_released_to_hf`), HF's multimodal in-memory names
+    (`model.language_model.*`), and HF's text-only ones (`model.*`). The
+    vision and audio towers and the MTP draft layers are dropped. Stacked-3D
     expert tensors split into per-expert `MixtralExpert` weights; SConv
     weights lose HF's Conv1d singleton dim.
     """
+    hf_named: dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        if _DROP_RE.search(key):
+            continue
+        if key.startswith("model.llm."):
+            hf_named.update(_released_to_hf(key, tensor))
+        else:
+            hf_named[key] = tensor
+
     remapped: dict[str, torch.Tensor] = {}
-    for raw_key, tensor in hf_state_dict.items():
+    for raw_key, tensor in hf_named.items():
         key = raw_key
         if key.startswith("model.language_model."):
             key = "model." + key[len("model.language_model.") :]
-        if _DROP_RE.search(key):
-            continue
 
         gate_up = _EXPERT_GATE_UP_RE.match(key)
         if gate_up is not None:  # (E, 2*I, H): per expert -> w1 / w3
