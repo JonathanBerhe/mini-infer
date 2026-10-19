@@ -52,7 +52,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -1347,6 +1348,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         *,
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
+        config_overrides: Mapping[str, Any] | None = None,
     ) -> DeepseekV4ForCausalLM:
         """Load a V4 checkpoint into a ready-to-run model on `device`.
 
@@ -1369,6 +1371,12 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         Under tensor parallelism, initialise the process group and set the
         per-rank CUDA device BEFORE calling this; `load_weights` reads the
         current rank / world size to slice each shard.
+
+        `config_overrides` replaces fields of the parsed `DeepseekV4Config`
+        before construction, for example `{"simulate_act_quant": True}` to run
+        the reference's QAT round trips on a released checkpoint. An unknown
+        field name raises `ValueError`; the config's own validation then runs
+        on the result.
         """
         from mini_infer.models.loader import load_safetensors_state_dict
 
@@ -1382,6 +1390,14 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         with config_path.open() as config_file:
             hf_config = json.load(config_file)
         cfg = DeepseekV4Config.from_hf(hf_config)
+        if config_overrides:
+            known_fields = {field.name for field in fields(cfg)}
+            unknown = sorted(set(config_overrides) - known_fields)
+            if unknown:
+                raise ValueError(
+                    f"unknown DeepseekV4Config field(s) in config_overrides: {unknown}"
+                )
+            cfg = replace(cfg, **config_overrides)
 
         # Meta construction: allocate parameter metadata without backing
         # storage, then let `load_weights` place each tensor on `device`.

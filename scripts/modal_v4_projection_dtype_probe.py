@@ -28,10 +28,19 @@ Same load path as `scripts/modal_v4_flash_generate.py` (per-rank
 `from_checkpoint`, tensor parallelism over 2 ranks). Ranks must agree on the
 generated tokens; the report is taken from rank 0.
 
+`--simulate-act-quant` loads the model with the reference's FP8 / FP4 round
+trips on the KV entries and the indexer (`DeepseekV4Config.simulate_act_quant`);
+`--simulate-fp8-gemm-inputs` adds the FP8 rounding of the inputs to the GEMMs
+whose weights are FP8 or FP4. Together they are the numerics of DeepSeek's
+reference inference code, which vLLM's quantized path follows.
+
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_projection_dtype_probe.py \
         --prompt-token-cap 8192 --max-new-tokens 32 \
         --out docs/benchmarks/data/v4-projection-dtype-probe.json
+    HF_TOKEN=<token> uv run modal run scripts/modal_v4_projection_dtype_probe.py \
+        --simulate-act-quant --simulate-fp8-gemm-inputs --skip-gemm-bench \
+        --out docs/benchmarks/data/v4-projection-dtype-probe-qat.json
 """
 
 from __future__ import annotations
@@ -184,6 +193,7 @@ def _run_one_rank(
     max_new_tokens: int,
     pairs: list[str],
     run_gemm_bench: bool,
+    config_overrides: dict[str, bool],
 ) -> dict[str, Any]:
     import time
 
@@ -207,9 +217,13 @@ def _run_one_rank(
     try:
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
-        _checkpoint(rank, f"loading V4-Flash via from_checkpoint onto {device}...")
+        _checkpoint(
+            rank,
+            f"loading V4-Flash via from_checkpoint onto {device} "
+            f"(config overrides: {config_overrides or 'none'})...",
+        )
         model = DeepseekV4ForCausalLM.from_checkpoint(
-            _MODEL_NAME, device=device, dtype=torch.bfloat16
+            _MODEL_NAME, device=device, dtype=torch.bfloat16, config_overrides=config_overrides
         )
         model.eval()
         tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
@@ -247,6 +261,8 @@ def _run_one_rank(
         return {
             "rank": rank,
             "n_prompt_tokens": len(prompt_ids),
+            "config_overrides": config_overrides,
+            "moe_swiglu_limit": model.cfg.moe_swiglu_limit,
             "reports": reports,
             "report_texts": report_texts,
             "pair_seconds": pair_seconds,
@@ -270,11 +286,18 @@ def _child_entry(
     max_new_tokens: int,
     pairs: list[str],
     run_gemm_bench: bool,
+    config_overrides: dict[str, bool],
     queue: Any,
 ) -> None:
     try:
         result = _run_one_rank(
-            rank, world_size, prompt_token_cap, max_new_tokens, pairs, run_gemm_bench
+            rank,
+            world_size,
+            prompt_token_cap,
+            max_new_tokens,
+            pairs,
+            run_gemm_bench,
+            config_overrides,
         )
         queue.put(("ok", result))
     except Exception:
@@ -331,7 +354,11 @@ def _collect_rank_results(processes: list[Any], queue: Any) -> list[dict[str, An
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
 def probe(
-    prompt_token_cap: int, max_new_tokens: int, pairs: list[str], run_gemm_bench: bool
+    prompt_token_cap: int,
+    max_new_tokens: int,
+    pairs: list[str],
+    run_gemm_bench: bool,
+    config_overrides: dict[str, bool],
 ) -> dict[str, Any]:
     import torch.multiprocessing as mp
 
@@ -347,6 +374,7 @@ def probe(
                 max_new_tokens,
                 pairs,
                 run_gemm_bench,
+                config_overrides,
                 queue,
             ),
         )
@@ -372,13 +400,29 @@ def main(
     max_new_tokens: int = 32,
     pairs: str = ",".join(_PAIR_NAMES),
     skip_gemm_bench: bool = False,
+    simulate_act_quant: bool = False,
+    simulate_fp8_gemm_inputs: bool = False,
     out: str = "v4_projection_dtype_probe.json",
 ) -> None:
     pair_names = _parse_pairs(pairs)  # fail before any GPU time is spent
-    result = probe.remote(prompt_token_cap, max_new_tokens, pair_names, not skip_gemm_bench)
+    if simulate_fp8_gemm_inputs and not simulate_act_quant:
+        raise ValueError("--simulate-fp8-gemm-inputs requires --simulate-act-quant")
+    # The reference's FP8 / FP4 round trips (off by default in the port).
+    config_overrides: dict[str, bool] = {}
+    if simulate_act_quant:
+        config_overrides["simulate_act_quant"] = True
+    if simulate_fp8_gemm_inputs:
+        config_overrides["simulate_fp8_gemm_inputs"] = True
+    result = probe.remote(
+        prompt_token_cap, max_new_tokens, pair_names, not skip_gemm_bench, config_overrides
+    )
     rank0 = result["rank0"]
     print(f"\nranks agree (TP consistency, every pair): {result['ranks_agree']}")
     print(f"device: {rank0['device_name']}  torch: {rank0['torch_version']}")
+    print(
+        f"config overrides: {rank0['config_overrides'] or 'none'}  "
+        f"moe_swiglu_limit: {rank0['moe_swiglu_limit']}"
+    )
     print(
         f"fp32-out policy used torch.mm(out_dtype=float32): {rank0['mm_fp32_out_kernel']}  "
         f"peak memory rank 0: {rank0['peak_memory_gb']:.1f} GB"

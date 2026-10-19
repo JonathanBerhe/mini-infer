@@ -414,3 +414,53 @@ def test_from_checkpoint_round_trips_a_synthetic_v4_checkpoint(tmp_path) -> None
     # And the loaded model generates through the StateCache path.
     out = StateCacheGenerator(loaded).generate_ids(list(range(8)), max_new_tokens=4)
     assert len(out) == 4
+
+
+def test_from_checkpoint_applies_config_overrides(tmp_path) -> None:
+    """`config_overrides` switches on the QAT round trips for a saved checkpoint.
+
+    The config uses dims the round trips accept: the non-RoPE KV width (72 - 8)
+    is one FP8 block of 64, and the indexer head dim is 32. The checkpoint's
+    own config.json leaves `simulate_act_quant` off.
+    """
+    import dataclasses
+    import json
+
+    from safetensors.torch import save_file
+
+    from mini_infer.models.blocks.v4.compressor import TokenLevelCompressor
+
+    cfg = dataclasses.replace(_make_config(), kv_head_dim=72, index_head_dim=32)
+    torch.manual_seed(0)
+    source = DeepseekV4ForCausalLM(cfg).eval()
+    config_json = {**dataclasses.asdict(cfg), "architectures": ["DeepseekV4ForCausalLM"]}
+    (tmp_path / "config.json").write_text(json.dumps(config_json))
+    save_file(
+        {k: v.detach().clone().contiguous() for k, v in source.state_dict().items()},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    plain = DeepseekV4ForCausalLM.from_checkpoint(str(tmp_path), device="cpu", dtype=torch.float32)
+    quantized = DeepseekV4ForCausalLM.from_checkpoint(
+        str(tmp_path),
+        device="cpu",
+        dtype=torch.float32,
+        config_overrides={"simulate_act_quant": True},
+    )
+    assert not plain.cfg.simulate_act_quant
+    assert quantized.cfg.simulate_act_quant
+    compressors = [m for m in quantized.modules() if isinstance(m, TokenLevelCompressor)]
+    assert compressors and all(c.act_quant is not None for c in compressors)
+
+    input_ids = torch.tensor([list(range(16))], dtype=torch.long)  # (1, 16)
+    with torch.inference_mode():
+        plain_logits = plain(input_ids)  # (1, 16, V)
+        quantized_logits = quantized(input_ids)  # (1, 16, V)
+    torch.testing.assert_close(plain_logits, source(input_ids), rtol=1e-4, atol=1e-5)
+    assert torch.isfinite(quantized_logits).all()
+    assert not torch.equal(plain_logits, quantized_logits)
+
+    with pytest.raises(ValueError, match="unknown DeepseekV4Config field"):
+        DeepseekV4ForCausalLM.from_checkpoint(
+            str(tmp_path), device="cpu", config_overrides={"not_a_field": 1}
+        )
