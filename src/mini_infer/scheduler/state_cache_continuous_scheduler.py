@@ -46,6 +46,7 @@ from mini_infer.engine.state_cache_generator import (
     StateCacheGenerator,
     prefill_with_prefix_cache,
 )
+from mini_infer.exceptions import EngineNotRunningError
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -53,6 +54,7 @@ from mini_infer.scheduler.request_state import (
     Request,
     RequestHandle,
     RunningRequest,
+    StepQueue,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,11 +107,18 @@ class StateCacheContinuousScheduler:
         # names a concrete cache type.
         self._cache: Any = None
         self._slots: list[_Slot | None] = [None] * max_batch_size
+        # See `ContinuousScheduler._stopping` and `ContinuousScheduler._crashed`.
+        self._stopping = False
+        self._crashed = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        if self._crashed:
+            # Requests of the crashed thread must not move to the new one. See ADR-028.
+            self._end_in_flight(crashed=True)
         self._stop_event.clear()
+        self._crashed = False
         self._cache = self._model.build_state_cache(
             max_seq_len=self._max_seq_len,
             batch_size=self._max_batch_size,
@@ -123,20 +132,52 @@ class StateCacheContinuousScheduler:
         self._thread.start()
 
     def stop(self, timeout: float = 10.0) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        """Join the engine thread and end what is left, as `ContinuousScheduler.stop` does."""
+        self._stopping = True
+        try:
+            self._stop_event.set()
+            thread = self._thread
+            if thread is not None:
+                thread.join(timeout=timeout)
+                self._thread = None
+                if not thread.is_alive():
+                    self._end_in_flight(crashed=self._crashed)
+        finally:
+            self._stopping = False
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the engine thread is alive, so False after a crash."""
+        return self._thread is not None and self._thread.is_alive()
 
     def submit(self, request: Request) -> RequestHandle:
-        if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError("scheduler not running; call start() before submit()")
+        """Enqueue a request. Its handle raises `EngineNotRunningError` if the thread dies."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            raise EngineNotRunningError("scheduler not running; call start() before submit()")
         running = RunningRequest(
             request=request,
-            output_queue=queue.Queue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
+            output_queue=StepQueue(maxsize=self.DEFAULT_OUTPUT_QUEUE_SIZE),
         )
         self._waiting.put(running)
-        return RequestHandle(running)
+        thread_alive = thread.is_alive
+        return RequestHandle(running, engine_alive=lambda: thread_alive() or self._stopping)
+
+    def _end_in_flight(self, *, crashed: bool) -> None:
+        """End every request in a slot or waiting. Call only after the engine thread exits.
+
+        The cache rows need no cleanup, because `start()` builds a new cache.
+        """
+        leftover = [slot.request for slot in self._slots if slot is not None]
+        self._slots = [None] * self._max_batch_size
+        while True:
+            try:
+                leftover.append(self._waiting.get_nowait())
+            except queue.Empty:
+                break
+        if not crashed:
+            for running in leftover:
+                self._finish(running, "cancelled")
 
     def run(self, request: Request) -> GenerationResult:
         return self.submit(request).wait()
@@ -162,6 +203,7 @@ class StateCacheContinuousScheduler:
                 self._decode_step()
         except Exception:
             logger.exception("state-cache continuous engine thread crashed")
+            self._crashed = True
             raise
 
     def _admit(self) -> None:
@@ -247,7 +289,7 @@ class StateCacheContinuousScheduler:
             current_text = tokenizer.decode(request.tokens_generated)
             delta = current_text[len(request.last_text) :]
             request.last_text = current_text
-            self._emit(request, GenerationStep(text=delta))
+            self._emit(request, GenerationStep(text=delta, num_tokens=1))
             if len(request.tokens_generated) >= request.request.max_tokens:
                 self._finish(request, "length")
                 self._slots[slot_idx] = None

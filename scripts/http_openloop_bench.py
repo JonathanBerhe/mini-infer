@@ -146,6 +146,12 @@ async def _one_request(
                         chunk = json.loads(body)
                     except json.JSONDecodeError:
                         continue
+                    if "error" in chunk:
+                        # The engine failed during the stream. The server still
+                        # ends the stream with [DONE], so this event is the only
+                        # sign that the request did not finish.
+                        error = f"stream error: {chunk['error'].get('message')}"
+                        break
                     choices = chunk.get("choices") or [{}]
                     text = choices[0].get("text", "")
                     if text:

@@ -1,7 +1,7 @@
 """OpenAI-compatible HTTP API for mini-infer.
 
 Security posture (the server is meant to run behind a trusted reverse proxy
-or on localhost — these guards are belt-and-suspenders):
+or on localhost, so these guards are belt-and-suspenders):
 
 - Defaults to binding `127.0.0.1`. Set `MINI_INFER_HOST=0.0.0.0` to expose.
 - Optional bearer-token auth: set `MINI_INFER_API_KEY=<secret>` and clients
@@ -14,9 +14,16 @@ or on localhost — these guards are belt-and-suspenders):
   and cancels the request when the client drops the connection.
 - A global exception handler converts uncaught engine errors into a sanitized
   503 instead of letting FastAPI emit a stack trace.
+- A dead engine thread gives a 503 `engine_unavailable` until the server restarts.
+  A stream that already started gets an SSE error event and then `[DONE]`.
+- If the engine fails one request and keeps running, that request gets a 500
+  `server_error` (or an SSE error event). Only the server log holds the exception text.
+- Requests wait for output on the event loop (`RequestHandle.get_step_async`),
+  so no thread pool limits the requests in flight. See ADR-029.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -44,6 +51,7 @@ from mini_infer.engine.model_runner import (
 )
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
+from mini_infer.exceptions import EngineNotRunningError, RequestFailedError
 from mini_infer.models import architecture_uses_state_cache
 from mini_infer.scheduler import (
     ContinuousScheduler,
@@ -182,7 +190,7 @@ async def completions(
     req: CompletionRequest,
     fastapi_req: FastAPIRequest,
     _auth: None = Depends(_verify_auth),
-) -> StreamingResponse | CompletionResponse:
+) -> StreamingResponse | JSONResponse | CompletionResponse:
     scheduler: ContinuousScheduler | PDScheduler | StateCacheContinuousScheduler = (
         fastapi_req.app.state.scheduler
     )
@@ -198,22 +206,39 @@ async def completions(
     completion_id = f"cmpl-{uuid4().hex[:12]}"
     created = int(time.time())
 
-    if req.stream:
+    try:
         handle = scheduler.submit(internal)
+    except EngineNotRunningError:
+        logger.error("%s: rejected, the engine is not running", completion_id)
+        return _engine_unavailable_response()
+
+    if req.stream:
 
         async def event_stream() -> AsyncIterator[str]:
             """Stream generation steps as SSE.
 
             A background watcher polls `fastapi_req.is_disconnected` every
             100 ms; on client drop it calls `handle.cancel()`, which makes
-            the engine emit a terminal step and unblocks the consumer's
-            `get_step()` so resources (KV blocks, batch slot) are freed
+            the engine emit a terminal step and wakes the consumer's
+            `get_step_async()` so resources (KV blocks, batch slot) are freed
             promptly.
+
+            The 200 status goes out before the first step, so errors arrive as an
+            error event, then `[DONE]`, as in vLLM and SGLang. The OpenAI client raises on it.
             """
             watcher = asyncio.create_task(_watch_disconnect(fastapi_req, handle))
             try:
                 while True:
-                    step = await asyncio.to_thread(handle.get_step)
+                    try:
+                        step = await handle.get_step_async()
+                    except EngineNotRunningError:
+                        logger.error("%s: the engine stopped mid-stream", completion_id)
+                        yield f"data: {json.dumps(_ENGINE_UNAVAILABLE)}\n\n"
+                        break
+                    except RequestFailedError:
+                        logger.error("%s: the engine failed the request mid-stream", completion_id)
+                        yield f"data: {json.dumps(_REQUEST_FAILED)}\n\n"
+                        break
                     chunk = CompletionChunk(
                         id=completion_id,
                         created=created,
@@ -232,7 +257,25 @@ async def completions(
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    result = scheduler.run(internal)
+    # Read the steps on the event loop, as the stream does (see ADR-029). If this
+    # coroutine is cancelled, the cancel in `finally` frees the batch slot. On a
+    # finished request it does nothing.
+    try:
+        text_parts: list[str] = []
+        while True:
+            step = await handle.get_step_async()
+            if step.finish_reason is not None:
+                break
+            text_parts.append(step.text)
+    except EngineNotRunningError:
+        logger.error("%s: the engine stopped before the request finished", completion_id)
+        return _engine_unavailable_response()
+    except RequestFailedError:
+        logger.error("%s: the engine failed the request", completion_id)
+        return JSONResponse(status_code=500, content=_REQUEST_FAILED)
+    finally:
+        handle.cancel()
+    result = handle.build_result("".join(text_parts), step.finish_reason)
     return CompletionResponse(
         id=completion_id,
         created=created,
@@ -246,14 +289,29 @@ async def completions(
     )
 
 
+# Fixed messages, because a response must not carry internal state. A 503 means the
+# engine is down for all requests. A 500 means it failed only this request.
+_ENGINE_UNAVAILABLE = {"error": {"type": "engine_unavailable", "message": "engine is not running"}}
+_REQUEST_FAILED = {
+    "error": {
+        "type": "server_error",
+        "message": "the engine failed while processing this request",
+    }
+}
+
+
+def _engine_unavailable_response() -> JSONResponse:
+    return JSONResponse(status_code=503, content=_ENGINE_UNAVAILABLE)
+
+
 async def _watch_disconnect(fastapi_req: FastAPIRequest, handle: RequestHandle) -> None:
     """Poll the client's connection; cancel the request when it drops.
 
     Runs as a background task during streaming. When the client closes
     the SSE connection, calling `handle.cancel()` makes the engine emit a
-    terminal step at its next safe point, which unblocks the main stream
-    loop's `get_step()` call so the response generator returns and FastAPI
-    cleans up.
+    terminal step at its next safe point, which wakes the main stream
+    loop's `get_step_async()` call so the response generator returns and
+    FastAPI cleans up.
     """
     try:
         while True:
