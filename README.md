@@ -53,6 +53,7 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 |---|---|---|
 | `Qwen2ForCausalLM` | Qwen2.5 0.5B to 32B | |
 | `Qwen3ForCausalLM` | Qwen3 0.6B to 32B | [doc](docs/architectures/qwen3.md) |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.8-27B, Qwen3.5, Qwen3.6 (text only) | [doc](docs/architectures/qwen3-5.md) |
 | `LlamaForCausalLM` | Llama 2/3/4, SmolLM2, TinyLlama, Nemotron | [doc](docs/architectures/llama.md) |
 | `MistralForCausalLM` | Mistral 7B, Small, Large | [doc](docs/architectures/mistral.md) |
 | `Gemma3ForCausalLM` | Gemma 3 1B, 4B | [doc](docs/architectures/gemma-3.md) |
