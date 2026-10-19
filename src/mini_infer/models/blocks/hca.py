@@ -74,6 +74,7 @@ from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4 import (
     AttentionSink,
     GroupedOutputProjection,
+    SimulatedActQuant,
     TokenLevelCompressor,
 )
 
@@ -271,6 +272,7 @@ class HCAAttention(nn.Module):
         window_size: int,
         compression_ratio: int,
         rms_norm_eps: float = 1e-6,
+        act_quant: SimulatedActQuant | None = None,
     ) -> None:
         super().__init__()
         if rope_head_dim < 0 or rope_head_dim > kv_head_dim:
@@ -296,6 +298,11 @@ class HCAAttention(nn.Module):
         self.window_size = window_size
         self.compression_ratio = compression_ratio
         self.rms_norm_eps = rms_norm_eps
+        # Reference QAT round trip (FP8 on the non-RoPE dims) for the window
+        # KV and the compressed KV; `None` keeps both at full precision.
+        if act_quant is not None:
+            act_quant.check_kv_dims(kv_head_dim, rope_head_dim)
+        self.act_quant = act_quant
 
         # --- Q low-rank path: H -> wq_a -> q_norm -> wq_b -> per-head q-norm (no scale).
         # `q_a_proj` produces a small replicated latent; `q_b_proj` expands
@@ -315,6 +322,7 @@ class HCAAttention(nn.Module):
             rope_head_dim=rope_head_dim,
             compression_ratio=compression_ratio,
             rms_norm_eps=rms_norm_eps,
+            act_quant=act_quant,
         )
 
         # --- Per-head attention sink.
@@ -375,6 +383,8 @@ class HCAAttention(nn.Module):
         swa_kv = self.kv_norm(swa_kv)
         if rd > 0:
             swa_kv = apply_partial_rope_last_n_dims(swa_kv, cos_t, sin_t, rd)
+        if self.act_quant is not None:
+            swa_kv = self.act_quant.kv(swa_kv, rd)
 
         # ---- Compressed K=V ----
         compressed_kv = self.compressor(hidden_states, compressed_position_embeddings)
@@ -487,6 +497,8 @@ class HCAAttention(nn.Module):
             swa_kv = apply_partial_rope_last_n_dims(
                 swa_kv, cos_for_tokens, sin_for_tokens, rope_dim
             )
+        if self.act_quant is not None:
+            swa_kv = self.act_quant.kv(swa_kv, rope_dim)
 
         # ---- Compressed K=V via cache-aware compressor (mutates in-flight state) ----
         compressed_kv = self.compressor.forward_prefill_with_cache(
@@ -625,6 +637,8 @@ class HCAAttention(nn.Module):
         new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))  # (B, 1, c)
         if rd > 0:
             new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rd)
+        if self.act_quant is not None:
+            new_swa = self.act_quant.kv(new_swa, rd)
         state.swa_kv[:, start_pos % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
         state.swa_count = min(state.swa_count + 1, n_win)
 
@@ -743,6 +757,8 @@ class HCAAttention(nn.Module):
         new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))
         if rd > 0:
             new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rd)
+        if self.act_quant is not None:
+            new_swa = self.act_quant.kv(new_swa, rd)
         state.swa_kv[rows, positions % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
 
         # ---- Ragged compressor step: flushes only the rows that close a block ----

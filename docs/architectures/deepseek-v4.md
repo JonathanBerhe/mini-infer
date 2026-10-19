@@ -403,6 +403,72 @@ V4-Pro inference reference) sit alongside the unit tests under the
 same `tests/unit/` directory; the V4 model-level test is the
 end-to-end gate.
 
+## Activation quantization: two modes
+
+DeepSeek trained V4 with quantization-aware training (QAT): training
+rounded some attention activations to low-precision formats. The
+reference inference code repeats that rounding. It quantizes a tensor
+and converts it straight back (a round trip), so attention sees the
+rounding that the model learned with. Three points get a round trip:
+
+| Where (reference) | Reference call | Round trip |
+|---|---|---|
+| Window KV after RoPE (`Attention.forward`) | `act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)` | FP8 e4m3 on the non-RoPE dims, one scale per 64 values |
+| Main compressor output after RoPE (`Compressor.forward`, `rotate=False`) | same call | same |
+| Indexer keys and indexer queries (`Compressor.forward` with `rotate=True`, `Indexer.forward`) | `rotate_activation(x)`, then `fp4_act_quant(x, 32, True)` | Hadamard rotation, then FP4 e2m1 on all dims, one scale per 32 values |
+
+The RoPE dims of the KV stay unquantized. With `scale_fmt="ue8m0"`,
+which every released V4 config sets, each FP8 scale is rounded up to a
+power of two. FP4 scales are always powers of two.
+
+`DeepseekV4Config.simulate_act_quant` selects one of two modes:
+
+- Off (the default). The port skips the round trips. Window KV,
+  compressed KV and the Lightning Indexer run at the working precision
+  (FP32 on CPU, BF16 on GPU). This is more precise than the reference's
+  real inference path. The identity-stub parity tests pin this mode:
+  they replace the reference quantizers with functions that return
+  their input.
+- On. The port applies the same round trips at the same points. This
+  covers prefill, cache-aware prefill, decode and ragged decode, in SWA,
+  CSA and HCA layers. `act_quant_scale_fmt` mirrors the reference's
+  `scale_fmt` (`"ue8m0"` or `None`).
+
+The code is in `blocks/v4/act_quant.py`. It transcribes the tilelang
+kernels and the Hadamard transform into PyTorch. Like the kernels, it
+computes in FP32 and casts back to the input dtype. Each attention
+block takes `act_quant: SimulatedActQuant | None`, and `None` means off.
+On mode needs `kv_head_dim - rope_head_dim` to be a multiple of 64 and
+`index_head_dim` to be a power of two and a multiple of 32. V4 meets
+both (448 and 128). The block constructors check this.
+
+The mode matters most for the indexer. FP8 moves each KV value by a
+small relative amount, because e4m3 keeps 3 mantissa bits. FP4 is
+coarse: each e2m1 value is 0, 0.5, 1, 1.5, 2, 3, 4 or 6 times its
+block scale. That rounding changes the indexer scores enough to change
+which compressed blocks the top-k selects. On the synthetic parity
+config, the off mode against the quantized reference fell to cosine
+0.955 on one CSA decode step. The on mode stayed within a relative
+error of 2e-7.
+
+The quantized-mode parity tests (`pytest tests/unit -k act_quant`) run
+the reference with real PyTorch mirrors of its quantizer kernels in
+place of the identity stubs. On mode then matches the reference's
+quantized dims and indexer keys bit for bit, and its indexer top-k
+picks exactly. The RoPE dims differ only by last-bit RoPE rounding.
+
+Two limits apply:
+
+- On mode simulates the QAT round trips only. The reference also
+  quantizes the inputs of its FP8 and FP4 weight GEMMs to FP8 (in
+  `linear()`). The port dequantizes those weights and runs plain
+  matmuls, so it does not simulate that rounding.
+- The CPU tests compare against PyTorch mirrors of the kernels, not
+  against a GPU run. The CUDA Hadamard kernel sums in a different
+  order. A value that falls exactly on an FP4 rounding boundary can
+  then round the other way, so bit equality with a GPU run is not
+  guaranteed.
+
 ## Where we diverged + why
 
 Pulled out into [ADR-014](../decisions/ADR-014-deepseek-v4-hybrid-attention.md):
