@@ -32,6 +32,7 @@ from mini_infer.bench.v4_projection_dtype_probe import (
     _summarize_logits,
     applied_policy,
     attention_blocks,
+    block_means,
     block_stderr,
     make_synthetic_hybrid_config,
     run_paired_prefill,
@@ -318,6 +319,14 @@ def test_block_stderr() -> None:
     assert block_stderr(torch.zeros(1)) is None
 
 
+def test_block_means_keeps_a_short_last_block() -> None:
+    values = torch.tensor([1.0, 3.0, 5.0, 7.0, 10.0])  # (5,)
+    assert block_means(values, block_size=2) == (2.0, 6.0, 10.0)
+    assert block_means(torch.zeros(0), block_size=4) == ()
+    with pytest.raises(ValueError, match="block_size"):
+        block_means(values, block_size=0)
+
+
 def test_projection_policy_names_and_validation() -> None:
     assert FP32_OUT.name == "float32"
     assert NATIVE_OUT.name == "native"
@@ -390,6 +399,11 @@ def test_paired_prefill_controls_report_zero_drift(
     assert lg.mean_nll_delta == 0.0 and lg.nll_delta_block_stderr == 0.0
     assert lg.baseline_mean_nll == lg.alternate_mean_nll > 0.0
     assert lg.baseline_top1_accuracy == lg.alternate_top1_accuracy
+    assert lg.nll_block_size == 256
+    # 127 scored positions fit in one block of 256; both runs agree exactly.
+    assert len(lg.baseline_nll_by_block) == 1
+    assert lg.baseline_nll_by_block == lg.alternate_nll_by_block
+    assert lg.baseline_nll_by_block[0] == pytest.approx(lg.baseline_mean_nll, rel=1e-12)
     assert report.tokens.identical and report.tokens.n_generated == 4
 
 

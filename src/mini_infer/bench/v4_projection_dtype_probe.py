@@ -285,6 +285,12 @@ class LogitsDrift:
     nll_delta_block_stderr: float | None
     baseline_top1_accuracy: float
     alternate_top1_accuracy: float
+    # Mean NLL of each run over consecutive blocks of `nll_block_size` scored
+    # positions (the last block may be shorter): where along the prompt the
+    # predictions get better or worse.
+    nll_block_size: int
+    baseline_nll_by_block: tuple[float, ...]
+    alternate_nll_by_block: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -592,6 +598,16 @@ def _summarize_logits(
     )
 
 
+def block_means(values: torch.Tensor, *, block_size: int = _NLL_BLOCK_SIZE) -> tuple[float, ...]:
+    """Means of `(N,)` `values` over consecutive blocks of `block_size`; the last may be shorter."""
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    return tuple(
+        float(values[start : start + block_size].double().mean())
+        for start in range(0, values.shape[0], block_size)
+    )
+
+
 def block_stderr(values: torch.Tensor, *, block_size: int = _NLL_BLOCK_SIZE) -> float | None:
     """Standard error of `values.mean()` from the means of contiguous blocks.
 
@@ -669,6 +685,9 @@ def logits_drift(baseline: LogitsSummary, alternate: LogitsSummary) -> LogitsDri
         nll_delta_block_stderr=block_stderr(nll_delta),
         baseline_top1_accuracy=float(baseline.target_top1.float().mean()) if n_scored else 0.0,
         alternate_top1_accuracy=float(alternate.target_top1.float().mean()) if n_scored else 0.0,
+        nll_block_size=_NLL_BLOCK_SIZE,
+        baseline_nll_by_block=block_means(baseline.target_nll),
+        alternate_nll_by_block=block_means(alternate.target_nll),
     )
 
 
