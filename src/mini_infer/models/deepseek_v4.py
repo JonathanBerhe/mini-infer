@@ -69,6 +69,7 @@ from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4Decoder
 from mini_infer.models.blocks.hyper_connections import HCHeadReduction
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding
+from mini_infer.models.blocks.v4.act_quant import ScaleFormat, SimulatedActQuant
 
 # HF V4 -> mini-infer renames. Same MoE expert structure as V2/V3 (the
 # block geometry didn't change across generations), with the additional
@@ -392,6 +393,17 @@ class DeepseekV4Config:
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # Reference QAT activation round trips (see `blocks/v4/act_quant.py`).
+    # Off (default): window KV, compressed KV and the Lightning Indexer run
+    # at full working precision. On: FP8 e4m3 on the non-RoPE KV dims and
+    # Hadamard + FP4 e2m1 on the indexer's queries and keys, exactly where
+    # the reference inference code applies them. Needs
+    # `kv_head_dim - rope_head_dim` divisible by 64 and a power-of-two
+    # `index_head_dim` divisible by 32 (true for every released V4 config).
+    # `act_quant_scale_fmt` mirrors the reference's `scale_fmt`: "ue8m0"
+    # (power-of-two FP8 scales, every released V4 config) or None.
+    simulate_act_quant: bool = False
+    act_quant_scale_fmt: str | None = "ue8m0"
 
     def __post_init__(self) -> None:
         if len(self.compress_ratios) != self.num_hidden_layers:
@@ -427,6 +439,17 @@ class DeepseekV4Config:
                 )
         if self.use_hyper_connections and self.hc_mult <= 0:
             raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {self.hc_mult}")
+        if self.act_quant_scale_fmt not in ("ue8m0", None):
+            raise ValueError(
+                f"act_quant_scale_fmt must be 'ue8m0' or None; got {self.act_quant_scale_fmt!r}"
+            )
+
+    def act_quant(self) -> SimulatedActQuant | None:
+        """The per-layer QAT round-trip setting, or None when `simulate_act_quant` is off."""
+        if not self.simulate_act_quant:
+            return None
+        scale_fmt: ScaleFormat = "ue8m0" if self.act_quant_scale_fmt == "ue8m0" else None
+        return SimulatedActQuant(fp8_scale_fmt=scale_fmt)
 
     def is_csa_layer(self, layer_idx: int) -> bool:
         """CSA layers have compression_ratio == 4 (paper §4.2.1)."""
@@ -574,6 +597,9 @@ class DeepseekV4Config:
             hc_mult=int(_pick("hc_mult", default_value=0)),
             hc_sinkhorn_iters=int(_pick("hc_sinkhorn_iters", default_value=20)),
             hc_eps=float(_pick("hc_eps", default_value=1e-6)),
+            # Not part of the HF schema: off unless a caller's config dict opts in.
+            simulate_act_quant=bool(_pick("simulate_act_quant", default_value=False)),
+            act_quant_scale_fmt=_pick("act_quant_scale_fmt", default_value="ue8m0"),
         )
 
 
@@ -661,6 +687,7 @@ class _DeepseekV4InnerModel(nn.Module):
             index_num_heads=cfg.index_num_heads,
             index_head_dim=cfg.index_head_dim,
             index_top_k=cfg.index_top_k,
+            act_quant=cfg.act_quant(),
         )
         if cfg.use_moe_ffn:
             routing_mode = "hash" if cfg.is_hash_routed_layer(layer_idx) else "score_topk"

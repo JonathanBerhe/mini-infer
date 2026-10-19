@@ -245,12 +245,17 @@ def test_swa_forward_decode_ragged_matches_scalar_per_request() -> None:
 
 
 def _model_config(
-    *, use_moe_ffn: bool = False, use_hyper_connections: bool = False
+    *,
+    use_moe_ffn: bool = False,
+    use_hyper_connections: bool = False,
+    simulate_act_quant: bool = False,
 ) -> DeepseekV4Config:
     """Full hybrid stack: layer ratios (0, 4, 8, 4) = SWA, CSA, HCA, CSA.
 
     Exercises every V4 attention mode in the ragged decode, including the CSA
-    LightningIndexer (ratio 4) with its per-row masked top-k.
+    LightningIndexer (ratio 4) with its per-row masked top-k. With
+    `simulate_act_quant`, the KV and indexer dims widen to whole quantizer
+    blocks (non-RoPE KV width 64, indexer head dim 32).
     """
     return DeepseekV4Config(
         vocab_size=128,
@@ -259,14 +264,14 @@ def _model_config(
         num_hidden_layers=4,
         num_attention_heads=4,
         q_lora_rank=32,
-        kv_head_dim=32,
+        kv_head_dim=72 if simulate_act_quant else 32,
         rope_head_dim=8,
         o_num_groups=2,
         o_lora_rank=32,
         window_size=8,
         compress_ratios=(0, 4, 8, 4),
         index_num_heads=2,
-        index_head_dim=16,
+        index_head_dim=32 if simulate_act_quant else 16,
         index_top_k=2,
         rms_norm_eps=1e-6,
         rope_theta=10000.0,
@@ -283,6 +288,7 @@ def _model_config(
         hc_mult=4 if use_hyper_connections else 0,
         hc_sinkhorn_iters=20,
         hc_eps=1e-6,
+        simulate_act_quant=simulate_act_quant,
     )
 
 
@@ -307,21 +313,26 @@ def _clone_all_layers(cache: StateCache) -> list[dict[str, torch.Tensor]]:
 
 
 @pytest.mark.parametrize(
-    "use_moe_ffn,use_hyper_connections",
-    [(False, False), (True, False), (False, True)],
-    ids=["vanilla", "moe", "hyper_connections"],
+    "use_moe_ffn,use_hyper_connections,simulate_act_quant",
+    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
+    ids=["vanilla", "moe", "hyper_connections", "simulated_act_quant"],
 )
 def test_model_forward_decode_ragged_matches_per_request_scalar(
-    use_moe_ffn: bool, use_hyper_connections: bool
+    use_moe_ffn: bool, use_hyper_connections: bool, simulate_act_quant: bool
 ) -> None:
     """Ragged batched decode == per-request scalar decode, end to end.
 
     Three prompts of DIFFERENT lengths prefill into their own caches (so they
     sit at different positions), then decode greedily: scalar (each alone) vs
     ragged (all in one batched forward). The token streams must match exactly,
-    across the vanilla / MoE / Hyper-Connections backbones.
+    across the vanilla / MoE / Hyper-Connections backbones and with the
+    reference's QAT round trips switched on.
     """
-    cfg = _model_config(use_moe_ffn=use_moe_ffn, use_hyper_connections=use_hyper_connections)
+    cfg = _model_config(
+        use_moe_ffn=use_moe_ffn,
+        use_hyper_connections=use_hyper_connections,
+        simulate_act_quant=simulate_act_quant,
+    )
     torch.manual_seed(0)
     model = DeepseekV4ForCausalLM(cfg).eval()
 

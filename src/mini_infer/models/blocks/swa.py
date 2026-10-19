@@ -50,7 +50,11 @@ from mini_infer.models.blocks.hca import (
 )
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
-from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
+from mini_infer.models.blocks.v4 import (
+    AttentionSink,
+    GroupedOutputProjection,
+    SimulatedActQuant,
+)
 
 if TYPE_CHECKING:
     from mini_infer.cache.state_cache import StateCache
@@ -71,6 +75,7 @@ class SWAAttention(nn.Module):
         o_lora_rank: int,
         window_size: int,
         rms_norm_eps: float = 1e-6,
+        act_quant: SimulatedActQuant | None = None,
     ) -> None:
         super().__init__()
         if rope_head_dim < 0 or rope_head_dim > kv_head_dim:
@@ -96,6 +101,11 @@ class SWAAttention(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.window_size = window_size
         self.rms_norm_eps = rms_norm_eps
+        # Reference QAT round trip (FP8 on the non-RoPE dims) for the window
+        # KV; `None` keeps it at full precision.
+        if act_quant is not None:
+            act_quant.check_kv_dims(kv_head_dim, rope_head_dim)
+        self.act_quant = act_quant
 
         # Q low-rank: same structure as HCA/CSA. `q_a_proj` and
         # `q_a_layernorm` are replicated; `q_b_proj` is column-parallel.
@@ -165,6 +175,8 @@ class SWAAttention(nn.Module):
         swa_kv = self.kv_norm(swa_kv)
         if rope_dim > 0:
             swa_kv = apply_partial_rope_last_n_dims(swa_kv, cos_t, sin_t, rope_dim)
+        if self.act_quant is not None:
+            swa_kv = self.act_quant.kv(swa_kv, rope_dim)
 
         # ---- Window-only gather indices (no compressed branch) ----
         topk_idxs = _build_window_topk_idxs(
@@ -235,6 +247,8 @@ class SWAAttention(nn.Module):
         swa_kv = self.kv_norm(self.swa_kv_proj(hidden_states))
         if rope_dim > 0:
             swa_kv = apply_partial_rope_last_n_dims(swa_kv, cos_t, sin_t, rope_dim)
+        if self.act_quant is not None:
+            swa_kv = self.act_quant.kv(swa_kv, rope_dim)
 
         # ---- SWA cache write: last min(seqlen, n_win) tokens (rotated layout) ----
         if seqlen <= n_win:
@@ -314,6 +328,8 @@ class SWAAttention(nn.Module):
         new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))
         if rope_dim > 0:
             new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rope_dim)
+        if self.act_quant is not None:
+            new_swa = self.act_quant.kv(new_swa, rope_dim)
         state.swa_kv[:, start_pos % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
         state.swa_count = min(state.swa_count + 1, n_win)
 
@@ -383,6 +399,8 @@ class SWAAttention(nn.Module):
         new_swa = self.kv_norm(self.swa_kv_proj(hidden_state))
         if rope_dim > 0:
             new_swa = apply_partial_rope_last_n_dims(new_swa, cos_t, sin_t, rope_dim)
+        if self.act_quant is not None:
+            new_swa = self.act_quant.kv(new_swa, rope_dim)
         state.swa_kv[rows, positions % n_win] = new_swa.squeeze(1).to(state.swa_kv.dtype)
 
         topk_idxs = _build_window_decode_topk_idxs_ragged(

@@ -20,10 +20,12 @@ compressed entry survives only if at least one head likes it. Without
 ReLU, a strongly-negative score on one head could cancel a positive on
 another.
 
-The reference (`Indexer` in `model.py`) wraps Q in a Hadamard rotation
-and FP4 quantization for compute precision. We keep the math at fp32
-for parity testing; the rotation cancels in `q · k^T` because Hadamard
-is unitary, so dropping it leaves the dot products identical.
+The reference (`Indexer` in `model.py`) rotates Q and the compressed
+keys with a Hadamard transform and round-trips both through FP4, the
+precision the model was trained with. By default we skip both and keep
+the scores at full precision: the rotation alone cancels in `q · k^T`
+because Hadamard is orthogonal. Passing `act_quant` turns the rotation
+and the FP4 round trip back on for Q and the keys (see `act_quant.py`).
 
 Compressor for the indexer is its OWN module (separate weights), uses
 `overlap_mode=True` because CSA's compression ratio is `m=4`. Its
@@ -52,6 +54,7 @@ from torch.nn.functional import relu
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
+from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
 from mini_infer.models.blocks.v4.compressor import TokenLevelCompressor
 
 if TYPE_CHECKING:
@@ -73,6 +76,8 @@ class LightningIndexer(nn.Module):
         compression_ratio: Indexer's compression ratio (`m=4` in V4).
         top_k: How many compressed entries to keep per query.
         rms_norm_eps: Forwarded to the indexer's compressor norm.
+        act_quant: When set, Q (after RoPE) and the compressed keys get the
+            reference's Hadamard + FP4 round trip. `None` (default) skips it.
     """
 
     def __init__(
@@ -86,6 +91,7 @@ class LightningIndexer(nn.Module):
         compression_ratio: int,
         top_k: int,
         rms_norm_eps: float = 1e-6,
+        act_quant: SimulatedActQuant | None = None,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_world_size
@@ -106,6 +112,9 @@ class LightningIndexer(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.compression_ratio = compression_ratio
         self.top_k = top_k
+        if act_quant is not None:
+            act_quant.check_indexer_dim(head_dim)
+        self.act_quant = act_quant
 
         # Q up-projection from the SHARED q_lora latent (the main attention's
         # `q_a_layernorm` output). Column-parallel by head: each rank emits
@@ -124,10 +133,33 @@ class LightningIndexer(nn.Module):
             compression_ratio=compression_ratio,
             rms_norm_eps=rms_norm_eps,
             overlap_mode=True,
+            act_quant=act_quant,
+            indexer_keys=True,
         )
         # Score scaling: 1/sqrt(d) AND a 1/sqrt(n_h_idx) factor pre-applied to the weights.
         # Reference: `weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)`.
         self._weight_scale = (head_dim**-0.5) * (num_heads**-0.5)
+
+    def _project_query(
+        self,
+        q_lora_latent: torch.Tensor,
+        token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """`(B, T, q_lora_rank)` -> per-head Q `(B, T, n_h_local, head_dim)`.
+
+        Column-parallel `wq_b` (this rank's head slice), partial RoPE on the
+        last `rope_head_dim` dims, then the optional Hadamard + FP4 round trip.
+        """
+        bsz, seqlen, _ = q_lora_latent.shape
+        q: torch.Tensor = self.wq_b(q_lora_latent).view(
+            bsz, seqlen, self.num_heads_local, self.head_dim
+        )
+        cos_t, sin_t = token_position_embeddings
+        if self.rope_head_dim > 0:
+            q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, self.rope_head_dim)
+        if self.act_quant is not None:
+            q = self.act_quant.indexer(q)
+        return q
 
     def forward(
         self,
@@ -159,17 +191,11 @@ class LightningIndexer(nn.Module):
             invalid compressed block are returned as `-1` (the dispatcher
             masks them to `-inf` in the softmax).
         """
-        bsz, seqlen, _ = hidden_states.shape
-        n_h_local = self.num_heads_local
-        d = self.head_dim
+        seqlen = hidden_states.shape[1]
         m = self.compression_ratio
 
-        # ---- Q: shared latent -> per-head + partial RoPE ----
-        # Each rank computes its slice of heads via the column-parallel `wq_b`.
-        q = self.wq_b(q_lora_latent).view(bsz, seqlen, n_h_local, d)
-        cos_t, sin_t = token_position_embeddings
-        if self.rope_head_dim > 0:
-            q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, self.rope_head_dim)
+        # ---- Q: shared latent -> per-head (this rank's slice) + partial RoPE ----
+        q = self._project_query(q_lora_latent, token_position_embeddings)
 
         # ---- K: indexer's own compressed KV (shared across heads, replicated) ----
         compressed_k = self.compressor(hidden_states, compressed_position_embeddings)
@@ -252,17 +278,10 @@ class LightningIndexer(nn.Module):
               remainder + previous-overlap (always overlap mode).
         """
         batch_size, seqlen, _ = hidden_states.shape
-        num_heads_local = self.num_heads_local
-        head_dim = self.head_dim
         compression_ratio = self.compression_ratio
 
         # ---- Q: shared latent -> per-head + partial RoPE (per-rank head slice) ----
-        q = self.wq_b(q_lora_latent).view(batch_size, seqlen, num_heads_local, head_dim)
-        cos_for_tokens, sin_for_tokens = token_position_embeddings
-        if self.rope_head_dim > 0:
-            q = apply_partial_rope_last_n_dims(
-                q, cos_for_tokens, sin_for_tokens, self.rope_head_dim
-            )
+        q = self._project_query(q_lora_latent, token_position_embeddings)
 
         # ---- K: indexer's own cache-aware compressor ----
         compressed_keys = self.compressor.forward_prefill_with_cache(
@@ -359,14 +378,9 @@ class LightningIndexer(nn.Module):
         batch_size, seqlen, _ = hidden_state.shape
         if seqlen != 1:
             raise ValueError(f"forward_decode_step expects seqlen=1, got {seqlen}")
-        num_heads_local = self.num_heads_local
-        head_dim = self.head_dim
 
         # ---- Q: shared latent -> per-head + partial RoPE (per-rank head slice) ----
-        q = self.wq_b(q_lora_latent).view(batch_size, 1, num_heads_local, head_dim)
-        cos_for_token, sin_for_token = token_position_embeddings
-        if self.rope_head_dim > 0:
-            q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, self.rope_head_dim)
+        q = self._project_query(q_lora_latent, token_position_embeddings)
 
         # ---- Indexer's own compressor decode step ----
         flushed_compressed = self.compressor.forward_decode_step(
@@ -442,15 +456,10 @@ class LightningIndexer(nn.Module):
         batch_size, seqlen, _ = hidden_state.shape
         if seqlen != 1:
             raise ValueError(f"forward_decode_step_ragged expects seqlen=1, got {seqlen}")
-        num_heads_local = self.num_heads_local
-        head_dim = self.head_dim
         compression_ratio = self.compressor.compression_ratio
         device = hidden_state.device
 
-        q = self.wq_b(q_lora_latent).view(batch_size, 1, num_heads_local, head_dim)
-        cos_for_token, sin_for_token = token_position_embeddings
-        if self.rope_head_dim > 0:
-            q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, self.rope_head_dim)
+        q = self._project_query(q_lora_latent, token_position_embeddings)
 
         compressed, flush_mask = self.compressor.forward_decode_step_ragged(
             hidden_state,
