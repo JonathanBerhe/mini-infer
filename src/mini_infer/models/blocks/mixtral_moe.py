@@ -67,9 +67,20 @@ class MixtralExpert(nn.Module):
         # passes `swigluoai`.
         self._activation = activation
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out: torch.Tensor = self.w2(self._activation(self.w1(x), self.w3(x)))
-        return out
+    def forward(self, x: torch.Tensor, routing_weights: torch.Tensor | None = None) -> torch.Tensor:
+        """`(N, hidden)` -> `(N, hidden)`.
+
+        `routing_weights` (`(N, 1)`), when given, scales the activation BEFORE
+        the down projection `w2`, the DeepSeek reference `Expert`'s order. The
+        math equals scaling the output, but `w2` then sees the scaled input,
+        which matters when that input is quantized.
+        """
+        if routing_weights is None:
+            out: torch.Tensor = self.w2(self._activation(self.w1(x), self.w3(x)))
+            return out
+        hidden = self._activation(self.w1(x), self.w3(x)) * routing_weights
+        scaled_out: torch.Tensor = self.w2(hidden)
+        return scaled_out
 
 
 class MoEFFN(nn.Module):

@@ -18,8 +18,10 @@ from typing import Any
 
 import pytest
 import torch
+from torch.nn import functional
 from torch.nn.functional import cosine_similarity
 
+from mini_infer.models.blocks.activations import clamped_swiglu, expert_swiglu, swiglu
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 
 # ---------- Direct unit tests ----------
@@ -143,7 +145,9 @@ def test_n_shared_experts_zero_leaves_shared_experts_none() -> None:
 # ---------- Bit-parity vs V4 reference's `MoE` ----------
 
 
-def _build_reference_args(reference_module: Any, *, score_func: str, n_hash_layers: int) -> Any:
+def _build_reference_args(
+    reference_module: Any, *, score_func: str, n_hash_layers: int, swiglu_limit: float = 0
+) -> Any:
     return reference_module.ModelArgs(
         max_batch_size=2,
         max_seq_len=64,
@@ -176,7 +180,7 @@ def _build_reference_args(reference_module: Any, *, score_func: str, n_hash_laye
         vocab_size=32,
         moe_inter_dim=32,
         n_shared_experts=1,
-        swiglu_limit=0,
+        swiglu_limit=swiglu_limit,
         expert_dtype="bf16",
     )
 
@@ -305,3 +309,80 @@ def test_moe_matches_v4_reference(
         f"({routing_mode=}, {our_score_func=}): cosine_sim={cs:.6f}, "
         f"max_abs_diff={max_abs_diff:.3e}"
     )
+
+
+# ---------- swiglu_limit (V4 experts clamp gate / up) ----------
+
+
+def test_clamped_swiglu_hand_computed() -> None:
+    # limit 10: gate capped from above only, up clamped both ways.
+    gate = torch.tensor([12.0, -20.0, 3.0, 0.5])
+    up = torch.tensor([15.0, -15.0, 2.0, -0.5])
+    expected = torch.stack(
+        [
+            functional.silu(torch.tensor(10.0)) * 10.0,
+            functional.silu(torch.tensor(-20.0)) * -10.0,
+            functional.silu(torch.tensor(3.0)) * 2.0,
+            functional.silu(torch.tensor(0.5)) * -0.5,
+        ]
+    )
+    torch.testing.assert_close(clamped_swiglu(gate, up, limit=10.0), expected)
+    assert expert_swiglu(0.0) is swiglu
+    with pytest.raises(ValueError, match="swiglu_limit"):
+        expert_swiglu(-1.0)
+
+
+# Small enough to clamp a good share of the synthetic pre-activations (~0.2 std).
+_SMALL_SWIGLU_LIMIT = 0.2
+
+
+@pytest.mark.parametrize("routing_mode", ["hash", "score_topk"])
+def test_moe_matches_v4_reference_with_swiglu_limit(
+    reference_module: Any, routing_mode: str
+) -> None:
+    """Every expert (routed and shared) clamps like the reference's `Expert`."""
+    n_hash_layers = 4 if routing_mode == "hash" else 0
+    args = _build_reference_args(
+        reference_module,
+        score_func="softmax",
+        n_hash_layers=n_hash_layers,
+        swiglu_limit=_SMALL_SWIGLU_LIMIT,
+    )
+    ref_moe = reference_module.MoE(0, args)
+    _seed_fill_module(
+        ref_moe,
+        seed=42,
+        vocab_size=args.vocab_size,
+        num_routed_experts=args.n_routed_experts,
+        num_activated_experts=args.n_activated_experts,
+    )
+    torch.manual_seed(0)
+    hidden_states = torch.randn(2, 6, args.dim) * 0.5
+    input_ids = torch.randint(0, args.vocab_size, (2, 6), dtype=torch.long)
+
+    outputs: dict[float, torch.Tensor] = {}
+    with torch.no_grad():
+        # The clamp must actually bite, on both branches, or parity proves nothing.
+        gate = ref_moe.shared_experts.w1(hidden_states)
+        up = ref_moe.shared_experts.w3(hidden_states)
+        assert (gate > _SMALL_SWIGLU_LIMIT).any() and (up < -_SMALL_SWIGLU_LIMIT).any()
+        theirs = ref_moe(hidden_states, input_ids)
+        for swiglu_limit in (_SMALL_SWIGLU_LIMIT, 0.0):
+            our_moe = HashRoutedMoEFFN(
+                hidden_size=args.dim,
+                intermediate_size=args.moe_inter_dim,
+                num_routed_experts=args.n_routed_experts,
+                num_activated_experts=args.n_activated_experts,
+                routing_mode=routing_mode,  # type: ignore[arg-type]
+                score_func="softmax",
+                route_scale=args.route_scale,
+                vocab_size=args.vocab_size if routing_mode == "hash" else None,
+                n_shared_experts=args.n_shared_experts,
+                swiglu_limit=swiglu_limit,
+            )
+            _sync_moe_weights(our_moe, ref_moe, routing_mode=routing_mode)
+            outputs[swiglu_limit] = our_moe(hidden_states, input_ids)
+
+    torch.testing.assert_close(outputs[_SMALL_SWIGLU_LIMIT], theirs, rtol=1e-5, atol=1e-6)
+    # Without the clamp the port misses the reference by far more than that.
+    assert (outputs[0.0] - theirs).abs().max().item() > 1e-3

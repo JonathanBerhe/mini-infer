@@ -33,11 +33,43 @@ lands with the cache wiring stage.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from torch import nn
+from torch.nn import functional
 
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
+from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
+
+
+@functools.cache
+def cuda_mm_fp32_out_supported(device_index: int) -> bool:
+    """Whether `torch.mm(bf16, bf16, out_dtype=torch.float32)` runs on this CUDA device.
+
+    The `mm.dtype` overload is recent; an older torch build raises. Checked once
+    per device with a tiny GEMM.
+    """
+    probe = torch.zeros(16, 16, device=torch.device("cuda", device_index), dtype=torch.bfloat16)
+    try:
+        torch.mm(probe, probe, out_dtype=torch.float32)
+    except (TypeError, RuntimeError, NotImplementedError):
+        return False
+    return True
+
+
+# Output dtype of the two compressor projections (`kv_proj`, `weight_proj`).
+#   None          -> the matmul emits its native dtype (bf16 in production, fp32
+#                    in CPU tests) and the result is upcast to fp32 afterwards.
+#   torch.float32 -> a reduced-precision matmul emits fp32 directly, so the
+#                    projected kv / score entries are never rounded to bf16
+#                    before the compression softmax. This is how vLLM runs the
+#                    same GEMMs for DeepSeek-V4 (`torch.mm(..., out_dtype=float32)`).
+# The accumulation is fp32 either way; the policy only decides whether the GEMM
+# output is rounded once to the input dtype. See `_project`.
+ProjectionOutDtype = torch.dtype | None
+_SUPPORTED_PROJECTION_OUT_DTYPES: tuple[torch.dtype | None, ...] = (None, torch.float32)
 
 
 class TokenLevelCompressor(nn.Module):
@@ -54,6 +86,15 @@ class TokenLevelCompressor(nn.Module):
             tokens plus `m` from the previous block. KV/score projections emit
             `2 * kv_head_dim`-wide outputs; the position bias is also doubled.
             When False (HCA): the standard non-overlapping form.
+        projection_out_dtype: Output-dtype policy of `kv_proj` / `weight_proj`
+            (`None` = native dtype then upcast, `torch.float32` = fp32 output
+            with no intermediate rounding). See the module-level note.
+        act_quant: When set, every emitted entry gets the reference's QAT
+            round trip after RoPE. `None` (default) keeps full precision.
+        indexer_keys: True for the Lightning Indexer's own compressor. With
+            `act_quant` set, its entries get the Hadamard + FP4 round trip
+            (the reference's `Compressor(rotate=True)`) instead of FP8 on
+            the non-RoPE dims.
     """
 
     def __init__(
@@ -65,6 +106,9 @@ class TokenLevelCompressor(nn.Module):
         compression_ratio: int,
         rms_norm_eps: float = 1e-6,
         overlap_mode: bool = False,
+        projection_out_dtype: ProjectionOutDtype = None,
+        act_quant: SimulatedActQuant | None = None,
+        indexer_keys: bool = False,
     ) -> None:
         super().__init__()
         if compression_ratio <= 0:
@@ -80,6 +124,14 @@ class TokenLevelCompressor(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.compression_ratio = compression_ratio
         self.overlap_mode = overlap_mode
+        self.projection_out_dtype = projection_out_dtype
+        if act_quant is not None:
+            if indexer_keys:
+                act_quant.check_indexer_dim(kv_head_dim)
+            else:
+                act_quant.check_kv_dims(kv_head_dim, rope_head_dim)
+        self.act_quant = act_quant
+        self.indexer_keys = indexer_keys
         # `coff` is the multiplier on the projection's output width:
         # 1 for HCA (current block only), 2 for CSA (current + overlap).
         coff = 2 if overlap_mode else 1
@@ -110,6 +162,58 @@ class TokenLevelCompressor(nn.Module):
             out[:, 1:, :m] = tensor[:, :-1, :, :c]
         return out
 
+    @property
+    def projection_out_dtype(self) -> ProjectionOutDtype:
+        """Output-dtype policy of `kv_proj` / `weight_proj` (see the module-level note)."""
+        return self._projection_out_dtype
+
+    @projection_out_dtype.setter
+    def projection_out_dtype(self, value: ProjectionOutDtype) -> None:
+        if value not in _SUPPORTED_PROJECTION_OUT_DTYPES:
+            raise ValueError(
+                f"projection_out_dtype must be one of {_SUPPORTED_PROJECTION_OUT_DTYPES}; "
+                f"got {value!r}"
+            )
+        self._projection_out_dtype = value
+
+    def _project(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project `(..., hidden_size)` to fp32 `(kv, score)`, each `(..., coff * kv_head_dim)`.
+
+        `kv` are the per-token KV entries (`wkv` in the reference) and `score`
+        the pre-softmax compression logits (`wgate`), WITHOUT the position bias.
+
+        Policy `None`: the matmul runs in the input's native dtype (which is the
+        weight dtype; upcasting the input first would mismatch a bf16-loaded
+        weight) and the output is upcast afterwards, so a bf16 input yields
+        bf16-rounded entries. Policy `torch.float32`: the output is emitted in
+        fp32 with no intermediate rounding. On CUDA that is
+        `torch.mm(..., out_dtype=float32)`, the op vLLM uses for these GEMMs;
+        elsewhere (or on a torch without the `mm.dtype` overload) the same
+        arithmetic is an fp32 GEMM over upcast operands, since products of
+        bf16 values are exact in fp32. An fp32 input is unaffected by the policy.
+        """
+        if self._projection_out_dtype is None or hidden_states.dtype == torch.float32:
+            return self.kv_proj(hidden_states).float(), self.weight_proj(hidden_states).float()
+        kv_weight = self.kv_proj.weight  # (coff*c, hidden_size)
+        score_weight = self.weight_proj.weight  # (coff*c, hidden_size)
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])  # (N, hidden_size)
+        if flat.is_cuda and cuda_mm_fp32_out_supported(flat.device.index or 0):
+            kv_flat = torch.mm(flat, kv_weight.t(), out_dtype=torch.float32)  # (N, coff*c)
+            score_flat = torch.mm(flat, score_weight.t(), out_dtype=torch.float32)  # (N, coff*c)
+        else:
+            kv_flat = functional.linear(flat.float(), kv_weight.float())  # (N, coff*c)
+            score_flat = functional.linear(flat.float(), score_weight.float())  # (N, coff*c)
+        out_shape = (*hidden_states.shape[:-1], kv_flat.shape[-1])
+        return kv_flat.view(out_shape), score_flat.view(out_shape)
+
+    def _simulate_act_quant(self, compressed: torch.Tensor) -> torch.Tensor:
+        """QAT round trip on `(B, n, kv_head_dim)` entries; identity when off."""
+        if self.act_quant is None:
+            return compressed
+        if self.indexer_keys:
+            return self.act_quant.indexer(compressed)
+        return self.act_quant.kv(compressed, self.rope_head_dim)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -127,21 +231,16 @@ class TokenLevelCompressor(nn.Module):
         if seqlen % m != 0:
             raise ValueError(f"seqlen={seqlen} must be a multiple of compression_ratio={m}")
 
-        # Run the matmul in the input/weight native dtype (BF16 in V4-Flash
-        # production, FP32 in CPU tests). Casting the input to FP32 *before*
-        # the linear would mismatch BF16-loaded `kv_proj.weight` and produce
-        # the "mat1 and mat2 dtype" error. The softmax math below still runs
-        # in FP32 — we just defer the cast until after the matmul. The
-        # reference's compressor wraps `wkv` in a custom Linear that
-        # transparently upcasts; we accomplish the same correctness with
-        # plain `nn.Linear` by deferring the cast.
-        kv = self.kv_proj(hidden_states)  # (B, T, coff*c)
-        score = self.weight_proj(hidden_states)  # (B, T, coff*c)
+        # fp32 (kv, score) under `projection_out_dtype`; the softmax math below
+        # runs in fp32 regardless of the policy.
+        kv, score = self._project(hidden_states)  # each (B, T, coff*c) fp32
 
-        # Reshape to (B, n_blocks, m, coff*c). Cast both to FP32 here so
-        # `position_bias` (FP32) adds cleanly and softmax is precision-safe.
-        kv = kv.unflatten(1, (-1, m)).float()
-        score = score.unflatten(1, (-1, m)).float() + self.position_bias
+        # Reshape to (B, n_blocks, m, coff*c); `position_bias` (fp32) adds cleanly.
+        batch_size, width = kv.shape[0], kv.shape[-1]
+        kv = kv.reshape(batch_size, -1, m, width)  # (B, n_blocks, m, coff*c)
+        score = (
+            score.reshape(batch_size, -1, m, width) + self.position_bias
+        )  # (B, n_blocks, m, coff*c)
 
         if self.overlap_mode:
             # Overlap: each block's softmax spans 2m slots — its own m + the previous block's m.
@@ -160,7 +259,7 @@ class TokenLevelCompressor(nn.Module):
         cos, sin = compressed_position_embeddings
         if self.rope_head_dim > 0:
             compressed = apply_partial_rope_last_n_dims(compressed, cos, sin, self.rope_head_dim)
-        return compressed
+        return self._simulate_act_quant(compressed)
 
     def forward_prefill_with_cache(
         self,
@@ -224,14 +323,9 @@ class TokenLevelCompressor(nn.Module):
         remainder = seqlen % compression_ratio
         aligned_cutoff = seqlen - remainder
 
-        # Run the projections in the input/weight native dtype (BF16 in
-        # V4-Flash production, FP32 in CPU tests), then cast outputs to
-        # FP32 — same reasoning as the standalone `forward` path: FP32
-        # input vs BF16 weight would mismatch in `F.linear`. State
-        # buffers (`cmp_kv_state`, `cmp_score_state`) are FP32, so the
-        # subsequent assignments below carry the cast automatically.
-        full_kv = self.kv_proj(hidden_states).float()  # (B, T, coff*c)
-        full_score = self.weight_proj(hidden_states).float()  # (B, T, coff*c)
+        # fp32 (kv, score) under `projection_out_dtype`. The state buffers
+        # (`cmp_kv_state`, `cmp_score_state`) are fp32, matching these.
+        full_kv, full_score = self._project(hidden_states)  # each (B, T, coff*c) fp32
 
         # ---- Stash the LAST aligned block as previous-overlap (CSA only) ----
         if self.overlap_mode and aligned_cutoff >= compression_ratio:
@@ -262,11 +356,14 @@ class TokenLevelCompressor(nn.Module):
                 device=hidden_states.device,
             )
 
-        aligned_kv = full_kv[:, :aligned_cutoff].unflatten(1, (-1, compression_ratio))
+        width = full_kv.shape[-1]
+        aligned_kv = full_kv[:, :aligned_cutoff].reshape(
+            batch_size, -1, compression_ratio, width
+        )  # (B, n_blocks, m, coff*c)
         aligned_score = (
-            full_score[:, :aligned_cutoff].unflatten(1, (-1, compression_ratio))
+            full_score[:, :aligned_cutoff].reshape(batch_size, -1, compression_ratio, width)
             + self.position_bias
-        )
+        )  # (B, n_blocks, m, coff*c)
         if self.overlap_mode:
             aligned_kv = self._overlap_transform(aligned_kv, value=0.0)
             aligned_score = self._overlap_transform(aligned_score, value=float("-inf"))
@@ -282,7 +379,7 @@ class TokenLevelCompressor(nn.Module):
             )
         # Re-bind to a Tensor-typed local so mypy doesn't widen through `Any`
         # (the trailing-remainder branch above can return early without RoPE).
-        compressed_out: torch.Tensor = compressed
+        compressed_out: torch.Tensor = self._simulate_act_quant(compressed)
         return compressed_out
 
     def forward_decode_step(
@@ -344,14 +441,11 @@ class TokenLevelCompressor(nn.Module):
 
         position_in_block = start_pos % compression_ratio
 
-        # Project to KV + score; the in-flight accumulator is fp32, match it.
-        # Project in the input's native dtype (matches weight dtype), then
-        # cast to FP32 so the state-buffer assignments + softmax math run
-        # at FP32 precision.
-        kv_for_token = self.kv_proj(hidden_state).squeeze(1).float()
+        # fp32 (kv, score) for the one new token; the in-flight accumulator is fp32.
+        kv_token, score_token = self._project(hidden_state)  # each (B, 1, coff*c) fp32
+        kv_for_token = kv_token.squeeze(1)  # (B, coff*c)
         score_for_token = (
-            self.weight_proj(hidden_state).squeeze(1).float()
-            + self.position_bias[position_in_block]
+            score_token.squeeze(1) + self.position_bias[position_in_block]  # (B, coff*c)
         )
 
         if self.overlap_mode:
@@ -404,7 +498,7 @@ class TokenLevelCompressor(nn.Module):
             compressed = apply_partial_rope_last_n_dims(
                 compressed, cos_for_block, sin_for_block, self.rope_head_dim
             )
-        return compressed
+        return self._simulate_act_quant(compressed)
 
     def forward_decode_step_ragged(
         self,
@@ -453,10 +547,10 @@ class TokenLevelCompressor(nn.Module):
         rows = torch.arange(batch_size, device=hidden_state.device)
         position_in_block = positions % m  # (B,)
 
-        kv_for_token = self.kv_proj(hidden_state).squeeze(1).float()  # (B, c) or (B, 2c)
+        kv_token, score_token = self._project(hidden_state)  # each (B, 1, coff*c) fp32
+        kv_for_token = kv_token.squeeze(1)  # (B, c) or (B, 2c)
         score_for_token = (
-            self.weight_proj(hidden_state).squeeze(1).float()
-            + self.position_bias[position_in_block]  # (B, c) or (B, 2c)
+            score_token.squeeze(1) + self.position_bias[position_in_block]  # (B, c) or (B, 2c)
         )
 
         if self.overlap_mode:
@@ -501,4 +595,19 @@ class TokenLevelCompressor(nn.Module):
             compressed = apply_partial_rope_last_n_dims(
                 compressed, cos_for_block, sin_for_block, self.rope_head_dim
             )
-        return compressed, flush_mask
+        return self._simulate_act_quant(compressed), flush_mask
+
+
+def configure_projection_out_dtype(module: nn.Module, out_dtype: ProjectionOutDtype) -> int:
+    """Set `projection_out_dtype` on every `TokenLevelCompressor` under `module`.
+
+    Returns how many compressors were configured. A V4 model has one per HCA
+    layer and two per CSA layer (the main compressor plus the Lightning
+    Indexer's own compressor).
+    """
+    count = 0
+    for submodule in module.modules():
+        if isinstance(submodule, TokenLevelCompressor):
+            submodule.projection_out_dtype = out_dtype
+            count += 1
+    return count

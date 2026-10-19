@@ -1,0 +1,2619 @@
+{
+  "ranks_agree": true,
+  "pairs": [
+    "fp32_vs_native",
+    "fp32_vs_fp32",
+    "fp32_vs_fp32_upcast"
+  ],
+  "rank0": {
+    "rank": 0,
+    "n_prompt_tokens": 8192,
+    "config_overrides": {
+      "simulate_act_quant": true,
+      "simulate_fp8_gemm_inputs": true
+    },
+    "moe_swiglu_limit": 10.0,
+    "reports": {
+      "fp32_vs_native": {
+        "baseline": "float32",
+        "alternate": "native",
+        "n_prompt_tokens": 8192,
+        "isolated": [
+          {
+            "layer_idx": 2,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.00925686500283523,
+              "cosine": 0.9999571341868596,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 2,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.028997612715820797,
+              "cosine": 0.999579608649623,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 2,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.994556188583374,
+              "min_set_agreement": 0.9765625,
+              "fraction_identical": 0.2767333984375,
+              "n_queries": 8192,
+              "n_flipped_slots": 22833
+            }
+          },
+          {
+            "layer_idx": 3,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.005794643943420269,
+              "cosine": 0.9999832566779013,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 4,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.009381936157103836,
+              "cosine": 0.9999558102093253,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 4,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.028395606947282846,
+              "cosine": 0.9995968429785467,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 4,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9948775768280029,
+              "min_set_agreement": 0.9765625,
+              "fraction_identical": 0.2781982421875,
+              "n_queries": 8192,
+              "n_flipped_slots": 21485
+            }
+          },
+          {
+            "layer_idx": 5,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.125,
+              "rms_rel": 0.005568038550178337,
+              "cosine": 0.9999844759259104,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 6,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.008792848915866312,
+              "cosine": 0.9999613328253381,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 6,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.027403981058750856,
+              "cosine": 0.9996245598039379,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 6,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9952116012573242,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.2845458984375,
+              "n_queries": 8192,
+              "n_flipped_slots": 20084
+            }
+          },
+          {
+            "layer_idx": 7,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.03125,
+              "rms_rel": 0.002171655042663766,
+              "cosine": 0.9999976273777048,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 8,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.009811192594716984,
+              "cosine": 0.9999519203548659,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 8,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.030404950276528484,
+              "cosine": 0.9995378502173162,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 8,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9951307773590088,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.2772216796875,
+              "n_queries": 8192,
+              "n_flipped_slots": 20423
+            }
+          },
+          {
+            "layer_idx": 9,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.0625,
+              "rms_rel": 0.0015500622546361531,
+              "cosine": 0.9999987122140854,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 10,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.01032481649949809,
+              "cosine": 0.9999465456663084,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 10,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.029010974770788806,
+              "cosine": 0.9995791964179513,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 10,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9948389530181885,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.2774658203125,
+              "n_queries": 8192,
+              "n_flipped_slots": 21647
+            }
+          },
+          {
+            "layer_idx": 11,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.03075265884399414,
+              "rms_rel": 0.0014157338439931492,
+              "cosine": 0.9999989607149012,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 12,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.00976729527535638,
+              "cosine": 0.9999522911310786,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 12,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.02891221130809869,
+              "cosine": 0.999582045080979,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 12,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9953334331512451,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.2750244140625,
+              "n_queries": 8192,
+              "n_flipped_slots": 19573
+            }
+          },
+          {
+            "layer_idx": 13,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.005883726791633617,
+              "cosine": 0.9999826537896624,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 14,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010470989478830746,
+              "cosine": 0.9999451478669886,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 14,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.029317699020066985,
+              "cosine": 0.9995701812610731,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 14,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9956178665161133,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.280029296875,
+              "n_queries": 8192,
+              "n_flipped_slots": 18380
+            }
+          },
+          {
+            "layer_idx": 15,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.004308038601688646,
+              "cosine": 0.9999908122780865,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 16,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010924669263776707,
+              "cosine": 0.9999403891869244,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 16,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.030176446735956066,
+              "cosine": 0.9995447176428768,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 16,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.995326042175293,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.2799072265625,
+              "n_queries": 8192,
+              "n_flipped_slots": 19604
+            }
+          },
+          {
+            "layer_idx": 17,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.0093450005907064,
+              "cosine": 0.999956457360368,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 18,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.009229220361717768,
+              "cosine": 0.9999575104761028,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 18,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.02903311698228289,
+              "cosine": 0.9995785859721059,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 18,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9947605133056641,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.2698974609375,
+              "n_queries": 8192,
+              "n_flipped_slots": 21976
+            }
+          },
+          {
+            "layer_idx": 19,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.005673964972626533,
+              "cosine": 0.9999840853697411,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 20,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010824517029659857,
+              "cosine": 0.9999412873167481,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 20,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.029574068394989522,
+              "cosine": 0.9995627285288776,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 20,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9955446720123291,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.279052734375,
+              "n_queries": 8192,
+              "n_flipped_slots": 18687
+            }
+          },
+          {
+            "layer_idx": 21,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.006180429518632691,
+              "cosine": 0.9999811581200952,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 22,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.010746814425980583,
+              "cosine": 0.9999422691730901,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 22,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 2.0,
+              "rms_rel": 0.02990959956935607,
+              "cosine": 0.9995526540956358,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 22,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9953703880310059,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.279296875,
+              "n_queries": 8192,
+              "n_flipped_slots": 19418
+            }
+          },
+          {
+            "layer_idx": 23,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.005352191986430181,
+              "cosine": 0.9999857342562201,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 24,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.011323620813116404,
+              "cosine": 0.9999359212946515,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 24,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.03204889600282501,
+              "cosine": 0.999486550313158,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 24,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9944720268249512,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.2705078125,
+              "n_queries": 8192,
+              "n_flipped_slots": 23186
+            }
+          },
+          {
+            "layer_idx": 25,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.0044783742194837136,
+              "cosine": 0.9999899687186662,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 26,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.01044659505978164,
+              "cosine": 0.9999454742136381,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 26,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.030532966328487524,
+              "cosine": 0.999533798935883,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 26,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9956226348876953,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.27294921875,
+              "n_queries": 8192,
+              "n_flipped_slots": 18360
+            }
+          },
+          {
+            "layer_idx": 27,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010433557438151322,
+              "cosine": 0.99994554470864,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 28,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010085816583516151,
+              "cosine": 0.9999490777498219,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 28,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.030728950432690184,
+              "cosine": 0.9995278201274425,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 28,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.994443416595459,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.26611328125,
+              "n_queries": 8192,
+              "n_flipped_slots": 23306
+            }
+          },
+          {
+            "layer_idx": 29,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.00775791589853312,
+              "cosine": 0.9999699387141744,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 30,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.010146897173990548,
+              "cosine": 0.9999485150363286,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 30,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.029452212947488315,
+              "cosine": 0.9995663761074016,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 30,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9951052665710449,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.279296875,
+              "n_queries": 8192,
+              "n_flipped_slots": 20530
+            }
+          },
+          {
+            "layer_idx": 31,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.125,
+              "rms_rel": 0.0027017019138761865,
+              "cosine": 0.999996404459289,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 32,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.011195781399859205,
+              "cosine": 0.9999372288730598,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 32,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.03194132122162349,
+              "cosine": 0.9994898144823446,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 32,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9947488307952881,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.272705078125,
+              "n_queries": 8192,
+              "n_flipped_slots": 22025
+            }
+          },
+          {
+            "layer_idx": 33,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.033402442932128906,
+              "rms_rel": 0.0017086467016900965,
+              "cosine": 0.9999984090336835,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 34,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010995567111320147,
+              "cosine": 0.9999393522164622,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 34,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.03013881019020046,
+              "cosine": 0.9995458907880356,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 34,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9951670169830322,
+              "min_set_agreement": 0.98046875,
+              "fraction_identical": 0.2738037109375,
+              "n_queries": 8192,
+              "n_flipped_slots": 20271
+            }
+          },
+          {
+            "layer_idx": 35,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.0625,
+              "rms_rel": 0.001994224536355211,
+              "cosine": 0.9999981425137933,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 36,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.009716446314600105,
+              "cosine": 0.999952822190182,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 36,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.028487907629542484,
+              "cosine": 0.9995942093263654,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 36,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9948406219482422,
+              "min_set_agreement": 0.974609375,
+              "fraction_identical": 0.280029296875,
+              "n_queries": 8192,
+              "n_flipped_slots": 21640
+            }
+          },
+          {
+            "layer_idx": 37,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.0625,
+              "rms_rel": 0.0022267813914349207,
+              "cosine": 0.9999974929189637,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 38,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.011421685042333787,
+              "cosine": 0.9999348298065754,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 38,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.03142995119784356,
+              "cosine": 0.9995062375381112,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 38,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.994251012802124,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.268798828125,
+              "n_queries": 8192,
+              "n_flipped_slots": 24113
+            }
+          },
+          {
+            "layer_idx": 39,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.25,
+              "rms_rel": 0.003822027215394407,
+              "cosine": 0.9999926855897302,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 40,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.009302558134556972,
+              "cosine": 0.9999567063429047,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 40,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.02611826202106852,
+              "cosine": 0.9996589050997555,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 40,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.9958341121673584,
+              "min_set_agreement": 0.982421875,
+              "fraction_identical": 0.2861328125,
+              "n_queries": 8192,
+              "n_flipped_slots": 17473
+            }
+          },
+          {
+            "layer_idx": 41,
+            "role": "hca.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.006310821516772705,
+              "cosine": 0.999980221936417,
+              "numel": 32768
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 42,
+            "role": "csa.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.010091331301438845,
+              "cosine": 0.9999490687029617,
+              "numel": 1048576
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 42,
+            "role": "csa.indexer.compressor",
+            "tensor": {
+              "max_abs": 0.5,
+              "rms_rel": 0.028742555104337347,
+              "cosine": 0.9995869703347711,
+              "numel": 262144
+            },
+            "topk": null
+          },
+          {
+            "layer_idx": 42,
+            "role": "csa.indexer.topk",
+            "tensor": null,
+            "topk": {
+              "mean_set_agreement": 0.994666576385498,
+              "min_set_agreement": 0.978515625,
+              "fraction_identical": 0.2755126953125,
+              "n_queries": 8192,
+              "n_flipped_slots": 22370
+            }
+          }
+        ],
+        "attention_outputs": [
+          {
+            "layer_idx": 2,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.119140625,
+              "rms_rel": 0.014707582994803398,
+              "cosine": 0.9997906172929928,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 3,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.34375,
+              "rms_rel": 0.031802584575033696,
+              "cosine": 0.9993903547696144,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 4,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.234375,
+              "rms_rel": 0.040111418519703464,
+              "cosine": 0.9990896670739903,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 5,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.53125,
+              "rms_rel": 0.058621871081228946,
+              "cosine": 0.9981846072343402,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 6,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.875,
+              "rms_rel": 0.06685275780072046,
+              "cosine": 0.997670357206016,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 7,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.875,
+              "rms_rel": 0.08310074704321409,
+              "cosine": 0.9964462329906844,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 8,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.8125,
+              "rms_rel": 0.07662314785877478,
+              "cosine": 0.9969700911835683,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 9,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 2.015625,
+              "rms_rel": 0.07617021436274007,
+              "cosine": 0.9969990779963006,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 10,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.25,
+              "rms_rel": 0.08120884944424724,
+              "cosine": 0.9965968831626741,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 11,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.0,
+              "rms_rel": 0.10254740396639922,
+              "cosine": 0.9946404913476419,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 12,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.21875,
+              "rms_rel": 0.10754497110843331,
+              "cosine": 0.994156053092998,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 13,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.4921875,
+              "rms_rel": 0.13573959395574786,
+              "cosine": 0.9906841727449395,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 14,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.625,
+              "rms_rel": 0.14085406819242513,
+              "cosine": 0.9899577636592859,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 15,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.625,
+              "rms_rel": 0.16072384673635554,
+              "cosine": 0.986996968500954,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 16,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 12.0,
+              "rms_rel": 0.17548130675585416,
+              "cosine": 0.9844948715518911,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 17,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 2.0625,
+              "rms_rel": 0.1869762853667084,
+              "cosine": 0.9825193501971418,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 18,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.0,
+              "rms_rel": 0.1659859162954317,
+              "cosine": 0.9861345661995796,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 19,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 15.171875,
+              "rms_rel": 0.17515734477447673,
+              "cosine": 0.9845762710233895,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 20,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.294921875,
+              "rms_rel": 0.17146820050538691,
+              "cosine": 0.9852093351601026,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 21,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.203125,
+              "rms_rel": 0.1865816092153411,
+              "cosine": 0.9824802356151414,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 22,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 6.15625,
+              "rms_rel": 0.20086327360585166,
+              "cosine": 0.979882193986774,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 23,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 4.375,
+              "rms_rel": 0.15890663068784816,
+              "cosine": 0.9873020202162416,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 24,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 10.5625,
+              "rms_rel": 0.14517366113469476,
+              "cosine": 0.9893593176031766,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 25,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.875,
+              "rms_rel": 0.11028110476521095,
+              "cosine": 0.993816583009597,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 26,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 4.33203125,
+              "rms_rel": 0.14380260158767272,
+              "cosine": 0.9895603587709144,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 27,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 9.59375,
+              "rms_rel": 0.09811673792067911,
+              "cosine": 0.995103113321567,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 28,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 14.46875,
+              "rms_rel": 0.15749068741595265,
+              "cosine": 0.9874994390860842,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 29,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 2.6796875,
+              "rms_rel": 0.1496746648720904,
+              "cosine": 0.9887221864364184,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 30,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 8.171875,
+              "rms_rel": 0.13460784946796073,
+              "cosine": 0.9908354341648804,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 31,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 2.33203125,
+              "rms_rel": 0.16682874942469936,
+              "cosine": 0.9860578515894644,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 32,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 9.484375,
+              "rms_rel": 0.15698452321045483,
+              "cosine": 0.9876107868284604,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 33,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 30.6875,
+              "rms_rel": 0.1514550246873553,
+              "cosine": 0.9884329714751218,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 34,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 4.921875,
+              "rms_rel": 0.1875139109623385,
+              "cosine": 0.9823331814704819,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 35,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.84375,
+              "rms_rel": 0.2083909484671827,
+              "cosine": 0.9781583750376491,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 36,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 6.3359375,
+              "rms_rel": 0.11029916792847914,
+              "cosine": 0.9938255501927608,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 37,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 4.28125,
+              "rms_rel": 0.16923815925349023,
+              "cosine": 0.9855809821878047,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 38,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 26.5,
+              "rms_rel": 0.17416624010723922,
+              "cosine": 0.9847459722709413,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 39,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 12.125,
+              "rms_rel": 0.18109703758199533,
+              "cosine": 0.9835535350618168,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 40,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 23.15625,
+              "rms_rel": 0.15237848655558298,
+              "cosine": 0.9882850545017978,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 41,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 6.859375,
+              "rms_rel": 0.18585903789012478,
+              "cosine": 0.9826480490369651,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 42,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 14.75,
+              "rms_rel": 0.04879127866100851,
+              "cosine": 0.9987514559917098,
+              "numel": 1556480
+            }
+          }
+        ],
+        "logits": {
+          "n_positions": 8192,
+          "argmax_agreement": 0.9598388671875,
+          "n_argmax_flips": 329,
+          "max_baseline_margin_at_flip": 1.5,
+          "n_subset_positions": 380,
+          "subset_max_abs": 9.5,
+          "subset_mean_abs": 0.29777953028678894,
+          "subset_mean_kl": 0.012349497526884079,
+          "n_scored_positions": 8191,
+          "baseline_mean_nll": 1.485485096124987,
+          "alternate_mean_nll": 1.4861898830045406,
+          "mean_nll_delta": 0.0007047868794628334,
+          "nll_delta_block_stderr": 0.0015738530827272077,
+          "baseline_top1_accuracy": 0.654132604598999,
+          "alternate_top1_accuracy": 0.6551092863082886,
+          "nll_block_size": 256,
+          "baseline_nll_by_block": [
+            2.5329084857674564,
+            2.2552448840857995,
+            0.9184471794006347,
+            1.1875445724334726,
+            1.4916219458466047,
+            1.2484256329806658,
+            1.4898235606462567,
+            2.031444593179923,
+            1.1858623340355412,
+            1.0945478164719686,
+            1.252262303341658,
+            1.0144615050971906,
+            1.1910769698550865,
+            1.8374781639997015,
+            1.5900438051340726,
+            1.672231454774472,
+            1.0407693244261838,
+            0.7388673376166888,
+            1.1960133644248696,
+            1.3956614716467644,
+            2.2825492999376022,
+            1.7066456505345187,
+            1.5152665144303332,
+            1.281934597010582,
+            1.7796665528689917,
+            1.8272455370079363,
+            2.0579392451118284,
+            1.1874572884950576,
+            0.9149776499098368,
+            2.1729206444683182,
+            1.1267034775968656,
+            1.3168210696091172
+          ],
+          "alternate_nll_by_block": [
+            2.5348515763553445,
+            2.26730084077949,
+            0.9148405275535985,
+            1.203179144475695,
+            1.4893013829603097,
+            1.254367695028077,
+            1.4995382147113592,
+            2.039120458704428,
+            1.1843737610450313,
+            1.0971217899181736,
+            1.235634054159125,
+            1.0170610298641656,
+            1.202446474834562,
+            1.8310274427315658,
+            1.5996398429387688,
+            1.6613284573623934,
+            1.0360566548564105,
+            0.7454443215366771,
+            1.1811020982682257,
+            1.3896018313391538,
+            2.293278370794951,
+            1.7001426976533782,
+            1.5210251922539357,
+            1.2920428042278274,
+            1.7725682145495263,
+            1.8174227737422102,
+            2.0680265299133684,
+            1.1889932002917285,
+            0.9162450548457947,
+            2.1678302431838588,
+            1.114730581336154,
+            1.321790810051286
+          ]
+        },
+        "tokens": {
+          "n_generated": 32,
+          "n_matching_prefix": 23,
+          "identical": false
+        }
+      },
+      "fp32_vs_fp32": {
+        "baseline": "float32",
+        "alternate": "float32",
+        "n_prompt_tokens": 8192,
+        "isolated": [],
+        "attention_outputs": [
+          {
+            "layer_idx": 2,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998990361174679,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 3,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998924027781619,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 4,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998926138138627,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 5,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999011049709241,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 6,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999045855704384,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 7,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998991781685405,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 8,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999097527767042,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 9,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998967190919195,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 10,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999009206301952,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 11,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999008854278613,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 12,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999002181090645,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 13,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999022786078925,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 14,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998838146643959,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 15,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998982391284907,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 16,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998876150524737,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 17,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999019416185224,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 18,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998992896543466,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 19,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998972299560358,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 20,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998909693255489,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 21,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998851587319142,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 22,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.999894122740999,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 23,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999052331745222,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 24,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998977258854239,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 25,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999000779960303,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 26,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999071678852826,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 27,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999263497974977,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 28,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999028332520059,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 29,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999078981860822,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 30,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999055493066302,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 31,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998973225115383,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 32,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999019710237721,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 33,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998901814810492,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 34,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998902645152389,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 35,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998885921851239,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 36,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999086842203384,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 37,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999077825977617,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 38,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.999894730646536,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 39,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999045459627889,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 40,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999066227600958,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 41,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9998939243836013,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 42,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0,
+              "rms_rel": 0.0,
+              "cosine": 0.9999402120602009,
+              "numel": 1556480
+            }
+          }
+        ],
+        "logits": {
+          "n_positions": 8192,
+          "argmax_agreement": 1.0,
+          "n_argmax_flips": 0,
+          "max_baseline_margin_at_flip": 0.0,
+          "n_subset_positions": 380,
+          "subset_max_abs": 0.0,
+          "subset_mean_abs": 0.0,
+          "subset_mean_kl": 0.0,
+          "n_scored_positions": 8191,
+          "baseline_mean_nll": 1.485485096124987,
+          "alternate_mean_nll": 1.485485096124987,
+          "mean_nll_delta": 0.0,
+          "nll_delta_block_stderr": 0.0,
+          "baseline_top1_accuracy": 0.654132604598999,
+          "alternate_top1_accuracy": 0.654132604598999,
+          "nll_block_size": 256,
+          "baseline_nll_by_block": [
+            2.5329084857674564,
+            2.2552448840857995,
+            0.9184471794006347,
+            1.1875445724334726,
+            1.4916219458466047,
+            1.2484256329806658,
+            1.4898235606462567,
+            2.031444593179923,
+            1.1858623340355412,
+            1.0945478164719686,
+            1.252262303341658,
+            1.0144615050971906,
+            1.1910769698550865,
+            1.8374781639997015,
+            1.5900438051340726,
+            1.672231454774472,
+            1.0407693244261838,
+            0.7388673376166888,
+            1.1960133644248696,
+            1.3956614716467644,
+            2.2825492999376022,
+            1.7066456505345187,
+            1.5152665144303332,
+            1.281934597010582,
+            1.7796665528689917,
+            1.8272455370079363,
+            2.0579392451118284,
+            1.1874572884950576,
+            0.9149776499098368,
+            2.1729206444683182,
+            1.1267034775968656,
+            1.3168210696091172
+          ],
+          "alternate_nll_by_block": [
+            2.5329084857674564,
+            2.2552448840857995,
+            0.9184471794006347,
+            1.1875445724334726,
+            1.4916219458466047,
+            1.2484256329806658,
+            1.4898235606462567,
+            2.031444593179923,
+            1.1858623340355412,
+            1.0945478164719686,
+            1.252262303341658,
+            1.0144615050971906,
+            1.1910769698550865,
+            1.8374781639997015,
+            1.5900438051340726,
+            1.672231454774472,
+            1.0407693244261838,
+            0.7388673376166888,
+            1.1960133644248696,
+            1.3956614716467644,
+            2.2825492999376022,
+            1.7066456505345187,
+            1.5152665144303332,
+            1.281934597010582,
+            1.7796665528689917,
+            1.8272455370079363,
+            2.0579392451118284,
+            1.1874572884950576,
+            0.9149776499098368,
+            2.1729206444683182,
+            1.1267034775968656,
+            1.3168210696091172
+          ]
+        },
+        "tokens": {
+          "n_generated": 32,
+          "n_matching_prefix": 32,
+          "identical": true
+        }
+      },
+      "fp32_vs_fp32_upcast": {
+        "baseline": "float32",
+        "alternate": "float32+upcast_gemm",
+        "n_prompt_tokens": 8192,
+        "isolated": [],
+        "attention_outputs": [
+          {
+            "layer_idx": 2,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.0625,
+              "rms_rel": 0.006276520815473933,
+              "cosine": 0.999875339355706,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 3,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.3515625,
+              "rms_rel": 0.028732496713883185,
+              "cosine": 0.9994820855731267,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 4,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.265625,
+              "rms_rel": 0.038531072032523754,
+              "cosine": 0.9991547816170495,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 5,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.5625,
+              "rms_rel": 0.057951894991281394,
+              "cosine": 0.9982229340801048,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 6,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.9375,
+              "rms_rel": 0.06707305395811756,
+              "cosine": 0.9976575086519777,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 7,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.8515625,
+              "rms_rel": 0.0845370593191251,
+              "cosine": 0.9963271879351582,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 8,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 0.703125,
+              "rms_rel": 0.0776319830460346,
+              "cosine": 0.9968944670752062,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 9,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.6953125,
+              "rms_rel": 0.07552234894247693,
+              "cosine": 0.9970462302110098,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 10,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.1015625,
+              "rms_rel": 0.08250455328879423,
+              "cosine": 0.9964961725564548,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 11,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.1953125,
+              "rms_rel": 0.10477052874734086,
+              "cosine": 0.9944077157265397,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 12,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.125,
+              "rms_rel": 0.1087463688320022,
+              "cosine": 0.9940012446528641,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 13,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 1.203125,
+              "rms_rel": 0.14219332557124903,
+              "cosine": 0.9897776228297566,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 14,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.3125,
+              "rms_rel": 0.14879298529685686,
+              "cosine": 0.9888143107576273,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 15,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.546875,
+              "rms_rel": 0.16529713404359894,
+              "cosine": 0.9862520502804142,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 16,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 10.375,
+              "rms_rel": 0.177685191190742,
+              "cosine": 0.9841046090419114,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 17,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 2.265625,
+              "rms_rel": 0.1885424031098643,
+              "cosine": 0.9821191169039482,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 18,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.1875,
+              "rms_rel": 0.16730624247426512,
+              "cosine": 0.9859141294606998,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 19,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 32.9375,
+              "rms_rel": 0.1797504891271415,
+              "cosine": 0.983741668105152,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 20,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.8125,
+              "rms_rel": 0.17375301337018226,
+              "cosine": 0.9848133238921571,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 21,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.4375,
+              "rms_rel": 0.18834470578505075,
+              "cosine": 0.9821565623391827,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 22,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.46875,
+              "rms_rel": 0.1918054981102448,
+              "cosine": 0.9815847369701863,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 23,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 4.921875,
+              "rms_rel": 0.15930045082552124,
+              "cosine": 0.987220571604507,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 24,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 11.75,
+              "rms_rel": 0.1445334757054409,
+              "cosine": 0.989459209014375,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 25,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 9.0625,
+              "rms_rel": 0.1096523048627674,
+              "cosine": 0.9938805466730656,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 26,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 6.44140625,
+              "rms_rel": 0.16219847418800984,
+              "cosine": 0.9867474833014704,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 27,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 8.765625,
+              "rms_rel": 0.11932245277513881,
+              "cosine": 0.9927942437409772,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 28,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 8.859375,
+              "rms_rel": 0.1579126281308196,
+              "cosine": 0.9874054253591859,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 29,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 2.53125,
+              "rms_rel": 0.1500144079176813,
+              "cosine": 0.9886548688590131,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 30,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.265625,
+              "rms_rel": 0.1328673117926335,
+              "cosine": 0.9910625862566578,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 31,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 3.125,
+              "rms_rel": 0.17008250439018066,
+              "cosine": 0.9854683301105954,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 32,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 19.625,
+              "rms_rel": 0.17262833003530093,
+              "cosine": 0.9849887672363238,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 33,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 15.71875,
+              "rms_rel": 0.15149473854745135,
+              "cosine": 0.9884124138778079,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 34,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 7.484375,
+              "rms_rel": 0.19552326475593607,
+              "cosine": 0.9807664593716242,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 35,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 5.515625,
+              "rms_rel": 0.20852155660751526,
+              "cosine": 0.9782306023178536,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 36,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 7.765625,
+              "rms_rel": 0.11122438971597866,
+              "cosine": 0.9937311629656219,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 37,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 4.5390625,
+              "rms_rel": 0.16971520652897898,
+              "cosine": 0.9854892165307274,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 38,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 27.0,
+              "rms_rel": 0.17609050234543117,
+              "cosine": 0.9844060007318385,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 39,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 16.125,
+              "rms_rel": 0.17971990286999248,
+              "cosine": 0.9837931657390027,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 40,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 21.703125,
+              "rms_rel": 0.15798844046359603,
+              "cosine": 0.9874100263745513,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 41,
+            "role": "hca",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 10.625,
+              "rms_rel": 0.18774545121384614,
+              "cosine": 0.9822531216339719,
+              "numel": 1556480
+            }
+          },
+          {
+            "layer_idx": 42,
+            "role": "csa",
+            "n_positions": 380,
+            "tensor": {
+              "max_abs": 6.9375,
+              "rms_rel": 0.04846417977748719,
+              "cosine": 0.9987696977273256,
+              "numel": 1556480
+            }
+          }
+        ],
+        "logits": {
+          "n_positions": 8192,
+          "argmax_agreement": 0.9600830078125,
+          "n_argmax_flips": 327,
+          "max_baseline_margin_at_flip": 3.5,
+          "n_subset_positions": 380,
+          "subset_max_abs": 18.25,
+          "subset_mean_abs": 0.29303842782974243,
+          "subset_mean_kl": 0.011144359596073627,
+          "n_scored_positions": 8191,
+          "baseline_mean_nll": 1.485485096124987,
+          "alternate_mean_nll": 1.4860014101961188,
+          "mean_nll_delta": 0.0005163140804816889,
+          "nll_delta_block_stderr": 0.0018787689677552193,
+          "baseline_top1_accuracy": 0.654132604598999,
+          "alternate_top1_accuracy": 0.6551092863082886,
+          "nll_block_size": 256,
+          "baseline_nll_by_block": [
+            2.5329084857674564,
+            2.2552448840857995,
+            0.9184471794006347,
+            1.1875445724334726,
+            1.4916219458466047,
+            1.2484256329806658,
+            1.4898235606462567,
+            2.031444593179923,
+            1.1858623340355412,
+            1.0945478164719686,
+            1.252262303341658,
+            1.0144615050971906,
+            1.1910769698550865,
+            1.8374781639997015,
+            1.5900438051340726,
+            1.672231454774472,
+            1.0407693244261838,
+            0.7388673376166888,
+            1.1960133644248696,
+            1.3956614716467644,
+            2.2825492999376022,
+            1.7066456505345187,
+            1.5152665144303332,
+            1.281934597010582,
+            1.7796665528689917,
+            1.8272455370079363,
+            2.0579392451118284,
+            1.1874572884950576,
+            0.9149776499098368,
+            2.1729206444683182,
+            1.1267034775968656,
+            1.3168210696091172
+          ],
+          "alternate_nll_by_block": [
+            2.55619483513971,
+            2.256287007873315,
+            0.9127630835168041,
+            1.1878743794677897,
+            1.4964419309289452,
+            1.255353797627264,
+            1.4991929751831043,
+            2.032057566843903,
+            1.1835933281857698,
+            1.0894879395331856,
+            1.2392678963674197,
+            1.0140339354742,
+            1.2087422597643642,
+            1.8165445086142418,
+            1.5940725929291144,
+            1.6570610913241373,
+            1.0409049894530056,
+            0.7267882433027228,
+            1.2038999371466736,
+            1.3985123473515908,
+            2.2980610431252675,
+            1.6896665504783925,
+            1.5161106946692617,
+            1.287320614542596,
+            1.7887908824440757,
+            1.8114284054596277,
+            2.0714960888025784,
+            1.1895344304586328,
+            0.9134805377224864,
+            2.168278090271757,
+            1.1331665789496141,
+            1.3149684658855367
+          ]
+        },
+        "tokens": {
+          "n_generated": 32,
+          "n_matching_prefix": 23,
+          "identical": false
+        }
+      }
+    },
+    "report_texts": {
+      "fp32_vs_native": "policies: baseline=float32 alternate=native prompt_tokens=8192\n\nisolated per-layer drift (alternate vs baseline on the same input):\n  layer role                        max_abs    rms_rel     cosine  topk_mean  identical  flipped\n      2 csa.compressor            5.000e-01  9.257e-03   0.999957                               \n      2 csa.indexer.compressor    1.000e+00  2.900e-02   0.999580                               \n      2 csa.indexer.topk                                            0.994556   0.276733    22833\n      3 hca.compressor            2.500e-01  5.795e-03   0.999983                               \n      4 csa.compressor            5.000e-01  9.382e-03   0.999956                               \n      4 csa.indexer.compressor    1.000e+00  2.840e-02   0.999597                               \n      4 csa.indexer.topk                                            0.994878   0.278198    21485\n      5 hca.compressor            1.250e-01  5.568e-03   0.999984                               \n      6 csa.compressor            2.500e-01  8.793e-03   0.999961                               \n      6 csa.indexer.compressor    1.000e+00  2.740e-02   0.999625                               \n      6 csa.indexer.topk                                            0.995212   0.284546    20084\n      7 hca.compressor            3.125e-02  2.172e-03   0.999998                               \n      8 csa.compressor            5.000e-01  9.811e-03   0.999952                               \n      8 csa.indexer.compressor    1.000e+00  3.040e-02   0.999538                               \n      8 csa.indexer.topk                                            0.995131   0.277222    20423\n      9 hca.compressor            6.250e-02  1.550e-03   0.999999                               \n     10 csa.compressor            5.000e-01  1.032e-02   0.999947                               \n     10 csa.indexer.compressor    5.000e-01  2.901e-02   0.999579                               \n     10 csa.indexer.topk                                            0.994839   0.277466    21647\n     11 hca.compressor            3.075e-02  1.416e-03   0.999999                               \n     12 csa.compressor            2.500e-01  9.767e-03   0.999952                               \n     12 csa.indexer.compressor    5.000e-01  2.891e-02   0.999582                               \n     12 csa.indexer.topk                                            0.995333   0.275024    19573\n     13 hca.compressor            2.500e-01  5.884e-03   0.999983                               \n     14 csa.compressor            5.000e-01  1.047e-02   0.999945                               \n     14 csa.indexer.compressor    1.000e+00  2.932e-02   0.999570                               \n     14 csa.indexer.topk                                            0.995618   0.280029    18380\n     15 hca.compressor            2.500e-01  4.308e-03   0.999991                               \n     16 csa.compressor            5.000e-01  1.092e-02   0.999940                               \n     16 csa.indexer.compressor    1.000e+00  3.018e-02   0.999545                               \n     16 csa.indexer.topk                                            0.995326   0.279907    19604\n     17 hca.compressor            5.000e-01  9.345e-03   0.999956                               \n     18 csa.compressor            5.000e-01  9.229e-03   0.999958                               \n     18 csa.indexer.compressor    1.000e+00  2.903e-02   0.999579                               \n     18 csa.indexer.topk                                            0.994761   0.269897    21976\n     19 hca.compressor            5.000e-01  5.674e-03   0.999984                               \n     20 csa.compressor            5.000e-01  1.082e-02   0.999941                               \n     20 csa.indexer.compressor    1.000e+00  2.957e-02   0.999563                               \n     20 csa.indexer.topk                                            0.995545   0.279053    18687\n     21 hca.compressor            5.000e-01  6.180e-03   0.999981                               \n     22 csa.compressor            1.000e+00  1.075e-02   0.999942                               \n     22 csa.indexer.compressor    2.000e+00  2.991e-02   0.999553                               \n     22 csa.indexer.topk                                            0.995370   0.279297    19418\n     23 hca.compressor            5.000e-01  5.352e-03   0.999986                               \n     24 csa.compressor            1.000e+00  1.132e-02   0.999936                               \n     24 csa.indexer.compressor    5.000e-01  3.205e-02   0.999487                               \n     24 csa.indexer.topk                                            0.994472   0.270508    23186\n     25 hca.compressor            2.500e-01  4.478e-03   0.999990                               \n     26 csa.compressor            1.000e+00  1.045e-02   0.999945                               \n     26 csa.indexer.compressor    1.000e+00  3.053e-02   0.999534                               \n     26 csa.indexer.topk                                            0.995623   0.272949    18360\n     27 hca.compressor            5.000e-01  1.043e-02   0.999946                               \n     28 csa.compressor            5.000e-01  1.009e-02   0.999949                               \n     28 csa.indexer.compressor    5.000e-01  3.073e-02   0.999528                               \n     28 csa.indexer.topk                                            0.994443   0.266113    23306\n     29 hca.compressor            5.000e-01  7.758e-03   0.999970                               \n     30 csa.compressor            1.000e+00  1.015e-02   0.999949                               \n     30 csa.indexer.compressor    1.000e+00  2.945e-02   0.999566                               \n     30 csa.indexer.topk                                            0.995105   0.279297    20530\n     31 hca.compressor            1.250e-01  2.702e-03   0.999996                               \n     32 csa.compressor            5.000e-01  1.120e-02   0.999937                               \n     32 csa.indexer.compressor    5.000e-01  3.194e-02   0.999490                               \n     32 csa.indexer.topk                                            0.994749   0.272705    22025\n     33 hca.compressor            3.340e-02  1.709e-03   0.999998                               \n     34 csa.compressor            5.000e-01  1.100e-02   0.999939                               \n     34 csa.indexer.compressor    5.000e-01  3.014e-02   0.999546                               \n     34 csa.indexer.topk                                            0.995167   0.273804    20271\n     35 hca.compressor            6.250e-02  1.994e-03   0.999998                               \n     36 csa.compressor            5.000e-01  9.716e-03   0.999953                               \n     36 csa.indexer.compressor    5.000e-01  2.849e-02   0.999594                               \n     36 csa.indexer.topk                                            0.994841   0.280029    21640\n     37 hca.compressor            6.250e-02  2.227e-03   0.999997                               \n     38 csa.compressor            5.000e-01  1.142e-02   0.999935                               \n     38 csa.indexer.compressor    5.000e-01  3.143e-02   0.999506                               \n     38 csa.indexer.topk                                            0.994251   0.268799    24113\n     39 hca.compressor            2.500e-01  3.822e-03   0.999993                               \n     40 csa.compressor            5.000e-01  9.303e-03   0.999957                               \n     40 csa.indexer.compressor    1.000e+00  2.612e-02   0.999659                               \n     40 csa.indexer.topk                                            0.995834   0.286133    17473\n     41 hca.compressor            5.000e-01  6.311e-03   0.999980                               \n     42 csa.compressor            5.000e-01  1.009e-02   0.999949                               \n     42 csa.indexer.compressor    5.000e-01  2.874e-02   0.999587                               \n     42 csa.indexer.topk                                            0.994667   0.275513    22370\n\nattention-block outputs across the two runs (position subset):\n  layer   2 csa  positions=380   max_abs=1.191e-01 rms_rel=1.471e-02 cosine=0.999791\n  layer   3 hca  positions=380   max_abs=3.438e-01 rms_rel=3.180e-02 cosine=0.999390\n  layer   4 csa  positions=380   max_abs=2.344e-01 rms_rel=4.011e-02 cosine=0.999090\n  layer   5 hca  positions=380   max_abs=5.312e-01 rms_rel=5.862e-02 cosine=0.998185\n  layer   6 csa  positions=380   max_abs=8.750e-01 rms_rel=6.685e-02 cosine=0.997670\n  layer   7 hca  positions=380   max_abs=8.750e-01 rms_rel=8.310e-02 cosine=0.996446\n  layer   8 csa  positions=380   max_abs=8.125e-01 rms_rel=7.662e-02 cosine=0.996970\n  layer   9 hca  positions=380   max_abs=2.016e+00 rms_rel=7.617e-02 cosine=0.996999\n  layer  10 csa  positions=380   max_abs=1.250e+00 rms_rel=8.121e-02 cosine=0.996597\n  layer  11 hca  positions=380   max_abs=1.000e+00 rms_rel=1.025e-01 cosine=0.994640\n  layer  12 csa  positions=380   max_abs=1.219e+00 rms_rel=1.075e-01 cosine=0.994156\n  layer  13 hca  positions=380   max_abs=1.492e+00 rms_rel=1.357e-01 cosine=0.990684\n  layer  14 csa  positions=380   max_abs=3.625e+00 rms_rel=1.409e-01 cosine=0.989958\n  layer  15 hca  positions=380   max_abs=5.625e+00 rms_rel=1.607e-01 cosine=0.986997\n  layer  16 csa  positions=380   max_abs=1.200e+01 rms_rel=1.755e-01 cosine=0.984495\n  layer  17 hca  positions=380   max_abs=2.062e+00 rms_rel=1.870e-01 cosine=0.982519\n  layer  18 csa  positions=380   max_abs=5.000e+00 rms_rel=1.660e-01 cosine=0.986135\n  layer  19 hca  positions=380   max_abs=1.517e+01 rms_rel=1.752e-01 cosine=0.984576\n  layer  20 csa  positions=380   max_abs=3.295e+00 rms_rel=1.715e-01 cosine=0.985209\n  layer  21 hca  positions=380   max_abs=5.203e+00 rms_rel=1.866e-01 cosine=0.982480\n  layer  22 csa  positions=380   max_abs=6.156e+00 rms_rel=2.009e-01 cosine=0.979882\n  layer  23 hca  positions=380   max_abs=4.375e+00 rms_rel=1.589e-01 cosine=0.987302\n  layer  24 csa  positions=380   max_abs=1.056e+01 rms_rel=1.452e-01 cosine=0.989359\n  layer  25 hca  positions=380   max_abs=3.875e+00 rms_rel=1.103e-01 cosine=0.993817\n  layer  26 csa  positions=380   max_abs=4.332e+00 rms_rel=1.438e-01 cosine=0.989560\n  layer  27 hca  positions=380   max_abs=9.594e+00 rms_rel=9.812e-02 cosine=0.995103\n  layer  28 csa  positions=380   max_abs=1.447e+01 rms_rel=1.575e-01 cosine=0.987499\n  layer  29 hca  positions=380   max_abs=2.680e+00 rms_rel=1.497e-01 cosine=0.988722\n  layer  30 csa  positions=380   max_abs=8.172e+00 rms_rel=1.346e-01 cosine=0.990835\n  layer  31 hca  positions=380   max_abs=2.332e+00 rms_rel=1.668e-01 cosine=0.986058\n  layer  32 csa  positions=380   max_abs=9.484e+00 rms_rel=1.570e-01 cosine=0.987611\n  layer  33 hca  positions=380   max_abs=3.069e+01 rms_rel=1.515e-01 cosine=0.988433\n  layer  34 csa  positions=380   max_abs=4.922e+00 rms_rel=1.875e-01 cosine=0.982333\n  layer  35 hca  positions=380   max_abs=5.844e+00 rms_rel=2.084e-01 cosine=0.978158\n  layer  36 csa  positions=380   max_abs=6.336e+00 rms_rel=1.103e-01 cosine=0.993826\n  layer  37 hca  positions=380   max_abs=4.281e+00 rms_rel=1.692e-01 cosine=0.985581\n  layer  38 csa  positions=380   max_abs=2.650e+01 rms_rel=1.742e-01 cosine=0.984746\n  layer  39 hca  positions=380   max_abs=1.212e+01 rms_rel=1.811e-01 cosine=0.983554\n  layer  40 csa  positions=380   max_abs=2.316e+01 rms_rel=1.524e-01 cosine=0.988285\n  layer  41 hca  positions=380   max_abs=6.859e+00 rms_rel=1.859e-01 cosine=0.982648\n  layer  42 csa  positions=380   max_abs=1.475e+01 rms_rel=4.879e-02 cosine=0.998751\n\nlogits: argmax agreement 0.959839 over 8192 positions (329 flips, max baseline top1-top2 margin at a flip 1.5000); subset[380] max_abs=9.500e+00 mean_abs=2.978e-01 mean_kl=1.235e-02 nats\nnext-token quality over 8191 prompt positions: NLL baseline 1.48549 alternate 1.48619 (delta +0.00070 nats/token, block stderr 0.00157); perplexity 4.4171 vs 4.4202; top-1 accuracy 0.65413 vs 0.65511\ngreedy tokens: 32 generated, common prefix 23, identical=False\nbaseline NLL per block of 256 positions: 2.53 2.26 0.92 1.19 1.49 1.25 1.49 2.03 1.19 1.09 1.25 1.01 1.19 1.84 1.59 1.67 1.04 0.74 1.20 1.40 2.28 1.71 1.52 1.28 1.78 1.83 2.06 1.19 0.91 2.17 1.13 1.32",
+      "fp32_vs_fp32": "policies: baseline=float32 alternate=float32 prompt_tokens=8192\n\nattention-block outputs across the two runs (position subset):\n  layer   2 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999899\n  layer   3 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999892\n  layer   4 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999893\n  layer   5 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999901\n  layer   6 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999905\n  layer   7 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999899\n  layer   8 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999910\n  layer   9 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999897\n  layer  10 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999901\n  layer  11 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999901\n  layer  12 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999900\n  layer  13 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999902\n  layer  14 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999884\n  layer  15 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999898\n  layer  16 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999888\n  layer  17 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999902\n  layer  18 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999899\n  layer  19 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999897\n  layer  20 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999891\n  layer  21 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999885\n  layer  22 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999894\n  layer  23 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999905\n  layer  24 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999898\n  layer  25 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999900\n  layer  26 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999907\n  layer  27 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999926\n  layer  28 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999903\n  layer  29 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999908\n  layer  30 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999906\n  layer  31 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999897\n  layer  32 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999902\n  layer  33 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999890\n  layer  34 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999890\n  layer  35 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999889\n  layer  36 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999909\n  layer  37 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999908\n  layer  38 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999895\n  layer  39 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999905\n  layer  40 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999907\n  layer  41 hca  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999894\n  layer  42 csa  positions=380   max_abs=0.000e+00 rms_rel=0.000e+00 cosine=0.999940\n\nlogits: argmax agreement 1.000000 over 8192 positions (0 flips, max baseline top1-top2 margin at a flip 0.0000); subset[380] max_abs=0.000e+00 mean_abs=0.000e+00 mean_kl=0.000e+00 nats\nnext-token quality over 8191 prompt positions: NLL baseline 1.48549 alternate 1.48549 (delta +0.00000 nats/token, block stderr 0.00000); perplexity 4.4171 vs 4.4171; top-1 accuracy 0.65413 vs 0.65413\ngreedy tokens: 32 generated, common prefix 32, identical=True\nbaseline NLL per block of 256 positions: 2.53 2.26 0.92 1.19 1.49 1.25 1.49 2.03 1.19 1.09 1.25 1.01 1.19 1.84 1.59 1.67 1.04 0.74 1.20 1.40 2.28 1.71 1.52 1.28 1.78 1.83 2.06 1.19 0.91 2.17 1.13 1.32",
+      "fp32_vs_fp32_upcast": "policies: baseline=float32 alternate=float32+upcast_gemm prompt_tokens=8192\n\nattention-block outputs across the two runs (position subset):\n  layer   2 csa  positions=380   max_abs=6.250e-02 rms_rel=6.277e-03 cosine=0.999875\n  layer   3 hca  positions=380   max_abs=3.516e-01 rms_rel=2.873e-02 cosine=0.999482\n  layer   4 csa  positions=380   max_abs=2.656e-01 rms_rel=3.853e-02 cosine=0.999155\n  layer   5 hca  positions=380   max_abs=5.625e-01 rms_rel=5.795e-02 cosine=0.998223\n  layer   6 csa  positions=380   max_abs=9.375e-01 rms_rel=6.707e-02 cosine=0.997658\n  layer   7 hca  positions=380   max_abs=8.516e-01 rms_rel=8.454e-02 cosine=0.996327\n  layer   8 csa  positions=380   max_abs=7.031e-01 rms_rel=7.763e-02 cosine=0.996894\n  layer   9 hca  positions=380   max_abs=1.695e+00 rms_rel=7.552e-02 cosine=0.997046\n  layer  10 csa  positions=380   max_abs=1.102e+00 rms_rel=8.250e-02 cosine=0.996496\n  layer  11 hca  positions=380   max_abs=1.195e+00 rms_rel=1.048e-01 cosine=0.994408\n  layer  12 csa  positions=380   max_abs=1.125e+00 rms_rel=1.087e-01 cosine=0.994001\n  layer  13 hca  positions=380   max_abs=1.203e+00 rms_rel=1.422e-01 cosine=0.989778\n  layer  14 csa  positions=380   max_abs=3.312e+00 rms_rel=1.488e-01 cosine=0.988814\n  layer  15 hca  positions=380   max_abs=3.547e+00 rms_rel=1.653e-01 cosine=0.986252\n  layer  16 csa  positions=380   max_abs=1.038e+01 rms_rel=1.777e-01 cosine=0.984105\n  layer  17 hca  positions=380   max_abs=2.266e+00 rms_rel=1.885e-01 cosine=0.982119\n  layer  18 csa  positions=380   max_abs=3.188e+00 rms_rel=1.673e-01 cosine=0.985914\n  layer  19 hca  positions=380   max_abs=3.294e+01 rms_rel=1.798e-01 cosine=0.983742\n  layer  20 csa  positions=380   max_abs=3.812e+00 rms_rel=1.738e-01 cosine=0.984813\n  layer  21 hca  positions=380   max_abs=3.438e+00 rms_rel=1.883e-01 cosine=0.982157\n  layer  22 csa  positions=380   max_abs=5.469e+00 rms_rel=1.918e-01 cosine=0.981585\n  layer  23 hca  positions=380   max_abs=4.922e+00 rms_rel=1.593e-01 cosine=0.987221\n  layer  24 csa  positions=380   max_abs=1.175e+01 rms_rel=1.445e-01 cosine=0.989459\n  layer  25 hca  positions=380   max_abs=9.062e+00 rms_rel=1.097e-01 cosine=0.993881\n  layer  26 csa  positions=380   max_abs=6.441e+00 rms_rel=1.622e-01 cosine=0.986747\n  layer  27 hca  positions=380   max_abs=8.766e+00 rms_rel=1.193e-01 cosine=0.992794\n  layer  28 csa  positions=380   max_abs=8.859e+00 rms_rel=1.579e-01 cosine=0.987405\n  layer  29 hca  positions=380   max_abs=2.531e+00 rms_rel=1.500e-01 cosine=0.988655\n  layer  30 csa  positions=380   max_abs=5.266e+00 rms_rel=1.329e-01 cosine=0.991063\n  layer  31 hca  positions=380   max_abs=3.125e+00 rms_rel=1.701e-01 cosine=0.985468\n  layer  32 csa  positions=380   max_abs=1.962e+01 rms_rel=1.726e-01 cosine=0.984989\n  layer  33 hca  positions=380   max_abs=1.572e+01 rms_rel=1.515e-01 cosine=0.988412\n  layer  34 csa  positions=380   max_abs=7.484e+00 rms_rel=1.955e-01 cosine=0.980766\n  layer  35 hca  positions=380   max_abs=5.516e+00 rms_rel=2.085e-01 cosine=0.978231\n  layer  36 csa  positions=380   max_abs=7.766e+00 rms_rel=1.112e-01 cosine=0.993731\n  layer  37 hca  positions=380   max_abs=4.539e+00 rms_rel=1.697e-01 cosine=0.985489\n  layer  38 csa  positions=380   max_abs=2.700e+01 rms_rel=1.761e-01 cosine=0.984406\n  layer  39 hca  positions=380   max_abs=1.612e+01 rms_rel=1.797e-01 cosine=0.983793\n  layer  40 csa  positions=380   max_abs=2.170e+01 rms_rel=1.580e-01 cosine=0.987410\n  layer  41 hca  positions=380   max_abs=1.062e+01 rms_rel=1.877e-01 cosine=0.982253\n  layer  42 csa  positions=380   max_abs=6.938e+00 rms_rel=4.846e-02 cosine=0.998770\n\nlogits: argmax agreement 0.960083 over 8192 positions (327 flips, max baseline top1-top2 margin at a flip 3.5000); subset[380] max_abs=1.825e+01 mean_abs=2.930e-01 mean_kl=1.114e-02 nats\nnext-token quality over 8191 prompt positions: NLL baseline 1.48549 alternate 1.48600 (delta +0.00052 nats/token, block stderr 0.00188); perplexity 4.4171 vs 4.4194; top-1 accuracy 0.65413 vs 0.65511\ngreedy tokens: 32 generated, common prefix 23, identical=False\nbaseline NLL per block of 256 positions: 2.53 2.26 0.92 1.19 1.49 1.25 1.49 2.03 1.19 1.09 1.25 1.01 1.19 1.84 1.59 1.67 1.04 0.74 1.20 1.40 2.28 1.71 1.52 1.28 1.78 1.83 2.06 1.19 0.91 2.17 1.13 1.32"
+    },
+    "pair_seconds": {
+      "fp32_vs_native": 57.412353884,
+      "fp32_vs_fp32": 52.35212364999998,
+      "fp32_vs_fp32_upcast": 53.031224361
+    },
+    "gemm_microbench": [],
+    "torch_version": "2.10.0+cu128",
+    "device_name": "NVIDIA B200",
+    "mm_fp32_out_kernel": true,
+    "peak_memory_gb": 110.171568128
+  }
+}

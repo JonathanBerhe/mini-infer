@@ -62,6 +62,7 @@ from mini_infer.models.blocks.v4 import (
     AttentionSink,
     GroupedOutputProjection,
     LightningIndexer,
+    SimulatedActQuant,
     TokenLevelCompressor,
 )
 
@@ -88,6 +89,7 @@ class CSAAttention(nn.Module):
         index_head_dim: int,
         index_top_k: int,
         rms_norm_eps: float = 1e-6,
+        act_quant: SimulatedActQuant | None = None,
     ) -> None:
         super().__init__()
         if rope_head_dim < 0 or rope_head_dim > kv_head_dim:
@@ -113,6 +115,11 @@ class CSAAttention(nn.Module):
         self.window_size = window_size
         self.compression_ratio = compression_ratio
         self.rms_norm_eps = rms_norm_eps
+        # Reference QAT round trips: FP8 on the window and compressed KV's
+        # non-RoPE dims, Hadamard + FP4 inside the indexer. `None` skips them.
+        if act_quant is not None:
+            act_quant.check_kv_dims(kv_head_dim, rope_head_dim)
+        self.act_quant = act_quant
 
         # --- Q low-rank path (shared latent reused by the indexer below) ---
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
@@ -132,6 +139,7 @@ class CSAAttention(nn.Module):
             compression_ratio=compression_ratio,
             rms_norm_eps=rms_norm_eps,
             overlap_mode=True,
+            act_quant=act_quant,
         )
 
         # --- Lightning Indexer ---
@@ -144,6 +152,7 @@ class CSAAttention(nn.Module):
             compression_ratio=compression_ratio,
             top_k=index_top_k,
             rms_norm_eps=rms_norm_eps,
+            act_quant=act_quant,
         )
 
         # --- Per-head sink + grouped output projection ---
@@ -155,6 +164,12 @@ class CSAAttention(nn.Module):
             o_lora_rank=o_lora_rank,
             hidden_size=hidden_size,
         )
+        # The reference's FP8-weight linears (`wq_a`, `wq_b`, `wkv`, `wo_b`):
+        # their inputs get the FP8 GEMM-input round trip when enabled.
+        if act_quant is not None:
+            act_quant.quantize_gemm_inputs(
+                self.q_a_proj, self.q_b_proj, self.swa_kv_proj, self.grouped_output.wo_b
+            )
 
         self.softmax_scale = kv_head_dim**-0.5
 
@@ -191,6 +206,8 @@ class CSAAttention(nn.Module):
         swa_kv = self.kv_norm(self.swa_kv_proj(hidden_states))
         if rd > 0:
             swa_kv = apply_partial_rope_last_n_dims(swa_kv, cos_t, sin_t, rd)
+        if self.act_quant is not None:
+            swa_kv = self.act_quant.kv(swa_kv, rd)
 
         # ---- Main compressed K=V ----
         compressed_kv = self.compressor(hidden_states, compressed_position_embeddings)
@@ -284,6 +301,8 @@ class CSAAttention(nn.Module):
             swa_kv = apply_partial_rope_last_n_dims(
                 swa_kv, cos_for_tokens, sin_for_tokens, rope_dim
             )
+        if self.act_quant is not None:
+            swa_kv = self.act_quant.kv(swa_kv, rope_dim)
 
         # ---- Main compressor with state writes ----
         compressed_kv = self.compressor.forward_prefill_with_cache(
@@ -412,6 +431,8 @@ class CSAAttention(nn.Module):
             new_swa_kv = apply_partial_rope_last_n_dims(
                 new_swa_kv, cos_for_token, sin_for_token, rope_dim
             )
+        if self.act_quant is not None:
+            new_swa_kv = self.act_quant.kv(new_swa_kv, rope_dim)
         layer_state.swa_kv[rows, positions % window_size] = new_swa_kv.squeeze(1).to(
             layer_state.swa_kv.dtype
         )
@@ -548,6 +569,8 @@ class CSAAttention(nn.Module):
             new_swa_kv = apply_partial_rope_last_n_dims(
                 new_swa_kv, cos_for_token, sin_for_token, rope_dim
             )
+        if self.act_quant is not None:
+            new_swa_kv = self.act_quant.kv(new_swa_kv, rope_dim)
         layer_state.swa_kv[:, start_pos % window_size] = new_swa_kv.squeeze(1).to(
             layer_state.swa_kv.dtype
         )
