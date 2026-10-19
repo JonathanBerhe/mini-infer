@@ -69,6 +69,7 @@ from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4Decoder
 from mini_infer.models.blocks.hyper_connections import HCHeadReduction
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding
+from mini_infer.models.blocks.v4.act_quant import ScaleFormat, SimulatedActQuant
 
 # HF V4 -> mini-infer renames. Same MoE expert structure as V2/V3 (the
 # block geometry didn't change across generations), with the additional
@@ -383,6 +384,11 @@ class DeepseekV4Config:
     # HBM (see scripts/profile_v4_dequant.py). Shared experts are
     # unaffected (they ship FP8 and dequantize to BF16 regardless).
     expert_dtype: str = "bf16"
+    # HF / reference `swiglu_limit`: every expert (routed and shared) clamps
+    # its gate projection to `<= limit` and its up projection to
+    # `[-limit, limit]` before the SiLU. 0 disables the clamp. Released V4
+    # configs set 10.
+    moe_swiglu_limit: float = 0.0
     # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
     # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
     # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
@@ -392,6 +398,23 @@ class DeepseekV4Config:
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # Reference QAT activation round trips (see `blocks/v4/act_quant.py`).
+    # Off (default): window KV, compressed KV and the Lightning Indexer run
+    # at full working precision. On: FP8 e4m3 on the non-RoPE KV dims and
+    # Hadamard + FP4 e2m1 on the indexer's queries and keys, exactly where
+    # the reference inference code applies them. Needs
+    # `kv_head_dim - rope_head_dim` divisible by 64 and a power-of-two
+    # `index_head_dim` divisible by 32 (true for every released V4 config).
+    # `act_quant_scale_fmt` mirrors the reference's `scale_fmt`: "ue8m0"
+    # (power-of-two FP8 scales, every released V4 config) or None.
+    simulate_act_quant: bool = False
+    act_quant_scale_fmt: str | None = "ue8m0"
+    # On top of `simulate_act_quant`: also round-trip the inputs of the
+    # linears whose weights are FP8 or FP4 in the released checkpoints
+    # through FP8 (block 128), as the reference's `fp8_gemm` / `fp4_gemm`
+    # path does (attention `wq_a`/`wq_b`/`wkv`/`wo_b`, indexer `wq_b`, the
+    # shared and routed experts). Needs those input widths divisible by 128.
+    simulate_fp8_gemm_inputs: bool = False
 
     def __post_init__(self) -> None:
         if len(self.compress_ratios) != self.num_hidden_layers:
@@ -425,8 +448,28 @@ class DeepseekV4Config:
                     "use_moe_ffn=True requires expert_dtype in ('bf16', 'fp4'); "
                     f"got {self.expert_dtype!r}"
                 )
+        if self.moe_swiglu_limit < 0:
+            raise ValueError(f"moe_swiglu_limit must be >= 0; got {self.moe_swiglu_limit}")
         if self.use_hyper_connections and self.hc_mult <= 0:
             raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {self.hc_mult}")
+        if self.act_quant_scale_fmt not in ("ue8m0", None):
+            raise ValueError(
+                f"act_quant_scale_fmt must be 'ue8m0' or None; got {self.act_quant_scale_fmt!r}"
+            )
+        if self.simulate_fp8_gemm_inputs and not self.simulate_act_quant:
+            raise ValueError(
+                "simulate_fp8_gemm_inputs=True requires simulate_act_quant=True: the "
+                "reference applies the QAT round trips whenever its GEMMs take FP8 inputs"
+            )
+
+    def act_quant(self) -> SimulatedActQuant | None:
+        """The per-layer QAT round-trip setting, or None when `simulate_act_quant` is off."""
+        if not self.simulate_act_quant:
+            return None
+        scale_fmt: ScaleFormat = "ue8m0" if self.act_quant_scale_fmt == "ue8m0" else None
+        return SimulatedActQuant(
+            fp8_scale_fmt=scale_fmt, fp8_gemm_inputs=self.simulate_fp8_gemm_inputs
+        )
 
     def is_csa_layer(self, layer_idx: int) -> bool:
         """CSA layers have compression_ratio == 4 (paper §4.2.1)."""
@@ -569,11 +612,16 @@ class DeepseekV4Config:
             ),
             n_shared_experts=int(_pick("n_shared_experts", default_value=0)),
             expert_dtype=_detect_expert_dtype(cfg_dict, _pick("expert_dtype", default_value=None)),
+            moe_swiglu_limit=float(_pick("moe_swiglu_limit", "swiglu_limit", default_value=0.0)),
             # Hyper-Connections. V4-Flash sets `hc_mult=4`.
             use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
             hc_mult=int(_pick("hc_mult", default_value=0)),
             hc_sinkhorn_iters=int(_pick("hc_sinkhorn_iters", default_value=20)),
             hc_eps=float(_pick("hc_eps", default_value=1e-6)),
+            # Not part of the HF schema: off unless a caller's config dict opts in.
+            simulate_act_quant=bool(_pick("simulate_act_quant", default_value=False)),
+            act_quant_scale_fmt=_pick("act_quant_scale_fmt", default_value="ue8m0"),
+            simulate_fp8_gemm_inputs=bool(_pick("simulate_fp8_gemm_inputs", default_value=False)),
         )
 
 
@@ -661,6 +709,7 @@ class _DeepseekV4InnerModel(nn.Module):
             index_num_heads=cfg.index_num_heads,
             index_head_dim=cfg.index_head_dim,
             index_top_k=cfg.index_top_k,
+            act_quant=cfg.act_quant(),
         )
         if cfg.use_moe_ffn:
             routing_mode = "hash" if cfg.is_hash_routed_layer(layer_idx) else "score_topk"
@@ -675,6 +724,7 @@ class _DeepseekV4InnerModel(nn.Module):
                 moe_vocab_size=cfg.vocab_size if routing_mode == "hash" else None,
                 n_shared_experts=cfg.n_shared_experts,
                 expert_dtype=cfg.expert_dtype,
+                moe_swiglu_limit=cfg.moe_swiglu_limit,
             )
         if cfg.use_hyper_connections:
             layer_kwargs.update(

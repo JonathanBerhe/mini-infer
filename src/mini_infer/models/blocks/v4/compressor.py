@@ -41,6 +41,7 @@ from torch.nn import functional
 
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
+from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
 
 
 @functools.cache
@@ -88,6 +89,12 @@ class TokenLevelCompressor(nn.Module):
         projection_out_dtype: Output-dtype policy of `kv_proj` / `weight_proj`
             (`None` = native dtype then upcast, `torch.float32` = fp32 output
             with no intermediate rounding). See the module-level note.
+        act_quant: When set, every emitted entry gets the reference's QAT
+            round trip after RoPE. `None` (default) keeps full precision.
+        indexer_keys: True for the Lightning Indexer's own compressor. With
+            `act_quant` set, its entries get the Hadamard + FP4 round trip
+            (the reference's `Compressor(rotate=True)`) instead of FP8 on
+            the non-RoPE dims.
     """
 
     def __init__(
@@ -100,6 +107,8 @@ class TokenLevelCompressor(nn.Module):
         rms_norm_eps: float = 1e-6,
         overlap_mode: bool = False,
         projection_out_dtype: ProjectionOutDtype = None,
+        act_quant: SimulatedActQuant | None = None,
+        indexer_keys: bool = False,
     ) -> None:
         super().__init__()
         if compression_ratio <= 0:
@@ -116,6 +125,13 @@ class TokenLevelCompressor(nn.Module):
         self.compression_ratio = compression_ratio
         self.overlap_mode = overlap_mode
         self.projection_out_dtype = projection_out_dtype
+        if act_quant is not None:
+            if indexer_keys:
+                act_quant.check_indexer_dim(kv_head_dim)
+            else:
+                act_quant.check_kv_dims(kv_head_dim, rope_head_dim)
+        self.act_quant = act_quant
+        self.indexer_keys = indexer_keys
         # `coff` is the multiplier on the projection's output width:
         # 1 for HCA (current block only), 2 for CSA (current + overlap).
         coff = 2 if overlap_mode else 1
@@ -190,6 +206,14 @@ class TokenLevelCompressor(nn.Module):
         out_shape = (*hidden_states.shape[:-1], kv_flat.shape[-1])
         return kv_flat.view(out_shape), score_flat.view(out_shape)
 
+    def _simulate_act_quant(self, compressed: torch.Tensor) -> torch.Tensor:
+        """QAT round trip on `(B, n, kv_head_dim)` entries; identity when off."""
+        if self.act_quant is None:
+            return compressed
+        if self.indexer_keys:
+            return self.act_quant.indexer(compressed)
+        return self.act_quant.kv(compressed, self.rope_head_dim)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -235,7 +259,7 @@ class TokenLevelCompressor(nn.Module):
         cos, sin = compressed_position_embeddings
         if self.rope_head_dim > 0:
             compressed = apply_partial_rope_last_n_dims(compressed, cos, sin, self.rope_head_dim)
-        return compressed
+        return self._simulate_act_quant(compressed)
 
     def forward_prefill_with_cache(
         self,
@@ -355,7 +379,7 @@ class TokenLevelCompressor(nn.Module):
             )
         # Re-bind to a Tensor-typed local so mypy doesn't widen through `Any`
         # (the trailing-remainder branch above can return early without RoPE).
-        compressed_out: torch.Tensor = compressed
+        compressed_out: torch.Tensor = self._simulate_act_quant(compressed)
         return compressed_out
 
     def forward_decode_step(
@@ -474,7 +498,7 @@ class TokenLevelCompressor(nn.Module):
             compressed = apply_partial_rope_last_n_dims(
                 compressed, cos_for_block, sin_for_block, self.rope_head_dim
             )
-        return compressed
+        return self._simulate_act_quant(compressed)
 
     def forward_decode_step_ragged(
         self,
@@ -571,7 +595,7 @@ class TokenLevelCompressor(nn.Module):
             compressed = apply_partial_rope_last_n_dims(
                 compressed, cos_for_block, sin_for_block, self.rope_head_dim
             )
-        return compressed, flush_mask
+        return self._simulate_act_quant(compressed), flush_mask
 
 
 def configure_projection_out_dtype(module: nn.Module, out_dtype: ProjectionOutDtype) -> int:

@@ -7,6 +7,7 @@ CSA reuses the same primitives plus a Lightning Indexer + top-k.
 V4 paper §2.3, formulas 20-27.
 """
 
+from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
 from mini_infer.models.blocks.v4.compressor import (
     ProjectionOutDtype,
     TokenLevelCompressor,
@@ -21,6 +22,7 @@ __all__ = [
     "GroupedOutputProjection",
     "LightningIndexer",
     "ProjectionOutDtype",
+    "SimulatedActQuant",
     "TokenLevelCompressor",
     "configure_projection_out_dtype",
 ]

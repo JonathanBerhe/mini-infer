@@ -9,6 +9,8 @@ gate and up projections and returns the gated activation:
   `hidden_act`). It clamps both branches and adds a unit bias to the up branch,
   so it is a JOINT function of gate and up, not a pointwise activation on the
   gate alone, and cannot be expressed by swapping the SiLU in `swiglu`.
+- `clamped_swiglu` is DeepSeek-V4's experts (`swiglu_limit`): the same two
+  clamps as `swigluoai`, then plain `silu(gate) * up`.
 
 Blocks that were SiLU-only (`SwiGLU`, `MixtralExpert`, `Fp8Expert`, `GlmMoeFFN`)
 take an `activation` combiner defaulting to `swiglu`, so existing families are
@@ -18,6 +20,7 @@ numerically unchanged; M3 passes `swigluoai`.
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 
 import torch
 from torch.nn import functional
@@ -29,6 +32,27 @@ GateUpActivation = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Standard SwiGLU: `silu(gate) * up`."""
     return functional.silu(gate) * up
+
+
+def clamped_swiglu(gate: torch.Tensor, up: torch.Tensor, *, limit: float) -> torch.Tensor:
+    """DeepSeek-V4 expert SwiGLU with `swiglu_limit`.
+
+        out = silu(clamp(gate, max=limit)) * clamp(up, -limit, limit)
+
+    Same clamps as the reference `Expert` and HF `DeepseekV4MLP` / `Experts`:
+    `gate` only from above, `up` symmetrically. `limit` must be positive;
+    callers keep plain `swiglu` for a limit of 0 (no clamp).
+    """
+    return functional.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+
+
+def expert_swiglu(swiglu_limit: float) -> GateUpActivation:
+    """The SwiGLU combiner for a DeepSeek-V4 expert: plain if `swiglu_limit` is 0."""
+    if swiglu_limit < 0:
+        raise ValueError(f"swiglu_limit must be >= 0, got {swiglu_limit}")
+    if swiglu_limit == 0:
+        return swiglu
+    return partial(clamped_swiglu, limit=swiglu_limit)
 
 
 def swigluoai(
