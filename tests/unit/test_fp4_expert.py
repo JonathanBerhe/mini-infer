@@ -61,6 +61,30 @@ def test_fp4_expert_matches_explicit_dequant_swiglu() -> None:
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
 
 
+def test_fp4_expert_swiglu_limit_clamps_gate_and_up() -> None:
+    """`swiglu_limit`: gate capped from above, up clamped to [-limit, limit], then SwiGLU."""
+    torch.manual_seed(0)
+    hidden, intermediate, limit = 64, 128, 2.0
+    expert = FP4Expert(hidden, intermediate, swiglu_limit=limit)
+    _fill_synthetic_fp4(expert, seed=1)
+    unclamped = FP4Expert(hidden, intermediate)
+    unclamped.load_state_dict(expert.state_dict())
+
+    x = torch.randn(4, hidden, dtype=torch.float32)
+    w1 = dequantize_nvfp4_to_bf16(expert.w1_packed, expert.w1_scale).float()
+    w2 = dequantize_nvfp4_to_bf16(expert.w2_packed, expert.w2_scale).float()
+    w3 = dequantize_nvfp4_to_bf16(expert.w3_packed, expert.w3_scale).float()
+    gate, up = functional.linear(x, w1), functional.linear(x, w3)
+    # The data must actually reach both clamps, or the check below proves nothing.
+    assert (gate > limit).any() and (gate < -limit).any() and (up.abs() > limit).any()
+    ref = functional.linear(
+        functional.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit), w2
+    )
+
+    torch.testing.assert_close(expert(x), ref, rtol=1e-5, atol=1e-5)
+    assert not torch.allclose(unclamped(x), ref, rtol=1e-2, atol=1e-2)
+
+
 def test_fp4_expert_buffers_are_packed_int8() -> None:
     """Storage is the packed FP4 form (int8, half-width), not BF16."""
     hidden, intermediate = 64, 128

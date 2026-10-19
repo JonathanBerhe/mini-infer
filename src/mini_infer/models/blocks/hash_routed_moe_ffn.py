@@ -31,11 +31,14 @@ both routing modes and the supported score functions.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
+from mini_infer.models.blocks.activations import expert_swiglu
 from mini_infer.models.blocks.fp4_expert import FP4Expert
 from mini_infer.models.blocks.hash_routed_gate import (
     HashRoutedGate,
@@ -43,6 +46,9 @@ from mini_infer.models.blocks.hash_routed_gate import (
     ScoreFunction,
 )
 from mini_infer.models.blocks.mixtral_moe import MixtralExpert
+
+if TYPE_CHECKING:
+    from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
 
 
 class HashRoutedMoEFFN(nn.Module):
@@ -62,6 +68,8 @@ class HashRoutedMoEFFN(nn.Module):
         n_shared_experts: int = 0,
         shared_intermediate_size: int | None = None,
         expert_dtype: str = "bf16",
+        act_quant: SimulatedActQuant | None = None,
+        swiglu_limit: float = 0.0,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -102,13 +110,32 @@ class HashRoutedMoEFFN(nn.Module):
         if expert_dtype not in ("bf16", "fp4"):
             raise ValueError(f"expert_dtype must be 'bf16' or 'fp4'; got {expert_dtype!r}")
         self.expert_dtype = expert_dtype
+        # V4's `swiglu_limit`: every expert (routed and shared) clamps its gate
+        # and up projections before the SiLU. 0 keeps plain SwiGLU.
+        self.swiglu_limit = swiglu_limit
+        activation = expert_swiglu(swiglu_limit)
         routed_experts: list[nn.Module] = []
         for _ in range(num_experts_per_rank):
             if expert_dtype == "fp4":
-                routed_experts.append(FP4Expert(hidden_size, intermediate_size))
+                routed_experts.append(
+                    FP4Expert(
+                        hidden_size,
+                        intermediate_size,
+                        act_quant=act_quant,
+                        swiglu_limit=swiglu_limit,
+                    )
+                )
             else:
-                routed_experts.append(MixtralExpert(hidden_size, intermediate_size))
+                expert = MixtralExpert(hidden_size, intermediate_size, activation=activation)
+                if act_quant is not None:
+                    act_quant.quantize_gemm_inputs(expert.w1, expert.w2, expert.w3)
+                routed_experts.append(expert)
         self.experts = nn.ModuleList(routed_experts)
+        # The reference's experts all hold FP8 (shared) or FP4 (routed) weights,
+        # so with the FP8 GEMM-input round trip on, the routing weight must
+        # scale the activation before `w2` (the reference's order) rather than
+        # the expert output: `w2` then quantizes the scaled input.
+        self.routing_weights_before_down_proj = act_quant is not None and act_quant.fp8_gemm_inputs
 
         # Shared expert(s): always-on MLP added to the routed sum. V4 uses one;
         # V2/V3 use two and we collapse them into a single MLP with a wider
@@ -122,8 +149,12 @@ class HashRoutedMoEFFN(nn.Module):
                 else intermediate_size
             )
             self.shared_experts: MixtralExpert | None = MixtralExpert(
-                hidden_size, shared_intermediate * n_shared_experts
+                hidden_size, shared_intermediate * n_shared_experts, activation=activation
             )
+            if act_quant is not None:
+                act_quant.quantize_gemm_inputs(
+                    self.shared_experts.w1, self.shared_experts.w2, self.shared_experts.w3
+                )
         else:
             self.shared_experts = None
 
@@ -162,13 +193,18 @@ class HashRoutedMoEFFN(nn.Module):
                 continue
             tokens_for_this_expert = flat_hidden_states[token_positions]
             weights_for_this_expert = per_token_weights[token_positions, top_k_slots, None]
-            # `MixtralExpert(x) * w` is equivalent to the reference's
-            # `expert(x, weights=w)` which folds `w` between SwiGLU and w2 —
-            # `w2` is linear and `w` is a per-row scalar, so the scalar
-            # commutes through the down-projection.
-            weighted_expert_output = (
-                self.experts[local_idx](tokens_for_this_expert) * weights_for_this_expert
-            )
+            if self.routing_weights_before_down_proj:
+                weighted_expert_output = self.experts[local_idx](
+                    tokens_for_this_expert, routing_weights=weights_for_this_expert
+                )
+            else:
+                # `MixtralExpert(x) * w` is equivalent to the reference's
+                # `expert(x, weights=w)` which folds `w` between SwiGLU and w2 —
+                # `w2` is linear and `w` is a per-row scalar, so the scalar
+                # commutes through the down-projection.
+                weighted_expert_output = (
+                    self.experts[local_idx](tokens_for_this_expert) * weights_for_this_expert
+                )
             routed_accumulator.index_add_(0, token_positions, weighted_expert_output.float())
 
         # All-reduce the routed sum across ranks; no-op at world_size=1.
