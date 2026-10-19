@@ -890,5 +890,7 @@ def format_report(report: PairedPrefillReport) -> str:
         f"{lg.baseline_top1_accuracy:.5f} vs {lg.alternate_top1_accuracy:.5f}",
         f"greedy tokens: {report.tokens.n_generated} generated, common prefix "
         f"{report.tokens.n_matching_prefix}, identical={report.tokens.identical}",
+        f"baseline NLL per block of {lg.nll_block_size} positions: "
+        + " ".join(f"{value:.2f}" for value in lg.baseline_nll_by_block),
     ]
     return "\n".join(lines)
