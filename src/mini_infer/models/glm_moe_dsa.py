@@ -1,8 +1,8 @@
 """GLM-MoE-DSA family: owned model implementation (text-only).
 
-Targets `GlmMoeDsaForCausalLM` (z.ai GLM-5.2). Architecturally this is
-DeepSeek-V3.2 plus GLM's IndexShare, so it reuses most of the DeepSeek-V2
-machinery with three deltas:
+Targets `GlmMoeDsaForCausalLM` (z.ai GLM-5.2 and GLM-5.3, which share one
+architecture). Architecturally this is DeepSeek-V3.2 plus GLM's IndexShare,
+so it reuses most of the DeepSeek-V2 machinery with three deltas:
 
   - **DeepSeek Sparse Attention (DSA)**: the `MLAAttention` carries a
     `GlmDsaIndexer` that scores raw tokens and selects `index_topk` keys per
@@ -14,10 +14,11 @@ machinery with three deltas:
   - **`noaux_tc` MoE**: DeepSeek-V3-style sigmoid gate with an aux-loss-free
     selection bias and grouped top-k (`GlmMoeFFN`), vs Mixtral's softmax gate.
 
-GLM's main MLA uses **interleaved (DeepSeek-style) RoPE** like V2/V3; only the
-indexer uses the non-interleaved NeoX split-half. (transformers < 5.7 applied
-the split-half in the main attention too, a bug fixed upstream in PR #46372;
-the parity reference here is transformers 5.12.)
+GLM's main MLA and its indexer both use **interleaved (DeepSeek-style) RoPE**
+like V2/V3, as the config's `rope_interleave` and `indexer_rope_interleave`
+say. (transformers < 5.7 applied the NeoX split-half in the main attention,
+a bug fixed upstream in PR #46372. Versions before 5.14 did the same in the
+indexer. The parity reference here is transformers 5.14.)
 Layers `< first_k_dense_replace` are dense `SwiGLU`; the rest are MoE. The MTP
 draft layer (`num_nextn_predict_layers`) is a speculative-decoding accelerator
 and is not modeled (its checkpoint keys are dropped at load).
