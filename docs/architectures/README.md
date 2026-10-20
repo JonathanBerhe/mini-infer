@@ -10,6 +10,7 @@ The direct realization of mini-infer's research-paper-engine niche
 
 | Family | Paper | Reference | Our walkthrough |
 |---|---|---|---|
+| Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated DeltaNet hybrid, text-only) | Gated DeltaNet paper (arXiv 2412.06464) | HF transformers `modeling_qwen3_5.py` (text path) | [qwen3-5.md](qwen3-5.md) |
 | Inkling / Inkling-Small | [Release post](https://thinkingmachines.ai/news/introducing-inkling/) | HF transformers `modeling_inkling.py` (text path) | [inkling.md](inkling.md) |
 | MiniMax-M3 (MSA) | MSA report (arXiv 2606.13392) | HF transformers `modeling_minimax_m3_vl.py` (text path) | [minimax-m3.md](minimax-m3.md) |
 | DeepSeek-V4 | DeepSeek-V4 technical report | [DeepSeek-V4-Pro/inference](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main/inference) | [deepseek-v4.md](deepseek-v4.md) |

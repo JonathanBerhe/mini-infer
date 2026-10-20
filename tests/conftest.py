@@ -5,6 +5,11 @@ kernels or CUDA-specific flash-attn paths that don't run on CPU or MPS.
 Without this hook every such test would fail at the first CUDA call rather
 than skipping cleanly.
 
+`large_model` opt-in: Tests marked `@pytest.mark.large_model` download a
+multi-GB checkpoint and need as much memory. They skip unless the run passes
+`--run-large-models`, so a plain `pytest` or `pytest -m requires_model` never
+starts such a download by accident.
+
 `requires_model` cleanup: Tests marked `@pytest.mark.requires_model` each
 load a HF checkpoint (~0.1-2 GB) onto the device. Across the suite we load
 SmolLM2 + Gemma 3 + Qwen2.5 + Qwen3 + int8/turbo variants — accumulated
@@ -21,7 +26,21 @@ import pytest
 import torch
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-large-models",
+        action="store_true",
+        default=False,
+        help="run tests marked large_model (multi-GB checkpoint downloads)",
+    )
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if not config.getoption("--run-large-models"):
+        skip_large = pytest.mark.skip(reason="large_model: pass --run-large-models to run")
+        for item in items:
+            if "large_model" in item.keywords:
+                item.add_marker(skip_large)
     if torch.cuda.is_available():
         return
     skip_cuda = pytest.mark.skip(reason="requires CUDA; not available on this host")

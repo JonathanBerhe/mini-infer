@@ -25,6 +25,11 @@ the new suffix, skipping the shared prefill. This touches only per-slot prefill
 (both paths leave the same row state); the decode loop is unchanged and output is
 identical.
 
+Pass `cuda_graph=True` to replay the decode step from a CUDA graph
+(`DecodeCudaGraph`) instead of launching its kernels one by one. Only models
+that declare `SUPPORTS_DECODE_CUDA_GRAPH` on a CUDA device can do this. The
+graph is captured in `start()`, right after the batched cache is built.
+
 Same start / stop / submit / run / stream interface as the other schedulers.
 """
 
@@ -41,6 +46,7 @@ from typing import Any
 import torch
 
 from mini_infer.cache.state_prefix_cache import StatePrefixCache
+from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode_cuda_graph
 from mini_infer.engine.sampler import sample
 from mini_infer.engine.state_cache_generator import (
     StateCacheGenerator,
@@ -82,6 +88,7 @@ class StateCacheContinuousScheduler:
         max_batch_size: int = 8,
         max_seq_len: int = 2048,
         prefix_cache: StatePrefixCache | None = None,
+        cuda_graph: bool = False,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
@@ -91,6 +98,13 @@ class StateCacheContinuousScheduler:
         self._model = generator.model
         self._device = generator.device
         self._dtype = generator.dtype
+        if cuda_graph and not supports_decode_cuda_graph(self._model, self._device):
+            raise ValueError(
+                f"cuda_graph=True needs a CUDA device and a model with "
+                f"SUPPORTS_DECODE_CUDA_GRAPH; got {type(self._model).__name__} on {self._device}"
+            )
+        self._cuda_graph = cuda_graph
+        self._decode_graph: DecodeCudaGraph | None = None
         self._max_batch_size = max_batch_size
         self._max_seq_len = max_seq_len
         # Opt-in cross-request prefix sharing. When set, a prompt that extends a
@@ -124,6 +138,14 @@ class StateCacheContinuousScheduler:
             batch_size=self._max_batch_size,
             device=self._device,
             dtype=self._dtype,
+        )
+        # Capture before any admission: warmup and capture write into every row.
+        self._decode_graph = (
+            DecodeCudaGraph(
+                self._model, self._cache, batch_size=self._max_batch_size, device=self._device
+            )
+            if self._cuda_graph
+            else None
         )
         self._slots = [None] * self._max_batch_size
         self._thread = threading.Thread(
@@ -306,12 +328,17 @@ class StateCacheContinuousScheduler:
             if slot is not None:
                 input_tokens[slot_idx, 0] = slot.next_token
                 positions[slot_idx] = slot.position
-        with torch.inference_mode():
-            logits = self._model.forward_decode_with_cache_ragged(
-                input_tokens.to(self._device),
-                positions=positions.to(self._device),
-                state_cache=self._cache,
-            )
+        if self._decode_graph is not None:
+            # `positions` is on the host, so this check costs no device sync.
+            self._cache.check_capacity(int(positions.max()) + 1)
+            logits = self._decode_graph.replay(input_tokens, positions)
+        else:
+            with torch.inference_mode():
+                logits = self._model.forward_decode_with_cache_ragged(
+                    input_tokens.to(self._device),
+                    positions=positions.to(self._device),
+                    state_cache=self._cache,
+                )
 
         # 3. Sample each still-active slot's next token; advance its position.
         for slot_idx in decode_slots:

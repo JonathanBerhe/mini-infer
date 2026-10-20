@@ -44,6 +44,7 @@ from mini_infer.api.schemas import (
     CompletionUsage,
 )
 from mini_infer.cache.state_prefix_cache import StatePrefixCache
+from mini_infer.engine.cuda_graph_decode import supports_decode_cuda_graph
 from mini_infer.engine.model_runner import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_NUM_BLOCKS,
@@ -129,14 +130,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # requests at their own positions through one ragged forward per step
         # (dynamic admit / evict). PD / packed-varlen continuous batching don't
         # apply to the per-request StateCache path.
+        generator = StateCacheGenerator.from_pretrained(model_name)
+        # Replay the decode step from a CUDA graph where the model supports it:
+        # same tokens as the eager step, without its per-kernel launch cost.
+        cuda_graph = supports_decode_cuda_graph(generator.model, generator.device)
         logger.info(
-            "Backing /v1/completions with StateCacheContinuousScheduler for %s (prefix_sharing=%s)",
+            "Backing /v1/completions with StateCacheContinuousScheduler for %s "
+            "(prefix_sharing=%s, cuda_graph=%s)",
             model_name,
             _PREFIX_SHARING,
+            cuda_graph,
         )
         scheduler = StateCacheContinuousScheduler(
-            StateCacheGenerator.from_pretrained(model_name),
+            generator,
             prefix_cache=StatePrefixCache() if _PREFIX_SHARING else None,
+            cuda_graph=cuda_graph,
         )
     else:
         # MINI_INFER_NUM_BLOCKS / MINI_INFER_BLOCK_SIZE let benchmarks size

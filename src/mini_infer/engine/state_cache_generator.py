@@ -169,11 +169,12 @@ class StateCacheGenerator:
 
         Dispatches on the checkpoint's registered architecture: classes with
         their own `from_checkpoint` (DeepSeek-V4's meta-device streaming
-        constructor) use it; the rest (Kimi Linear) load through the generic
-        `load_model` path. This is the single-device entry (local CPU/MPS, or
-        one GPU). For multi-GPU tensor parallelism, initialise the process
-        group per rank, build the per-rank model directly, and construct
-        `StateCacheGenerator(model, tokenizer)` around it.
+        constructor, the Qwen hybrid's shard-by-shard one) use it; the rest
+        (Kimi Linear) load through the generic `load_model` path. This is the
+        single-device entry (local CPU/MPS, or one GPU). For multi-GPU tensor
+        parallelism, initialise the process group per rank, build the per-rank
+        model directly, and construct `StateCacheGenerator(model, tokenizer)`
+        around it.
         """
         from mini_infer.engine.model_runner import _dtype_for, _resolve_device
         from mini_infer.models import REGISTRY, checkpoint_architecture, load_model
