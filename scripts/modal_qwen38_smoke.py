@@ -17,14 +17,20 @@ ratio and an untied `lm_head`. On one GPU it runs, in order:
    Greedy agreement with the reference and between batch sizes is reported,
    not asserted, because bf16 rounding can flip a near-tie.
 
-With `--cuda-graph`, the run first executes the CUDA-graph unit tests
-(`tests/unit/test_cuda_graph_decode.py`) on the GPU, then serves step 3
+On CUDA the Gated DeltaNet layers decode through the fused Triton step
+(`blocks/gdn_decode_kernel.py`) unless the benchmark switches it off.
+
+With `--cuda-graph`, the run first executes the CUDA-graph and fused-step
+unit tests (`tests/unit/test_cuda_graph_decode.py`,
+`tests/unit/test_gdn_decode_kernel.py`) on the GPU, then serves step 3
 through `DecodeCudaGraph`, requires the same tokens as an eager batch-1
 pass, and adds step 4:
 
 4. A decode benchmark: milliseconds per decode step at batch 1 and 4 after
-   a 64-token prefill per row, eager against CUDA graph, with one host sync
-   per step for sampling, as in serving.
+   a 64-token prefill per row, with one host sync per step for sampling, as
+   in serving. It crosses eager against CUDA graph with the fused Gated
+   DeltaNet step off and on. A graph must give the same tokens as eager
+   with the same step; the two steps are compared, not required to match.
 
 The weights live in a Modal Volume. Fill it once with the CPU-only
 `download` function, so that the GPU never waits on Hugging Face.
@@ -338,23 +344,45 @@ def run_checks(
         failures.append(f"no 'Paris' in {sequential[0].text!r}")
 
     if bench:
+        from mini_infer.models.blocks import gdn_decode_kernel
+
         _log("step 4: decode benchmark")
+        fused_options = (False, True) if device.startswith("cuda") else (False,)
         for batch_size in (1, 4):
-            eager_ms, eager_out = _decode_bench(
-                model, device, dtype, batch_size=batch_size, cuda_graph=False
-            )
-            line = f"decode batch {batch_size}: eager {eager_ms:.1f} ms/step"
-            if cuda_graph:
-                graph_ms, graph_out = _decode_bench(
-                    model, device, dtype, batch_size=batch_size, cuda_graph=True
+            by_step: dict[bool, list[list[int]]] = {}
+            for fused in fused_options:
+                gdn_decode_kernel._KERNEL_DISABLED_FOR_BENCH = not fused
+                eager_ms, eager_out = _decode_bench(
+                    model, device, dtype, batch_size=batch_size, cuda_graph=False
                 )
-                line += (
-                    f", cuda graph {graph_ms:.1f} ms/step ({eager_ms / graph_ms:.2f}x), "
-                    f"tokens equal: {graph_out == eager_out}"
+                line = (
+                    f"decode batch {batch_size}, fused GDN {'on ' if fused else 'off'}: "
+                    f"eager {eager_ms:.1f} ms/step"
                 )
-                if graph_out != eager_out:
-                    failures.append(f"decode bench batch {batch_size}: graph tokens differ")
-            lines.append(line)
+                if cuda_graph:
+                    graph_ms, graph_out = _decode_bench(
+                        model, device, dtype, batch_size=batch_size, cuda_graph=True
+                    )
+                    line += (
+                        f", cuda graph {graph_ms:.1f} ms/step ({eager_ms / graph_ms:.2f}x), "
+                        f"tokens equal: {graph_out == eager_out}"
+                    )
+                    if graph_out != eager_out:
+                        failures.append(
+                            f"decode bench batch {batch_size}, fused={fused}: graph tokens differ"
+                        )
+                lines.append(line)
+                by_step[fused] = eager_out
+            if len(by_step) == 2:
+                agree = [
+                    _common_prefix(on, off)
+                    for on, off in zip(by_step[True], by_step[False], strict=True)
+                ]
+                lines.append(
+                    f"decode batch {batch_size}: fused vs eager GDN step, equal greedy prefix "
+                    f"per row {agree} of {len(by_step[True][0])}"
+                )
+        gdn_decode_kernel._KERNEL_DISABLED_FOR_BENCH = False
 
     report = "\n".join(lines)
     if failures:
@@ -390,13 +418,14 @@ def qwen38_smoke(cuda_graph: bool = False) -> str:
     assert torch.cuda.is_available(), "CUDA not available in Modal container"
     if cuda_graph:
         # Fail fast on the tiny model before loading 55 GB.
-        _log("step 0: CUDA-graph unit tests")
+        _log("step 0: CUDA-graph and fused-step unit tests")
         subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pytest",
                 "/root/tests/unit/test_cuda_graph_decode.py",
+                "/root/tests/unit/test_gdn_decode_kernel.py",
                 "-q",
                 "-rs",
                 "-p",

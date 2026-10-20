@@ -154,9 +154,12 @@ the unwritten slots on the device, with the query heads of each KV head
 stacked on the query axis. The step therefore has no host sync and no
 data-dependent shape, and `decode_step_static` can be captured in a CUDA
 graph. On CUDA the serving scheduler replays it from the graph
-([ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md)): on the
-real 27B on an A100 that is 46 ms per step at batch 1 instead of 107 ms,
-with identical tokens.
+([ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md)), and
+each Gated DeltaNet layer runs its decode step as two fused Triton kernels
+instead of about 50 small ones
+([ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md)). On the real
+27B on an A100 a batch-1 step takes 39.6 ms, against 110 ms for the eager
+PyTorch step and a weight-bandwidth bound of about 26 ms.
 
 ## Validation contract
 
@@ -188,9 +191,12 @@ four prompts from 4 to 83 tokens. Result on `Qwen/Qwen3.8-27B` at revision
 - Prefill logits: cosine 0.99985 to 0.99998 against the reference, the same
   last-token top-1 for every prompt, and the same argmax at 99 to 100 percent
   of positions.
-- Greedy decode through the state-cache scheduler: 32 of 32 tokens equal to
-  the reference for all four prompts, and identical across two runs. The
-  first prompt completes as " Paris.".
+- Greedy decode through the state-cache scheduler with the PyTorch decode
+  step: 32 of 32 tokens equal to the reference for all four prompts, and
+  identical across two runs. The first prompt completes as " Paris.". With
+  the fused Gated DeltaNet step (the CUDA default since ADR-034), three
+  prompts still match 32 of 32; the fourth takes the other side of a bf16
+  near-tie at token 14, where batching alone also flips it.
 - Two requests in flight: three prompts match the one-at-a-time run token for
   token; one diverges after 14 tokens. Batched bf16 matrix products round
   differently, so this is reported and not asserted.
@@ -209,10 +215,11 @@ rope on purpose, and staying single-rank for this port.
 
 - Reference: `transformers/models/qwen3_5/modeling_qwen3_5.py` (pinned 5.14)
 - Model: [src/mini_infer/models/qwen3_5.py](../../src/mini_infer/models/qwen3_5.py)
-- Blocks: [gdn.py](../../src/mini_infer/models/blocks/gdn.py), [kda.py](../../src/mini_infer/models/blocks/kda.py)
+- Blocks: [gdn.py](../../src/mini_infer/models/blocks/gdn.py), [kda.py](../../src/mini_infer/models/blocks/kda.py), [gdn_decode_kernel.py](../../src/mini_infer/models/blocks/gdn_decode_kernel.py)
 - Cache: [qwen3_5_state_cache.py](../../src/mini_infer/cache/qwen3_5_state_cache.py)
 - ADRs: [ADR-032](../decisions/ADR-032-qwen38-hybrid-port.md) (port),
-  [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode)
+  [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode),
+  [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md) (fused Gated DeltaNet step)
 - Graph runner: [cuda_graph_decode.py](../../src/mini_infer/engine/cuda_graph_decode.py)
 
 ## What is still open
@@ -225,7 +232,8 @@ rope on purpose, and staying single-rank for this port.
   `Qwen4ExpForConditionalGeneration` / `qwen4_exp` and is a 512-expert MoE,
   so it needs its own port.
 - Cross-request prefix sharing for the recurrent state.
-- Fused decode kernels. With the CUDA graph, a 27B decode step runs at
-  about 57 percent of the weight-bandwidth bound on an A100; the rest is
-  thousands of small kernels. See
-  [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md).
+- The rest of the decode gap. With the graph and the fused Gated DeltaNet
+  step, a 27B batch-1 step runs at about 66 percent of the weight-bandwidth
+  bound on an A100. Most remaining small kernels are the decoder RMSNorms,
+  the attention layers and the MLP activations. See
+  [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md).

@@ -124,7 +124,8 @@ faithful oracle for this checkpoint.
   one-GPU gate on the real weights (`scripts/modal_qwen38_smoke.py`, A100
   80 GB, bf16): prefill logit cosine of at least 0.99985 against
   transformers, and greedy output equal to the reference token for token on
-  all four prompts. Real weights are also covered by a local-only smoke on
+  all four prompts (with the PyTorch decode step; see ADR-034 for the fused
+  one). Real weights are also covered by a local-only smoke on
   `Qwen/Qwen3.5-4B` (same architecture, 2x GDN ratio). That smoke is marked
   `large_model` and runs only with `--run-large-models`, because its 9.3 GB
   download does not fit the bit-parity runner or its 10 GB cache.

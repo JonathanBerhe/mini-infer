@@ -62,6 +62,7 @@ from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import GemmaRMSNorm, RotaryEmbedding, SwiGLU
 from mini_infer.models.blocks.gdn import broadcast_gate, gated_rmsnorm_silu, gdn_gate
+from mini_infer.models.blocks.gdn_decode_kernel import gdn_decode_step, supports_gdn_decode_kernel
 from mini_infer.models.blocks.kda import (
     causal_conv1d_prefill,
     causal_conv1d_step,
@@ -315,6 +316,27 @@ class _QwenGatedDeltaNet(nn.Module):
         del row_starts, kv_len  # A linear-attention layer is position-free.
         cfg = self.cfg
         batch, seq_len, _ = hidden.shape
+
+        if layer_state is not None and seq_len == 1 and supports_gdn_decode_kernel(hidden.device):
+            # The fused step: the same math as below in two launches.
+            gated_step = gdn_decode_step(
+                self.in_proj_qkv(hidden)[:, 0],
+                layer_state.conv,
+                self.conv1d.weight,
+                self.in_proj_a(hidden)[:, 0],
+                self.in_proj_b(hidden)[:, 0],
+                self.A_log,
+                self.dt_bias,
+                layer_state.recurrent_state,
+                self.in_proj_z(hidden)[:, 0],
+                self.norm.weight,
+                num_k_heads=cfg.linear_num_key_heads,
+                head_k_dim=cfg.linear_key_head_dim,
+                head_v_dim=cfg.linear_value_head_dim,
+                rms_eps=cfg.rms_norm_eps,
+            )
+            fused_out: torch.Tensor = self.out_proj(gated_step.view(batch, 1, -1))
+            return fused_out
 
         # z, beta and the decay gate read the PRE-convolution hidden state;
         # only the fused q/k/v path is convolved.
