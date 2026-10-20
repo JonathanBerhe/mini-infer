@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 
@@ -98,6 +99,7 @@ def iter_safetensors_shards(
     *,
     device: str | torch.device,
     dtype: torch.dtype,
+    max_bytes: int | None = None,
 ) -> Iterator[dict[str, torch.Tensor]]:
     """Yield the checkpoint one shard-dict at a time (streaming counterpart of
     `load_safetensors_state_dict`, same device/dtype/quantized-dtype rules).
@@ -108,6 +110,11 @@ def iter_safetensors_shards(
     checkpoint's own manifest, so co-located tensors (e.g. an FP8 weight and
     its `weight_scale_inv` scale) arrive together when the writer put them in
     the same shard.
+
+    With `max_bytes`, each file is read tensor by tensor and yielded in
+    batches of about `max_bytes`, so peak memory is one batch even when the
+    checkpoint is one large file. A batch can then split a weight from its
+    scale, so only consumers that load each tensor on its own may pass it.
     """
     local_dir = _resolve_local_dir(name_or_path)
     target_device = torch.device(device)
@@ -123,7 +130,47 @@ def iter_safetensors_shards(
             return t
         return t.to(dtype=dtype) if t.dtype != dtype else t
 
-    yield from _iter_shard_dicts(local_dir, safetensors_device, _maybe_cast)
+    if max_bytes is None:
+        yield from _iter_shard_dicts(local_dir, safetensors_device, _maybe_cast)
+        return
+    for path in _shard_paths(local_dir):
+        yield from _iter_bounded_batches(path, safetensors_device, _maybe_cast, max_bytes)
+
+
+def _shard_paths(local_dir: Path) -> list[Path]:
+    index_path = local_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        with index_path.open() as f:
+            weight_map = json.load(f)["weight_map"]
+        return [local_dir / shard for shard in sorted(set(weight_map.values()))]
+    single_file = local_dir / "model.safetensors"
+    if not single_file.exists():
+        raise FileNotFoundError(
+            f"no model.safetensors or model.safetensors.index.json under {local_dir}"
+        )
+    return [single_file]
+
+
+def _iter_bounded_batches(
+    path: Path,
+    safetensors_device: str,
+    maybe_cast: Callable[[torch.Tensor], torch.Tensor],
+    max_bytes: int,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Read one file tensor by tensor and yield batches of about `max_bytes`."""
+    with safe_open(str(path), framework="pt", device=safetensors_device) as handle:
+        batch: dict[str, torch.Tensor] = {}
+        size = 0
+        for key in handle.keys():  # noqa: SIM118 (safe_open handles are not mappings)
+            tensor = maybe_cast(handle.get_tensor(key))
+            batch[key] = tensor
+            size += tensor.numel() * tensor.element_size()
+            if size >= max_bytes:
+                yield batch
+                # Drop the reference before the next tensor loads.
+                batch, size = {}, 0
+        if batch:
+            yield batch
 
 
 def _quantized_dtypes() -> set[torch.dtype]:
