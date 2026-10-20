@@ -10,6 +10,7 @@ The direct realization of mini-infer's research-paper-engine niche
 
 | Family | Paper | Reference | Our walkthrough |
 |---|---|---|---|
+| Nemotron-H (Nemotron 3.5 Lightning, Nemotron 3 Nano; Mamba-2 hybrid, text-only) | Mamba-2 / SSD paper (arXiv 2405.21060) | HF transformers `modeling_nemotron_h.py` | [nemotron-h.md](nemotron-h.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated DeltaNet hybrid, text-only) | Gated DeltaNet paper (arXiv 2412.06464) | HF transformers `modeling_qwen3_5.py` (text path) | [qwen3-5.md](qwen3-5.md) |
 | Inkling / Inkling-Small | [Release post](https://thinkingmachines.ai/news/introducing-inkling/) | HF transformers `modeling_inkling.py` (text path) | [inkling.md](inkling.md) |
 | MiniMax-M3 (MSA) | MSA report (arXiv 2606.13392) | HF transformers `modeling_minimax_m3_vl.py` (text path) | [minimax-m3.md](minimax-m3.md) |
