@@ -17,14 +17,24 @@ ratio and an untied `lm_head`. On one GPU it runs, in order:
    Greedy agreement with the reference and between batch sizes is reported,
    not asserted, because bf16 rounding can flip a near-tie.
 
+With `--cuda-graph`, the run first executes the CUDA-graph unit tests
+(`tests/unit/test_cuda_graph_decode.py`) on the GPU, then serves step 3
+through `DecodeCudaGraph`, requires the same tokens as an eager batch-1
+pass, and adds step 4:
+
+4. A decode benchmark: milliseconds per decode step at batch 1 and 4 after
+   a 64-token prefill per row, eager against CUDA graph, with one host sync
+   per step for sampling, as in serving.
+
 The weights live in a Modal Volume. Fill it once with the CPU-only
 `download` function, so that the GPU never waits on Hugging Face.
 
 Run with:
     uv run modal run scripts/modal_qwen38_smoke.py::download
     uv run modal run scripts/modal_qwen38_smoke.py
+    uv run modal run scripts/modal_qwen38_smoke.py --cuda-graph
 Dry run on a tiny random checkpoint, on this machine (the transformers
-`device_map` path needs accelerate):
+`device_map` path needs accelerate; the benchmark runs eager only):
     uv run --with accelerate python scripts/modal_qwen38_smoke.py
 """
 
@@ -64,9 +74,11 @@ image = (
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",
+        "pytest",
     )
     .env({"HF_HOME": "/hf-cache"})
     .add_local_python_source("mini_infer")
+    .add_local_dir("tests", remote_path="/root/tests")
 )
 
 MAX_TOKENS = 32
@@ -127,13 +139,15 @@ def _reference_pass(model_dir: str, device: str, dtype: Any, eos: int | None) ->
     return out
 
 
-def _serve(generator: Any, *, max_batch_size: int) -> tuple[list[Any], float]:
+def _serve(
+    generator: Any, *, max_batch_size: int, cuda_graph: bool = False
+) -> tuple[list[Any], float]:
     """Serve PROMPTS through the state-cache scheduler; return results and wall time."""
     from mini_infer.engine.sampler import SamplingParams
     from mini_infer.scheduler import Request, StateCacheContinuousScheduler
 
     scheduler = StateCacheContinuousScheduler(
-        generator, max_batch_size=max_batch_size, max_seq_len=512
+        generator, max_batch_size=max_batch_size, max_seq_len=512, cuda_graph=cuda_graph
     )
     scheduler.start()
     start = time.perf_counter()
@@ -150,6 +164,60 @@ def _serve(generator: Any, *, max_batch_size: int) -> tuple[list[Any], float]:
     return results, time.perf_counter() - start
 
 
+def _decode_bench(
+    model: Any, device: str, dtype: Any, *, batch_size: int, cuda_graph: bool
+) -> tuple[float, list[list[int]]]:
+    """Milliseconds per greedy decode step at a full batch; also the tokens."""
+    import torch
+
+    from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph
+
+    prompt_len, warmup, steps = 64, 4, 48
+    cache = model.build_state_cache(
+        max_seq_len=512, batch_size=batch_size, device=device, dtype=dtype
+    )
+    # Capture first: warmup and capture write into every row of the cache.
+    graph = (
+        DecodeCudaGraph(model, cache, batch_size=batch_size, device=device) if cuda_graph else None
+    )
+    torch.manual_seed(0)
+    for row in range(batch_size):
+        single = model.build_state_cache(max_seq_len=512, batch_size=1, device=device, dtype=dtype)
+        ids = torch.randint(0, model.cfg.vocab_size, (1, prompt_len), device=device)
+        with torch.inference_mode():
+            model.forward_prefill_with_cache(ids, state_cache=single)
+        cache.copy_row_from(single, src_row=0, dst_row=row)
+    tokens = torch.zeros(batch_size, 1, dtype=torch.long)
+    positions = torch.full((batch_size,), prompt_len, dtype=torch.long)
+    generated: list[list[int]] = [[] for _ in range(batch_size)]
+
+    def step() -> None:
+        if graph is not None:
+            logits = graph.replay(tokens, positions)
+        else:
+            with torch.inference_mode():
+                logits = model.forward_decode_with_cache_ragged(
+                    tokens.to(device), positions=positions.to(device), state_cache=cache
+                )
+        # One host sync per step for sampling, as in serving.
+        chosen = logits[:, -1].argmax(-1).tolist()
+        for row, token in enumerate(chosen):
+            generated[row].append(token)
+            tokens[row, 0] = token
+        positions.add_(1)
+
+    for _ in range(warmup):
+        step()
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(steps):
+        step()
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    return 1000 * (time.perf_counter() - start) / steps, generated
+
+
 def _common_prefix(a: list[int], b: list[int]) -> int:
     n = 0
     for x, y in zip(a, b, strict=False):
@@ -159,8 +227,16 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
     return n
 
 
-def run_checks(model_dir: str, device: str, dtype: Any, *, expect_coherent: bool) -> str:
-    """Run the three steps; raise AssertionError with the full report on failure."""
+def run_checks(
+    model_dir: str,
+    device: str,
+    dtype: Any,
+    *,
+    expect_coherent: bool,
+    cuda_graph: bool = False,
+    bench: bool = False,
+) -> str:
+    """Run the steps; raise AssertionError with the full report on failure."""
     import torch
 
     from mini_infer.engine.state_cache_generator import StateCacheGenerator
@@ -218,17 +294,30 @@ def run_checks(model_dir: str, device: str, dtype: Any, *, expect_coherent: bool
         if ours_top1 not in ref_top5:
             failures.append(f"last-token top-1 {ours_top1} not in reference top-5 ({len(ids)} tok)")
 
-    _log("step 3: serving")
+    _log(f"step 3: serving (cuda_graph={cuda_graph})")
     tokenizer = generator.tokenizer
-    sequential, seq_s = _serve(generator, max_batch_size=1)
-    repeat, _ = _serve(generator, max_batch_size=1)
-    concurrent, conc_s = _serve(generator, max_batch_size=2)
+    sequential, seq_s = _serve(generator, max_batch_size=1, cuda_graph=cuda_graph)
+    repeat, _ = _serve(generator, max_batch_size=1, cuda_graph=cuda_graph)
+    concurrent, conc_s = _serve(generator, max_batch_size=2, cuda_graph=cuda_graph)
     seq_tokens = sum(len(r.tokens) for r in sequential)
     conc_tokens = sum(len(r.tokens) for r in concurrent)
     lines.append(
-        f"serving: batch 1 {seq_tokens / seq_s:.1f} tok/s, batch 2 {conc_tokens / conc_s:.1f} "
-        "tok/s (end to end, prefill included)"
+        f"serving (cuda_graph={cuda_graph}): batch 1 {seq_tokens / seq_s:.1f} tok/s, "
+        f"batch 2 {conc_tokens / conc_s:.1f} tok/s (end to end, prefill included)"
     )
+    if cuda_graph:
+        eager, eager_s = _serve(generator, max_batch_size=1)
+        eager_tokens = sum(len(r.tokens) for r in eager)
+        lines.append(
+            f"serving (cuda_graph=False): batch 1 {eager_tokens / eager_s:.1f} tok/s "
+            "(end to end, prefill included)"
+        )
+        for graphed, plain in zip(sequential, eager, strict=True):
+            if graphed.tokens != plain.tokens:
+                failures.append(
+                    f"graph tokens differ from eager after "
+                    f"{_common_prefix(graphed.tokens, plain.tokens)} tokens"
+                )
     for prompt, ref, first, again, both in zip(
         PROMPTS, reference, sequential, repeat, concurrent, strict=True
     ):
@@ -247,6 +336,25 @@ def run_checks(model_dir: str, device: str, dtype: Any, *, expect_coherent: bool
                 failures.append(f"request ended with {result.finish_reason!r}")
     if expect_coherent and "Paris" not in sequential[0].text:
         failures.append(f"no 'Paris' in {sequential[0].text!r}")
+
+    if bench:
+        _log("step 4: decode benchmark")
+        for batch_size in (1, 4):
+            eager_ms, eager_out = _decode_bench(
+                model, device, dtype, batch_size=batch_size, cuda_graph=False
+            )
+            line = f"decode batch {batch_size}: eager {eager_ms:.1f} ms/step"
+            if cuda_graph:
+                graph_ms, graph_out = _decode_bench(
+                    model, device, dtype, batch_size=batch_size, cuda_graph=True
+                )
+                line += (
+                    f", cuda graph {graph_ms:.1f} ms/step ({eager_ms / graph_ms:.2f}x), "
+                    f"tokens equal: {graph_out == eager_out}"
+                )
+                if graph_out != eager_out:
+                    failures.append(f"decode bench batch {batch_size}: graph tokens differ")
+            lines.append(line)
 
     report = "\n".join(lines)
     if failures:
@@ -272,11 +380,31 @@ def download() -> str:
     timeout=_TEST_TIMEOUT,
     volumes={"/hf-cache": hf_cache},
 )
-def qwen38_smoke() -> str:
+def qwen38_smoke(cuda_graph: bool = False) -> str:
+    import subprocess
+    import sys
+
     import torch
     from huggingface_hub import snapshot_download
 
     assert torch.cuda.is_available(), "CUDA not available in Modal container"
+    if cuda_graph:
+        # Fail fast on the tiny model before loading 55 GB.
+        _log("step 0: CUDA-graph unit tests")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "/root/tests/unit/test_cuda_graph_decode.py",
+                "-q",
+                "-rs",
+                "-p",
+                "no:cacheprovider",
+            ],
+            cwd="/root",
+            check=True,
+        )
     try:
         model_dir = snapshot_download(
             MODEL_NAME, revision=REVISION, allow_patterns=ALLOW_PATTERNS, local_files_only=True
@@ -287,12 +415,20 @@ def qwen38_smoke() -> str:
         f"gpu={torch.cuda.get_device_name()} cc={torch.cuda.get_device_capability()} "
         f"torch={torch.__version__} model={MODEL_NAME}@{REVISION[:7]}"
     )
-    return header + "\n" + run_checks(model_dir, "cuda", torch.bfloat16, expect_coherent=True)
+    report = run_checks(
+        model_dir,
+        "cuda",
+        torch.bfloat16,
+        expect_coherent=True,
+        cuda_graph=cuda_graph,
+        bench=cuda_graph,
+    )
+    return header + "\n" + report
 
 
 @app.local_entrypoint()
-def main() -> None:
-    print(qwen38_smoke.remote())
+def main(cuda_graph: bool = False) -> None:
+    print(qwen38_smoke.remote(cuda_graph))
 
 
 def _tiny_checkpoint() -> str:
@@ -335,4 +471,4 @@ def _tiny_checkpoint() -> str:
 if __name__ == "__main__":
     import torch
 
-    print(run_checks(_tiny_checkpoint(), "cpu", torch.float32, expect_coherent=False))
+    print(run_checks(_tiny_checkpoint(), "cpu", torch.float32, expect_coherent=False, bench=True))

@@ -310,8 +310,9 @@ class _QwenGatedDeltaNet(nn.Module):
         hidden: torch.Tensor,
         layer_state: QwenGdnLayerState | None,
         row_starts: torch.Tensor,
+        kv_len: int | None,
     ) -> torch.Tensor:
-        del row_starts  # A linear-attention layer is position-free.
+        del row_starts, kv_len  # A linear-attention layer is position-free.
         cfg = self.cfg
         batch, seq_len, _ = hidden.shape
 
@@ -398,7 +399,13 @@ class _QwenGatedAttention(nn.Module):
         hidden: torch.Tensor,
         layer_state: QwenAttentionLayerState | None,
         row_starts: torch.Tensor,
+        kv_len: int | None,
     ) -> torch.Tensor:
+        """`kv_len` is the cache length after this span, known on the host.
+
+        A cached span longer than one token (prefill or a prefill chunk) needs
+        it to slice the K/V buffers. A one-token step with a cache ignores it.
+        """
         cfg = self.cfg
         batch, seq_len, _ = hidden.shape
         heads, kv_heads, head_dim = (
@@ -431,11 +438,15 @@ class _QwenGatedAttention(nn.Module):
             rows = torch.arange(batch, device=hidden.device).view(batch, 1)
             layer_state.k[rows, positions] = key.transpose(1, 2).to(layer_state.k.dtype)
             layer_state.v[rows, positions] = value.transpose(1, 2).to(layer_state.v.dtype)
-            total = int(positions.max().item()) + 1
-            keys = layer_state.k[:, :total].transpose(1, 2).to(query.dtype)
-            values = layer_state.v[:, :total].transpose(1, 2).to(query.dtype)
+            if seq_len == 1:
+                attn = self._decode_attention(query, layer_state, positions)
+                return self._gated_output(attn, gate)
+            if kv_len is None:
+                raise ValueError("a cached span longer than one token needs kv_len")
+            keys = layer_state.k[:, :kv_len].transpose(1, 2).to(query.dtype)
+            values = layer_state.v[:, :kv_len].transpose(1, 2).to(query.dtype)
             key_positions = (
-                torch.arange(total, device=hidden.device).view(1, total).expand(batch, total)
+                torch.arange(kv_len, device=hidden.device).view(1, kv_len).expand(batch, kv_len)
             )
 
         # A key is visible to a query when it is at or before the query's
@@ -447,8 +458,48 @@ class _QwenGatedAttention(nn.Module):
         attn = functional.scaled_dot_product_attention(
             query, keys, values, attn_mask=allowed, scale=head_dim**-0.5
         )
-        attn = attn.transpose(1, 2).reshape(batch, seq_len, heads * head_dim)
-        out: torch.Tensor = self.o_proj(attn * torch.sigmoid(gate))
+        return self._gated_output(attn.transpose(1, 2), gate)
+
+    def _decode_attention(
+        self,
+        query: torch.Tensor,
+        layer_state: QwenAttentionLayerState,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """One new token per row, over the whole K/V buffer.
+
+        The buffer length is fixed and the mask comes from `positions` on the
+        device, so this has no host sync and no data-dependent shape, which
+        lets a CUDA graph capture the step. Slots past a row's position are
+        masked out. The query heads that share a KV head are stacked on the
+        query axis: that is grouped-query attention without copying K and V
+        once per query head.
+
+        Returns `(batch, 1, num_attention_heads, head_dim)`, the layout
+        `_gated_output` takes.
+        """
+        cfg = self.cfg
+        batch = query.shape[0]
+        kv_heads, head_dim = cfg.num_key_value_heads, cfg.head_dim
+        group = cfg.num_attention_heads // kv_heads
+        buffer_len = layer_state.k.shape[1]
+        grouped_query = query.reshape(batch, kv_heads, group, head_dim)
+        keys = layer_state.k.transpose(1, 2).to(query.dtype)
+        values = layer_state.v.transpose(1, 2).to(query.dtype)
+        slots = torch.arange(buffer_len, device=query.device)
+        allowed = (slots.view(1, buffer_len) <= positions.view(batch, 1)).view(
+            batch, 1, 1, buffer_len
+        )
+        attn = functional.scaled_dot_product_attention(
+            grouped_query, keys, values, attn_mask=allowed, scale=head_dim**-0.5
+        )
+        return attn.reshape(batch, cfg.num_attention_heads, 1, head_dim).transpose(1, 2)
+
+    def _gated_output(self, attn: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """`attn` is `(batch, seq_len, heads, head_dim)`; apply the sigmoid gate and project."""
+        batch, seq_len = attn.shape[:2]
+        flat = attn.reshape(batch, seq_len, self.cfg.num_attention_heads * self.cfg.head_dim)
+        out: torch.Tensor = self.o_proj(flat * torch.sigmoid(gate))
         return out
 
 
@@ -471,9 +522,10 @@ class _QwenDecoderLayer(nn.Module):
         hidden: torch.Tensor,
         layer_state: QwenGdnLayerState | QwenAttentionLayerState | None,
         row_starts: torch.Tensor,
+        kv_len: int | None,
     ) -> torch.Tensor:
         mixer = self.linear_attn if self.layer_kind == LINEAR_ATTENTION else self.self_attn
-        hidden = hidden + mixer(self.input_layernorm(hidden), layer_state, row_starts)
+        hidden = hidden + mixer(self.input_layernorm(hidden), layer_state, row_starts, kv_len)
         out: torch.Tensor = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return out
 
@@ -493,6 +545,8 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
     HF_ARCHITECTURE: ClassVar[str] = "Qwen3_5ForConditionalGeneration"
     Config: ClassVar[type] = Qwen35Config
     USES_STATE_CACHE: ClassVar[bool] = True
+    # `decode_step_static` is safe to capture in a CUDA graph.
+    SUPPORTS_DECODE_CUDA_GRAPH: ClassVar[bool] = True
 
     def __init__(self, cfg: Qwen35Config) -> None:
         super().__init__()
@@ -507,11 +561,13 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         input_ids: torch.Tensor,
         state_cache: Qwen35StateCache | None,
         row_starts: torch.Tensor,
+        kv_len: int | None = None,
     ) -> torch.Tensor:
+        """`kv_len`: cache length after this span, for cached spans of 2+ tokens."""
         hidden = self.model.embed_tokens(input_ids)
         for layer_idx, layer_module in enumerate(self.model.layers):
             layer_state = state_cache.layer(layer_idx) if state_cache is not None else None
-            hidden = layer_module(hidden, layer_state, row_starts)
+            hidden = layer_module(hidden, layer_state, row_starts, kv_len)
         hidden = self.model.norm(hidden)
         logits: torch.Tensor = self.lm_head(hidden)
         return logits
@@ -585,7 +641,7 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         row_starts = torch.full(
             (batch,), state_cache.start_pos, dtype=torch.long, device=input_ids.device
         )
-        return self._run(input_ids, state_cache, row_starts)
+        return self._run(input_ids, state_cache, row_starts, state_cache.start_pos + seq_len)
 
     def forward_decode_with_cache(
         self,
@@ -627,7 +683,22 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         if positions.shape != (batch,):
             raise ValueError(f"positions shape {tuple(positions.shape)} != (B={batch},)")
         state_cache.check_capacity(int(positions.max().item()) + 1)
-        return self._run(input_id, state_cache, positions.to(torch.long))
+        return self.decode_step_static(input_id, positions.to(torch.long), state_cache)
+
+    def decode_step_static(
+        self,
+        input_id: torch.Tensor,
+        positions: torch.Tensor,
+        state_cache: Qwen35StateCache,
+    ) -> torch.Tensor:
+        """The ragged decode step without the host-side checks.
+
+        `(B, 1)` token ids and `(B,)` int64 positions, both on the model's
+        device. It has no host sync and no data-dependent shape, and it
+        updates `state_cache` only in place, so `DecodeCudaGraph` can capture
+        it. The caller checks capacity and shapes.
+        """
+        return self._run(input_id, state_cache, positions)
 
     def _check_cache(self, state_cache: Qwen35StateCache) -> None:
         if state_cache.num_layers != self.cfg.num_hidden_layers:

@@ -147,6 +147,17 @@ the largest shard: for the 4B, about 8.5 GB of fp16 weights plus a 5.3 GB
 shard. The generic `load_model` builds in fp32 first, which for the 4B alone
 is about 17 GB.
 
+## Decode step
+
+A one-token step attends over the whole fixed-length K/V buffer and masks
+the unwritten slots on the device, with the query heads of each KV head
+stacked on the query axis. The step therefore has no host sync and no
+data-dependent shape, and `decode_step_static` can be captured in a CUDA
+graph. On CUDA the serving scheduler replays it from the graph
+([ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md)): on the
+real 27B on an A100 that is 46 ms per step at batch 1 instead of 107 ms,
+with identical tokens.
+
 ## Validation contract
 
 Bit-parity runs against the pinned transformers implementation of this exact
@@ -200,7 +211,9 @@ rope on purpose, and staying single-rank for this port.
 - Model: [src/mini_infer/models/qwen3_5.py](../../src/mini_infer/models/qwen3_5.py)
 - Blocks: [gdn.py](../../src/mini_infer/models/blocks/gdn.py), [kda.py](../../src/mini_infer/models/blocks/kda.py)
 - Cache: [qwen3_5_state_cache.py](../../src/mini_infer/cache/qwen3_5_state_cache.py)
-- ADR: [ADR-032](../decisions/ADR-032-qwen38-hybrid-port.md)
+- ADRs: [ADR-032](../decisions/ADR-032-qwen38-hybrid-port.md) (port),
+  [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode)
+- Graph runner: [cuda_graph_decode.py](../../src/mini_infer/engine/cuda_graph_decode.py)
 
 ## What is still open
 
@@ -212,6 +225,7 @@ rope on purpose, and staying single-rank for this port.
   `Qwen4ExpForConditionalGeneration` / `qwen4_exp` and is a 512-expert MoE,
   so it needs its own port.
 - Cross-request prefix sharing for the recurrent state.
-- Decode speed. The 27B gate serves through plain PyTorch, with no CUDA
-  graphs and no fused Gated DeltaNet kernel; it checks correctness, not
-  throughput.
+- Fused decode kernels. With the CUDA graph, a 27B decode step runs at
+  about 57 percent of the weight-bandwidth bound on an A100; the rest is
+  thousands of small kernels. See
+  [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md).
