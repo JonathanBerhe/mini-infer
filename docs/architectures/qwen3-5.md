@@ -166,8 +166,25 @@ architecture. It goes through `StateCacheGenerator.from_pretrained` and the
 state-cache scheduler, and checks the layout and a greedy "Paris" completion.
 It passed on an M1 Pro (16 GB, MPS, fp16) in about 4 minutes, mostly
 loading. The download is 9.3 GB, so the test carries the `large_model`
-marker and skips unless you pass `--run-large-models`. The 27B is 55.6 GB
-and does not fit the local development box.
+marker and skips unless you pass `--run-large-models`.
+
+The 27B is 55.6 GB and does not fit the local development box.
+[scripts/modal_qwen38_smoke.py](../../scripts/modal_qwen38_smoke.py) runs it
+on one A100 80 GB GPU in bf16 against transformers on the same weights, with
+four prompts from 4 to 83 tokens. Result on `Qwen/Qwen3.8-27B` at revision
+`1d4bf0f`:
+
+- Prefill logits: cosine 0.99985 to 0.99998 against the reference, the same
+  last-token top-1 for every prompt, and the same argmax at 99 to 100 percent
+  of positions.
+- Greedy decode through the state-cache scheduler: 32 of 32 tokens equal to
+  the reference for all four prompts, and identical across two runs. The
+  first prompt completes as " Paris.".
+- Two requests in flight: three prompts match the one-at-a-time run token for
+  token; one diverges after 14 tokens. Batched bf16 matrix products round
+  differently, so this is reported and not asserted.
+- `from_checkpoint` loads the model in 11 seconds from a warm volume, at
+  50.1 GiB of GPU memory.
 
 ## Where we diverged and why
 
@@ -194,7 +211,7 @@ rope on purpose, and staying single-rank for this port.
 - `Qwen3.8-Flash-Next` is NOT this architecture. It declares
   `Qwen4ExpForConditionalGeneration` / `qwen4_exp` and is a 512-expert MoE,
   so it needs its own port.
-- Live GPU validation on the real 27B weights, and a real-weight logit
-  comparison with transformers (the 4B smoke checks a greedy completion only,
-  because two copies of the 4B do not fit the 16 GB box).
 - Cross-request prefix sharing for the recurrent state.
+- Decode speed. The 27B gate serves through plain PyTorch, with no CUDA
+  graphs and no fused Gated DeltaNet kernel; it checks correctness, not
+  throughput.

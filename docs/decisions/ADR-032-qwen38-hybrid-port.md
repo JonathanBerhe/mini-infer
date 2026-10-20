@@ -120,11 +120,14 @@ faithful oracle for this checkpoint.
 - `blocks/gdn.py` is small because the expensive math was already in
   `blocks/kda.py`. The cost of the Kimi Linear port is partly recovered here.
 - The 27B cannot run on the local Apple Silicon box at 55.6 GB. Its 3x
-  GDN ratio is covered by synthetic parity against the reference. Real
-  weights are covered by a local-only smoke on `Qwen/Qwen3.5-4B` (same
-  architecture, 2x GDN ratio). It is marked `large_model` and runs only
-  with `--run-large-models`, because its 9.3 GB download does not fit the
-  bit-parity runner or its 10 GB cache.
+  GDN ratio is covered by synthetic parity against the reference, and by a
+  one-GPU gate on the real weights (`scripts/modal_qwen38_smoke.py`, A100
+  80 GB, bf16): prefill logit cosine of at least 0.99985 against
+  transformers, and greedy output equal to the reference token for token on
+  all four prompts. Real weights are also covered by a local-only smoke on
+  `Qwen/Qwen3.5-4B` (same architecture, 2x GDN ratio). That smoke is marked
+  `large_model` and runs only with `--run-large-models`, because its 9.3 GB
+  download does not fit the bit-parity runner or its 10 GB cache.
 - `Qwen3.8-Flash-Next` is explicitly NOT covered. It is a different
   architecture (`Qwen4ExpForConditionalGeneration`, model_type `qwen4_exp`,
   512-expert MoE) and remains a separate port.
