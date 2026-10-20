@@ -53,6 +53,7 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 |---|---|---|
 | `Qwen2ForCausalLM` | Qwen2.5 0.5B to 32B | |
 | `Qwen3ForCausalLM` | Qwen3 0.6B to 32B | [doc](docs/architectures/qwen3.md) |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.8-27B, Qwen3.5, Qwen3.6 (text only) | [doc](docs/architectures/qwen3-5.md) |
 | `LlamaForCausalLM` | Llama 2/3/4, SmolLM2, TinyLlama, Nemotron | [doc](docs/architectures/llama.md) |
 | `MistralForCausalLM` | Mistral 7B, Small, Large | [doc](docs/architectures/mistral.md) |
 | `Gemma3ForCausalLM` | Gemma 3 1B, 4B | [doc](docs/architectures/gemma-3.md) |
@@ -139,7 +140,7 @@ uv run pytest tests/golden/ -q
 uv run pytest -m requires_model -v
 ```
 
-The unit tests run on the CPU on each push. The golden tests compare the output token by token with Hugging Face. The `requires_model` tests download models and compare them bit for bit. A weekly workflow runs them against pinned Hugging Face revisions.
+The unit tests run on the CPU on each push. The golden tests compare the output token by token with Hugging Face. The `requires_model` tests download models and compare them bit for bit. A weekly workflow runs them against pinned Hugging Face revisions. Tests marked `large_model` download several GB, so they run only when you add `--run-large-models`.
 
 ## Out of scope
 

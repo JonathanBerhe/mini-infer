@@ -151,7 +151,13 @@ def _iter_shard_dicts(
         shards = sorted(set(weight_map.values()))
         for shard in shards:
             shard_dict = load_file(str(local_dir / shard), device=safetensors_device)
-            yield {k: maybe_cast(v) for k, v in shard_dict.items()}
+            # Cast in place so each source tensor is freed as it is replaced,
+            # and drop the reference after the yield so this shard is gone
+            # before the next one loads. Peak memory stays near one shard.
+            for key, tensor in shard_dict.items():
+                shard_dict[key] = maybe_cast(tensor)
+            yield shard_dict
+            del shard_dict
     else:
         single_file = local_dir / "model.safetensors"
         if not single_file.exists():
