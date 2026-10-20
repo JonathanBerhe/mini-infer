@@ -11,6 +11,41 @@ Status: Accepted
 > transformers 5.12. HF also stopped instantiating indexer weights on
 > "shared" IndexShare layers; the port mirrors that.
 
+> Amendment (2026-10-20): GLM-5.3 runs on this port with no code change.
+> `zai-org/GLM-5.3` (revision `ba32f8c19c8738e2c57c71798c601d477a7bf844`) is
+> another `GlmMoeDsaForCausalLM`. It ships under the GLM-5.3 License, while
+> GLM-5.2 is MIT. Read the license before you serve the weights. We checked
+> the config, the generation config and the safetensors index. We did not
+> download weights.
+>
+> - The config equals the GLM-5.2-FP8 config except `transformers_version`.
+>   The generation config and the index are byte-identical to GLM-5.2-FP8.
+>   All 141 shards have the same size and none has the same hash, so the
+>   weights are new and the layout is the same. The generation config has
+>   no `repetition_penalty`, so the reference does not post-process logits.
+> - `from_hf` ignores some fields that look like they change the math. None
+>   does. `indexer_types` is explicit, and `index_topk_freq` 4 with
+>   `index_skip_topk_offset` 3 gives the same 21 full layers (0, 1, 2, then
+>   every fourth from 6). `indexer_rope_interleave`, `rope_interleave`,
+>   `scoring_func`, `topk_method` and `moe_router_dtype` hold the values that
+>   the port fixes in code. The MTP fields only concern layer 78, which
+>   `load_weights` drops.
+> - The reference built on the meta device has 58794 text tensors. The index
+>   holds exactly those plus 1569 MTP tensors: 0 missing, 0 extra. Our
+>   `load_weights` accepts that key set, FP8 scales included, on meta tensors.
+> - transformers 5.15 changed `modeling_glm_moe_dsa.py` in structure only
+>   (buffers, a KV expand helper, a yarn helper, deprecation decorators). On
+>   one tiny model with the same weights, 5.14 and 5.15 give bit-identical
+>   logits for prefill, cached decode and `generate`. The GLM unit tests also
+>   pass with 5.15 as the reference. The pin stays at 5.14.
+> - Correction to the first amendment: since transformers 5.14 the indexer
+>   also uses interleaved RoPE, and so does the port. The config says the
+>   same with `indexer_rope_interleave: true`.
+>
+> The index lists names only, so real tensor shapes come from the reference.
+> No GLM-5.3 weights have run on a GPU. `tests/unit/test_glm53_config.py`
+> keeps the config, the unread fields and the meta-device load under test.
+
 ## Context
 
 GLM-5.2 (z.ai, released June 2026) ships as `GlmMoeDsaForCausalLM`

@@ -61,7 +61,7 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 | `MixtralForCausalLM` | Mixtral 8x7B, 8x22B | [doc](docs/architectures/mixtral.md) |
 | `DeepseekV2ForCausalLM` | DeepSeek-V2, V3, Kimi-K2 | [doc](docs/architectures/deepseek-v2-mla.md) |
 | `DeepseekV4ForCausalLM` | DeepSeek-V4-Pro, V4-Flash | [doc](docs/architectures/deepseek-v4.md) |
-| `GlmMoeDsaForCausalLM` | GLM-5.2 | [ADR-021](docs/decisions/ADR-021-glm-moe-dsa-port.md) |
+| `GlmMoeDsaForCausalLM` | GLM-5.2, GLM-5.3 | [ADR-021](docs/decisions/ADR-021-glm-moe-dsa-port.md) |
 | `MiniMaxM3SparseForConditionalGeneration` | MiniMax-M3 (text only) | [doc](docs/architectures/minimax-m3.md) |
 | `InklingForConditionalGeneration` | Inkling (text only) | [doc](docs/architectures/inkling.md) |
 | `KimiLinearForCausalLM` | Kimi Linear 48B | [ADR-026](docs/decisions/ADR-026-kimi-linear-kda-port.md) |
