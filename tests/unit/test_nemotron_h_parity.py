@@ -5,14 +5,17 @@ checkpoint-shaped keys (`backbone.` prefix, one tensor per routed expert,
 `(channels, 1, kernel)` conv taps, an `mtp.` layer), so the remapping is
 tested together with the math.
 
-Which reference to use: transformers 5.14's CPU fallback for Mamba-2
-(`torch_forward`) carries the state between chunks along the wrong axis, so
-its one-shot prefill is wrong for spans longer than `chunk_size` (the CUDA
-kernels it falls back from are correct). Its token-by-token decode path
-shares no code with the chunked scan. The tests therefore compare spans of
-one chunk against the one-shot reference, and longer spans against the
-reference fed one token at a time. `test_reference_chunked_fallback_is_off`
-pins the upstream behavior, so a fixed transformers shows up here.
+Which reference to use: up to transformers 5.14, the CPU fallback for
+Mamba-2 (`torch_forward`, also in Zamba2) sums the inter-chunk recurrence
+over the target chunk instead of the source chunk, so its one-shot prefill is
+wrong for spans longer than `chunk_size` (the CUDA kernels are correct).
+transformers 5.15.0 fixed it as part of a refactor
+(huggingface/transformers#47452). The token-by-token decode path shares no
+code with the chunked scan, so the tests compare spans of one chunk against
+the one-shot reference and longer spans against the reference fed one token
+at a time, which holds on every version.
+`test_reference_chunked_fallback_matches_its_version` pins which behavior
+the installed transformers has.
 """
 
 from __future__ import annotations
@@ -146,13 +149,19 @@ def test_prefill_across_chunks_matches_reference_token_by_token(pair) -> None:  
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_reference_chunked_fallback_is_off(pair) -> None:  # type: ignore[no-untyped-def]
-    """Pins the upstream defect: one-shot reference != its own token-by-token path."""
+def test_reference_chunked_fallback_matches_its_version(pair) -> None:  # type: ignore[no-untyped-def]
+    """Up to 5.14 the one-shot reference is off past one chunk; from 5.15.0 it is right."""
+    from packaging.version import Version
+
     hf, _ = pair
     ids = torch.randint(0, VOCAB, (1, 3 * CHUNK - 3))
     with torch.no_grad():
         one_shot = hf(input_ids=ids, use_cache=False).logits[0]
-    assert (one_shot - _reference_token_by_token(hf, ids)).abs().max() > 1e-6
+    gap = float((one_shot - _reference_token_by_token(hf, ids)).abs().max())
+    if Version(transformers.__version__) >= Version("5.15.0"):
+        assert gap < 1e-5
+    else:
+        assert gap > 1e-6
 
 
 def test_greedy_decode_matches_reference(pair) -> None:  # type: ignore[no-untyped-def]

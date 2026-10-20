@@ -44,13 +44,18 @@ upgrade.
    is `(0, inf)`). The transformers CPU fallback also clamps the step size at
    `time_step_min`, which changes only steps below 1e-3.
 4. **Parity oracle for long spans: the reference's token-by-token path.**
-   In transformers 5.14 the CPU fallback for Mamba-2 sums the inter-chunk
-   state recurrence over the wrong axis. It is exact for one chunk and wrong
-   beyond it: on a test model its one-shot logits differ from its own
-   token-by-token logits by 1.6e-5, while ours match the token-by-token ones
-   within 7e-8. Spans of one chunk are compared one shot, longer spans
-   against the reference fed one token at a time, and a test pins the
-   upstream defect so a fixed transformers shows up.
+   Up to transformers 5.14, the CPU fallback for Mamba-2 in Nemotron-H and
+   Zamba2 sums the inter-chunk state recurrence over the target chunk
+   instead of the source chunk. It is exact for one chunk and wrong beyond
+   it: on a test model its one-shot logits differ from its own token-by-token
+   logits by 1.6e-5, while ours match the token-by-token ones within 7e-8.
+   transformers 5.15.0 fixed it as part of a convolution refactor
+   (huggingface/transformers#47452), and from 5.18 all Mamba-2 models share
+   one chunk scan. Running a reproduction on each release confirmed the
+   bisection. The repo pins 5.14, so spans of one chunk are compared one
+   shot and longer spans against the reference fed one token at a time,
+   which is valid on every version. A test asserts the behavior that matches
+   the installed version, so a transformers upgrade does not fail it.
 5. **MoE: reuse the GLM router, stack the experts.** `GlmNoAuxTcGate` is
    the same sigmoid, aux-free-bias, grouped router. The routed experts are
    stacked into two tensors that the loader fills slot by slot. Up to 64
@@ -76,7 +81,11 @@ upgrade.
   port: the repo writes its kernels from scratch, and the PyTorch path runs
   on CPU and MPS. A fused decode kernel, like ADR-034's, can follow.
 - **Match the transformers CPU fallback exactly.** Rejected: it is not what
-  the model is served with, and its chunked path is wrong past one chunk.
+  the model is served with, and in the pinned 5.14 its chunked path is
+  wrong past one chunk.
+- **Upgrade transformers to 5.15 or later for this port.** Deferred: every
+  other parity suite in the repo is pinned to 5.14, and the token-by-token
+  oracle makes the upgrade unnecessary here.
 
 ## Consequences
 

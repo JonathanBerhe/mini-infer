@@ -8,9 +8,10 @@ it runs, in order:
 0. The Nemotron-H CUDA-graph unit test on the GPU, to fail fast.
 1. transformers' `NemotronHForCausalLM` on the real weights: prefill logits
    and a short greedy continuation for each prompt, then the model is freed.
-   Its Mamba-2 CPU path is forced (`use_mamba_kernels=False`). That path is
-   wrong for spans longer than one chunk (see ADR-035), so every prompt is
-   shorter than the 128-token chunk, and decode runs one token at a time.
+   Its Mamba-2 CPU path is forced (`use_mamba_kernels=False`). In the pinned
+   transformers 5.14 that path is wrong for spans longer than one chunk
+   (fixed in 5.15.0, see ADR-035), so every prompt is shorter than the
+   128-token chunk, and decode runs one token at a time.
 2. Our port, loaded through `StateCacheGenerator.from_pretrained` (the
    batch-streaming `from_checkpoint`). Prefill logits must match the
    reference: cosine above 0.99 and our top-1 inside the reference top-5.

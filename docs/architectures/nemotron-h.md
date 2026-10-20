@@ -16,9 +16,10 @@ Three details matter most:
   projection. The router is the DeepSeek-V3 sigmoid router with an aux-free
   selection bias, which mini-infer already had for GLM.
 - The attention layers use no RoPE. Order comes from the Mamba layers.
-- The transformers CPU fallback for Mamba-2 is wrong for spans longer than
-  one 128-token chunk, so parity for long spans uses its token-by-token
-  path ([ADR-035](../decisions/ADR-035-nemotron-h-port.md)).
+- In the pinned transformers 5.14, the CPU fallback for Mamba-2 is wrong
+  for spans longer than one chunk (fixed upstream in 5.15.0), so parity for
+  long spans uses its token-by-token path
+  ([ADR-035](../decisions/ADR-035-nemotron-h-port.md)).
 
 ## The map
 
