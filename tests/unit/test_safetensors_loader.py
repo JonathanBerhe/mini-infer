@@ -20,7 +20,7 @@ from __future__ import annotations
 import torch
 from safetensors.torch import save_file
 
-from mini_infer.models.loader import load_safetensors_state_dict
+from mini_infer.models.loader import iter_safetensors_shards, load_safetensors_state_dict
 
 
 def test_int8_weights_are_not_cast_to_bf16(tmp_path) -> None:
@@ -83,3 +83,27 @@ def test_bf16_target_casts_float16_source(tmp_path) -> None:
     state_dict = load_safetensors_state_dict(str(tmp_path), device="cpu", dtype=torch.bfloat16)
 
     assert state_dict["w.weight"].dtype == torch.bfloat16
+
+
+def test_bounded_batches_split_a_single_file_and_keep_every_tensor(tmp_path) -> None:
+    """`max_bytes` yields a large single-file checkpoint in small batches."""
+    # fp16 sources, so the bf16 cast applies (fp32 sources are kept as is).
+    tensors = {
+        f"layer.{i}.weight": torch.full((16, 16), float(i), dtype=torch.float16) for i in range(5)
+    }
+    tensors["layer.packed"] = torch.randint(0, 256, (8, 4), dtype=torch.uint8).view(torch.int8)
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+
+    batches = list(
+        iter_safetensors_shards(
+            str(tmp_path), device="cpu", dtype=torch.bfloat16, max_bytes=2 * 16 * 16 * 2
+        )
+    )
+
+    assert len(batches) > 1
+    assert all(len(batch) <= 2 for batch in batches)
+    merged = {key: value for batch in batches for key, value in batch.items()}
+    assert set(merged) == set(tensors)
+    assert merged["layer.3.weight"].dtype == torch.bfloat16
+    assert torch.equal(merged["layer.3.weight"].float(), tensors["layer.3.weight"])
+    assert merged["layer.packed"].dtype == torch.int8
