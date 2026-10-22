@@ -384,7 +384,7 @@ def block_fp8_grouped_mm(
     per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
     gluon = not per_segment if _GLUON_FOR_BENCH is None else _GLUON_FOR_BENCH
     if gluon and group_ends.dtype == torch.int32:
-        gluon_tiles = fp8_grouped_gluon.tiles_for(num_rows, num_groups)
+        gluon_tiles = fp8_grouped_gluon.tiles_for(num_rows, num_groups, rows.device)
         if fp8_grouped_gluon.supports_gluon_block_fp8_grouped_mm(rows, weight, block, gluon_tiles):
             return fp8_grouped_gluon.gluon_block_fp8_grouped_mm(
                 rows, weight, scale, block=block, group_ends=group_ends, tiles=gluon_tiles

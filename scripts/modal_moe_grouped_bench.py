@@ -626,6 +626,17 @@ FP8_GLUON_TILES = [
     (128, 128, 64, 8, 4, False),
     (128, 256, 64, 8, 3, False),
 ]
+# On sm100 `warps` counts the dequantization warps.
+FP8_GLUON_BLACKWELL_TILES = [
+    (128, 64, 64, 4, 4, True),
+    (128, 64, 64, 8, 4, True),
+    (128, 128, 64, 4, 4, True),
+    (128, 128, 64, 8, 4, True),
+    (128, 128, 128, 4, 3, True),
+    (128, 256, 64, 4, 3, True),
+    (128, 256, 64, 8, 3, True),
+    (128, 256, 128, 4, 2, True),
+]
 FP8_GLUON_SWEEP_TOKENS = [256, 1024, 4096, 16384]
 
 
@@ -697,14 +708,16 @@ def fp8_gluon_bench(
 ) -> list[str]:
     """The GLM-5.3 FP8 layer with the Gluon kernel against the Triton kernel.
 
-    Eager milliseconds per forward for Triton, Gluon (warp-specialized and
-    not) and the bf16 layer on `grouped_mm`, then each projection alone,
-    profiles at 4096 tokens and a sweep of Gluon tiles.
+    Eager milliseconds per forward for Triton, Gluon (on Hopper also without
+    warp specialization) and the bf16 layer on `grouped_mm`, then each
+    projection alone, profiles at 4096 tokens and a sweep of Gluon tiles.
     """
     import torch
 
+    from mini_infer.device import is_datacenter_blackwell_device
     from mini_infer.models.blocks import fp8_grouped_gluon
 
+    blackwell = is_datacenter_blackwell_device(device)
     specs = {spec["kind"]: spec for spec in _layer_specs(fixtures, tiny=False)}
     spec = specs["glm_fp8"]
     torch.manual_seed(0)
@@ -723,12 +736,13 @@ def fp8_gluon_bench(
     for tokens in FP8_GLUON_TOKENS:
         x = inputs[tokens]
         pairs = tokens * spec["top_k"]
-        tiles = fp8_grouped_gluon.tiles_for(pairs, spec["experts"])
-        runs = (
+        tiles = fp8_grouped_gluon.tiles_for(pairs, spec["experts"], torch.device(device))
+        runs: list[tuple[str, bool, tuple[Any, ...] | None]] = [
             ("triton", False, None),
             ("gluon", True, None),
-            ("gluon no-ws", True, (*tiles[:5], False)),
-        )
+        ]
+        if not blackwell:
+            runs.append(("gluon no-ws", True, (*tiles[:5], False)))
         wall: dict[str, float] = {}
         outs: dict[str, Any] = {}
         with torch.inference_mode(), _grouped(True):
@@ -738,10 +752,12 @@ def fp8_gluon_bench(
                     outs[label] = layer(x).float()
         base = outs["triton"]
         rel = float((outs["gluon"] - base).norm() / base.norm().clamp_min(1e-30))
-        best = min(wall["gluon"], wall["gluon no-ws"])
+        no_ws = wall.get("gluon no-ws")
+        best = min(wall["gluon"], no_ws if no_ws is not None else wall["gluon"])
+        no_ws_cell = f"{no_ws:12.3f}" if no_ws is not None else f"{'-':>12}"
         lines.append(
             f"{tokens:>9} | {wall['triton']:9.3f} | {wall['gluon']:9.3f} | "
-            f"{wall['gluon no-ws']:12.3f} | {', '.join(map(str, tiles)):<22} | "
+            f"{no_ws_cell} | {', '.join(map(str, tiles)):<22} | "
             f"{wall['triton'] / best:6.2f}x | {rel:8.1e}"
         )
 
@@ -763,7 +779,7 @@ def fp8_gluon_bench(
         "   BLOCK_W, BLOCK_T, BLOCK_K, warps, stages, ws | "
         + " | ".join(f"{tokens:>7} tok" for tokens in FP8_GLUON_SWEEP_TOKENS),
     ]
-    for tiles in FP8_GLUON_TILES:
+    for tiles in FP8_GLUON_BLACKWELL_TILES if blackwell else FP8_GLUON_TILES:
         cells = []
         try:
             with torch.inference_mode(), _grouped(True), _fp8_kernel(True, tiles):

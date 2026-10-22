@@ -1,10 +1,11 @@
-"""Grouped matmul over MoE experts with block-FP8 weights, in Gluon for Hopper.
+"""Grouped matmul over MoE experts with block-FP8 weights, in Gluon.
 
 The same product as `fp8_grouped_kernel.block_fp8_grouped_mm` with the same
 numerics: each e4m3 weight times its fp32 128x128 block scale, rounded to
 bf16, multiplied with the bf16 rows on the tensor cores with an fp32
-accumulator. This kernel is for many rows (prefill) on sm90. The Triton
-kernel keeps the other cases.
+accumulator. These kernels are for many rows (prefill), one for sm90
+(`wgmma`) and one for sm100 (`tcgen05`). The Triton kernel keeps the other
+cases.
 
 Differences from the Triton kernel:
 
@@ -25,6 +26,13 @@ Differences from the Triton kernel:
   copies for the next item start while the other warps store a finished
   tile. Without it, the same warps copy and multiply.
 
+On sm100 the kernel keeps the work items, the persistent walk and the copy
+warp, and splits the rest over more warps. `tcgen05` takes no register
+operand, so dequantization warps write the bf16 weight tile into tensor
+memory, a single MMA warp multiplies it with the row tile from shared
+memory into an accumulator in tensor memory, and the default warps store
+finished accumulators while the next tile is multiplied.
+
 Rows routed to another rank's experts (expert parallelism) sort after the
 local groups. Their items store zeros.
 """
@@ -35,12 +43,18 @@ import functools
 
 import torch
 
-from mini_infer.device import is_hopper_device
+from mini_infer.device import is_datacenter_blackwell_device, is_hopper_device
 
 try:
     import triton
     from triton.experimental import gluon
     from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        TensorMemoryLayout,
+        allocate_tensor_memory,
+        tcgen05_commit,
+        tcgen05_mma,
+    )
     from triton.experimental.gluon.language.nvidia.hopper import (
         fence_async_shared,
         mbarrier,
@@ -65,36 +79,54 @@ Tiles = tuple[int, int, int, int, int, bool]
 # picked from the mean rows per expert, so that few rows of a tile are
 # padding. Picked from a sweep of the GLM-5.3 layer on an H100
 # (`docs/benchmarks/2026-10-21-moe-grouped-gemm.md`).
-_TILES: tuple[tuple[float, Tiles], ...] = (
+_HOPPER_TILES: tuple[tuple[float, Tiles], ...] = (
     (64, (128, 64, 64, 4, 4, True)),
     (192, (128, 128, 64, 8, 4, True)),
     (float("inf"), (128, 256, 64, 8, 3, True)),
+)
+# On sm100, `num_warps` counts the dequantization warps; the kernel always
+# has a copy warp, an MMA warp and 4 store warps.
+_BLACKWELL_TILES: tuple[tuple[float, Tiles], ...] = (
+    (64, (128, 64, 64, 4, 4, True)),
+    (192, (128, 128, 64, 4, 4, True)),
+    (float("inf"), (128, 256, 64, 4, 3, True)),
 )
 # Bench hook, not a public API: force a tile.
 _TILES_FOR_BENCH: Tiles | None = None
 # Registers of the copy warp. It runs the item walk and issues TMA copies.
 _LOAD_REGS = 40
+# sm100: registers of the dequantization warps and of the MMA warp, the
+# weight tiles in tensor memory, and the accumulator columns that the store
+# warps read at a time.
+_DEQUANT_REGS = 192
+_MMA_REGS = 40
+_WEIGHT_BUFFERS = 4
+_STORE_COLUMNS = 32
 
 
-def tiles_for(num_rows: int, num_groups: int) -> Tiles:
-    """The tile for `num_rows` sorted rows over `num_groups` experts."""
+def tiles_for(num_rows: int, num_groups: int, device: torch.device) -> Tiles:
+    """The tile for `num_rows` sorted rows over `num_groups` experts on `device`."""
     if _TILES_FOR_BENCH is not None:
         return _TILES_FOR_BENCH
+    table = _BLACKWELL_TILES if is_datacenter_blackwell_device(device) else _HOPPER_TILES
     mean_rows = num_rows / max(num_groups, 1)
-    return next(tiles for limit, tiles in _TILES if mean_rows <= limit)
+    return next(tiles for limit, tiles in table if mean_rows <= limit)
 
 
 def supports_gluon_block_fp8_grouped_mm(
     rows: torch.Tensor, weight: torch.Tensor, block: int, tiles: Tiles
 ) -> bool:
-    """Whether the Gluon kernel takes these operands on this device.
+    """Whether a Gluon kernel takes these operands on this device.
 
-    It needs Gluon, an sm90 GPU, contiguous bf16 rows and weights, a K that
-    TMA can copy (16-byte rows) in an even number of K steps, and a scale
-    block that each weight tile fits in, so that one scale covers a tile at
-    each K step.
+    Both need Gluon, contiguous bf16 rows and weights, a K that TMA can copy
+    (16-byte rows), and a scale block that each weight tile fits in, so that
+    one scale covers a tile at each K step. The sm90 kernel also needs an
+    even number of K steps.
     """
-    if not _GLUON_AVAILABLE or not is_hopper_device(rows.device):
+    if not _GLUON_AVAILABLE:
+        return False
+    hopper = is_hopper_device(rows.device)
+    if not hopper and not is_datacenter_blackwell_device(rows.device):
         return False
     block_w, _block_t, block_k = tiles[:3]
     k_dim = rows.shape[1]
@@ -103,7 +135,7 @@ def supports_gluon_block_fp8_grouped_mm(
         and rows.is_contiguous()
         and weight.is_contiguous()
         and k_dim % 16 == 0
-        and -(-k_dim // block_k) % 2 == 0
+        and (not hopper or -(-k_dim // block_k) % 2 == 0)
         and block % block_w == 0
         and block % block_k == 0
     )
@@ -650,6 +682,370 @@ if _GLUON_AVAILABLE:
             [LOAD_REGS],
         )
 
+    @gluon.jit  # type: ignore[untyped-decorator]
+    def _bw_dequant_partition(  # type: ignore[no-untyped-def]
+        w_bufs,
+        ready,
+        a_tmem,
+        a_ready,
+        a_empty,
+        s_ptr,
+        group_ends_ptr,
+        num_rows,
+        n_dim,
+        k_dim,
+        num_groups,
+        stride_se,
+        stride_sn,
+        stride_sk,
+        BLOCK_T: gl.constexpr,
+        QBLOCK: gl.constexpr,
+    ):
+        """sm100 dequantization warps: e4m3 tile in shared memory to bf16 in tensor memory."""
+        NUM_STAGES: gl.constexpr = w_bufs.type.shape[0]
+        BLOCK_W: gl.constexpr = w_bufs.type.shape[1]
+        BLOCK_K: gl.constexpr = w_bufs.type.shape[2]
+        WEIGHT_BUFFERS: gl.constexpr = a_tmem.shape[0]
+        layout: gl.constexpr = a_tmem.index(0).get_reg_layout()
+        n_tiles = gl.cdiv(n_dim, BLOCK_W)
+        k_steps = gl.cdiv(k_dim, BLOCK_K)
+        consumed = 0
+        group = 0
+        first = 0
+        start = 0
+        end = _group_end(group_ends_ptr, 0, num_groups, num_rows)
+        tiles = gl.cdiv(end, BLOCK_T)
+        items = tiles * n_tiles
+        item = gl.program_id(0)
+        while group <= num_groups:
+            group, first, items, tiles, start, end = _walk_to(
+                item,
+                group,
+                first,
+                items,
+                tiles,
+                start,
+                end,
+                group_ends_ptr,
+                num_groups,
+                num_rows,
+                n_tiles,
+                BLOCK_T,
+            )
+            if group <= num_groups:
+                col = ((item - first) // tiles) * BLOCK_W
+                k_iters = gl.where(group < num_groups, k_steps, 0)
+                s_base = s_ptr + group * stride_se + (col // QBLOCK) * stride_sn
+                for ki in range(k_iters):
+                    stage = consumed % NUM_STAGES
+                    buffer = consumed % WEIGHT_BUFFERS
+                    mbarrier.wait(ready.index(stage), (consumed // NUM_STAGES) & 1)
+                    mbarrier.wait(a_empty.index(buffer), ((consumed // WEIGHT_BUFFERS) & 1) ^ 1)
+                    scale = gl.load(s_base + ((ki * BLOCK_K) // QBLOCK) * stride_sk)
+                    w = _dequantize(w_bufs.index(stage).load(layout), scale)
+                    a_tmem.index(buffer).store(w)
+                    mbarrier.arrive(a_ready.index(buffer))
+                    consumed += 1
+                item += gl.num_programs(0)
+
+    @gluon.jit
+    def _bw_mma_partition(  # type: ignore[no-untyped-def]
+        x_bufs,
+        ready,
+        empty,
+        a_tmem,
+        a_ready,
+        a_empty,
+        acc_tmem,
+        acc_ready,
+        acc_empty,
+        group_ends_ptr,
+        num_rows,
+        n_dim,
+        k_dim,
+        num_groups,
+    ):
+        """sm100 MMA warp: `acc[cols, rows] += W @ rows.T` with W from tensor memory."""
+        NUM_STAGES: gl.constexpr = x_bufs.type.shape[0]
+        BLOCK_T: gl.constexpr = x_bufs.type.shape[1]
+        BLOCK_K: gl.constexpr = x_bufs.type.shape[2]
+        BLOCK_W: gl.constexpr = a_tmem.shape[1]
+        WEIGHT_BUFFERS: gl.constexpr = a_tmem.shape[0]
+        ACC_BUFFERS: gl.constexpr = acc_tmem.shape[0]
+        n_tiles = gl.cdiv(n_dim, BLOCK_W)
+        k_steps = gl.cdiv(k_dim, BLOCK_K)
+        consumed = 0
+        done = 0
+        group = 0
+        first = 0
+        start = 0
+        end = _group_end(group_ends_ptr, 0, num_groups, num_rows)
+        tiles = gl.cdiv(end, BLOCK_T)
+        items = tiles * n_tiles
+        item = gl.program_id(0)
+        while group <= num_groups:
+            group, first, items, tiles, start, end = _walk_to(
+                item,
+                group,
+                first,
+                items,
+                tiles,
+                start,
+                end,
+                group_ends_ptr,
+                num_groups,
+                num_rows,
+                n_tiles,
+                BLOCK_T,
+            )
+            if group <= num_groups:
+                k_iters = gl.where(group < num_groups, k_steps, 0)
+                acc_buffer = done % ACC_BUFFERS
+                # A new barrier counts as released once, so the first round
+                # of accumulators does not wait.
+                mbarrier.wait(acc_empty.index(acc_buffer), ((done // ACC_BUFFERS) & 1) ^ 1)
+                acc = acc_tmem.index(acc_buffer)
+                for ki in range(k_iters):
+                    stage = consumed % NUM_STAGES
+                    buffer = consumed % WEIGHT_BUFFERS
+                    mbarrier.wait(a_ready.index(buffer), (consumed // WEIGHT_BUFFERS) & 1)
+                    mbarrier.wait(ready.index(stage), (consumed // NUM_STAGES) & 1)
+                    # Its completion frees the stage and the weight buffer.
+                    tcgen05_mma(
+                        a_tmem.index(buffer),
+                        x_bufs.index(stage).permute((1, 0)),
+                        acc,
+                        use_acc=ki > 0,
+                        mbarriers=[empty.index(stage), a_empty.index(buffer)],
+                    )
+                    consumed += 1
+                tcgen05_commit(acc_ready.index(acc_buffer))
+                done += 1
+                item += gl.num_programs(0)
+
+    @gluon.jit  # type: ignore[untyped-decorator]
+    def _bw_store_partition(  # type: ignore[no-untyped-def]
+        acc_tmem,
+        acc_ready,
+        acc_empty,
+        out_ptr,
+        group_ends_ptr,
+        num_rows,
+        n_dim,
+        k_dim,
+        num_groups,
+        stride_om,
+        BLOCK_K: gl.constexpr,
+        STORE_COLUMNS: gl.constexpr,
+    ):
+        """sm100 store warps: finished accumulators from tensor memory to `out`."""
+        ACC_BUFFERS: gl.constexpr = acc_tmem.shape[0]
+        BLOCK_W: gl.constexpr = acc_tmem.shape[1]
+        BLOCK_T: gl.constexpr = acc_tmem.shape[2]
+        layout: gl.constexpr = acc_tmem.index(0).slice(0, STORE_COLUMNS).get_reg_layout()
+        n_tiles = gl.cdiv(n_dim, BLOCK_W)
+        k_steps = gl.cdiv(k_dim, BLOCK_K)
+        done = 0
+        group = 0
+        first = 0
+        start = 0
+        end = _group_end(group_ends_ptr, 0, num_groups, num_rows)
+        tiles = gl.cdiv(end, BLOCK_T)
+        items = tiles * n_tiles
+        item = gl.program_id(0)
+        while group <= num_groups:
+            group, first, items, tiles, start, end = _walk_to(
+                item,
+                group,
+                first,
+                items,
+                tiles,
+                start,
+                end,
+                group_ends_ptr,
+                num_groups,
+                num_rows,
+                n_tiles,
+                BLOCK_T,
+            )
+            if group <= num_groups:
+                local = item - first
+                col = (local // tiles) * BLOCK_W
+                row = start + (local % tiles) * BLOCK_T
+                row_end = gl.minimum(row + BLOCK_T, end)
+                # The off-rank tail ran no multiply: its tile is zeros.
+                computed = (group < num_groups) & (k_steps > 0)
+                acc_buffer = done % ACC_BUFFERS
+                mbarrier.wait(acc_ready.index(acc_buffer), (done // ACC_BUFFERS) & 1)
+                acc = acc_tmem.index(acc_buffer)
+                for part in gl.static_range(BLOCK_T // STORE_COLUMNS):
+                    columns = acc.slice(part * STORE_COLUMNS, STORE_COLUMNS)
+                    values = gl.where(computed, columns.load(layout), 0.0)
+                    if part == BLOCK_T // STORE_COLUMNS - 1:
+                        # Every column is in registers: the MMA warp may reuse it.
+                        mbarrier.arrive(acc_empty.index(acc_buffer))
+                    cols = col + gl.arange(0, BLOCK_W, layout=gl.SliceLayout(1, layout))
+                    rows = (
+                        row
+                        + part * STORE_COLUMNS
+                        + gl.arange(0, STORE_COLUMNS, layout=gl.SliceLayout(0, layout))
+                    )
+                    mask = (cols[:, None] < n_dim) & (rows[None, :] < row_end)
+                    gl.store(
+                        out_ptr + rows[None, :].to(gl.int64) * stride_om + cols[:, None],
+                        values.to(gl.bfloat16),
+                        mask=mask,
+                    )
+                done += 1
+                item += gl.num_programs(0)
+
+    @gluon.jit  # type: ignore[untyped-decorator]
+    def _block_fp8_grouped_mm_blackwell(  # type: ignore[no-untyped-def]
+        x_desc,
+        w_desc,
+        s_ptr,
+        group_ends_ptr,
+        out_ptr,
+        num_rows,
+        n_dim,
+        k_dim,
+        num_groups,
+        stride_se,
+        stride_sn,
+        stride_sk,
+        stride_om,
+        QBLOCK: gl.constexpr,
+        NUM_STAGES: gl.constexpr,
+        WEIGHT_BUFFERS: gl.constexpr,
+        ACC_BUFFERS: gl.constexpr,
+        STORE_COLUMNS: gl.constexpr,
+        DEQUANT_WARPS: gl.constexpr,
+        DEQUANT_REGS: gl.constexpr,
+        MMA_REGS: gl.constexpr,
+        LOAD_REGS: gl.constexpr,
+        num_warps: gl.constexpr,
+    ):
+        """sm100 version: copy, dequantization, MMA and store warps."""
+        BLOCK_W: gl.constexpr = w_desc.block_type.shape[0]
+        BLOCK_K: gl.constexpr = w_desc.block_type.shape[1]
+        BLOCK_T: gl.constexpr = x_desc.block_type.shape[0]
+        gl.static_assert(QBLOCK % BLOCK_W == 0, "a weight tile must fit in one scale block")
+        gl.static_assert(QBLOCK % BLOCK_K == 0, "a K step must fit in one scale block")
+        x_bufs = gl.allocate_shared_memory(
+            x_desc.dtype, [NUM_STAGES] + x_desc.block_type.shape, x_desc.layout
+        )
+        w_bufs = gl.allocate_shared_memory(
+            w_desc.dtype, [NUM_STAGES] + w_desc.block_type.shape, w_desc.layout
+        )
+        a_tmem = allocate_tensor_memory(
+            gl.bfloat16,
+            [WEIGHT_BUFFERS, BLOCK_W, BLOCK_K],
+            TensorMemoryLayout((BLOCK_W, BLOCK_K), col_stride=1),
+        )
+        acc_tmem = allocate_tensor_memory(
+            gl.float32,
+            [ACC_BUFFERS, BLOCK_W, BLOCK_T],
+            TensorMemoryLayout((BLOCK_W, BLOCK_T), col_stride=1),
+        )
+        ready = gl.allocate_shared_memory(gl.int64, [NUM_STAGES, 1], mbarrier.MBarrierLayout())
+        empty = gl.allocate_shared_memory(gl.int64, [NUM_STAGES, 1], mbarrier.MBarrierLayout())
+        a_ready = gl.allocate_shared_memory(
+            gl.int64, [WEIGHT_BUFFERS, 1], mbarrier.MBarrierLayout()
+        )
+        a_empty = gl.allocate_shared_memory(
+            gl.int64, [WEIGHT_BUFFERS, 1], mbarrier.MBarrierLayout()
+        )
+        acc_ready = gl.allocate_shared_memory(gl.int64, [ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
+        acc_empty = gl.allocate_shared_memory(gl.int64, [ACC_BUFFERS, 1], mbarrier.MBarrierLayout())
+        for i in gl.static_range(NUM_STAGES):
+            mbarrier.init(ready.index(i), count=1)
+            mbarrier.init(empty.index(i), count=1)
+        for i in gl.static_range(WEIGHT_BUFFERS):
+            mbarrier.init(a_ready.index(i), count=1)
+            mbarrier.init(a_empty.index(i), count=1)
+        for i in gl.static_range(ACC_BUFFERS):
+            mbarrier.init(acc_ready.index(i), count=1)
+            mbarrier.init(acc_empty.index(i), count=1)
+        gl.warp_specialize(
+            [
+                (
+                    _bw_store_partition,
+                    (
+                        acc_tmem,
+                        acc_ready,
+                        acc_empty,
+                        out_ptr,
+                        group_ends_ptr,
+                        num_rows,
+                        n_dim,
+                        k_dim,
+                        num_groups,
+                        stride_om,
+                        BLOCK_K,
+                        STORE_COLUMNS,
+                    ),
+                ),
+                (
+                    _bw_dequant_partition,
+                    (
+                        w_bufs,
+                        ready,
+                        a_tmem,
+                        a_ready,
+                        a_empty,
+                        s_ptr,
+                        group_ends_ptr,
+                        num_rows,
+                        n_dim,
+                        k_dim,
+                        num_groups,
+                        stride_se,
+                        stride_sn,
+                        stride_sk,
+                        BLOCK_T,
+                        QBLOCK,
+                    ),
+                ),
+                (
+                    _bw_mma_partition,
+                    (
+                        x_bufs,
+                        ready,
+                        empty,
+                        a_tmem,
+                        a_ready,
+                        a_empty,
+                        acc_tmem,
+                        acc_ready,
+                        acc_empty,
+                        group_ends_ptr,
+                        num_rows,
+                        n_dim,
+                        k_dim,
+                        num_groups,
+                    ),
+                ),
+                (
+                    _ws_load_partition,
+                    (
+                        x_desc,
+                        w_desc,
+                        x_bufs,
+                        w_bufs,
+                        ready,
+                        empty,
+                        group_ends_ptr,
+                        num_rows,
+                        n_dim,
+                        k_dim,
+                        num_groups,
+                    ),
+                ),
+            ],
+            [DEQUANT_WARPS, 1, 1],
+            [DEQUANT_REGS, MMA_REGS, LOAD_REGS],
+        )
+
 
 def _max_registers(num_warps: int, warp_specialize: bool) -> int | None:
     """Register limit per thread so that one program fits on an SM.
@@ -663,6 +1059,31 @@ def _max_registers(num_warps: int, warp_specialize: bool) -> int | None:
     return min(255, 65536 // (warpgroups * 128)) // 8 * 8
 
 
+def blackwell_launch_options(tiles: Tiles) -> dict[str, int]:
+    """Constexprs and launch options of the sm100 kernel for these tiles.
+
+    Tensor memory has 512 columns. Each bf16 weight tile takes `BLOCK_K / 2`
+    of them and each fp32 accumulator `BLOCK_T`, so two accumulators fit up
+    to 128 token rows and one above.
+    """
+    _block_w, block_t, _block_k, dequant_warps, stages, _ = tiles
+    # The store warps (4), the dequantization warps, then one warpgroup that
+    # holds the MMA and copy warps.
+    warpgroups = 1 + dequant_warps // 4 + 1
+    return {
+        "NUM_STAGES": stages,
+        "WEIGHT_BUFFERS": _WEIGHT_BUFFERS,
+        "ACC_BUFFERS": 2 if block_t <= 128 else 1,
+        "STORE_COLUMNS": _STORE_COLUMNS,
+        "DEQUANT_WARPS": dequant_warps,
+        "DEQUANT_REGS": _DEQUANT_REGS,
+        "MMA_REGS": _MMA_REGS,
+        "LOAD_REGS": _LOAD_REGS,
+        "num_warps": 4,
+        "maxnreg": min(255, 65536 // (warpgroups * 128)) // 8 * 8,
+    }
+
+
 def gluon_block_fp8_grouped_mm(
     rows: torch.Tensor,
     weight: torch.Tensor,
@@ -672,7 +1093,7 @@ def gluon_block_fp8_grouped_mm(
     group_ends: torch.Tensor,
     tiles: Tiles,
 ) -> torch.Tensor:
-    """`rows @ dequant(weight[e]).T` for each row's expert `e`, on Hopper.
+    """`rows @ dequant(weight[e]).T` for each row's expert `e`, on sm90 or sm100.
 
     Arguments as `fp8_grouped_kernel.block_fp8_grouped_mm`, which checks them
     and calls this function when `supports_gluon_block_fp8_grouped_mm` holds.
@@ -708,7 +1129,11 @@ def gluon_block_fp8_grouped_mm(
         scale.stride(2),
         out.stride(0),
     )
-    if warp_specialize:
+    if is_datacenter_blackwell_device(rows.device):
+        _block_fp8_grouped_mm_blackwell[grid](
+            *args, QBLOCK=block, **blackwell_launch_options(tiles)
+        )
+    elif warp_specialize:
         _block_fp8_grouped_mm_hopper_ws[grid](
             *args,
             QBLOCK=block,

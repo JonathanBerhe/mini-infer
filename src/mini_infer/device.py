@@ -61,6 +61,16 @@ def is_blackwell_device(device: torch.device | str | None = None) -> bool:
     return major is not None and major >= 10
 
 
+def is_datacenter_blackwell_device(device: torch.device | str | None = None) -> bool:
+    """Whether the current (or specified) CUDA device is SM_10x (B200, B300).
+
+    Same device argument as `is_blackwell_device`. These are the Blackwell
+    GPUs with `tcgen05` and tensor memory; the RTX 50-series (12, 0) has
+    neither.
+    """
+    return _cuda_major(device) == 10
+
+
 def is_hopper_device(device: torch.device | str | None = None) -> bool:
     """Whether the current (or specified) CUDA device is Hopper (SM_90).
 
