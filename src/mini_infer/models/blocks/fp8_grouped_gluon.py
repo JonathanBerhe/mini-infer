@@ -85,12 +85,14 @@ _HOPPER_TILES: tuple[tuple[float, Tiles], ...] = (
     (float("inf"), (128, 256, 64, 8, 3, True)),
 )
 # On sm100, `num_warps` counts the dequantization warps; the kernel always
-# has a copy warp, an MMA warp and 4 store warps.
+# has a copy warp, an MMA warp and 4 store warps. Picked from a sweep on a
+# B200. Up to 64 mean rows per expert the Triton kernel is as fast, so the
+# default path keeps it there (`on_by_default`).
 _BLACKWELL_TILES: tuple[tuple[float, Tiles], ...] = (
-    (64, (128, 64, 64, 4, 4, True)),
-    (192, (128, 128, 64, 4, 4, True)),
-    (float("inf"), (128, 256, 64, 4, 3, True)),
+    (64, (128, 64, 64, 8, 4, True)),
+    (float("inf"), (128, 128, 128, 4, 3, True)),
 )
+_BLACKWELL_MIN_MEAN_ROWS = 64
 # Bench hook, not a public API: force a tile.
 _TILES_FOR_BENCH: Tiles | None = None
 # Registers of the copy warp. It runs the item walk and issues TMA copies.
@@ -111,6 +113,17 @@ def tiles_for(num_rows: int, num_groups: int, device: torch.device) -> Tiles:
     table = _BLACKWELL_TILES if is_datacenter_blackwell_device(device) else _HOPPER_TILES
     mean_rows = num_rows / max(num_groups, 1)
     return next(tiles for limit, tiles in table if mean_rows <= limit)
+
+
+def on_by_default(num_rows: int, num_groups: int, device: torch.device) -> bool:
+    """Whether the default path takes a Gluon kernel for this many sorted rows.
+
+    On sm90 it always does. On sm100 the Triton kernel's expert tiles are as
+    fast up to 64 mean rows per expert, so the Gluon kernel runs above.
+    """
+    if not is_datacenter_blackwell_device(device):
+        return True
+    return num_rows / max(num_groups, 1) > _BLACKWELL_MIN_MEAN_ROWS
 
 
 def supports_gluon_block_fp8_grouped_mm(
@@ -843,6 +856,15 @@ if _GLUON_AVAILABLE:
         BLOCK_W: gl.constexpr = acc_tmem.shape[1]
         BLOCK_T: gl.constexpr = acc_tmem.shape[2]
         layout: gl.constexpr = acc_tmem.index(0).slice(0, STORE_COLUMNS).get_reg_layout()
+        # In the tensor-memory layout each thread holds one output column, so
+        # its stores are 2 bytes wide. This layout gives each thread 8
+        # neighbouring columns: 16-byte stores, 8 times fewer of them.
+        store_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[8, 1],
+            threads_per_warp=[BLOCK_W // 8, 256 // BLOCK_W],
+            warps_per_cta=[1, gl.num_warps()],
+            order=[0, 1],
+        )
         n_tiles = gl.cdiv(n_dim, BLOCK_W)
         k_steps = gl.cdiv(k_dim, BLOCK_K)
         done = 0
@@ -884,16 +906,17 @@ if _GLUON_AVAILABLE:
                     if part == BLOCK_T // STORE_COLUMNS - 1:
                         # Every column is in registers: the MMA warp may reuse it.
                         mbarrier.arrive(acc_empty.index(acc_buffer))
-                    cols = col + gl.arange(0, BLOCK_W, layout=gl.SliceLayout(1, layout))
+                    values = gl.convert_layout(values.to(gl.bfloat16), store_layout)
+                    cols = col + gl.arange(0, BLOCK_W, layout=gl.SliceLayout(1, store_layout))
                     rows = (
                         row
                         + part * STORE_COLUMNS
-                        + gl.arange(0, STORE_COLUMNS, layout=gl.SliceLayout(0, layout))
+                        + gl.arange(0, STORE_COLUMNS, layout=gl.SliceLayout(0, store_layout))
                     )
                     mask = (cols[:, None] < n_dim) & (rows[None, :] < row_end)
                     gl.store(
                         out_ptr + rows[None, :].to(gl.int64) * stride_om + cols[:, None],
-                        values.to(gl.bfloat16),
+                        values,
                         mask=mask,
                     )
                 done += 1

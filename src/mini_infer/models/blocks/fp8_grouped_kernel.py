@@ -382,7 +382,12 @@ def block_fp8_grouped_mm(
         raise ValueError(f"block={block} must be a power of two of at least 16")
     small = num_rows <= _SMALL_ROWS
     per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
-    gluon = not per_segment if _GLUON_FOR_BENCH is None else _GLUON_FOR_BENCH
+    if _GLUON_FOR_BENCH is None:
+        gluon = not per_segment and fp8_grouped_gluon.on_by_default(
+            num_rows, num_groups, rows.device
+        )
+    else:
+        gluon = _GLUON_FOR_BENCH
     if gluon and group_ends.dtype == torch.int32:
         gluon_tiles = fp8_grouped_gluon.tiles_for(num_rows, num_groups, rows.device)
         if fp8_grouped_gluon.supports_gluon_block_fp8_grouped_mm(rows, weight, block, gluon_tiles):

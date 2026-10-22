@@ -307,6 +307,21 @@ def test_supports_only_operands_the_kernel_handles(
     )
 
 
+@pytest.mark.parametrize(
+    ("blackwell", "num_rows", "takes"),
+    [(False, 512, True), (False, 32768, True), (True, 16384, False), (True, 32768, True)],
+)
+def test_on_by_default_only_where_the_kernel_wins(
+    monkeypatch: pytest.MonkeyPatch, blackwell: bool, num_rows: int, takes: bool
+) -> None:
+    """On sm100 the Gluon kernel is the default above 64 mean rows per expert."""
+    monkeypatch.setattr(
+        fp8_grouped_gluon, "is_datacenter_blackwell_device", lambda device: blackwell
+    )
+    on = fp8_grouped_gluon.on_by_default(num_rows, 256, torch.device("cpu"))
+    assert on is takes
+
+
 @pytest.mark.requires_cuda
 def test_default_path_uses_gluon_for_many_rows_and_matches_triton(
     monkeypatch: pytest.MonkeyPatch,
