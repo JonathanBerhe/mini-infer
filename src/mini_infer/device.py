@@ -33,6 +33,22 @@ def require_cuda_device(device: torch.device | str, what: str) -> None:
         raise RuntimeError(f"{what} requires CUDA; got device={device}")
 
 
+def _cuda_major(device: torch.device | str | None) -> int | None:
+    """Compute-capability major of a CUDA device, or `None` if it is not one."""
+    if not torch.cuda.is_available():
+        return None
+    if device is not None and not is_cuda_device(device):
+        return None
+    if device is None:
+        idx: int | str = torch.cuda.current_device()
+    elif isinstance(device, str):
+        idx = device
+    else:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+    major, _minor = torch.cuda.get_device_capability(idx)
+    return major
+
+
 def is_blackwell_device(device: torch.device | str | None = None) -> bool:
     """Whether the current (or specified) CUDA device is Blackwell (SM_100+).
 
@@ -41,15 +57,15 @@ def is_blackwell_device(device: torch.device | str | None = None) -> bool:
     family (B100, B200, B300, RTX 50-series, ...). H100 is (9, 0); A100
     is (8, 0).
     """
-    if not torch.cuda.is_available():
-        return False
-    if device is not None and not is_cuda_device(device):
-        return False
-    if device is None:
-        idx: int | str = torch.cuda.current_device()
-    elif isinstance(device, str):
-        idx = device
-    else:
-        idx = device.index if device.index is not None else torch.cuda.current_device()
-    major, _minor = torch.cuda.get_device_capability(idx)
-    return major >= 10
+    major = _cuda_major(device)
+    return major is not None and major >= 10
+
+
+def is_hopper_or_newer_device(device: torch.device | str | None = None) -> bool:
+    """Whether the current (or specified) CUDA device is Hopper or newer (SM_90+).
+
+    Same device argument as `is_blackwell_device`. H100 / H200 are (9, 0);
+    every Blackwell part also qualifies.
+    """
+    major = _cuda_major(device)
+    return major is not None and major >= 9
