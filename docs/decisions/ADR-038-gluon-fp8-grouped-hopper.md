@@ -63,8 +63,8 @@ specialization directly.
    between releases), bf16 rows, a scale block that is a multiple of the
    tile, K a multiple of 16, and an even number of K steps. GLM-5 and
    MiniMax-M3 meet them. In every other case the Triton kernel runs. Up to
-   256 rows the per-segment Triton path stays. The B200 keeps the Triton
-   kernel.
+   256 rows the per-segment Triton path stays. The B200 has its own Gluon
+   kernel ([ADR-039](ADR-039-gluon-fp8-grouped-blackwell.md)).
 9. **Tests without a GPU where possible.** Gluon does not run under
    Triton's interpreter. The compile tests build every default tile for
    sm90 on the CPU and fail on register spills and on any instruction that
@@ -91,8 +91,8 @@ specialization directly.
   reads the bf16 tile through shared memory once more, which costs
   shared-memory bandwidth that the register operand does not use.
 - **A Blackwell (`tcgen05`) version.** It is a different kernel with tensor
-  memory. The B200 numbers of ADR-037 show a smaller gap, and this change
-  does not cover it.
+  memory, and this change does not cover it.
+  [ADR-039](ADR-039-gluon-fp8-grouped-blackwell.md) adds it for the B200.
 
 ## Consequences
 

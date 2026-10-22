@@ -9,16 +9,19 @@ experts). The real `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
 (revision `a9904d2`), with prefill on `scripts/data/technical_passage.md`
 Engine: mini-infer with the grouped expert paths of
 [ADR-036](../decisions/ADR-036-grouped-expert-matmuls.md) (bf16),
-[ADR-037](../decisions/ADR-037-block-fp8-grouped-kernel.md) (block FP8) and
+[ADR-037](../decisions/ADR-037-block-fp8-grouped-kernel.md) (block FP8),
 [ADR-038](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) (block FP8 in
-Gluon on the H100)
+Gluon on the H100) and
+[ADR-039](../decisions/ADR-039-gluon-fp8-grouped-blackwell.md) (block FP8
+in Gluon on the B200)
 Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
 `--fp8-tiles`, `--fp8-gluon` and `--fp8-expert-tiles` for the FP8 runs)
 Raw output: bf16 on the [H100](data/moe-grouped-gemm-h100.txt) and the
 [B200](data/moe-grouped-gemm-b200.txt), FP8 on the
 [H100](data/moe-grouped-fp8-h100.txt) and the
-[B200](data/moe-grouped-fp8-b200.txt), the Gluon kernel on the
-[H100](data/moe-grouped-fp8-gluon-h100.txt), the expert tiles on the
+[B200](data/moe-grouped-fp8-b200.txt), the Gluon kernels on the
+[H100](data/moe-grouped-fp8-gluon-h100.txt) and the
+[B200](data/moe-grouped-fp8-gluon-b200.txt), the expert tiles on the
 [H100](data/moe-grouped-fp8-expert-tiles-h100.txt) and the
 [B200](data/moe-grouped-fp8-expert-tiles-b200.txt)
 
@@ -53,6 +56,11 @@ Raw output: bf16 on the [H100](data/moe-grouped-gemm-h100.txt) and the
   to 1.42 times faster on the B200 and 1.06 to 1.31 times faster on the
   H100 than row tiles that span experts. The section "Expert tiles in the
   Triton kernel" has the details.
+- On the B200, the Gluon `tcgen05` kernel makes the FP8 layer 1.22 to 1.26
+  times faster than the Triton expert tiles from 4096 tokens. The FP8
+  layer is then 1.04 times faster than the bf16 layer at 4096 tokens and
+  1.15 times slower at 16384 tokens. The section "Gluon kernel for the
+  B200" has the details.
 - The grouped path is slower in three places: batch-1 graph decode on the
   B200 (3.6 percent), eager decode at small batches, and Mixtral at 16384
   tokens on the B200 (0.88x). The section "Where the grouped path is
@@ -539,7 +547,11 @@ H100. The outputs of the two splits are bit-identical on both GPUs.
 
 On the H100, the expert tiles give 60 to 70 percent of the Gluon kernel's
 gain over the row tiles at 1024 to 4096 tokens, and 23 percent at 16384
-tokens. At 64 and 256 tokens they are 3 and 2 percent faster than the
+tokens. A later `--fp8-gluon` run on the H100, with the expert tiles as the
+Triton default ([raw output](data/moe-grouped-fp8-gluon-h100-expert-tiles.txt),
+99 GPU tests passed), measured the Gluon kernel 1.17 to 1.33 times faster
+than the Triton kernel from 1024 tokens: 6.645 against 5.552 ms at 1024
+tokens, 12.683 against 9.911 at 4096, and 39.789 against 29.881 at 16384. At 64 and 256 tokens they are 3 and 2 percent faster than the
 Gluon kernel, which is within the noise of eager timing between runs (the
 Gluon kernel took 4.173 and 3.945 ms at 64 tokens in two runs).
 
@@ -581,4 +593,75 @@ weight tile goes into one tensor-memory buffer, which `tcgen05` reads. With
 one buffer, the dequantization of a K step waits until the previous
 multiply is done. The row tile goes through registers into shared memory,
 without TMA, and no warp is specialized.
+
+### Gluon kernel for the B200
+
+The `tcgen05` kernel of
+[ADR-039](../decisions/ADR-039-gluon-fp8-grouped-blackwell.md) against the
+Triton kernel with expert tiles, in one process on one B200 on 2026-10-22
+(`--fp8-gluon`, [raw output](data/moe-grouped-fp8-gluon-b200.txt)). The
+run first passed 82 unit tests on the GPU (the 26 sm90 tests skip there).
+They include the Gluon kernel against fp32 math, against the Triton
+kernel, in a CUDA graph, and under Triton's concurrency sanitizer.
+
+Eager milliseconds per forward. The Gluon kernel is forced on at every
+size. The default path calls it only above 64 mean rows per expert (from
+4096 tokens here):
+
+| tokens | Triton expert tiles | Gluon | Gluon tile | speedup | bf16 |
+|---:|---:|---:|---|---:|---:|
+| 32 | 2.232 | 2.539 | 128, 64, 64, 8, 4 | 0.88x | |
+| 64 | 3.212 | 3.112 | 128, 64, 64, 8, 4 | 1.03x | |
+| 256 | 3.671 | 3.615 | 128, 64, 64, 8, 4 | 1.02x | |
+| 1024 | 4.020 | 4.045 | 128, 64, 64, 8, 4 | 0.99x | 5.108 |
+| 2048 | 5.457 | 5.659 | 128, 64, 64, 8, 4 | 0.96x | |
+| 4096 | 8.266 | 6.583 | 128, 128, 128, 4, 3 | 1.26x | 6.870 |
+| 8192 | 14.330 | 11.762 | 128, 128, 128, 4, 3 | 1.22x | |
+| 16384 | 26.549 | 21.113 | 128, 128, 128, 4, 3 | 1.26x | 18.413 |
+
+The "bf16" column is the same layer with bf16 experts on `grouped_mm`, in
+the same run. On sm100 the fourth number of a tile counts the
+dequantization warps. The outputs of the two kernels are bit-identical at
+every size.
+
+Each projection alone, the median milliseconds of `do_bench` and the
+useful TFLOPS:
+
+| tokens | projection | Triton | Gluon | speedup | Triton TFLOPS | Gluon TFLOPS |
+|---:|---|---:|---:|---:|---:|---:|
+| 1024 | gate-up | 1.957 | 1.997 | 0.98x | 211 | 206 |
+| 1024 | down | 1.047 | 1.037 | 1.01x | 197 | 199 |
+| 4096 | gate-up | 3.951 | 3.055 | 1.29x | 417 | 540 |
+| 4096 | down | 2.205 | 1.548 | 1.42x | 374 | 533 |
+| 16384 | gate-up | 11.803 | 8.580 | 1.38x | 559 | 769 |
+| 16384 | down | 6.335 | 4.345 | 1.46x | 521 | 759 |
+
+Profile at 4096 tokens: the Triton kernel takes 5.665 ms of 8.206 ms GPU
+time per forward, the Gluon kernel 4.099 ms of 6.746 ms. The Gluon path
+also skips the GPU operations that count the expert tiles (63 against 87
+per forward).
+
+Gluon tiles, eager milliseconds per forward:
+
+| tile | 256 tok | 1024 | 4096 | 16384 |
+|---|---:|---:|---:|---:|
+| 128, 64, 64, 4, 4 | 3.792 | 4.220 | 9.348 | 31.587 |
+| 128, 64, 64, 8, 4 | 3.729 | 4.179 | 9.155 | 30.695 |
+| 128, 128, 64, 4, 4 | 4.068 | 4.550 | 7.401 | 23.180 |
+| 128, 128, 128, 4, 3 | 3.809 | 4.250 | 6.906 | 21.104 |
+| 128, 128, 128, 8, 3 | 3.744 | 4.199 | 6.865 | 21.317 |
+| 128, 256, 64, 4, 3 | 5.574 | 6.166 | 7.494 | 20.783 |
+| 128, 256, 128, 4, 2 | 5.986 | 6.630 | 7.906 | 21.764 |
+
+(128, 128, 128, 4, 3) is the default above 64 mean rows: within 1 percent
+of the fastest tile at 4096 tokens and within 2 percent at 16384 tokens.
+The 256-row tile has one accumulator, and the store of a tile then stalls
+the next multiply. It is the fastest at 16384 tokens but 9 percent slower
+at 4096.
+
+An earlier run on the same day
+([raw output](data/moe-grouped-fp8-gluon-b200-first.txt)) used 2-byte
+stores and other default tiles. It also passed all GPU tests. With the
+same tile, the 16-byte stores of the final version are 1 to 6 percent
+faster from 4096 tokens.
 

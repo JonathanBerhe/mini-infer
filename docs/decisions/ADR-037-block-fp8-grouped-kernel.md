@@ -140,7 +140,9 @@ Measured with the GLM-5.3 layer in one process per GPU
   times slower at 4096 and 16384 tokens.
 - On the H100, the expert tiles are 1.06 to 1.31 times faster than the row
   tiles. There the Gluon kernel of ADR-038 takes many rows when it can, and
-  the expert tiles run for the other shapes.
+  the expert tiles run for the other shapes. On the B200 the Gluon kernel
+  of [ADR-039](ADR-039-gluon-fp8-grouped-blackwell.md) takes over above 64
+  mean rows per expert.
 - The outputs of the two splits are bit-identical.
 - The Blackwell tile for 257 to 8192 rows changes from (64, 128, 64, 4, 4)
   to (64, 256, 64, 8, 3), the fastest expert tile at 1024 tokens in the
