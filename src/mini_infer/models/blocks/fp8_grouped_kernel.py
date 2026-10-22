@@ -21,16 +21,20 @@ Two ways to split the work, both without a host sync:
   per column tile. A program runs only where a segment starts: the first
   row of an expert's group, then every `BLOCK_M` rows after it. Each
   segment gets its own program, so the experts of a batch load in parallel.
-- Per row tile, for many rows (prefill). One program computes a
-  `(BLOCK_M, BLOCK_N)` tile. Its rows can belong to several experts, so it
-  walks them in order and masks the rows of the other experts. A grid of one
-  program per row would be mostly idle here.
+- Per expert tile, for many rows (prefill). The rows of each expert are cut
+  into tiles of `BLOCK_M`, counted on the GPU, and each program takes one
+  tile of one expert. A grid of one program per row would be mostly idle
+  here.
+
+A third split, per row tile, stays for benchmarks: a program takes
+`BLOCK_M` sorted rows that can belong to several experts and runs the K
+loop once for each of them.
 
 Rows routed to another rank's experts (expert parallelism) sort after the
 local groups and get zeros.
 
-On Hopper, the per-row-tile split goes to the Gluon kernel of
-`fp8_grouped_gluon.py` when it takes the operands.
+On Hopper, many rows go to the Gluon kernel of `fp8_grouped_gluon.py` when
+it takes the operands.
 """
 
 from __future__ import annotations
@@ -69,7 +73,7 @@ _HOPPER_TILES: tuple[Tiles, Tiles, Tiles] = (
 )
 _BLACKWELL_TILES: tuple[Tiles, Tiles, Tiles] = (
     (16, 128, 64, 4, 3),
-    (64, 128, 64, 4, 4),
+    (64, 256, 64, 8, 3),
     (128, 256, 64, 8, 3),
 )
 _SMALL_ROWS = 256
@@ -80,8 +84,8 @@ _TILES_FOR_BENCH: Tiles | None = None
 _SWAP_AB_FOR_BENCH: bool | None = None
 _PER_SEGMENT_FOR_BENCH: bool | None = None
 _GLUON_FOR_BENCH: bool | None = None
-# Bench hook: split many rows into tiles of one expert each (True), not
-# into row tiles that span experts.
+# Bench hook: False splits many rows into row tiles that span experts, not
+# into tiles of one expert each (the default).
 _EXPERT_TILES_FOR_BENCH: bool | None = None
 
 
@@ -391,7 +395,7 @@ def block_fp8_grouped_mm(
     swap_ab = True if _SWAP_AB_FOR_BENCH is None else _SWAP_AB_FOR_BENCH
     tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows)
     block_m, block_n, tile_k, warps, stages = tiles
-    expert_tiles = not per_segment and bool(_EXPERT_TILES_FOR_BENCH)
+    expert_tiles = not per_segment and _EXPERT_TILES_FOR_BENCH is not False
     tile_ends = group_ends
     if expert_tiles:
         # Row tiles per group, the off-rank tail last, counted on the GPU.

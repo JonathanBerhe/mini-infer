@@ -441,15 +441,25 @@ def _previous_fp8_kernel(enabled: bool, rows: int) -> Iterator[None]:
     """
     from mini_infer.models.blocks import fp8_grouped_kernel as kernel
 
-    saved = (kernel._SWAP_AB_FOR_BENCH, kernel._PER_SEGMENT_FOR_BENCH, kernel._TILES_FOR_BENCH)
+    names = (
+        "_SWAP_AB_FOR_BENCH",
+        "_PER_SEGMENT_FOR_BENCH",
+        "_TILES_FOR_BENCH",
+        "_EXPERT_TILES_FOR_BENCH",
+        "_GLUON_FOR_BENCH",
+    )
+    saved = {name: getattr(kernel, name) for name in names}
     if enabled:
         kernel._SWAP_AB_FOR_BENCH = False
         kernel._PER_SEGMENT_FOR_BENCH = False
         kernel._TILES_FOR_BENCH = (16, 64, 64, 4, 3) if rows <= 256 else (64, 128, 64, 4, 4)
+        kernel._EXPERT_TILES_FOR_BENCH = False
+        kernel._GLUON_FOR_BENCH = False
     try:
         yield
     finally:
-        kernel._SWAP_AB_FOR_BENCH, kernel._PER_SEGMENT_FOR_BENCH, kernel._TILES_FOR_BENCH = saved
+        for name, value in saved.items():
+            setattr(kernel, name, value)
 
 
 # Token counts that land in each tier of the kernel's tile table at top-8.
