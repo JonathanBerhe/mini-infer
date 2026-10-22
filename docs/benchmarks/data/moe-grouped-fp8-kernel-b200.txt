@@ -1,0 +1,74 @@
+gpu=NVIDIA B200 cc=(10, 0) torch=2.14.1+cu130 cuda=13.0 triton=3.8.0
+
+## GPU unit tests
+.......................................                                  [100%]
+39 passed in 5.28s
+
+## FP8 kernel, previous against new (GLM-5.3, FP8 experts: hidden 6144, expert width 2048, 256 experts, top-8)
+wall ms per forward; graph columns are CUDA graph replays
+   tokens |      loop |  previous |       new | new vs previous | rel diff | graph previous | graph new
+        1 |     9.391 |     0.724 |     0.398 |           1.82x |  2.1e-04 |          0.577 |     0.255
+        4 |    17.918 |     1.199 |     0.689 |           1.74x |  5.9e-04 |          1.064 |     0.553
+       16 |    44.566 |     1.791 |     1.592 |           1.12x |  4.4e-04 |          1.652 |     1.459
+       64 |    88.577 |     4.331 |     3.980 |           1.09x |  0.0e+00 |          4.199 |     3.839
+      256 |    98.344 |     4.445 |     4.211 |           1.06x |  0.0e+00 |              - |         -
+     1024 |   100.189 |     5.608 |     5.386 |           1.04x |  0.0e+00 |              - |         -
+     4096 |   101.490 |    12.552 |    11.932 |           1.05x |  0.0e+00 |              - |         -
+    16384 |   109.306 |    38.691 |    37.262 |           1.04x |  0.0e+00 |              - |         -
+
+## Profile, previous against new kernel
+  glm_fp8_4tok_previous_kernel: 49 GPU ops, 1.088 ms GPU busy of 1.199 ms wall (GPU idle 9%), 0 host syncs per forward
+         0.919 ms  _block_fp8_grouped_mm_kernel
+         0.017 ms  void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_tn_align1>(cutlass_80_simt_sgemm_128x32_8x5_tn_align1::
+         0.016 ms  void at::native::sbtopk::gatherTopK<float, unsigned int, 2, false>(at::cuda::detail::TensorInfo<float const, u
+         0.015 ms  nvjet_sm100_tst_64x8_64x16_4x1_v_bz_splitK_TNT
+         0.011 ms  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{la
+  glm_fp8_4tok_new_kernel: 49 GPU ops, 0.575 ms GPU busy of 0.689 ms wall (GPU idle 17%), 0 host syncs per forward
+         0.404 ms  _block_fp8_grouped_mm_kernel
+         0.017 ms  void cutlass::Kernel2<cutlass_80_simt_sgemm_128x32_8x5_tn_align1>(cutlass_80_simt_sgemm_128x32_8x5_tn_align1::
+         0.016 ms  void at::native::sbtopk::gatherTopK<float, unsigned int, 2, false>(at::cuda::detail::TensorInfo<float const, u
+         0.015 ms  nvjet_sm100_tst_64x8_64x16_4x1_v_bz_splitK_TNT
+         0.011 ms  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{la
+  glm_fp8_2048tok_previous_kernel: 63 GPU ops, 8.379 ms GPU busy of 8.134 ms wall (GPU idle 0%), 0 host syncs per forward
+         6.914 ms  _block_fp8_grouped_mm_kernel
+         0.344 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.302 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.180 ms  cutlass3x_sm100_simt_sgemm_f32_f32_f32_f32_f32_64x32x16_1x1x1_3_tnn_align1_bias_f32_relu
+         0.120 ms  nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT
+  glm_fp8_2048tok_new_kernel: 63 GPU ops, 7.740 ms GPU busy of 7.472 ms wall (GPU idle 0%), 0 host syncs per forward
+         6.281 ms  _block_fp8_grouped_mm_kernel
+         0.344 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.301 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.179 ms  cutlass3x_sm100_simt_sgemm_f32_f32_f32_f32_f32_64x32x16_1x1x1_3_tnn_align1_bias_f32_relu
+         0.120 ms  nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT
+
+## FP8 kernel tiles, per segment, decode sizes (wall ms per forward)
+   BLOCK_M, BLOCK_N, BLOCK_K, warps, stages |       1 tok |       4 tok |      16 tok
+                        (16, 32, 128, 4, 3) |       0.437 |       0.725 |       1.638
+                         (16, 64, 64, 4, 3) |       0.446 |       0.737 |       1.644
+                        (16, 64, 128, 4, 3) |       0.462 |       0.801 |       1.861
+                        (16, 128, 64, 4, 3) |       0.431 |       0.677 |       1.397
+                       (16, 128, 128, 8, 3) |       0.465 |       0.792 |       1.787
+                        (32, 64, 128, 4, 3) |       0.470 |       0.845 |       1.948
+
+## FP8 kernel tiles, per row tile, prefill sizes (wall ms per forward)
+   BLOCK_M, BLOCK_N, BLOCK_K, warps, stages |     256 tok |    1024 tok |    4096 tok |   16384 tok
+                        (64, 128, 64, 4, 4) |       4.271 |       5.215 |      12.005 |      37.173
+                       (64, 128, 128, 4, 3) |       4.902 |       6.235 |      13.043 |      40.765
+                        (128, 64, 64, 4, 4) |       6.645 |       7.332 |      14.567 |      42.455
+                       (128, 128, 64, 4, 4) |       4.976 |       5.435 |      10.916 |      31.014
+                       (128, 128, 64, 8, 3) |       5.403 |       5.743 |      11.270 |      32.302
+                      (128, 128, 128, 8, 3) |       6.561 |       7.157 |      12.427 |      35.112
+                        (64, 256, 64, 8, 3) |       4.260 |       5.190 |      11.159 |      34.189
+                       (128, 256, 64, 8, 3) |       5.206 |       5.637 |      10.224 |      28.676
+
+## Target: the same layer with bf16 experts on grouped_mm (wall ms per forward)
+   tokens |     eager |     graph
+        1 |     0.466 |     0.290
+        4 |     0.837 |     0.638
+       16 |     1.856 |     1.795
+       64 |     4.002 |     4.004
+      256 |     4.897 |         -
+     1024 |     5.211 |         -
+     4096 |     6.938 |         -
+    16384 |    19.803 |         -

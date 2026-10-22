@@ -73,7 +73,7 @@ combination.
 
 **Reference**: `MixtralBLockSparseTop2MLP` is a SwiGLU-shaped FFN.
 
-**Our code**: `MixtralExpert` in `blocks/mixtral_moe.py:46`.
+**Our code**: `MixtralExpert` in `blocks/mixtral_moe.py:55`.
 
 ```python
 class MixtralExpert(nn.Module):
@@ -106,11 +106,17 @@ distribution.
 **Reference**: `routing_weights = routing_weights /
 routing_weights.sum(dim=-1, keepdim=True)` after `topk`.
 
-**Our code**: same step in `MoEFFN.forward` (`blocks/mixtral_moe.py:141`).
+**Our code**: same step in `MoEFFN.forward` (`blocks/mixtral_moe.py:269`).
 
 ### Dispatch implementation
 
-The per-expert loop is the V1 dispatch:
+On Hopper and newer GPUs, the routed experts run as two grouped matmuls
+over all (token, expert) pairs
+([ADR-036](../decisions/ADR-036-grouped-expert-matmuls.md)).
+`PackedSwigluExperts` stacks the expert weights on first use, and
+`grouped_expert_mlp` sorts the pairs by expert and calls
+`functional.grouped_mm` once per projection. On other devices the per-expert
+loop runs:
 
 ```python
 for expert_idx in range(num_experts):
@@ -124,10 +130,11 @@ for expert_idx in range(num_experts):
     output.index_add_(0, tokens_for_expert, weighted_output)
 ```
 
-Simple, correct, slow at large `num_experts`. The fused
-grouped-GEMM path (one matmul that computes all expert outputs
-simultaneously, then scatter) is a follow-up. Mixtral 8x7B has
-only 8 experts so the loop overhead is bounded.
+The loop is simple and correct, but each expert costs a host sync
+and about ten small launches. With Mixtral 8x7B sizes, the grouped
+path is 1.4 to 2.2 times faster up to 256 tokens on an H100 and a
+B200, and about equal from 4096 tokens
+([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)).
 
 ## Expert parallelism
 
@@ -220,12 +227,6 @@ Tests under `tests/unit/`; layout intentionally not enumerated.
 
 ## What's still open
 
-- **Fused grouped-GEMM dispatch.** The per-expert Python loop is
-  simple and correct but quadratic in the number of experts when most
-  receive a few tokens. A fused path (one matmul that computes all
-  expert outputs simultaneously, then scatter) is the optimisation
-  follow-up. Aligned with the niche only if it's the same fused
-  primitive the reference implementations use.
 - **All-to-all dispatch for expert parallelism.** When tokens cluster
   on a few experts, the current per-rank-local loop with a final
   all-reduce moves more data than needed. An all-to-all dispatch

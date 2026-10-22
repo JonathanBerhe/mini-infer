@@ -51,6 +51,7 @@ from mini_infer.cache.nemotron_h_state_cache import (
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks.glm_moe_gate import GlmNoAuxTcGate
+from mini_infer.models.blocks.grouped_experts import grouped_expert_mlp, supports_grouped_experts
 from mini_infer.models.blocks.mamba2 import (
     gated_group_rmsnorm,
     mamba_conv_prefill,
@@ -85,9 +86,10 @@ _EXPERT_RE = re.compile(
     r"^(backbone\.layers\.\d+\.mixer)\.experts\.(\d+)\.(up_proj|down_proj)\.weight$"
 )
 
-# Up to this many (token, expert) pairs, the MoE gathers the chosen experts'
-# weights instead of looping over experts. The gather has no host sync, so a
-# decode step stays capturable; the loop is cheaper for long prefills.
+# Without grouped matmuls (CPU, MPS, pre-Hopper GPUs): up to this many
+# (token, expert) pairs, the MoE gathers the chosen experts' weights instead
+# of looping over experts. The gather has no host sync, so a decode step stays
+# capturable; the loop is cheaper for long prefills.
 _GATHER_EXPERT_LIMIT = 64
 
 # Host memory the streaming loader holds at once.
@@ -448,6 +450,10 @@ class _NemotronAttention(nn.Module):
         return out
 
 
+def _relu_squared(x: torch.Tensor) -> torch.Tensor:
+    return functional.relu(x).square()
+
+
 class _ReluSquaredMLP(nn.Module):
     """`down(relu(up(x)) ** 2)`: the non-gated MLP of the dense layers and the shared expert."""
 
@@ -467,7 +473,9 @@ class _NemotronMoE(nn.Module):
     Routed experts are stored stacked, `experts_up` `(experts, intermediate,
     in)` and `experts_down` `(experts, in, intermediate)`; the loader copies
     the checkpoint's per-expert tensors into their slots. As in the
-    reference, the weighted expert outputs accumulate in fp32.
+    reference, the weighted expert outputs accumulate in fp32. On Hopper and
+    newer GPUs the stacked tensors feed `grouped_expert_mlp` directly; elsewhere
+    the MoE gathers or loops, see `_GATHER_EXPERT_LIMIT`.
     """
 
     def __init__(self, cfg: NemotronHConfig) -> None:
@@ -510,7 +518,18 @@ class _NemotronMoE(nn.Module):
         flat = hidden.reshape(-1, shape[-1])
         indices, weights = self.gate(flat)
         routed_in = self.fc1_latent_proj(flat) if self.fc1_latent_proj is not None else flat
-        if flat.shape[0] * self.cfg.num_experts_per_tok <= _GATHER_EXPERT_LIMIT:
+        if supports_grouped_experts(flat.device):
+            routed = grouped_expert_mlp(
+                routed_in,
+                indices,
+                weights,
+                self.experts_up,
+                self.experts_down,
+                _relu_squared,
+                num_experts=self.cfg.n_routed_experts,
+                accumulate_dtype=torch.float32,
+            )
+        elif flat.shape[0] * self.cfg.num_experts_per_tok <= _GATHER_EXPERT_LIMIT:
             routed = self._gathered(routed_in, indices, weights)
         else:
             routed = self._looped(routed_in, indices, weights)

@@ -111,13 +111,17 @@ drops the `mtp.` layer.
   is looser than for the dense Qwen3.8.
 - Decode with the CUDA graph on that GPU: 13.6 ms per step at batch 1
   (42.3 eager) and 29.5 at batch 4 (43.5 eager).
+- On Hopper and newer GPUs the routed experts run as grouped matmuls
+  ([ADR-036](../decisions/ADR-036-grouped-expert-matmuls.md)). On an H100
+  and a B200, prefill of 512 tokens is 8.0 to 8.5 times faster, and
+  graph decode at batch 4 is 1.21 to 1.52 times faster
+  ([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)).
 
 ## What is still open
 
 - Tensor parallelism: the Mamba heads, the conv channels and the experts
   would need sharding.
-- A fused Mamba-2 decode kernel, like the Gated DeltaNet one of ADR-034, and
-  a grouped expert matmul in place of the per-step expert gather.
+- A fused Mamba-2 decode kernel, like the Gated DeltaNet one of ADR-034.
 - A layer-by-layer MoE routing comparison against the reference on the
   real 30B-A3B weights.
 - The vision towers of Bolt and Super-VL, and the multi-token-prediction

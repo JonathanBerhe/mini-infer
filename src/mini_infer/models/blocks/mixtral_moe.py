@@ -16,9 +16,12 @@ Naming convention is Mixtral's `w1/w2/w3` instead of Llama's
 `gate_proj/up_proj/down_proj`. Mapping: `w1 = gate`, `w2 = down`,
 `w3 = up`. Same SiLU-gated FFN math as `SwiGLU`.
 
-V1 dispatch is the simple per-expert loop: gather tokens that picked
-this expert, run them through the expert's MLP, scatter weighted
-outputs back via `index_add_`. A fused grouped-GEMM is a follow-up.
+On Hopper and newer GPUs the routed experts run as two grouped matmuls
+over every (token, expert) pair (`grouped_experts.py`). For that,
+`PackedSwigluExperts` stacks the experts' weights into one tensor per
+projection on first use. Elsewhere dispatch is the per-expert loop:
+gather tokens that picked this expert, run them through the expert's
+MLP, scatter weighted outputs back via `index_add_`.
 
 Expert parallelism
 ------------------
@@ -35,6 +38,10 @@ optimisation (lower comm cost when tokens cluster on a few experts) is
 a follow-up.
 """
 
+from __future__ import annotations
+
+from typing import cast
+
 import torch
 from torch import nn
 from torch.nn import functional
@@ -42,6 +49,7 @@ from torch.nn import functional
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
 from mini_infer.models.blocks.activations import GateUpActivation, swiglu
+from mini_infer.models.blocks.grouped_experts import grouped_expert_mlp, supports_grouped_experts
 
 
 class MixtralExpert(nn.Module):
@@ -81,6 +89,90 @@ class MixtralExpert(nn.Module):
         hidden = self._activation(self.w1(x), self.w3(x)) * routing_weights
         scaled_out: torch.Tensor = self.w2(hidden)
         return scaled_out
+
+
+class PackedSwigluExperts:
+    """The weights of a list of `MixtralExpert`s, stacked for `grouped_expert_mlp`.
+
+    Building one copies every expert's `w1` and `w3` into one `(E, 2I, in)`
+    tensor and its `w2` into one `(E, out, I)` tensor, then points the
+    experts' own parameters at slices of the stacks. The experts still work
+    on their own, they share memory with the stacks, and `state_dict` keys do
+    not change. Anything that later gives a parameter new storage (a weight
+    reload, `module.to`) breaks the link. `matches` detects that, so
+    `current` packs again.
+    """
+
+    def __init__(self, experts: nn.ModuleList) -> None:
+        members = [cast(MixtralExpert, expert) for expert in experts]
+        first = members[0]
+        weight = first.w1.weight
+        inter, hidden_size = weight.shape
+        # Outside inference mode: an inference tensor as a parameter's storage
+        # would break any later use of the expert outside inference mode.
+        with torch.no_grad(), torch.inference_mode(False):
+            self.gate_up = torch.empty(
+                len(members), 2 * inter, hidden_size, dtype=weight.dtype, device=weight.device
+            )
+            self.down = torch.empty(
+                len(members),
+                first.w2.weight.shape[0],
+                inter,
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+            for idx, expert in enumerate(members):
+                self.gate_up[idx, :inter].copy_(expert.w1.weight)
+                self.gate_up[idx, inter:].copy_(expert.w3.weight)
+                self.down[idx].copy_(expert.w2.weight)
+                expert.w1.weight.data = self.gate_up[idx, :inter]
+                expert.w3.weight.data = self.gate_up[idx, inter:]
+                expert.w2.weight.data = self.down[idx]
+        self._inter = inter
+        self._combine = first._activation
+        self._first_ptr = first.w1.weight.data_ptr()
+        self._last_ptr = members[-1].w2.weight.data_ptr()
+
+    @staticmethod
+    def current(pack: PackedSwigluExperts | None, experts: nn.ModuleList) -> PackedSwigluExperts:
+        """`pack` if it still backs `experts`, else a fresh pack of them."""
+        if pack is not None and pack.matches(experts):
+            return pack
+        return PackedSwigluExperts(experts)
+
+    def matches(self, experts: nn.ModuleList) -> bool:
+        """Whether the experts' parameters still live in this pack's stacks."""
+        first = cast(MixtralExpert, experts[0])
+        last = cast(MixtralExpert, experts[-1])
+        return (
+            first.w1.weight.data_ptr() == self._first_ptr
+            and last.w2.weight.data_ptr() == self._last_ptr
+        )
+
+    def _activation(self, gate_up: torch.Tensor) -> torch.Tensor:
+        out: torch.Tensor = self._combine(gate_up[:, : self._inter], gate_up[:, self._inter :])
+        return out
+
+    def run(
+        self,
+        x: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        num_experts: int,
+        expert_start: int,
+    ) -> torch.Tensor:
+        """`grouped_expert_mlp` over the packed experts; see that function."""
+        return grouped_expert_mlp(
+            x,
+            topk_indices,
+            topk_weights,
+            self.gate_up,
+            self.down,
+            self._activation,
+            num_experts=num_experts,
+            expert_start=expert_start,
+        )
 
 
 class MoEFFN(nn.Module):
@@ -138,6 +230,8 @@ class MoEFFN(nn.Module):
         self.experts = nn.ModuleList(
             [MixtralExpert(hidden_size, intermediate_size) for _ in range(num_experts_per_rank)]
         )
+        # Built on the first grouped forward, see `PackedSwigluExperts`.
+        self._expert_pack: PackedSwigluExperts | None = None
         # Shared experts (DeepSeek-V2/V3): MLPs that fire on every token,
         # added to the routed output. `n_shared_experts=0` keeps Mixtral's
         # routed-only behavior.
@@ -177,24 +271,17 @@ class MoEFFN(nn.Module):
             top_k_weights = top_k_weights * self.routed_scaling_factor
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
-        out = torch.zeros_like(flat)
-        # `expert_mask[expert_idx, top_k_pos, token_idx] = 1` iff token `token_idx`
-        # picked `expert_idx` at position `top_k_pos` in its top-k. Permuting to
-        # `(num_experts, top_k, T)` makes the per-expert lookup an O(1) slice.
-        expert_mask = functional.one_hot(top_k_indices, num_classes=self.num_experts).permute(
-            2, 1, 0
-        )
-        # Loop only over experts this rank owns. Tokens routed to experts on
-        # other ranks contribute zero here — the all-reduce below fills them in.
-        for local_idx in range(self.num_experts_per_rank):
-            global_idx = self.local_expert_start + local_idx
-            top_k_pos, token_idx = torch.where(expert_mask[global_idx])
-            if token_idx.numel() == 0:
-                continue
-            tokens = flat[token_idx]
-            weights = top_k_weights[token_idx, top_k_pos, None]
-            expert_out = self.experts[local_idx](tokens) * weights
-            out.index_add_(0, token_idx, expert_out)
+        if supports_grouped_experts(flat.device):
+            self._expert_pack = PackedSwigluExperts.current(self._expert_pack, self.experts)
+            out = self._expert_pack.run(
+                flat,
+                top_k_indices,
+                top_k_weights,
+                num_experts=self.num_experts,
+                expert_start=self.local_expert_start,
+            )
+        else:
+            out = self._loop_experts(flat, top_k_indices, top_k_weights)
         # All-reduce the partial routed sums across ranks. At world_size=1
         # this is a no-op; existing single-device behaviour is bit-identical.
         out = all_reduce_sum(out)
@@ -204,3 +291,27 @@ class MoEFFN(nn.Module):
         if self.shared_experts is not None:
             out = out + self.shared_experts(flat)
         return out.view(input_shape)
+
+    def _loop_experts(
+        self, flat: torch.Tensor, top_k_indices: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-expert dispatch: one gather, MLP and `index_add_` per local expert."""
+        out = torch.zeros_like(flat)
+        # `expert_mask[expert_idx, top_k_pos, token_idx] = 1` iff token `token_idx`
+        # picked `expert_idx` at position `top_k_pos` in its top-k. Permuting to
+        # `(num_experts, top_k, T)` makes the per-expert lookup an O(1) slice.
+        expert_mask = functional.one_hot(top_k_indices, num_classes=self.num_experts).permute(
+            2, 1, 0
+        )
+        # Loop only over experts this rank owns. Tokens routed to experts on
+        # other ranks contribute zero here. The all-reduce in `forward` fills them in.
+        for local_idx in range(self.num_experts_per_rank):
+            global_idx = self.local_expert_start + local_idx
+            top_k_pos, token_idx = torch.where(expert_mask[global_idx])
+            if token_idx.numel() == 0:
+                continue
+            tokens = flat[token_idx]
+            weights = top_k_weights[token_idx, top_k_pos, None]
+            expert_out = self.experts[local_idx](tokens) * weights
+            out.index_add_(0, token_idx, expert_out)
+        return out
