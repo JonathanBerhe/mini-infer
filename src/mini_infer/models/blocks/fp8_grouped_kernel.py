@@ -28,6 +28,9 @@ Two ways to split the work, both without a host sync:
 
 Rows routed to another rank's experts (expert parallelism) sort after the
 local groups and get zeros.
+
+On Hopper, the per-row-tile split goes to the Gluon kernel of
+`fp8_grouped_gluon.py` when it takes the operands.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ import os
 import torch
 
 from mini_infer.device import is_blackwell_device, is_cuda_device
+from mini_infer.models.blocks import fp8_grouped_gluon
 
 try:
     import triton
@@ -70,10 +74,12 @@ _BLACKWELL_TILES: tuple[Tiles, Tiles, Tiles] = (
 )
 _SMALL_ROWS = 256
 _MEDIUM_ROWS = 8192
-# Bench hooks, not a public API: force a tile, the operand order, or the split.
+# Bench hooks, not a public API: force a tile, the operand order, the split,
+# or the Gluon kernel on Hopper (True: also for few rows, False: never).
 _TILES_FOR_BENCH: Tiles | None = None
 _SWAP_AB_FOR_BENCH: bool | None = None
 _PER_SEGMENT_FOR_BENCH: bool | None = None
+_GLUON_FOR_BENCH: bool | None = None
 
 
 def supports_block_fp8_grouped_mm(device: torch.device | str) -> bool:
@@ -320,11 +326,18 @@ def block_fp8_grouped_mm(
         raise ValueError(f"rows have K={k_dim} but weight has K={weight_k}")
     if block < 16 or block & (block - 1):
         raise ValueError(f"block={block} must be a power of two of at least 16")
+    small = num_rows <= _SMALL_ROWS
+    per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
+    gluon = not per_segment if _GLUON_FOR_BENCH is None else _GLUON_FOR_BENCH
+    if gluon and group_ends.dtype == torch.int32:
+        gluon_tiles = fp8_grouped_gluon.tiles_for(num_rows, num_groups)
+        if fp8_grouped_gluon.supports_gluon_block_fp8_grouped_mm(rows, weight, block, gluon_tiles):
+            return fp8_grouped_gluon.gluon_block_fp8_grouped_mm(
+                rows, weight, scale, block=block, group_ends=group_ends, tiles=gluon_tiles
+            )
     out = torch.empty(num_rows, n_dim, dtype=rows.dtype, device=rows.device)
     if num_rows == 0:
         return out
-    small = num_rows <= _SMALL_ROWS
-    per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
     swap_ab = True if _SWAP_AB_FOR_BENCH is None else _SWAP_AB_FOR_BENCH
     tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows)
     block_m, block_n, tile_k, warps, stages = tiles

@@ -35,7 +35,9 @@ Add `--fp8-only` to run only the unit tests and the FP8 layer (steps 0 to
 kernel's current form with its first one (`fp8_kernel_bench`), or
 `--fp8-tiles` for the same comparison without the loop, the profiles and
 the bf16 target, plus this GPU's default tiles with and without swapped
-operands. Add
+operands. On an H100, `--fp8-gluon` runs the unit tests and then compares
+the Gluon kernel of `fp8_grouped_gluon.py` with the Triton one
+(`fp8_gluon_bench`). Add
 `--out-dir <dir>` to keep the report and traces there (default: a new
 temporary directory). Dry run with tiny sizes on this machine (needs
 the Nemotron 3 Nano 4B tokenizer in the local Hugging Face cache; the FP8
@@ -77,7 +79,13 @@ _LOCAL_FIXTURES = _REPO / "tests" / "fixtures"
 _LOCAL_PASSAGE = _REPO / "scripts" / "data" / "technical_passage.md"
 _REMOTE_FIXTURES = Path("/root/tests/fixtures")
 _REMOTE_PASSAGE = Path("/root/data/technical_passage.md")
-_GPU_TESTS = ["tests/unit/test_fp8_grouped_kernel.py", "tests/unit/test_grouped_experts.py"]
+_GPU_TESTS = [
+    "tests/unit/test_fp8_grouped_kernel.py",
+    "tests/unit/test_fp8_grouped_gluon.py",
+    "tests/unit/test_grouped_experts.py",
+]
+# A deadlocked kernel never returns. The tests stop after this many seconds.
+_GPU_TESTS_TIMEOUT = 900
 
 hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
 
@@ -589,6 +597,189 @@ def fp8_kernel_bench(
     return lines
 
 
+# The Gluon kernel for Hopper against the Triton kernel (`--fp8-gluon`).
+FP8_GLUON_TOKENS = [32, 64, 256, 1024, 2048, 4096, 8192, 16384]
+FP8_GLUON_KERNEL_TOKENS = [1024, 4096, 16384]
+FP8_GLUON_TARGET_TOKENS = [1024, 4096, 16384]
+# (BLOCK_W, BLOCK_T, BLOCK_K, warps, stages, warp specialization).
+FP8_GLUON_TILES = [
+    (128, 32, 64, 4, 4, True),
+    (128, 64, 64, 4, 4, True),
+    (128, 64, 128, 4, 3, True),
+    (64, 128, 64, 4, 4, True),
+    (128, 128, 64, 8, 4, True),
+    (128, 128, 128, 8, 3, True),
+    (128, 256, 64, 8, 3, True),
+    (128, 64, 64, 4, 4, False),
+    (128, 128, 64, 8, 4, False),
+    (128, 256, 64, 8, 3, False),
+]
+FP8_GLUON_SWEEP_TOKENS = [256, 1024, 4096, 16384]
+
+
+@contextmanager
+def _fp8_kernel(gluon: bool | None, tiles: tuple[Any, ...] | None = None) -> Iterator[None]:
+    """Force the Triton kernel (False) or the Gluon one (True), or keep the default (None)."""
+    from mini_infer.models.blocks import fp8_grouped_gluon, fp8_grouped_kernel
+
+    saved = (fp8_grouped_kernel._GLUON_FOR_BENCH, fp8_grouped_gluon._TILES_FOR_BENCH)
+    fp8_grouped_kernel._GLUON_FOR_BENCH = gluon
+    fp8_grouped_gluon._TILES_FOR_BENCH = tiles
+    try:
+        yield
+    finally:
+        fp8_grouped_kernel._GLUON_FOR_BENCH, fp8_grouped_gluon._TILES_FOR_BENCH = saved
+
+
+def _fp8_kernel_alone(layer: Any, spec: dict[str, Any], device: str) -> list[str]:
+    """Each projection's grouped matmul alone, Triton against Gluon, with TFLOPS.
+
+    Uses the layer's packed expert weights and random routing over all
+    experts, as the layer benchmark does. TFLOPS count the useful products
+    only, `2 * rows * N * K`.
+    """
+    import torch
+    from triton.testing import do_bench
+
+    from mini_infer.models.blocks.fp8_grouped_kernel import block_fp8_grouped_mm
+
+    pack = layer._expert_pack
+    lines = [
+        "",
+        "## FP8 grouped matmul alone (ms, median of do_bench; useful TFLOPS)",
+        "   tokens | projection |    triton |     gluon | speedup | triton TFLOPS | gluon TFLOPS",
+    ]
+    for tokens in FP8_GLUON_KERNEL_TOKENS:
+        pairs = tokens * spec["top_k"]
+        experts = torch.randint(0, spec["experts"], (pairs,), device=device).sort().values
+        ends = torch.bincount(experts, minlength=spec["experts"]).cumsum(0).to(torch.int32)
+        for name, weight in (("gate_up", pack.gate_up), ("down", pack.down)):
+            n_dim, k_dim = weight.weight.shape[1:]
+            rows = torch.randn(pairs, k_dim, device=device, dtype=torch.bfloat16)
+            times = {}
+            for label, gluon in (("triton", False), ("gluon", True)):
+                with _fp8_kernel(gluon):
+                    times[label] = do_bench(
+                        partial(
+                            block_fp8_grouped_mm,
+                            rows,
+                            weight.weight,
+                            weight.scale,
+                            block=weight.block,
+                            row_experts=experts,
+                            group_ends=ends,
+                        ),
+                        return_mode="median",
+                    )
+            flops = 2 * pairs * n_dim * k_dim
+            lines.append(
+                f"{tokens:>9} | {name:>10} | {times['triton']:9.3f} | {times['gluon']:9.3f} | "
+                f"{times['triton'] / times['gluon']:6.2f}x | "
+                f"{flops / times['triton'] / 1e9:13.0f} | {flops / times['gluon'] / 1e9:12.0f}"
+            )
+    return lines
+
+
+def fp8_gluon_bench(
+    device: str, dtype: Any, fixtures: Path, *, traces: dict[str, bytes]
+) -> list[str]:
+    """The GLM-5.3 FP8 layer with the Gluon kernel against the Triton kernel.
+
+    Eager milliseconds per forward for Triton, Gluon (warp-specialized and
+    not) and the bf16 layer on `grouped_mm`, then each projection alone,
+    profiles at 4096 tokens and a sweep of Gluon tiles.
+    """
+    import torch
+
+    from mini_infer.models.blocks import fp8_grouped_gluon
+
+    specs = {spec["kind"]: spec for spec in _layer_specs(fixtures, tiny=False)}
+    spec = specs["glm_fp8"]
+    torch.manual_seed(0)
+    layer = _build_layer(spec, device, dtype)
+    lines = [
+        f"## FP8 layer, Triton against Gluon ({spec['name']}: hidden {spec['hidden']}, "
+        f"expert width {spec['inter']}, {spec['experts']} experts, top-{spec['top_k']})",
+        "eager wall ms per forward; rel diff is Gluon against Triton",
+        "   tokens |    triton |  gluon ws |  gluon no-ws | gluon tile             | "
+        "speedup | rel diff",
+    ]
+    inputs = {
+        tokens: torch.randn(1, tokens, spec["hidden"], device=device, dtype=dtype)
+        for tokens in FP8_GLUON_TOKENS
+    }
+    for tokens in FP8_GLUON_TOKENS:
+        x = inputs[tokens]
+        pairs = tokens * spec["top_k"]
+        tiles = fp8_grouped_gluon.tiles_for(pairs, spec["experts"])
+        runs = (
+            ("triton", False, None),
+            ("gluon", True, None),
+            ("gluon no-ws", True, (*tiles[:5], False)),
+        )
+        wall: dict[str, float] = {}
+        outs: dict[str, Any] = {}
+        with torch.inference_mode(), _grouped(True):
+            for label, gluon, forced in runs:
+                with _fp8_kernel(gluon, forced):
+                    wall[label] = _time_ms(partial(layer, x), device)
+                    outs[label] = layer(x).float()
+        base = outs["triton"]
+        rel = float((outs["gluon"] - base).norm() / base.norm().clamp_min(1e-30))
+        best = min(wall["gluon"], wall["gluon no-ws"])
+        lines.append(
+            f"{tokens:>9} | {wall['triton']:9.3f} | {wall['gluon']:9.3f} | "
+            f"{wall['gluon no-ws']:12.3f} | {', '.join(map(str, tiles)):<22} | "
+            f"{wall['triton'] / best:6.2f}x | {rel:8.1e}"
+        )
+
+    lines += _fp8_kernel_alone(layer, spec, device)
+
+    lines += ["", "## Profile at 4096 tokens"]
+    x = inputs[4096]
+    for label, gluon in (("triton", False), ("gluon", True)):
+        with _grouped(True), _fp8_kernel(gluon):
+            with torch.inference_mode():
+                ms = _time_ms(partial(layer, x), device)
+            lines += _profile(
+                layer, x, device, wall_ms=ms, name=f"glm_fp8_4096tok_{label}", traces=traces
+            )
+
+    lines += [
+        "",
+        "## Gluon tiles (eager wall ms per forward)",
+        "   BLOCK_W, BLOCK_T, BLOCK_K, warps, stages, ws | "
+        + " | ".join(f"{tokens:>7} tok" for tokens in FP8_GLUON_SWEEP_TOKENS),
+    ]
+    for tiles in FP8_GLUON_TILES:
+        cells = []
+        try:
+            with torch.inference_mode(), _grouped(True), _fp8_kernel(True, tiles):
+                for tokens in FP8_GLUON_SWEEP_TOKENS:
+                    cells.append(f"{_time_ms(partial(layer, inputs[tokens]), device):11.3f}")
+        except Exception as exc:
+            cells.append(f"failed: {exc!r}"[:120])
+        label = ", ".join(map(str, tiles))
+        lines.append(f"   {label:>44} | " + " | ".join(cells))
+    del layer
+    torch.cuda.empty_cache()
+
+    target = specs["glm"]
+    lines += [
+        "",
+        "## Target: the same layer with bf16 experts on grouped_mm (eager wall ms per forward)",
+    ]
+    torch.manual_seed(0)
+    layer = _build_layer(target, device, dtype)
+    with torch.inference_mode(), _grouped(True):
+        for tokens in FP8_GLUON_TARGET_TOKENS:
+            x = torch.randn(1, tokens, target["hidden"], device=device, dtype=dtype)
+            lines.append(f"{tokens:>9} | {_time_ms(partial(layer, x), device):9.3f}")
+    del layer
+    torch.cuda.empty_cache()
+    return lines
+
+
 def layer_bench(
     device: str,
     dtype: Any,
@@ -831,7 +1022,10 @@ def real_model_bench(model_dir: str, device: str, dtype: Any, passage: str) -> l
     volumes={"/hf-cache": hf_cache},
 )
 def moe_grouped_bench(
-    fp8_only: bool = False, fp8_kernel: bool = False, fp8_tiles: bool = False
+    fp8_only: bool = False,
+    fp8_kernel: bool = False,
+    fp8_tiles: bool = False,
+    fp8_gluon: bool = False,
 ) -> dict[str, Any]:
     import subprocess
     import sys
@@ -850,18 +1044,27 @@ def moe_grouped_bench(
     lines = [header, ""]
 
     _log("step 0: unit tests on the GPU")
-    tests = subprocess.run(
-        [sys.executable, "-m", "pytest", *_GPU_TESTS, "-q", "-rs", "-p", "no:cacheprovider"],
-        cwd="/root",
-        capture_output=True,
-        text=True,
-    )
+    try:
+        tests = subprocess.run(
+            [sys.executable, "-m", "pytest", *_GPU_TESTS, "-q", "-rs", "-p", "no:cacheprovider"],
+            cwd="/root",
+            capture_output=True,
+            text=True,
+            timeout=_GPU_TESTS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout or ""
+        lines += [f"unit tests timed out after {_GPU_TESTS_TIMEOUT} s", *partial.splitlines()[-60:]]
+        return {"report": "\n".join(lines), "traces": traces}
     lines += ["## GPU unit tests", *tests.stdout.strip().splitlines()[-6:], ""]
     if tests.returncode != 0:
         lines.append("unit tests failed, benchmark skipped")
-        lines += tests.stdout.splitlines()[-60:]
+        lines += tests.stdout.splitlines()[-150:]
         return {"report": "\n".join(lines), "traces": traces}
 
+    if fp8_gluon:
+        lines += fp8_gluon_bench("cuda", torch.bfloat16, _REMOTE_FIXTURES, traces=traces)
+        return {"report": "\n".join(lines), "traces": traces}
     if fp8_kernel or fp8_tiles:
         lines += fp8_kernel_bench(
             "cuda", torch.bfloat16, _REMOTE_FIXTURES, traces=traces, full=not fp8_tiles
@@ -895,9 +1098,15 @@ def _save(result: dict[str, Any], out_dir: str) -> Path:
 
 @app.local_entrypoint()
 def main(
-    out_dir: str = "", fp8_only: bool = False, fp8_kernel: bool = False, fp8_tiles: bool = False
+    out_dir: str = "",
+    fp8_only: bool = False,
+    fp8_kernel: bool = False,
+    fp8_tiles: bool = False,
+    fp8_gluon: bool = False,
 ) -> None:
-    result = moe_grouped_bench.remote(fp8_only=fp8_only, fp8_kernel=fp8_kernel, fp8_tiles=fp8_tiles)
+    result = moe_grouped_bench.remote(
+        fp8_only=fp8_only, fp8_kernel=fp8_kernel, fp8_tiles=fp8_tiles, fp8_gluon=fp8_gluon
+    )
     print(result["report"])
     print(f"\nreport and traces in {_save(result, out_dir)}")
 

@@ -89,6 +89,8 @@ NVFP4 (the dispatch table in PyTorch's `GroupedBlas.cpp`). It does not take
   That is two kernels to own (Hopper `wgmma`, Blackwell `tcgen05`), and
   Gluon does not run under Triton's interpreter, so every debugging step
   needs a GPU. It waits for a measured need.
+  [ADR-038](ADR-038-gluon-fp8-grouped-hopper.md) adds a Gluon kernel for
+  the H100 above 256 rows.
 
 ## Consequences
 
@@ -110,7 +112,8 @@ NVFP4 (the dispatch table in PyTorch's `GroupedBlas.cpp`). It does not take
   layer with bf16 experts on `grouped_mm`, the FP8 layer is 1.05 to 2.0
   times faster up to 256 tokens and about equal at 1024. From 4096 tokens
   it is 1.26 to 1.46 times slower: the kernel dequantizes on the CUDA cores
-  and multiplies in bf16, without TMA or warp specialization.
+  and multiplies in bf16, without TMA or warp specialization. On the H100,
+  ADR-038 closes this gap.
 - The outputs differ from the loop by a relative 3.8e-3, because the loop
   adds the 8 expert outputs into a bf16 tensor one at a time. bf16 experts
   show the same effect (3.3e-3). Against fp32 math with the same routing,

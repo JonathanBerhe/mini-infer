@@ -8,14 +8,17 @@ Lightning 30B-A3B, Mixtral 8x7B and GLM-5.3 (with bf16 and with block-FP8
 experts). The real `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
 (revision `a9904d2`), with prefill on `scripts/data/technical_passage.md`
 Engine: mini-infer with the grouped expert paths of
-[ADR-036](../decisions/ADR-036-grouped-expert-matmuls.md) (bf16) and
-[ADR-037](../decisions/ADR-037-block-fp8-grouped-kernel.md) (block FP8)
-Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`
-and `--fp8-tiles` for the FP8 runs)
+[ADR-036](../decisions/ADR-036-grouped-expert-matmuls.md) (bf16),
+[ADR-037](../decisions/ADR-037-block-fp8-grouped-kernel.md) (block FP8) and
+[ADR-038](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) (block FP8 in
+Gluon on the H100)
+Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
+`--fp8-tiles` and `--fp8-gluon` for the FP8 runs)
 Raw output: bf16 on the [H100](data/moe-grouped-gemm-h100.txt) and the
 [B200](data/moe-grouped-gemm-b200.txt), FP8 on the
 [H100](data/moe-grouped-fp8-h100.txt) and the
-[B200](data/moe-grouped-fp8-b200.txt)
+[B200](data/moe-grouped-fp8-b200.txt), the Gluon kernel on the
+[H100](data/moe-grouped-fp8-gluon-h100.txt)
 
 ## Result
 
@@ -40,6 +43,10 @@ Raw output: bf16 on the [H100](data/moe-grouped-gemm-h100.txt) and the
   Up to 256 tokens the FP8 layer is now faster than the same layer with
   bf16 experts. From 4096 tokens it is 1.26 to 1.46 times slower. The
   section "Block-FP8 experts" has the details.
+- On the H100, the Gluon kernel makes the FP8 layer 1.41 to 1.61 times
+  faster than the Triton kernel from 1024 tokens. The FP8 layer is then
+  1.26 times faster than the bf16 layer at 4096 tokens and equal at 16384
+  tokens. The section "Gluon kernel for Hopper" has the details.
 - The grouped path is slower in three places: batch-1 graph decode on the
   B200 (3.6 percent), eager decode at small batches, and Mixtral at 16384
   tokens on the B200 (0.88x). The section "Where the grouped path is
@@ -402,4 +409,96 @@ the same routing (unrounded dequantized weights, unquantized bf16 inputs),
 the routed-expert output of W8A16 has a relative error of 5.4e-3 to 5.5e-3,
 and that of W8A8 4.3e-2 to 4.4e-2, on both GPUs and at 1, 64 and 2048
 tokens.
+
+### Gluon kernel for Hopper
+
+The Gluon kernel of
+[ADR-038](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) against the
+Triton kernel of the sections above, in one process on one H100 on
+2026-10-22 (`--fp8-gluon`, [raw output](data/moe-grouped-fp8-gluon-h100.txt)).
+Before the timings, the run passed 84 unit tests on the GPU. They include
+the Gluon kernel against fp32 math, against the Triton kernel, in a CUDA
+graph, and under Triton's concurrency sanitizer.
+
+Eager milliseconds per forward. "Gluon" uses the default tile for the size
+and the copy warp (warp specialization). "No copy warp" is the same tile
+without it. Each Gluon run is forced on, also at 32 tokens, where the
+default path keeps the Triton kernel:
+
+| tokens | Triton | Gluon | no copy warp | Gluon tile | speedup |
+|---:|---:|---:|---:|---|---:|
+| 32 | 2.737 | 3.117 | 3.255 | 128, 64, 64, 4, 4 | 0.88x |
+| 64 | 4.468 | 4.173 | 4.325 | 128, 64, 64, 4, 4 | 1.07x |
+| 256 | 5.162 | 4.848 | 5.016 | 128, 64, 64, 4, 4 | 1.06x |
+| 1024 | 8.066 | 5.393 | 5.704 | 128, 64, 64, 4, 4 | 1.50x |
+| 2048 | 11.132 | 7.230 | 7.845 | 128, 64, 64, 4, 4 | 1.54x |
+| 4096 | 16.162 | 10.025 | 10.819 | 128, 128, 64, 8, 4 | 1.61x |
+| 8192 | 24.774 | 16.859 | 17.515 | 128, 256, 64, 8, 3 | 1.47x |
+| 16384 | 42.378 | 30.052 | 31.507 | 128, 256, 64, 8, 3 | 1.41x |
+
+A tile is (weight rows, token rows, K, warps, stages). The outputs of the
+two kernels are bit-identical at every size. At 32 tokens (256 rows) the
+Gluon kernel is slower than the per-segment Triton split, so the default
+path calls it only above 256 rows. The copy warp makes the layer 3.5 to 8.5
+percent faster at every size.
+
+Against the same layer with bf16 experts on `grouped_mm`, in the same run:
+
+| tokens | bf16 | FP8 Triton | FP8 Gluon |
+|---:|---:|---:|---:|
+| 1024 | 8.214 | 8.066 | 5.393 |
+| 4096 | 12.622 | 16.162 | 10.025 |
+| 16384 | 30.285 | 42.378 | 30.052 |
+
+Each projection alone, with random routing over the 256 experts. The
+median milliseconds of `triton.testing.do_bench`, and the useful TFLOPS
+(`2 * rows * N * K` per call):
+
+| tokens | projection | Triton | Gluon | speedup | Triton TFLOPS | Gluon TFLOPS |
+|---:|---|---:|---:|---:|---:|---:|
+| 1024 | gate-up | 4.607 | 2.894 | 1.59x | 90 | 142 |
+| 1024 | down | 2.357 | 1.473 | 1.60x | 87 | 140 |
+| 4096 | gate-up | 8.864 | 5.872 | 1.51x | 186 | 281 |
+| 4096 | down | 4.859 | 2.639 | 1.84x | 170 | 312 |
+| 16384 | gate-up | 21.015 | 13.336 | 1.58x | 314 | 495 |
+| 16384 | down | 10.652 | 7.457 | 1.43x | 310 | 442 |
+
+At 1024 tokens there are 32 rows per expert, so the layer reads all 9.7 GB
+of e4m3 expert weights for few products. The TFLOPS stay low there for both
+kernels.
+
+Profile at 4096 tokens: the Triton kernel takes 13.113 ms of 16.071 ms GPU
+time per forward, the Gluon kernel 7.025 ms of 10.200 ms. The other
+kernels of the layer (routing, gather, scatter, shared expert) take about
+the same time in both runs: 3.0 and 3.2 ms.
+
+Gluon tiles, eager milliseconds per forward:
+
+| tile | copy warp | 256 tok | 1024 | 4096 | 16384 |
+|---|---|---:|---:|---:|---:|
+| 128, 32, 64, 4, 4 | yes | 4.810 | 6.257 | 15.909 | 57.063 |
+| 128, 64, 64, 4, 4 | yes | 5.034 | 5.537 | 11.861 | 39.715 |
+| 128, 64, 128, 4, 3 | yes | 4.921 | 5.533 | 11.678 | 38.889 |
+| 64, 128, 64, 4, 4 | yes | 7.321 | 7.751 | 12.738 | 38.766 |
+| 128, 128, 64, 8, 4 | yes | 6.282 | 6.413 | 10.108 | 32.998 |
+| 128, 128, 128, 8, 3 | yes | 5.783 | 6.235 | 10.991 | 31.968 |
+| 128, 256, 64, 8, 3 | yes | 8.964 | 9.241 | 10.804 | 30.821 |
+| 128, 64, 64, 4, 4 | no | 5.144 | 5.768 | 12.642 | 42.453 |
+| 128, 128, 64, 8, 4 | no | 6.439 | 6.883 | 11.215 | 35.474 |
+| 128, 256, 64, 8, 3 | no | 9.247 | 9.614 | 11.482 | 31.441 |
+
+The kernel picks the token rows of a tile from the mean rows per expert:
+64 up to 64 rows (1024 and 2048 tokens), 128 up to 192 rows (4096 tokens),
+and 256 above. At 1024, 4096 and 16384 tokens, each default is the
+fastest tile of the sweep, or within 0.1 percent of it. At 256 tokens the
+32-row tile is 4.5 percent faster than the default tile in the sweep, but
+only 0.8 percent faster than the same default in the first table. That is
+within the noise of eager timing, so the kernel has no 32-row tier.
+
+Two earlier runs on the same day failed in the unit tests. The first found
+wrong results in the warp-specialized version: the next K step wrote the
+registers that the previous `wgmma` was still reading. ADR-038 describes
+the fault and the SASS check that now finds it without a GPU. The second
+run failed on a test with an odd number of K steps, which the kernel hands
+to the Triton kernel.
 
