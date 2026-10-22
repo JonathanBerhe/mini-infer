@@ -61,6 +61,15 @@ def is_blackwell_device(device: torch.device | str | None = None) -> bool:
     return major is not None and major >= 10
 
 
+def is_hopper_device(device: torch.device | str | None = None) -> bool:
+    """Whether the current (or specified) CUDA device is Hopper (SM_90).
+
+    Same device argument as `is_blackwell_device`. H100 / H200 are (9, 0).
+    For kernels that use Hopper-only instructions (`wgmma`).
+    """
+    return _cuda_major(device) == 9
+
+
 def is_hopper_or_newer_device(device: torch.device | str | None = None) -> bool:
     """Whether the current (or specified) CUDA device is Hopper or newer (SM_90+).
 
