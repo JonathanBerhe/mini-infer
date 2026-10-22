@@ -125,7 +125,10 @@ registers.
 - The dequantization warps run a fence (an instruction that orders memory
   accesses) before they give a weight tile to the MMA warp. Triton's Gluon
   guide asks for a fence between a read of shared memory and a later TMA
-  write into it.
+  write into it. A rerun with the fence passed all GPU tests. The layer
+  stayed within the noise between two runs, and the down projection alone
+  was 3 percent slower at 16384 tokens
+  ([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)).
 - Both B200 runs passed all GPU tests on the first try. `tcgen05` reads no
   registers, so the register fault of ADR-038 cannot occur here.
 - There are three FP8 grouped kernels to maintain: Triton for all GPUs,

@@ -160,7 +160,9 @@ together. With warp specialization, different warps do different jobs.
 - The multiply warps run a fence (an instruction that orders memory
   accesses) before they free each stage, the last stage of an item too.
   Triton's Gluon guide asks for a fence between a read of shared memory and
-  a later TMA write into it.
+  a later TMA write into it. A rerun with the fence passed all GPU tests,
+  and the kernel alone was as fast as before
+  ([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)).
 - There are two FP8 grouped kernels to maintain for the H100. CI pins
   Triton 3.6, so its Gluon tests skip there. The `mini-infer-triton-interp`
   Docker image runs the compile tests, and the H100 runs the rest.

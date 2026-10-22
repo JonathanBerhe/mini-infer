@@ -688,3 +688,31 @@ stores and other default tiles. It also passed all GPU tests. With the
 same tile, the 16-byte stores of the final version are 1 to 6 percent
 faster from 4096 tokens.
 
+### Rerun after the review fixes
+
+A code review changed the Gluon kernels in two ways that reach the GPU.
+The sm90 multiply warps and the sm100 dequantization warps now run a fence
+before they free a stage. The item walk, the store and the setup moved
+into shared helpers. We ran `--fp8-gluon` again on 2026-10-22, on one B200
+([raw output](data/moe-grouped-fp8-gluon-b200-review.txt)) and on one
+H100 ([raw output](data/moe-grouped-fp8-gluon-h100-review.txt)).
+
+- The B200 passed 87 GPU tests and the H100 passed 116. New tests give
+  each program many items, also under the concurrency sanitizer.
+- On both GPUs, the outputs of the Gluon and Triton kernels are
+  bit-identical at every size.
+- On the B200, the Gluon layer took 6.902, 11.800 and 21.385 ms at 4096,
+  8192 and 16384 tokens. Before, it took 6.583, 11.762 and 21.113 ms. In
+  the profile at 4096 tokens, the kernel took 4.059 ms, against 4.099 ms
+  before.
+- Alone at 16384 tokens, the B200 projections reached 762 and 737 TFLOPS,
+  against 769 and 759 before. The down projection is 3 percent slower.
+  This can come from the fence or from the noise between two runs.
+- On the H100, the Gluon layer took 10.326 and 30.708 ms at 4096 and 16384
+  tokens. The later run before took 9.911 and 29.881 ms. Alone, the gate-up
+  projection at 16384 tokens reached 521 TFLOPS, against 495 in the first
+  run.
+- No fix touched the bf16 layer, and it still moved by up to 3 percent
+  between the same runs. For example, it took 18.989 against 18.413 ms on
+  the B200 at 16384 tokens.
+
