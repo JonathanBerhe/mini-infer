@@ -85,6 +85,8 @@ def test_kernel_matches_dequantized_matmul(
     expert_tiles: bool | None,
 ) -> None:
     device = _device()
+    # This test is for the Triton kernel. The Gluon kernels have their own.
+    monkeypatch.setattr(fp8_grouped_kernel, "_GLUON_FOR_BENCH", False)
     monkeypatch.setattr(fp8_grouped_kernel, "_PER_SEGMENT_FOR_BENCH", per_segment)
     monkeypatch.setattr(fp8_grouped_kernel, "_SWAP_AB_FOR_BENCH", swap_ab)
     monkeypatch.setattr(fp8_grouped_kernel, "_EXPERT_TILES_FOR_BENCH", expert_tiles)
@@ -158,7 +160,9 @@ def _fp8_glm(hidden: int, inter: int, experts: int, top_k: int) -> GlmMoeFFN:
     return moe
 
 
-@pytest.mark.parametrize("tokens", [1, 5, 40])
+# 200 tokens give 400 (token, expert) rows: the expert tiles, or a Gluon kernel
+# on sm90 and sm100.
+@pytest.mark.parametrize("tokens", [1, 5, 40, 200])
 def test_fp8_glm_grouped_matches_loop(monkeypatch: pytest.MonkeyPatch, tokens: int) -> None:
     device = _device()
     moe = _fp8_glm(hidden=128, inter=128, experts=8, top_k=2).to(device)

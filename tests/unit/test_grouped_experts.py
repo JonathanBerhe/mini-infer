@@ -117,6 +117,38 @@ def test_off_rank_experts_contribute_zero(expert_start: int) -> None:
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
+def test_fp8_kernel_gets_the_expert_count_of_all_ranks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FP8 kernel picks its tile from the rows over all 16 experts, not the 4 local ones."""
+    seen: list[int] = []
+
+    def kernel(
+        rows: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, **kwargs: int
+    ) -> torch.Tensor:
+        seen.append(kwargs["num_experts"])
+        return rows.new_zeros(rows.shape[0], weight.shape[1])
+
+    monkeypatch.setattr(grouped_experts, "block_fp8_grouped_mm", kernel)
+    num_local, tokens = 4, 25
+    gate_up = grouped_experts.BlockFp8Weight(
+        torch.zeros(num_local, INTER, HIDDEN), torch.ones(num_local, 1, 1), 128
+    )
+    down = grouped_experts.BlockFp8Weight(
+        torch.zeros(num_local, HIDDEN, INTER), torch.ones(num_local, 1, 1), 128
+    )
+    indices, weights = _routing(tokens, 16, 4)
+    grouped_expert_mlp(
+        torch.randn(tokens, HIDDEN),
+        indices,
+        weights,
+        gate_up,
+        down,
+        _relu_squared,
+        num_experts=16,
+        expert_start=4,
+    )
+    assert seen == [16, 16]
+
+
 def test_unused_experts_and_fp32_accumulation() -> None:
     """Every token on two experts out of eight; bf16 rows summed in fp32."""
     torch.manual_seed(3)
