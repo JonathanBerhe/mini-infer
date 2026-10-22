@@ -33,8 +33,10 @@ from torch.nn import functional
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
 from mini_infer.models.blocks.activations import GateUpActivation, swiglu
-from mini_infer.models.blocks.fp8_expert import Fp8Expert
-from mini_infer.models.blocks.mixtral_moe import MixtralExpert
+from mini_infer.models.blocks.fp8_expert import Fp8Expert, PackedFp8Experts
+from mini_infer.models.blocks.fp8_grouped_kernel import supports_block_fp8_grouped_mm
+from mini_infer.models.blocks.grouped_experts import supports_grouped_experts
+from mini_infer.models.blocks.mixtral_moe import MixtralExpert, PackedSwigluExperts
 
 
 class GlmNoAuxTcGate(nn.Module):
@@ -167,6 +169,12 @@ class GlmMoeFFN(nn.Module):
                 for _ in range(num_experts_per_rank)
             ]
         )
+        # Routed experts can run as grouped matmuls, packed on first use: BF16
+        # ones by `PackedSwigluExperts`, FP8 ones by `PackedFp8Experts` when
+        # the expert width lines up with the scale blocks.
+        self._expert_dtype = expert_dtype
+        self._fp8_packable = PackedFp8Experts.can_pack(moe_intermediate_size)
+        self._expert_pack: PackedSwigluExperts | PackedFp8Experts | None = None
         # Shared expert fires on every token. DeepSeek collapses N shared
         # experts into one MLP of width `N * moe_intermediate_size`; replicated.
         self.n_shared_experts = n_shared_experts
@@ -185,6 +193,50 @@ class GlmMoeFFN(nn.Module):
         top_k_indices, top_k_weights = self.gate(flat)
         top_k_weights = top_k_weights.to(hidden_states.dtype)
 
+        pack = self._grouped_pack(flat)
+        if pack is not None:
+            out = pack.run(
+                flat,
+                top_k_indices,
+                top_k_weights,
+                num_experts=self.n_routed_experts,
+                expert_start=self.local_expert_start,
+            )
+        else:
+            out = self._loop_experts(flat, top_k_indices, top_k_weights)
+        # Sum partial routed contributions across ranks (no-op at world_size=1).
+        out = all_reduce_sum(out)
+        # Shared expert is replicated; add after the reduce so it isn't scaled
+        # by world_size.
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(flat)
+        return out.view(input_shape)
+
+    def _grouped_pack(self, flat: torch.Tensor) -> PackedSwigluExperts | PackedFp8Experts | None:
+        """The packed experts when this forward takes the grouped path, else `None`."""
+        if not supports_grouped_experts(flat.device):
+            return None
+        pack = self._expert_pack
+        if self._expert_dtype == "bf16":
+            bf16_pack = pack if isinstance(pack, PackedSwigluExperts) else None
+            self._expert_pack = PackedSwigluExperts.current(bf16_pack, self.experts)
+            return self._expert_pack
+        # The FP8 kernel rounds the dequantized weight to bf16 and multiplies
+        # in the activation dtype, which matches `Fp8Expert` for 16-bit inputs.
+        if (
+            self._fp8_packable
+            and flat.dtype in (torch.bfloat16, torch.float16)
+            and supports_block_fp8_grouped_mm(flat.device)
+        ):
+            fp8_pack = pack if isinstance(pack, PackedFp8Experts) else None
+            self._expert_pack = PackedFp8Experts.current(fp8_pack, self.experts)
+            return self._expert_pack
+        return None
+
+    def _loop_experts(
+        self, flat: torch.Tensor, top_k_indices: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-expert dispatch: one gather, MLP and `index_add_` per local expert."""
         out = torch.zeros_like(flat)
         # expert_mask[expert, top_k_pos, token] = 1 iff token picked expert at
         # that top-k slot. Permute so a per-expert lookup is an O(1) slice.
@@ -199,10 +251,4 @@ class GlmMoeFFN(nn.Module):
             tokens = flat[token_idx]
             weights = top_k_weights[token_idx, top_k_pos, None]
             out.index_add_(0, token_idx, self.experts[local_idx](tokens) * weights)
-        # Sum partial routed contributions across ranks (no-op at world_size=1).
-        out = all_reduce_sum(out)
-        # Shared expert is replicated; add after the reduce so it isn't scaled
-        # by world_size.
-        if self.shared_experts is not None:
-            out = out + self.shared_experts(flat)
-        return out.view(input_shape)
+        return out
