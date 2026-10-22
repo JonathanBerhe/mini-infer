@@ -120,3 +120,28 @@ NVFP4 (the dispatch table in PyTorch's `GroupedBlas.cpp`). It does not take
   the routed-expert output has a relative error of 5.4e-3 to 5.5e-3.
 - No real FP8 checkpoint was measured end to end. The GLM-5.x and
   MiniMax-M3 FP8 checkpoints need 4 to 8 GPUs.
+
+## Update 2026-10-22: tiles of one expert each
+
+The per-row-tile split of decision 2 gives a program rows of several
+experts, and the program runs the whole K loop once for each of them. The
+default split for more than 256 rows is now per expert tile: the rows of
+each expert are cut into tiles of `BLOCK_M`, and each program takes one
+tile of one expert. A few small GPU operations count the tiles of each
+expert, and a binary search over those counts finds a program's expert.
+Nothing reads back to the host. The row tiles stay as a bench option.
+
+Measured with the GLM-5.3 layer in one process per GPU
+([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)):
+
+- On the B200, the expert tiles are 1.08 to 1.42 times faster than the row
+  tiles from 64 to 16384 tokens. The FP8 layer is now faster than the bf16
+  layer at 1024 tokens (4.02 against 5.12 ms), and still 1.20 and 1.40
+  times slower at 4096 and 16384 tokens.
+- On the H100, the expert tiles are 1.06 to 1.31 times faster than the row
+  tiles. There the Gluon kernel of ADR-038 takes many rows when it can, and
+  the expert tiles run for the other shapes.
+- The outputs of the two splits are bit-identical.
+- The Blackwell tile for 257 to 8192 rows changes from (64, 128, 64, 4, 4)
+  to (64, 256, 64, 8, 3), the fastest expert tile at 1024 tokens in the
+  sweep.

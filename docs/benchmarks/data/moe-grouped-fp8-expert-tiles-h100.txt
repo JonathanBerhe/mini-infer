@@ -1,0 +1,67 @@
+gpu=NVIDIA H100 80GB HBM3 cc=(9, 0) torch=2.14.1+cu130 cuda=13.0 triton=3.8.0
+
+## GPU unit tests
+tests/unit/test_fp8_grouped_gluon.py:371
+  /root/tests/unit/test_fp8_grouped_gluon.py:371: PytestUnknownMarkWarning: Unknown pytest.mark.requires_cuda - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.requires_cuda
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+90 passed, 4 warnings in 48.33s
+
+## FP8 layer, Triton row tiles against expert tiles (GLM-5.3, FP8 experts: hidden 6144, expert width 2048, 256 experts, top-8)
+eager wall ms per forward; rel diff is expert tiles against row tiles
+   tokens |    row tiles | expert tiles |        gluon | expert vs row | rel diff
+       64 |        4.145 |        3.819 |        3.945 |         1.09x |  0.0e+00
+      256 |        5.225 |        4.741 |        4.823 |         1.10x |  0.0e+00
+     1024 |        8.097 |        6.402 |        5.382 |         1.26x |  0.0e+00
+     2048 |       10.991 |        8.389 |        7.203 |         1.31x |  0.0e+00
+     4096 |       16.612 |       12.662 |       10.105 |         1.31x |  0.0e+00
+     8192 |       24.852 |       22.098 |       17.058 |         1.12x |  0.0e+00
+    16384 |       42.911 |       40.452 |       32.116 |         1.06x |  0.0e+00
+
+## FP8 grouped matmul alone (ms, median of do_bench; useful TFLOPS in brackets)
+   tokens | projection |          row tiles |       expert tiles |              gluon
+     1024 |    gate_up |     4.617 (   89) |     3.530 (  117) |     2.905 (  142)
+     1024 |       down |     2.362 (   87) |     1.831 (  113) |     1.567 (  132)
+     4096 |    gate_up |     9.050 (  182) |     6.540 (  252) |     5.429 (  304)
+     4096 |       down |     4.517 (  183) |     3.427 (  241) |     2.685 (  307)
+    16384 |    gate_up |    22.035 (  299) |    20.138 (  328) |    12.726 (  518)
+    16384 |       down |    11.018 (  299) |    10.704 (  308) |     6.793 (  486)
+
+## Profile at 4096 tokens
+  glm_fp8_4096tok_row_tiles: 65 GPU ops, 16.192 ms GPU busy of 16.542 ms wall (GPU idle 2%), 0 host syncs per forward
+        13.240 ms  _block_fp8_grouped_mm_kernel
+         0.712 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.628 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.384 ms  nvjet_sm90_tst_256x128_64x4_1x2_h_bz_coopA_TNT
+         0.250 ms  sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize128x128x8_stage3_warpsize2x2x1_ffma_aligna4_alignc4_execute_kern
+  glm_fp8_4096tok_expert_tiles: 89 GPU ops, 12.382 ms GPU busy of 12.438 ms wall (GPU idle 0%), 0 host syncs per forward
+         9.386 ms  _block_fp8_grouped_mm_kernel
+         0.715 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.629 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.385 ms  nvjet_sm90_tst_256x128_64x4_1x2_h_bz_coopA_TNT
+         0.249 ms  sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize128x128x8_stage3_warpsize2x2x1_ffma_aligna4_alignc4_execute_kern
+  glm_fp8_4096tok_gluon: 65 GPU ops, 10.286 ms GPU busy of 10.369 ms wall (GPU idle 1%), 0 host syncs per forward
+         7.102 ms  _block_fp8_grouped_mm_hopper_ws
+         0.757 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.676 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.415 ms  nvjet_sm90_tst_256x128_64x4_1x2_h_bz_coopA_TNT
+         0.293 ms  sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize128x128x8_stage3_warpsize2x2x1_ffma_aligna4_alignc4_execute_kern
+
+## FP8 kernel tiles, expert tiles, prefill sizes (wall ms per forward)
+   BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, swapped |     256 tok |    1024 tok |    4096 tok |   16384 tok
+                              64, 128, 64, 4, 4, yes |       5.565 |       7.235 |      15.693 |      53.183
+                             64, 128, 128, 4, 3, yes |       4.891 |       6.542 |      14.507 |      49.509
+                              128, 64, 64, 4, 4, yes |       7.592 |       9.050 |      21.463 |      73.152
+                             128, 128, 64, 4, 4, yes |       6.388 |       7.462 |      14.879 |      45.773
+                             128, 128, 64, 8, 3, yes |       7.600 |       8.876 |      16.379 |      52.898
+                            128, 128, 128, 8, 3, yes |       6.495 |       7.415 |      14.179 |      46.094
+                              64, 256, 64, 8, 3, yes |       5.988 |       7.023 |      15.175 |      54.596
+                             128, 256, 64, 8, 3, yes |       6.601 |       7.450 |      12.819 |      42.418
+                              32, 128, 64, 4, 4, yes |       5.414 |       7.331 |      21.428 |      73.017
+                              32, 256, 64, 8, 3, yes |       5.817 |       7.833 |      21.601 |      80.508
+
+## Target: the same layer with bf16 experts on grouped_mm (eager wall ms per forward)
+     1024 |     8.126
+     4096 |    12.853
+    16384 |    31.010

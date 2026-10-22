@@ -1,0 +1,61 @@
+gpu=NVIDIA B200 cc=(10, 0) torch=2.14.1+cu130 cuda=13.0 triton=3.8.0
+
+## GPU unit tests
+    @pytest.mark.requires_cuda
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [27] tests/unit/test_fp8_grouped_gluon.py:140: needs an sm90 GPU
+63 passed, 27 skipped, 4 warnings in 11.65s
+
+## FP8 layer, Triton row tiles against expert tiles (GLM-5.3, FP8 experts: hidden 6144, expert width 2048, 256 experts, top-8)
+eager wall ms per forward; rel diff is expert tiles against row tiles
+   tokens |    row tiles | expert tiles | expert vs row | rel diff
+       64 |        4.372 |        3.078 |         1.42x |  0.0e+00
+      256 |        4.187 |        3.406 |         1.23x |  0.0e+00
+     1024 |        5.188 |        4.019 |         1.29x |  0.0e+00
+     2048 |        7.009 |        5.249 |         1.34x |  0.0e+00
+     4096 |       10.107 |        8.428 |         1.20x |  0.0e+00
+     8192 |       16.467 |       14.370 |         1.15x |  0.0e+00
+    16384 |       28.888 |       26.763 |         1.08x |  0.0e+00
+
+## FP8 grouped matmul alone (ms, median of do_bench; useful TFLOPS in brackets)
+   tokens | projection |          row tiles |       expert tiles
+     1024 |    gate_up |     3.132 (  132) |     2.231 (  185)
+     1024 |       down |     1.634 (  126) |     1.149 (  179)
+     4096 |    gate_up |     5.464 (  302) |     4.012 (  411)
+     4096 |       down |     2.841 (  290) |     2.172 (  380)
+    16384 |    gate_up |    13.743 (  480) |    12.047 (  548)
+    16384 |       down |     7.144 (  462) |     6.471 (  510)
+
+## Profile at 4096 tokens
+  glm_fp8_4096tok_row_tiles: 63 GPU ops, 10.023 ms GPU busy of 10.337 ms wall (GPU idle 3%), 0 host syncs per forward
+         7.587 ms  _block_fp8_grouped_mm_kernel
+         0.641 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.559 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.253 ms  cutlass3x_sm100_simt_sgemm_f32_f32_f32_f32_f32_128x64x16_1x1x1_3_tnn_align1_bias_f32_relu
+         0.205 ms  nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT
+  glm_fp8_4096tok_expert_tiles: 87 GPU ops, 8.600 ms GPU busy of 8.293 ms wall (GPU idle 0%), 0 host syncs per forward
+         6.018 ms  _block_fp8_grouped_mm_kernel
+         0.662 ms  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::
+         0.579 ms  void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2>
+         0.268 ms  cutlass3x_sm100_simt_sgemm_f32_f32_f32_f32_f32_128x64x16_1x1x1_3_tnn_align1_bias_f32_relu
+         0.213 ms  nvjet_sm100_tst_128x256_64x6_2x2_2cta_h_bz_TNT
+
+## FP8 kernel tiles, expert tiles, prefill sizes (wall ms per forward)
+   BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, swapped |     256 tok |    1024 tok |    4096 tok |   16384 tok
+                              64, 128, 64, 4, 4, yes |       3.491 |       3.880 |      10.460 |      35.872
+                             64, 128, 128, 4, 3, yes |       4.235 |       4.565 |      11.414 |      39.464
+                              128, 64, 64, 4, 4, yes |       5.766 |       6.129 |      12.072 |      40.774
+                             128, 128, 64, 4, 4, yes |       4.130 |       4.494 |       9.010 |      29.911
+                             128, 128, 64, 8, 3, yes |       4.518 |       4.865 |       9.395 |      30.536
+                            128, 128, 128, 8, 3, yes |       5.482 |       5.800 |       9.966 |      32.436
+                              64, 256, 64, 8, 3, yes |       3.402 |       3.739 |       9.657 |      32.903
+                             128, 256, 64, 8, 3, yes |       4.211 |       4.590 |       8.442 |      26.879
+                              32, 128, 64, 4, 4, yes |       3.181 |       4.558 |      14.040 |      50.690
+                              32, 256, 64, 8, 3, yes |       3.147 |       4.543 |      13.780 |      50.336
+
+## Target: the same layer with bf16 experts on grouped_mm (eager wall ms per forward)
+     1024 |     5.116
+     4096 |     7.026
+    16384 |    19.146

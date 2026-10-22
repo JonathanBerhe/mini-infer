@@ -76,11 +76,13 @@ specialization directly.
 
 ## Alternatives Considered
 
-- **The same schedule in Triton.** Expert-aligned work items would remove
-  the repeated K loops. But Triton's compiler would still wait for each
-  register-operand `wgmma`, so the dequantization would not overlap. It
-  was not built, so the benchmark does not split the gain between the
-  schedule and the overlap.
+- **The same schedule in Triton.** Expert-aligned work items remove the
+  repeated K loops, but Triton's compiler still waits for each
+  register-operand `wgmma`, so the dequantization does not overlap. It was
+  measured later as the Triton kernel's expert-tile split (ADR-037,
+  update). On the H100 it gives 60 to 70 percent of the Gluon gain at 1024
+  to 4096 tokens and 23 percent at 16384 tokens. The Gluon kernel stays
+  1.16 to 1.30 times faster than it from 1024 tokens.
 - **Wait for each `wgmma`, as Triton does.** It is safe without the
   two-step loop, but the dequantization then runs while the tensor cores
   are idle.
