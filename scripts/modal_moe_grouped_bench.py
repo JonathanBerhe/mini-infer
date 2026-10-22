@@ -2,7 +2,8 @@
 
 On Hopper and newer GPUs the MoE blocks run their routed experts as two
 grouped matmuls (`grouped_experts.py`): `functional.grouped_mm` for bf16
-experts, the Triton kernel of `fp8_grouped_kernel.py` for block-FP8 ones.
+experts, `fp8_grouped_kernel.block_fp8_grouped_mm` (Triton and Gluon kernels)
+for block-FP8 ones.
 Before, they looped over experts (Mixtral, GLM, Nemotron-H prefill) or
 gathered each token's expert weights (Nemotron-H decode). Both paths are
 still in the code, and `grouped_experts._DISABLED_FOR_BENCH` switches
@@ -35,12 +36,12 @@ Add `--fp8-only` to run only the unit tests and the FP8 layer (steps 0 to
 kernel's current form with its first one (`fp8_kernel_bench`), or
 `--fp8-tiles` for the same comparison without the loop, the profiles and
 the bf16 target, plus this GPU's default tiles with and without swapped
-operands. On an H100, `--fp8-gluon` runs the unit tests and then compares
-the Gluon kernel of `fp8_grouped_gluon.py` with the Triton one
+operands. On an H100 or a B200, `--fp8-gluon` runs the unit tests and then
+compares the Gluon kernels of `fp8_grouped_gluon.py` with the Triton one
 (`fp8_gluon_bench`). `--fp8-expert-tiles` compares the Triton kernel's row
 tiles with tiles of one expert each, on any GPU (`fp8_expert_tiles_bench`).
-Add
-`--out-dir <dir>` to keep the report and traces there (default: a new
+`--tests-only` runs only the unit tests of step 0.
+Add `--out-dir <dir>` to keep the report and traces there (default: a new
 temporary directory). Dry run with tiny sizes on this machine (needs
 the Nemotron 3 Nano 4B tokenizer in the local Hugging Face cache; the FP8
 layer needs Triton, so it is skipped here):
@@ -113,9 +114,10 @@ image = (
 LAYER_TOKENS = [1, 4, 16, 64, 256, 1024, 4096, 16384]
 GRAPH_TOKENS = [1, 4, 16, 64]
 PROFILE_TOKENS = [4, 2048]
-# Tiles of the FP8 kernel, (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages).
-# The kernel splits the work per segment up to 256 rows (32 tokens at top-8)
-# and per row tile above, so each list is tried at the sizes it serves.
+# Tiles of the Triton FP8 kernel, (BLOCK_M, BLOCK_N, BLOCK_K, num_warps,
+# num_stages). The kernel splits the work per segment up to 256 rows (32
+# tokens at top-8) and per expert tile above, so each list is tried at the
+# sizes it serves.
 FP8_SMALL_TILES = [
     (16, 32, 128, 4, 3),
     (16, 64, 64, 4, 3),
@@ -392,26 +394,27 @@ def _fp8_tile_sweep(
     }
     for tiles in tile_list:
         for swap in swaps:
-            fp8_grouped_kernel._TILES_FOR_BENCH = tiles
-            fp8_grouped_kernel._SWAP_AB_FOR_BENCH = swap
             cells = []
+            hooks = _hooks(
+                fp8_grouped_kernel,
+                _TILES_FOR_BENCH=tiles,
+                _SWAP_AB_FOR_BENCH=swap,
+                _GLUON_FOR_BENCH=False,
+            )
             try:
-                with _grouped(True), torch.inference_mode():
+                with hooks, _grouped(True), torch.inference_mode():
                     for tokens in token_counts:
                         ms = _time_ms(partial(layer, inputs[tokens]), device)
                         cells.append(f"{ms:11.3f}")
             except Exception as exc:
                 cells.append(f"failed: {exc!r}"[:120])
-            finally:
-                fp8_grouped_kernel._TILES_FOR_BENCH = None
-                fp8_grouped_kernel._SWAP_AB_FOR_BENCH = None
             label = f"{', '.join(map(str, tiles))}, {'yes' if swap else 'no'}"
             lines.append(f"   {label:>49} | " + " | ".join(cells))
     return lines
 
 
 def _fp8_sweeps(layer: Any, hidden: int, device: str, dtype: Any) -> list[str]:
-    """Per-segment tiles at decode sizes, per-tile tiles at prefill sizes."""
+    """Triton tiles per segment at decode sizes and per expert tile at prefill sizes."""
     return _fp8_tile_sweep(
         layer,
         hidden,
@@ -427,12 +430,24 @@ def _fp8_sweeps(layer: Any, hidden: int, device: str, dtype: Any) -> list[str]:
         dtype,
         tile_list=FP8_LARGE_TILES,
         token_counts=FP8_LARGE_TILE_TOKENS,
-        title="per row tile, prefill sizes",
+        title="per expert tile, prefill sizes",
     )
 
 
 @contextmanager
-def _previous_fp8_kernel(enabled: bool, rows: int) -> Iterator[None]:
+def _hooks(module: Any, **values: Any) -> Iterator[None]:
+    """Set these bench hooks of `module` inside the block, and restore them after."""
+    saved = {name: getattr(module, name) for name in values}
+    for name, value in values.items():
+        setattr(module, name, value)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(module, name, value)
+
+
+def _previous_fp8_kernel(enabled: bool, rows: int) -> Any:
     """Run the FP8 kernel as first measured: per row tile, weights on the right.
 
     That is the kernel's state before the swapped operands, the per-segment
@@ -441,25 +456,16 @@ def _previous_fp8_kernel(enabled: bool, rows: int) -> Iterator[None]:
     """
     from mini_infer.models.blocks import fp8_grouped_kernel as kernel
 
-    names = (
-        "_SWAP_AB_FOR_BENCH",
-        "_PER_SEGMENT_FOR_BENCH",
-        "_TILES_FOR_BENCH",
-        "_EXPERT_TILES_FOR_BENCH",
-        "_GLUON_FOR_BENCH",
+    if not enabled:
+        return _hooks(kernel)
+    return _hooks(
+        kernel,
+        _SWAP_AB_FOR_BENCH=False,
+        _PER_SEGMENT_FOR_BENCH=False,
+        _TILES_FOR_BENCH=(16, 64, 64, 4, 3) if rows <= 256 else (64, 128, 64, 4, 4),
+        _EXPERT_TILES_FOR_BENCH=False,
+        _GLUON_FOR_BENCH=False,
     )
-    saved = {name: getattr(kernel, name) for name in names}
-    if enabled:
-        kernel._SWAP_AB_FOR_BENCH = False
-        kernel._PER_SEGMENT_FOR_BENCH = False
-        kernel._TILES_FOR_BENCH = (16, 64, 64, 4, 3) if rows <= 256 else (64, 128, 64, 4, 4)
-        kernel._EXPERT_TILES_FOR_BENCH = False
-        kernel._GLUON_FOR_BENCH = False
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            setattr(kernel, name, value)
 
 
 # Token counts that land in each tier of the kernel's tile table at top-8.
@@ -609,7 +615,7 @@ def fp8_kernel_bench(
     return lines
 
 
-# The Gluon kernel for Hopper against the Triton kernel (`--fp8-gluon`).
+# The Gluon kernels (sm90 and sm100) against the Triton kernel (`--fp8-gluon`).
 FP8_GLUON_TOKENS = [32, 64, 256, 1024, 2048, 4096, 8192, 16384]
 FP8_GLUON_KERNEL_TOKENS = [1024, 4096, 16384]
 FP8_GLUON_TARGET_TOKENS = [1024, 4096, 16384]
@@ -626,25 +632,37 @@ FP8_GLUON_TILES = [
     (128, 128, 64, 8, 4, False),
     (128, 256, 64, 8, 3, False),
 ]
+# On sm100 `warps` counts the dequantization warps.
+FP8_GLUON_BLACKWELL_TILES = [
+    (128, 64, 64, 4, 4, True),
+    (128, 64, 64, 8, 4, True),
+    (128, 128, 64, 4, 4, True),
+    (128, 128, 128, 4, 3, True),
+    (128, 128, 128, 8, 3, True),
+    (128, 256, 64, 4, 3, True),
+    (128, 256, 128, 4, 2, True),
+]
 FP8_GLUON_SWEEP_TOKENS = [256, 1024, 4096, 16384]
 
 
 @contextmanager
 def _fp8_kernel(gluon: bool | None, tiles: tuple[Any, ...] | None = None) -> Iterator[None]:
-    """Force the Triton kernel (False) or the Gluon one (True), or keep the default (None)."""
+    """Force the Triton kernel (False) or a Gluon one (True), or keep the default (None)."""
     from mini_infer.models.blocks import fp8_grouped_gluon, fp8_grouped_kernel
 
-    saved = (fp8_grouped_kernel._GLUON_FOR_BENCH, fp8_grouped_gluon._TILES_FOR_BENCH)
-    fp8_grouped_kernel._GLUON_FOR_BENCH = gluon
-    fp8_grouped_gluon._TILES_FOR_BENCH = tiles
-    try:
+    with (
+        _hooks(fp8_grouped_kernel, _GLUON_FOR_BENCH=gluon),
+        _hooks(fp8_grouped_gluon, _TILES_FOR_BENCH=tiles),
+    ):
         yield
-    finally:
-        fp8_grouped_kernel._GLUON_FOR_BENCH, fp8_grouped_gluon._TILES_FOR_BENCH = saved
 
 
-def _fp8_kernel_alone(layer: Any, spec: dict[str, Any], device: str) -> list[str]:
-    """Each projection's grouped matmul alone, Triton against Gluon, with TFLOPS.
+# A label and a context that picks the FP8 kernel for that label.
+KernelRuns = list[tuple[str, Callable[[], Any]]]
+
+
+def _fp8_kernel_alone(layer: Any, spec: dict[str, Any], device: str, runs: KernelRuns) -> list[str]:
+    """Each projection's grouped matmul alone, once for each of `runs`, with TFLOPS.
 
     Uses the layer's packed expert weights and random routing over all
     experts, as the layer benchmark does. TFLOPS count the useful products
@@ -658,8 +676,8 @@ def _fp8_kernel_alone(layer: Any, spec: dict[str, Any], device: str) -> list[str
     pack = layer._expert_pack
     lines = [
         "",
-        "## FP8 grouped matmul alone (ms, median of do_bench; useful TFLOPS)",
-        "   tokens | projection |    triton |     gluon | speedup | triton TFLOPS | gluon TFLOPS",
+        "## FP8 grouped matmul alone (ms, median of do_bench; useful TFLOPS in brackets)",
+        "   tokens | projection | " + " | ".join(f"{label:>18}" for label, _ in runs),
     ]
     for tokens in FP8_GLUON_KERNEL_TOKENS:
         pairs = tokens * spec["top_k"]
@@ -668,10 +686,11 @@ def _fp8_kernel_alone(layer: Any, spec: dict[str, Any], device: str) -> list[str
         for name, weight in (("gate_up", pack.gate_up), ("down", pack.down)):
             n_dim, k_dim = weight.weight.shape[1:]
             rows = torch.randn(pairs, k_dim, device=device, dtype=torch.bfloat16)
-            times = {}
-            for label, gluon in (("triton", False), ("gluon", True)):
-                with _fp8_kernel(gluon):
-                    times[label] = do_bench(
+            flops = 2 * pairs * n_dim * k_dim
+            cells = []
+            for _label, choose in runs:
+                with choose():
+                    ms = do_bench(
                         partial(
                             block_fp8_grouped_mm,
                             rows,
@@ -683,12 +702,44 @@ def _fp8_kernel_alone(layer: Any, spec: dict[str, Any], device: str) -> list[str
                         ),
                         return_mode="median",
                     )
-            flops = 2 * pairs * n_dim * k_dim
-            lines.append(
-                f"{tokens:>9} | {name:>10} | {times['triton']:9.3f} | {times['gluon']:9.3f} | "
-                f"{times['triton'] / times['gluon']:6.2f}x | "
-                f"{flops / times['triton'] / 1e9:13.0f} | {flops / times['gluon'] / 1e9:12.0f}"
-            )
+                cells.append(f"{ms:9.3f} ({flops / ms / 1e9:5.0f})")
+            lines.append(f"{tokens:>9} | {name:>10} | " + " | ".join(cells))
+    return lines
+
+
+def _fp8_profiles(
+    layer: Any, x: Any, device: str, runs: KernelRuns, *, traces: dict[str, bytes]
+) -> list[str]:
+    """A profile of the FP8 layer on `x` for each of `runs`."""
+    import torch
+
+    tokens = x.shape[1]
+    lines = ["", f"## Profile at {tokens} tokens"]
+    for label, choose in runs:
+        with _grouped(True), choose():
+            with torch.inference_mode():
+                ms = _time_ms(partial(layer, x), device)
+            name = f"glm_fp8_{tokens}tok_{label.replace(' ', '_')}"
+            lines += _profile(layer, x, device, wall_ms=ms, name=name, traces=traces)
+    return lines
+
+
+def _bf16_target(spec: dict[str, Any], device: str, dtype: Any) -> list[str]:
+    """The same layer with bf16 experts on `grouped_mm`, eager."""
+    import torch
+
+    lines = [
+        "",
+        "## Target: the same layer with bf16 experts on grouped_mm (eager wall ms per forward)",
+    ]
+    torch.manual_seed(0)
+    layer = _build_layer(spec, device, dtype)
+    with torch.inference_mode(), _grouped(True):
+        for tokens in FP8_GLUON_TARGET_TOKENS:
+            x = torch.randn(1, tokens, spec["hidden"], device=device, dtype=dtype)
+            lines.append(f"{tokens:>9} | {_time_ms(partial(layer, x), device):9.3f}")
+    del layer
+    torch.cuda.empty_cache()
     return lines
 
 
@@ -697,14 +748,17 @@ def fp8_gluon_bench(
 ) -> list[str]:
     """The GLM-5.3 FP8 layer with the Gluon kernel against the Triton kernel.
 
-    Eager milliseconds per forward for Triton, Gluon (warp-specialized and
-    not) and the bf16 layer on `grouped_mm`, then each projection alone,
-    profiles at 4096 tokens and a sweep of Gluon tiles.
+    It times the layer eager with Triton and with Gluon, on Hopper also
+    without warp specialization. Then it times each projection alone,
+    profiles both kernels at 4096 tokens, sweeps the Gluon tiles, and times
+    the bf16 layer on `grouped_mm`.
     """
     import torch
 
+    from mini_infer.device import is_datacenter_blackwell_device
     from mini_infer.models.blocks import fp8_grouped_gluon
 
+    blackwell = is_datacenter_blackwell_device(device)
     specs = {spec["kind"]: spec for spec in _layer_specs(fixtures, tiny=False)}
     spec = specs["glm_fp8"]
     torch.manual_seed(0)
@@ -723,12 +777,13 @@ def fp8_gluon_bench(
     for tokens in FP8_GLUON_TOKENS:
         x = inputs[tokens]
         pairs = tokens * spec["top_k"]
-        tiles = fp8_grouped_gluon.tiles_for(pairs, spec["experts"])
-        runs = (
+        tiles = fp8_grouped_gluon.default_tiles(pairs / spec["experts"], torch.device(device))
+        runs: list[tuple[str, bool, tuple[Any, ...] | None]] = [
             ("triton", False, None),
             ("gluon", True, None),
-            ("gluon no-ws", True, (*tiles[:5], False)),
-        )
+        ]
+        if not blackwell:
+            runs.append(("gluon no-ws", True, (*tiles[:5], False)))
         wall: dict[str, float] = {}
         outs: dict[str, Any] = {}
         with torch.inference_mode(), _grouped(True):
@@ -738,24 +793,21 @@ def fp8_gluon_bench(
                     outs[label] = layer(x).float()
         base = outs["triton"]
         rel = float((outs["gluon"] - base).norm() / base.norm().clamp_min(1e-30))
-        best = min(wall["gluon"], wall["gluon no-ws"])
+        no_ws = wall.get("gluon no-ws")
+        best = min(wall["gluon"], no_ws if no_ws is not None else wall["gluon"])
+        no_ws_cell = f"{no_ws:12.3f}" if no_ws is not None else f"{'-':>12}"
         lines.append(
             f"{tokens:>9} | {wall['triton']:9.3f} | {wall['gluon']:9.3f} | "
-            f"{wall['gluon no-ws']:12.3f} | {', '.join(map(str, tiles)):<22} | "
+            f"{no_ws_cell} | {', '.join(map(str, tiles)):<22} | "
             f"{wall['triton'] / best:6.2f}x | {rel:8.1e}"
         )
 
-    lines += _fp8_kernel_alone(layer, spec, device)
-
-    lines += ["", "## Profile at 4096 tokens"]
-    x = inputs[4096]
-    for label, gluon in (("triton", False), ("gluon", True)):
-        with _grouped(True), _fp8_kernel(gluon):
-            with torch.inference_mode():
-                ms = _time_ms(partial(layer, x), device)
-            lines += _profile(
-                layer, x, device, wall_ms=ms, name=f"glm_fp8_4096tok_{label}", traces=traces
-            )
+    kernels: KernelRuns = [
+        ("triton", partial(_fp8_kernel, False)),
+        ("gluon", partial(_fp8_kernel, True)),
+    ]
+    lines += _fp8_kernel_alone(layer, spec, device, kernels)
+    lines += _fp8_profiles(layer, inputs[4096], device, kernels, traces=traces)
 
     lines += [
         "",
@@ -763,7 +815,7 @@ def fp8_gluon_bench(
         "   BLOCK_W, BLOCK_T, BLOCK_K, warps, stages, ws | "
         + " | ".join(f"{tokens:>7} tok" for tokens in FP8_GLUON_SWEEP_TOKENS),
     ]
-    for tiles in FP8_GLUON_TILES:
+    for tiles in FP8_GLUON_BLACKWELL_TILES if blackwell else FP8_GLUON_TILES:
         cells = []
         try:
             with torch.inference_mode(), _grouped(True), _fp8_kernel(True, tiles):
@@ -775,21 +827,7 @@ def fp8_gluon_bench(
         lines.append(f"   {label:>44} | " + " | ".join(cells))
     del layer
     torch.cuda.empty_cache()
-
-    target = specs["glm"]
-    lines += [
-        "",
-        "## Target: the same layer with bf16 experts on grouped_mm (eager wall ms per forward)",
-    ]
-    torch.manual_seed(0)
-    layer = _build_layer(target, device, dtype)
-    with torch.inference_mode(), _grouped(True):
-        for tokens in FP8_GLUON_TARGET_TOKENS:
-            x = torch.randn(1, tokens, target["hidden"], device=device, dtype=dtype)
-            lines.append(f"{tokens:>9} | {_time_ms(partial(layer, x), device):9.3f}")
-    del layer
-    torch.cuda.empty_cache()
-    return lines
+    return lines + _bf16_target(specs["glm"], device, dtype)
 
 
 # Two splits of the Triton kernel for many rows (`--fp8-expert-tiles`).
@@ -798,18 +836,11 @@ FP8_EXPERT_TILES = [*FP8_LARGE_TILES, (32, 128, 64, 4, 4), (32, 256, 64, 8, 3)]
 FP8_EXPERT_PROFILE_TOKENS = 4096
 
 
-@contextmanager
-def _triton_split(expert_tiles: bool) -> Iterator[None]:
+def _triton_split(expert_tiles: bool) -> Any:
     """Force the Triton kernel, with tiles of one expert each (True) or row tiles."""
     from mini_infer.models.blocks import fp8_grouped_kernel as kernel
 
-    saved = (kernel._EXPERT_TILES_FOR_BENCH, kernel._GLUON_FOR_BENCH)
-    kernel._EXPERT_TILES_FOR_BENCH = expert_tiles
-    kernel._GLUON_FOR_BENCH = False
-    try:
-        yield
-    finally:
-        kernel._EXPERT_TILES_FOR_BENCH, kernel._GLUON_FOR_BENCH = saved
+    return _hooks(kernel, _EXPERT_TILES_FOR_BENCH=expert_tiles, _GLUON_FOR_BENCH=False)
 
 
 def fp8_expert_tiles_bench(
@@ -817,22 +848,21 @@ def fp8_expert_tiles_bench(
 ) -> list[str]:
     """The GLM-5.3 FP8 layer with the Triton kernel's two splits for many rows.
 
-    Row tiles (the default) span several experts and run the K loop once for
-    each. Expert tiles hold the rows of one expert. On Hopper the Gluon
-    kernel runs too. Then each projection alone, profiles at 4096 tokens,
-    a tile sweep of the expert tiles, and the bf16 layer on `grouped_mm`.
+    Row tiles span several experts and run the K loop once for each. Expert
+    tiles (the default) hold the rows of one expert. On Hopper the Gluon
+    kernel runs too. Then it times each projection alone, profiles the
+    kernels at 4096 tokens, sweeps the expert tiles, and times the bf16
+    layer on `grouped_mm`.
     """
     import torch
-    from triton.testing import do_bench
 
     from mini_infer.device import is_hopper_device
-    from mini_infer.models.blocks.fp8_grouped_kernel import block_fp8_grouped_mm
 
     specs = {spec["kind"]: spec for spec in _layer_specs(fixtures, tiny=False)}
     spec = specs["glm_fp8"]
     torch.manual_seed(0)
     layer = _build_layer(spec, device, dtype)
-    runs: list[tuple[str, Callable[[], Any]]] = [
+    runs: KernelRuns = [
         ("row tiles", partial(_triton_split, False)),
         ("expert tiles", partial(_triton_split, True)),
     ]
@@ -868,48 +898,8 @@ def fp8_expert_tiles_bench(
             f"{rel:8.1e}"
         )
 
-    pack = layer._expert_pack
-    lines += [
-        "",
-        "## FP8 grouped matmul alone (ms, median of do_bench; useful TFLOPS in brackets)",
-        "   tokens | projection | " + " | ".join(f"{label:>18}" for label in labels),
-    ]
-    for tokens in FP8_GLUON_KERNEL_TOKENS:
-        pairs = tokens * spec["top_k"]
-        experts = torch.randint(0, spec["experts"], (pairs,), device=device).sort().values
-        ends = torch.bincount(experts, minlength=spec["experts"]).cumsum(0).to(torch.int32)
-        for name, weight in (("gate_up", pack.gate_up), ("down", pack.down)):
-            n_dim, k_dim = weight.weight.shape[1:]
-            rows = torch.randn(pairs, k_dim, device=device, dtype=torch.bfloat16)
-            flops = 2 * pairs * n_dim * k_dim
-            cells = []
-            for _label, choose in runs:
-                with choose():
-                    ms = do_bench(
-                        partial(
-                            block_fp8_grouped_mm,
-                            rows,
-                            weight.weight,
-                            weight.scale,
-                            block=weight.block,
-                            row_experts=experts,
-                            group_ends=ends,
-                        ),
-                        return_mode="median",
-                    )
-                cells.append(f"{ms:9.3f} ({flops / ms / 1e9:5.0f})")
-            lines.append(f"{tokens:>9} | {name:>10} | " + " | ".join(cells))
-
-    tokens = FP8_EXPERT_PROFILE_TOKENS
-    lines += ["", f"## Profile at {tokens} tokens"]
-    x = inputs[tokens]
-    for label, choose in runs:
-        with _grouped(True), choose():
-            with torch.inference_mode():
-                ms = _time_ms(partial(layer, x), device)
-            name = f"glm_fp8_{tokens}tok_{label.replace(' ', '_')}"
-            lines += _profile(layer, x, device, wall_ms=ms, name=name, traces=traces)
-
+    lines += _fp8_kernel_alone(layer, spec, device, runs)
+    lines += _fp8_profiles(layer, inputs[FP8_EXPERT_PROFILE_TOKENS], device, runs, traces=traces)
     with _triton_split(True):
         lines += _fp8_tile_sweep(
             layer,
@@ -922,21 +912,7 @@ def fp8_expert_tiles_bench(
         )
     del layer
     torch.cuda.empty_cache()
-
-    target = specs["glm"]
-    lines += [
-        "",
-        "## Target: the same layer with bf16 experts on grouped_mm (eager wall ms per forward)",
-    ]
-    torch.manual_seed(0)
-    layer = _build_layer(target, device, dtype)
-    with torch.inference_mode(), _grouped(True):
-        for tokens in FP8_GLUON_TARGET_TOKENS:
-            x = torch.randn(1, tokens, target["hidden"], device=device, dtype=dtype)
-            lines.append(f"{tokens:>9} | {_time_ms(partial(layer, x), device):9.3f}")
-    del layer
-    torch.cuda.empty_cache()
-    return lines
+    return lines + _bf16_target(specs["glm"], device, dtype)
 
 
 def layer_bench(
@@ -1186,6 +1162,7 @@ def moe_grouped_bench(
     fp8_tiles: bool = False,
     fp8_gluon: bool = False,
     fp8_expert_tiles: bool = False,
+    tests_only: bool = False,
 ) -> dict[str, Any]:
     import subprocess
     import sys
@@ -1213,13 +1190,16 @@ def moe_grouped_bench(
             timeout=_GPU_TESTS_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
-        partial = exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout or ""
-        lines += [f"unit tests timed out after {_GPU_TESTS_TIMEOUT} s", *partial.splitlines()[-60:]]
+        output = exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout or ""
+        lines += [f"unit tests timed out after {_GPU_TESTS_TIMEOUT} s", *output.splitlines()[-60:]]
         return {"report": "\n".join(lines), "traces": traces}
     lines += ["## GPU unit tests", *tests.stdout.strip().splitlines()[-6:], ""]
     if tests.returncode != 0:
         lines.append("unit tests failed, benchmark skipped")
         lines += tests.stdout.splitlines()[-150:]
+        return {"report": "\n".join(lines), "traces": traces}
+    if tests_only:
+        lines += tests.stdout.splitlines()[-40:]
         return {"report": "\n".join(lines), "traces": traces}
 
     if fp8_gluon:
@@ -1267,6 +1247,7 @@ def main(
     fp8_tiles: bool = False,
     fp8_gluon: bool = False,
     fp8_expert_tiles: bool = False,
+    tests_only: bool = False,
 ) -> None:
     result = moe_grouped_bench.remote(
         fp8_only=fp8_only,
@@ -1274,6 +1255,7 @@ def main(
         fp8_tiles=fp8_tiles,
         fp8_gluon=fp8_gluon,
         fp8_expert_tiles=fp8_expert_tiles,
+        tests_only=tests_only,
     )
     print(result["report"])
     print(f"\nreport and traces in {_save(result, out_dir)}")
