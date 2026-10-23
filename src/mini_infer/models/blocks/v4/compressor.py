@@ -531,12 +531,13 @@ class TokenLevelCompressor(nn.Module):
             `(compressed, flush_mask)` where `compressed` is `(B, 1, kv_head_dim)`
             (valid only for rows where `flush_mask` is True) and `flush_mask` is
             `(B,)` bool marking the rows that closed a block this step. The caller
-            writes `compressed[flush_mask]` into compressed history at slot
-            `positions[b] // m`, and only for those rows.
+            writes `compressed` into the compressed history at slot
+            `positions[b] // m` for those rows only (`write_flushed_blocks`).
 
         Unlike the scalar path this always computes `compressed` for every row
         (the block softmax is cheap and lets the whole batch share one forward);
-        non-flushing rows produce a value the caller discards.
+        non-flushing rows produce a value the caller discards. The step has no
+        host sync and no data-dependent shape, so a CUDA graph can capture it.
         """
         batch_size, seqlen, _ = hidden_state.shape
         if seqlen != 1:
@@ -575,10 +576,14 @@ class TokenLevelCompressor(nn.Module):
             softmax_weights = flat_score.softmax(dim=1)
             compressed = (flat_kv * softmax_weights).sum(dim=1, keepdim=True)
             # Slide only the rows that flushed: their current block becomes the
-            # next block's "previous overlap". Advanced-index read copies first,
-            # so the [:m] write does not alias the [m:] read.
-            cmp_kv_state[flush_mask, :m] = cmp_kv_state[flush_mask, m:]
-            cmp_score_state[flush_mask, :m] = cmp_score_state[flush_mask, m:]
+            # next block's "previous overlap". `torch.where` builds the new
+            # half before the copy, so the [:m] write does not alias the [m:]
+            # read, and the select keeps the step free of host syncs.
+            flushed = flush_mask.view(batch_size, 1, 1)
+            cmp_kv_state[:, :m] = torch.where(flushed, cmp_kv_state[:, m:], cmp_kv_state[:, :m])
+            cmp_score_state[:, :m] = torch.where(
+                flushed, cmp_score_state[:, m:], cmp_score_state[:, :m]
+            )
         else:
             softmax_weights = cmp_score_state.softmax(dim=1)
             compressed = (cmp_kv_state * softmax_weights).sum(dim=1, keepdim=True)
@@ -596,6 +601,35 @@ class TokenLevelCompressor(nn.Module):
                 compressed, cos_for_block, sin_for_block, self.rope_head_dim
             )
         return self._simulate_act_quant(compressed), flush_mask
+
+
+def write_flushed_blocks(
+    history: torch.Tensor,
+    compressed: torch.Tensor,
+    flush_mask: torch.Tensor,
+    positions: torch.Tensor,
+    compression_ratio: int,
+) -> None:
+    """Write the blocks of one ragged decode step into a compressed history, in place.
+
+    Row `b` writes `compressed[b]` at slot `positions[b] // compression_ratio`
+    when `flush_mask[b]` is set, and writes back the entry already there
+    otherwise. Every row writes, so the step has no host sync and no
+    data-dependent shape. The slot is clamped to the history, so a row that
+    holds no request cannot write out of bounds. The caller checks capacity
+    for real rows (`StateCache.check_capacity`).
+
+    Args:
+        history: `(B, max_n_compressed, c)` compressed history.
+        compressed: `(B, 1, c)` from `forward_decode_step_ragged`.
+        flush_mask: `(B,)` bool, the rows that closed a block this step.
+        positions: `(B,)` int64 positions of the new tokens.
+        compression_ratio: `m` of the compressor.
+    """
+    rows = torch.arange(history.shape[0], device=history.device)
+    slots = (positions // compression_ratio).clamp(max=history.shape[1] - 1)
+    new_blocks = compressed.squeeze(1).to(history.dtype)
+    history[rows, slots] = torch.where(flush_mask.unsqueeze(1), new_blocks, history[rows, slots])
 
 
 def configure_projection_out_dtype(module: nn.Module, out_dtype: ProjectionOutDtype) -> int:

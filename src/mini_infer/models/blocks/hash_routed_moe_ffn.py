@@ -216,28 +216,32 @@ class HashRoutedMoEFFN(nn.Module):
 
         return result.view(original_shape)
 
-    def _grouped_pack(self, flat: torch.Tensor) -> PackedSwigluExperts | PackedFp4Experts | None:
-        """The packed experts when this forward takes the grouped path, else `None`.
+    def runs_grouped(self, device: torch.device | str, dtype: torch.dtype) -> bool:
+        """Whether a forward on `device` with `dtype` activations takes the grouped path.
 
         The reference's FP8 GEMM-input round trip quantizes each expert's
-        inputs, which the grouped matmuls do not do, so it keeps the loop.
+        inputs, which the grouped matmuls do not do, so it keeps the loop. The
+        FP4 kernel rounds the dequantized weight to bf16 and multiplies in the
+        activation dtype, which matches `FP4Expert` for 16-bit inputs only.
         """
-        if self.routing_weights_before_down_proj or not supports_grouped_experts(flat.device):
+        if self.routing_weights_before_down_proj or not supports_grouped_experts(device):
+            return False
+        if self.expert_dtype == "bf16":
+            return True
+        return dtype in (torch.bfloat16, torch.float16) and supports_block_fp4_grouped_mm(device)
+
+    def _grouped_pack(self, flat: torch.Tensor) -> PackedSwigluExperts | PackedFp4Experts | None:
+        """The packed experts when this forward takes the grouped path, else `None`."""
+        if not self.runs_grouped(flat.device, flat.dtype):
             return None
         pack = self._expert_pack
         if self.expert_dtype == "bf16":
             bf16_pack = pack if isinstance(pack, PackedSwigluExperts) else None
             self._expert_pack = PackedSwigluExperts.current(bf16_pack, self.experts)
             return self._expert_pack
-        # The FP4 kernel rounds the dequantized weight to bf16 and multiplies
-        # in the activation dtype, which matches `FP4Expert` for 16-bit inputs.
-        if flat.dtype in (torch.bfloat16, torch.float16) and supports_block_fp4_grouped_mm(
-            flat.device
-        ):
-            fp4_pack = pack if isinstance(pack, PackedFp4Experts) else None
-            self._expert_pack = PackedFp4Experts.current(fp4_pack, self.experts)
-            return self._expert_pack
-        return None
+        fp4_pack = pack if isinstance(pack, PackedFp4Experts) else None
+        self._expert_pack = PackedFp4Experts.current(fp4_pack, self.experts)
+        return self._expert_pack
 
     def _loop_experts(
         self,
