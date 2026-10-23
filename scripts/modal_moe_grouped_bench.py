@@ -866,14 +866,15 @@ FP4_GLUON_TILES = [
     (128, 256, 64, 8, 4, True),
     (128, 256, 128, 8, 2, True),
 ]
-# On sm100 `warps` counts the dequantization warps, one warpgroup for FP4.
+# On sm100 `warps` counts the dequantization warps: one warpgroup (4) or two
+# that take turns on the K steps (8).
 FP4_GLUON_BLACKWELL_TILES = [
-    (128, 64, 64, 4, 4, True),
-    (128, 128, 64, 4, 4, True),
-    (128, 128, 128, 4, 3, True),
     (128, 128, 128, 4, 4, True),
+    (128, 128, 64, 8, 4, True),
+    (128, 128, 128, 8, 4, True),
     (128, 256, 64, 4, 3, True),
-    (128, 256, 128, 4, 2, True),
+    (128, 256, 64, 8, 3, True),
+    (128, 256, 64, 8, 4, True),
 ]
 # The best Triton tile at 16384 tokens in the 2026-10-23 profile on a B200.
 FP4_TRITON_LARGE_TILE = (256, 128, 64, 8, 4)

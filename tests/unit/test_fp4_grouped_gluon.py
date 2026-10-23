@@ -41,9 +41,12 @@ needs_gluon = pytest.mark.skipif(
 
 Case = tuple[int, GluonTiles]
 
-# (compute capability, tiles): the default tiles of each GPU family.
-_CASES: list[Case] = [(90, tiles) for _limit, tiles in fp4_grouped_gluon._HOPPER_TILES] + [
-    (100, tiles) for _limit, tiles in fp4_grouped_gluon._BLACKWELL_TILES
+# (compute capability, tiles): the default tiles of each GPU family, and an
+# sm100 tile with one dequantization warpgroup instead of two.
+_CASES: list[Case] = [
+    *[(90, tiles) for _limit, tiles in fp4_grouped_gluon._HOPPER_TILES],
+    *[(100, tiles) for _limit, tiles in fp4_grouped_gluon._BLACKWELL_TILES],
+    (100, (128, 128, 128, 4, 4, True)),
 ]
 
 
@@ -214,7 +217,7 @@ def _force_gluon(monkeypatch: pytest.MonkeyPatch, tiles: GluonTiles | None) -> l
     ("counts", "off_rank", "n_dim", "k_dim", "power_of_two"),
     [
         # Empty and one-row experts, several row tiles, partial column and K
-        # tiles (K = 352 is 5.5 steps of 64 and 2.75 of 128).
+        # tiles (K = 352 is 5.5 steps of 64 and 2.75 of 128, an odd count).
         ([3, 0, 300, 1, 70], 0, 320, 352, False),
         # Rows routed to other ranks sort last and give zeros. Power-of-two
         # scales, as in the checkpoint.
@@ -275,16 +278,16 @@ def _misaligned(rows: int, k_dim: int) -> torch.Tensor:
     ("hopper", "k_dim", "block", "rows", "ends", "takes"),
     [
         (True, 4096, 32, None, torch.int32, True),
-        (True, 384, 32, None, torch.int32, True),  # 6 steps of 64
-        (True, 320, 32, None, torch.int32, False),  # 5 steps: the loop runs two at a time
-        (False, 320, 32, None, torch.int32, True),  # the sm100 loop takes one step at a time
+        (True, 320, 32, None, torch.int32, True),  # 5 steps of 64
+        (False, 352, 32, None, torch.int32, True),  # 5.5 steps of 64
         (True, 4096, 16, None, torch.int32, False),  # the decode reads one scale per 32
         (True, 4112, 32, None, torch.int32, False),  # K must hold whole scale groups
         (True, 4096, 32, torch.float16, torch.int32, False),
         (True, 4096, 32, "misaligned", torch.int32, False),  # TMA needs 16-byte aligned data
         (True, 4096, 32, None, torch.int64, False),  # the kernels read int32 group ends
-        (False, 4096, 32, "8 warps", torch.int32, False),  # the sm100 decode is one warpgroup
-        (True, 4096, 32, "8 warps", torch.int32, True),
+        (False, 4096, 32, "8 warps", torch.int32, True),  # two dequant warpgroups
+        (False, 4096, 32, "12 warps", torch.int32, False),  # the sm100 decode has 1 or 2
+        (True, 4096, 32, "12 warps", torch.int32, True),
     ],
 )
 def test_gluon_takes_only_operands_the_kernel_handles(
@@ -297,7 +300,8 @@ def test_gluon_takes_only_operands_the_kernel_handles(
     takes: bool,
 ) -> None:
     _pretend_gpu(monkeypatch, blackwell=not hopper)
-    tiles: GluonTiles = (128, 128, 64, 8 if rows == "8 warps" else 4, 4, True)
+    warps = {"8 warps": 8, "12 warps": 12}.get(str(rows), 4)
+    tiles: GluonTiles = (128, 128, 64, warps, 4, True)
     monkeypatch.setattr(fp4_grouped_gluon, "_TILES_FOR_BENCH", tiles)
     if rows == "misaligned":
         operand = _misaligned(8, k_dim)
@@ -340,7 +344,8 @@ def test_gluon_needs_contiguous_scales(monkeypatch: pytest.MonkeyPatch) -> None:
         (False, 12288, 32, fp4_grouped_gluon._HOPPER_TILES[0][1]),
         # sm100 runs it above 64 mean rows per expert.
         (True, 16384, 256, None),
-        (True, 98304, 256, fp4_grouped_gluon._BLACKWELL_TILES[1][1]),
+        (True, 32768, 256, fp4_grouped_gluon._BLACKWELL_TILES[1][1]),
+        (True, 98304, 256, fp4_grouped_gluon._BLACKWELL_TILES[2][1]),
         (True, 16384, 32, None),
     ],
 )

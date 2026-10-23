@@ -15,9 +15,10 @@ The warps that dequantize load the bytes in the layout that `gl.fp4_to_fp`
 turns into the operand layout of the multiply, so no layout conversion
 runs. They load one scale per row and 32 columns and multiply in fp32.
 
-On sm90 the bf16 tile is the register operand of an asynchronous `wgmma`,
-and the K loop takes two steps at a time with two register sets, as in the
-FP8 kernel. On sm100 the dequantization warps write it into tensor memory.
+On sm90 the multiply warps decode the tile into one of two shared-memory
+buffers, and an asynchronous `wgmma` reads it from there while they decode
+the next one. On sm100 one or two warpgroups of dequantization warps take
+turns and write the tile into tensor memory.
 
 Rows routed to another rank's experts (expert parallelism) sort after the
 local groups. Their items store zeros.
@@ -69,8 +70,9 @@ _HOPPER_TILES: tuple[tuple[float, GluonTiles], ...] = (
     (float("inf"), (128, 256, 64, 8, 3, True)),
 )
 _BLACKWELL_TILES: tuple[tuple[float, GluonTiles], ...] = (
-    (64, (128, 64, 64, 4, 4, True)),
-    (float("inf"), (128, 128, 128, 4, 4, True)),
+    (64, (128, 64, 64, 8, 4, True)),
+    (192, (128, 128, 64, 8, 4, True)),
+    (float("inf"), (128, 256, 64, 8, 3, True)),
 )
 # Up to this many mean rows per expert, the default path keeps the Triton
 # kernel. On the V4-Flash layer, the H100 Triton kernel is faster at 24 mean
@@ -106,8 +108,8 @@ def gluon_tiles(
     The kernels need Triton 3.8 and an sm90 or sm100 GPU. They also need
     contiguous bf16 rows, contiguous packed weights and scales, int32
     `group_ends`, and one scale per 32 columns. TMA needs 16-byte aligned
-    operands. The sm90 kernel needs an even number of K steps, and the sm100
-    kernel dequantizes with one warpgroup (4 warps).
+    operands. The sm100 kernel dequantizes with one or two warpgroups (4 or
+    8 warps).
 
     `num_experts` counts the experts of all ranks, so the rows over all
     experts give the mean rows of a local expert. With `by_default`, the
@@ -137,8 +139,7 @@ def gluon_tiles(
         and packed.data_ptr() % 16 == 0
         and k_dim % _SCALE_BLOCK == 0
         and block_k % _SCALE_BLOCK == 0
-        and (not hopper or -(-k_dim // block_k) % 2 == 0)
-        and (hopper or warps == 4)
+        and (hopper or warps in (4, 8))
     )
     return tiles if fits else None
 
@@ -244,7 +245,7 @@ if _GLUON_AVAILABLE:
     @gluon.jit  # type: ignore[untyped-decorator]
     def _mma_step(  # type: ignore[no-untyped-def]
         acc,
-        w_prev,
+        a_bufs,
         x_bufs,
         w_bufs,
         ready,
@@ -255,36 +256,53 @@ if _GLUON_AVAILABLE:
         k_dim,
         stride_sn,
         stride_sk,
-        mma_layout: gl.constexpr,
+        num_warps: gl.constexpr,
     ):
-        """One sm90 K step: dequantize the stage's weight tile and issue its async wgmma.
+        """One sm90 K step: decode the stage's weight tile into shared memory, then its wgmma.
 
-        The bf16 tile is the wgmma's register operand (two values of K per
-        register), so its bytes load as the operand with one value per byte.
-        As in the FP8 kernel, the previous step's wgmma reads `w_prev` until
-        the wait at the end, so the new tile goes into other registers.
+        Each thread reads 16 bytes of one row, which is one scale group. In
+        the register operand layout of a wgmma, a thread's bytes are
+        scattered, so they load one byte at a time. The bf16 tile goes into
+        one of two shared-memory buffers, and the async wgmma reads it from
+        there. The previous step's wgmma reads the other buffer while this
+        step decodes. The wait at the end lets that wgmma finish, so its
+        buffer is free for the next step.
         """
         NUM_STAGES: gl.constexpr = x_bufs.type.shape[0]
         BLOCK_K: gl.constexpr = x_bufs.type.shape[2]
+        THREADS_K: gl.constexpr = BLOCK_K // 32
+        bytes_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 16], [32 // THREADS_K, THREADS_K], [num_warps, 1], [1, 0]
+        )
+        layout: gl.constexpr = gl.BlockedLayout(
+            [1, 32], [32 // THREADS_K, THREADS_K], [num_warps, 1], [1, 0]
+        )
         stage, phase = _ring_slot(consumed, NUM_STAGES)
         mbarrier.wait(ready.index(stage), phase)
-        w = _dequantize(
-            w_bufs.index(stage),
-            s_base,
-            ki * BLOCK_K,
-            n_left,
-            k_dim,
-            stride_sn,
-            stride_sk,
-            gl.DotOperandLayout(operand_index=0, parent=mma_layout, k_width=1),
-            gl.DotOperandLayout(operand_index=0, parent=mma_layout, k_width=2),
+        a_buf = a_bufs.index(consumed % 2)
+        a_buf.store(
+            _dequantize(
+                w_bufs.index(stage),
+                s_base,
+                ki * BLOCK_K,
+                n_left,
+                k_dim,
+                stride_sn,
+                stride_sk,
+                bytes_layout,
+                layout,
+            )
         )
-        acc = warpgroup_mma(w, x_bufs.index(stage).permute((1, 0)), acc, is_async=True)
-        acc, w_prev = warpgroup_mma_wait(num_outstanding=1, deps=(acc, w_prev))
-        return acc, w
+        # Each thread makes its stores visible to the wgmma, then all warps
+        # are done before it starts.
+        fence_async_shared()
+        gl.barrier()
+        acc = warpgroup_mma(a_buf, x_bufs.index(stage).permute((1, 0)), acc, is_async=True)
+        return warpgroup_mma_wait(num_outstanding=1, deps=(acc,))
 
     @gluon.jit  # type: ignore[untyped-decorator]
     def _hopper_mma_partition(  # type: ignore[no-untyped-def]
+        a_bufs,
         x_bufs,
         w_bufs,
         ready,
@@ -312,8 +330,6 @@ if _GLUON_AVAILABLE:
         BLOCK_T: gl.constexpr = x_bufs.type.shape[1]
         NUM_STAGES: gl.constexpr = x_bufs.type.shape[0]
         mma_layout: gl.constexpr = _wgmma_layouts(num_warps, BLOCK_T)[0]
-        w_reg_layout: gl.constexpr = _wgmma_layouts(num_warps, BLOCK_T)[1]
-        gl.static_assert(w_reg_layout.k_width == 2, "the bf16 operand holds two values of K")
         walk = _Walk.create(group_ends_ptr, num_groups, num_rows, gl.cdiv(n_dim, BLOCK_W), BLOCK_T)
         k_steps = gl.cdiv(k_dim, BLOCK_K)
         consumed = 0
@@ -326,13 +342,10 @@ if _GLUON_AVAILABLE:
                 s_base = s_ptr + walk.group * stride_se + col * stride_sn
                 n_left = n_dim - col
                 acc = gl.zeros((BLOCK_W, BLOCK_T), dtype=gl.float32, layout=mma_layout)
-                # Two K steps per iteration (`k_iters` is even), so the two
-                # register operands of the running wgmmas alternate.
-                w_odd = gl.zeros((BLOCK_W, BLOCK_K), dtype=gl.bfloat16, layout=w_reg_layout)
-                for ki in range(0, k_iters, 2):
-                    acc, w_even = _mma_step(
+                for ki in range(k_iters):
+                    acc = _mma_step(
                         acc,
-                        w_odd,
+                        a_bufs,
                         x_bufs,
                         w_bufs,
                         ready,
@@ -343,7 +356,7 @@ if _GLUON_AVAILABLE:
                         k_dim,
                         stride_sn,
                         stride_sk,
-                        mma_layout,
+                        num_warps,
                     )
                     # The previous step's wgmma is done: free its stage. The
                     # arrive waits for all warps of this partition first.
@@ -351,25 +364,8 @@ if _GLUON_AVAILABLE:
                     mbarrier.arrive(
                         empty.index((consumed + NUM_STAGES - 1) % NUM_STAGES), pred=ki > 0
                     )
-                    acc, w_odd = _mma_step(
-                        acc,
-                        w_even,
-                        x_bufs,
-                        w_bufs,
-                        ready,
-                        consumed + 1,
-                        s_base,
-                        ki + 1,
-                        n_left,
-                        k_dim,
-                        stride_sn,
-                        stride_sk,
-                        mma_layout,
-                    )
-                    fence_async_shared()
-                    mbarrier.arrive(empty.index(consumed % NUM_STAGES))
-                    consumed += 2
-                acc, w_odd = warpgroup_mma_wait(num_outstanding=0, deps=(acc, w_odd))
+                    consumed += 1
+                acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
                 fence_async_shared()
                 mbarrier.arrive(
                     empty.index((consumed + NUM_STAGES - 1) % NUM_STAGES), pred=k_iters > 0
@@ -406,7 +402,15 @@ if _GLUON_AVAILABLE:
         num_warps: gl.constexpr,
     ):
         """sm90 version: one warp copies, `num_warps` warps dequantize and multiply."""
+        BLOCK_W: gl.constexpr = w_desc.block_type.shape[0]
+        BLOCK_K: gl.constexpr = x_desc.block_type.shape[1]
         x_bufs, w_bufs = _allocate_ring(x_desc, w_desc, NUM_STAGES)
+        # Two buffers for the bf16 weight tiles: one for the running wgmma,
+        # one for the next decode.
+        a_layout: gl.constexpr = gl.NVMMASharedLayout(
+            swizzle_byte_width=min(128, BLOCK_K * 2), element_bitwidth=16, rank=2
+        )
+        a_bufs = gl.allocate_shared_memory(gl.bfloat16, [2, BLOCK_W, BLOCK_K], a_layout)
         ready = _allocate_barriers(NUM_STAGES)
         empty = _allocate_barriers(NUM_STAGES)
         gl.warp_specialize(
@@ -414,6 +418,7 @@ if _GLUON_AVAILABLE:
                 (
                     _hopper_mma_partition,
                     (
+                        a_bufs,
                         x_bufs,
                         w_bufs,
                         ready,
@@ -470,15 +475,19 @@ if _GLUON_AVAILABLE:
         stride_sn,
         stride_sk,
         BLOCK_T: gl.constexpr,
+        PART: gl.constexpr,
+        PARTS: gl.constexpr,
     ):
         """sm100 dequantization warps: packed tile in shared memory to bf16 in tensor memory.
 
-        One warpgroup: in the register layout of a tensor-memory store, each
-        thread then holds one weight row. Its bytes load as one row per thread
-        too, which `gl.fp4_to_fp` unpacks into that layout, so neither the
-        unpack nor the store converts a layout.
+        A partition is one warpgroup: in the register layout of a
+        tensor-memory store, each thread then holds one weight row. Its bytes
+        load as one row per thread too, which `gl.fp4_to_fp` unpacks into that
+        layout, so neither the unpack nor the store converts a layout. With
+        `PARTS` partitions, this one takes the K steps whose count is `PART`
+        modulo `PARTS`, so the decode of the next step overlaps this one.
         """
-        gl.static_assert(gl.num_warps() == 4, "the FP4 dequantization is one warpgroup")
+        gl.static_assert(gl.num_warps() == 4, "a dequantization partition is one warpgroup")
         NUM_STAGES: gl.constexpr = w_bufs.type.shape[0]
         BLOCK_W: gl.constexpr = w_bufs.type.shape[1]
         BLOCK_K: gl.constexpr = a_tmem.shape[2]
@@ -495,27 +504,28 @@ if _GLUON_AVAILABLE:
                 col, _row = walk.tile(item, BLOCK_W)
                 s_base = s_ptr + walk.group * stride_se + col * stride_sn
                 for ki in range(walk.k_iters(k_steps)):
-                    stage, phase = _ring_slot(consumed, NUM_STAGES)
-                    buffer, buffer_phase = _ring_slot(consumed, WEIGHT_BUFFERS)
-                    mbarrier.wait(ready.index(stage), phase)
-                    mbarrier.wait(a_empty.index(buffer), buffer_phase ^ 1)
-                    w = _dequantize(
-                        w_bufs.index(stage),
-                        s_base,
-                        ki * BLOCK_K,
-                        n_dim - col,
-                        k_dim,
-                        stride_sn,
-                        stride_sk,
-                        bytes_layout,
-                        layout,
-                    )
-                    a_tmem.index(buffer).store(w)
-                    # The completion of the multiply frees the stage for the
-                    # next TMA write. The fence orders this shared-memory read
-                    # before that write.
-                    fence_async_shared()
-                    mbarrier.arrive(a_ready.index(buffer))
+                    if consumed % PARTS == PART:
+                        stage, phase = _ring_slot(consumed, NUM_STAGES)
+                        buffer, buffer_phase = _ring_slot(consumed, WEIGHT_BUFFERS)
+                        mbarrier.wait(ready.index(stage), phase)
+                        mbarrier.wait(a_empty.index(buffer), buffer_phase ^ 1)
+                        w = _dequantize(
+                            w_bufs.index(stage),
+                            s_base,
+                            ki * BLOCK_K,
+                            n_dim - col,
+                            k_dim,
+                            stride_sn,
+                            stride_sk,
+                            bytes_layout,
+                            layout,
+                        )
+                        a_tmem.index(buffer).store(w)
+                        # The completion of the multiply frees the stage for
+                        # the next TMA write. The fence orders this
+                        # shared-memory read before that write.
+                        fence_async_shared()
+                        mbarrier.arrive(a_ready.index(buffer))
                     consumed += 1
                 item += gl.num_programs(0)
 
@@ -538,13 +548,18 @@ if _GLUON_AVAILABLE:
         WEIGHT_BUFFERS: gl.constexpr,
         ACC_BUFFERS: gl.constexpr,
         STORE_COLUMNS: gl.constexpr,
-        DEQUANT_WARPS: gl.constexpr,
+        DEQUANT_PARTS: gl.constexpr,
         DEQUANT_REGS: gl.constexpr,
         MMA_REGS: gl.constexpr,
         LOAD_REGS: gl.constexpr,
         num_warps: gl.constexpr,
     ):
-        """sm100 version: copy, dequantization, MMA and store warps."""
+        """sm100 version: copy, dequantization, MMA and store warps.
+
+        `DEQUANT_PARTS` dequantization warpgroups (1 or 2) take turns on the K
+        steps. One warpgroup puts one dequantization warp on each scheduler of
+        the SM, which issues too slowly to keep the tensor cores busy.
+        """
         BLOCK_W: gl.constexpr = w_desc.block_type.shape[0]
         BLOCK_T: gl.constexpr = x_desc.block_type.shape[0]
         BLOCK_K: gl.constexpr = x_desc.block_type.shape[1]
@@ -565,84 +580,191 @@ if _GLUON_AVAILABLE:
         a_empty = _allocate_barriers(WEIGHT_BUFFERS)
         acc_ready = _allocate_barriers(ACC_BUFFERS)
         acc_empty = _allocate_barriers(ACC_BUFFERS)
-        gl.warp_specialize(
-            [
-                (
-                    _bw_store_partition,
+        gl.static_assert(DEQUANT_PARTS == 1 or DEQUANT_PARTS == 2, "1 or 2 dequant warpgroups")
+        if DEQUANT_PARTS == 1:
+            gl.warp_specialize(
+                [
                     (
-                        acc_tmem,
-                        acc_ready,
-                        acc_empty,
-                        out_ptr,
-                        group_ends_ptr,
-                        num_rows,
-                        n_dim,
-                        k_dim,
-                        num_groups,
-                        stride_om,
-                        BLOCK_K,
-                        STORE_COLUMNS,
+                        _bw_store_partition,
+                        (
+                            acc_tmem,
+                            acc_ready,
+                            acc_empty,
+                            out_ptr,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                            stride_om,
+                            BLOCK_K,
+                            STORE_COLUMNS,
+                        ),
                     ),
-                ),
-                (
-                    _bw_dequant_partition,
                     (
-                        w_bufs,
-                        ready,
-                        a_tmem,
-                        a_ready,
-                        a_empty,
-                        s_ptr,
-                        group_ends_ptr,
-                        num_rows,
-                        n_dim,
-                        k_dim,
-                        num_groups,
-                        stride_se,
-                        stride_sn,
-                        stride_sk,
-                        BLOCK_T,
+                        _bw_dequant_partition,
+                        (
+                            w_bufs,
+                            ready,
+                            a_tmem,
+                            a_ready,
+                            a_empty,
+                            s_ptr,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                            stride_se,
+                            stride_sn,
+                            stride_sk,
+                            BLOCK_T,
+                            0,
+                            1,
+                        ),
                     ),
-                ),
-                (
-                    _bw_mma_partition,
                     (
-                        x_bufs,
-                        ready,
-                        empty,
-                        a_tmem,
-                        a_ready,
-                        a_empty,
-                        acc_tmem,
-                        acc_ready,
-                        acc_empty,
-                        group_ends_ptr,
-                        num_rows,
-                        n_dim,
-                        k_dim,
-                        num_groups,
+                        _bw_mma_partition,
+                        (
+                            x_bufs,
+                            ready,
+                            empty,
+                            a_tmem,
+                            a_ready,
+                            a_empty,
+                            acc_tmem,
+                            acc_ready,
+                            acc_empty,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                        ),
                     ),
-                ),
-                (
-                    _load_partition,
                     (
-                        x_desc,
-                        w_desc,
-                        x_bufs,
-                        w_bufs,
-                        ready,
-                        empty,
-                        group_ends_ptr,
-                        num_rows,
-                        n_dim,
-                        k_dim,
-                        num_groups,
+                        _load_partition,
+                        (
+                            x_desc,
+                            w_desc,
+                            x_bufs,
+                            w_bufs,
+                            ready,
+                            empty,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                        ),
                     ),
-                ),
-            ],
-            [DEQUANT_WARPS, 1, 1],
-            [DEQUANT_REGS, MMA_REGS, LOAD_REGS],
-        )
+                ],
+                [4, 1, 1],
+                [DEQUANT_REGS, MMA_REGS, LOAD_REGS],
+            )
+        else:
+            gl.warp_specialize(
+                [
+                    (
+                        _bw_store_partition,
+                        (
+                            acc_tmem,
+                            acc_ready,
+                            acc_empty,
+                            out_ptr,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                            stride_om,
+                            BLOCK_K,
+                            STORE_COLUMNS,
+                        ),
+                    ),
+                    (
+                        _bw_dequant_partition,
+                        (
+                            w_bufs,
+                            ready,
+                            a_tmem,
+                            a_ready,
+                            a_empty,
+                            s_ptr,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                            stride_se,
+                            stride_sn,
+                            stride_sk,
+                            BLOCK_T,
+                            0,
+                            2,
+                        ),
+                    ),
+                    (
+                        _bw_dequant_partition,
+                        (
+                            w_bufs,
+                            ready,
+                            a_tmem,
+                            a_ready,
+                            a_empty,
+                            s_ptr,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                            stride_se,
+                            stride_sn,
+                            stride_sk,
+                            BLOCK_T,
+                            1,
+                            2,
+                        ),
+                    ),
+                    (
+                        _bw_mma_partition,
+                        (
+                            x_bufs,
+                            ready,
+                            empty,
+                            a_tmem,
+                            a_ready,
+                            a_empty,
+                            acc_tmem,
+                            acc_ready,
+                            acc_empty,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                        ),
+                    ),
+                    (
+                        _load_partition,
+                        (
+                            x_desc,
+                            w_desc,
+                            x_bufs,
+                            w_bufs,
+                            ready,
+                            empty,
+                            group_ends_ptr,
+                            num_rows,
+                            n_dim,
+                            k_dim,
+                            num_groups,
+                        ),
+                    ),
+                ],
+                [4, 4, 1, 1],
+                [DEQUANT_REGS, DEQUANT_REGS, MMA_REGS, LOAD_REGS],
+            )
 
 
 def _kernel_and_arguments(
@@ -684,11 +806,10 @@ def _kernel_and_arguments(
         out.stride(0),
     )
     if blackwell:
-        return (
-            _fp4_grouped_mm_blackwell,
-            args,
-            fp8_grouped_gluon.blackwell_launch_options(tiles),
-        )
+        # The FP8 launch options, with the dequantization warps in warpgroups.
+        options = fp8_grouped_gluon.blackwell_launch_options(tiles)
+        options["DEQUANT_PARTS"] = options.pop("DEQUANT_WARPS") // 4
+        return _fp4_grouped_mm_blackwell, args, options
     return (
         _fp4_grouped_mm_hopper,
         args,
