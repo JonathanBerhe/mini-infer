@@ -161,6 +161,8 @@ class PackedSwigluExperts:
         *,
         num_experts: int,
         expert_start: int,
+        accumulate_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """`grouped_expert_mlp` over the packed experts; see that function."""
         return grouped_expert_mlp(
@@ -172,6 +174,8 @@ class PackedSwigluExperts:
             self._activation,
             num_experts=num_experts,
             expert_start=expert_start,
+            accumulate_dtype=accumulate_dtype,
+            out_dtype=out_dtype,
         )
 
 
