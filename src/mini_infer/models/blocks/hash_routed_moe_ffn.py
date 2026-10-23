@@ -27,6 +27,11 @@ added once after the reduce.
 
 Bit-parity vs the reference's `MoE.forward` on synthetic input across
 both routing modes and the supported score functions.
+
+On Hopper and newer GPUs the routed experts run as grouped matmuls
+(`grouped_experts.py`): FP4 experts through `PackedFp4Experts`, bf16 ones
+through `PackedSwigluExperts`, both summed in fp32 like the loop. With the
+reference's FP8 GEMM-input round trip on, the block keeps the per-expert loop.
 """
 
 from __future__ import annotations
@@ -39,13 +44,15 @@ from torch import nn
 from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
 from mini_infer.models.blocks.activations import expert_swiglu
-from mini_infer.models.blocks.fp4_expert import FP4Expert
+from mini_infer.models.blocks.fp4_expert import FP4Expert, PackedFp4Experts
+from mini_infer.models.blocks.fp4_grouped_kernel import supports_block_fp4_grouped_mm
+from mini_infer.models.blocks.grouped_experts import supports_grouped_experts
 from mini_infer.models.blocks.hash_routed_gate import (
     HashRoutedGate,
     RoutingMode,
     ScoreFunction,
 )
-from mini_infer.models.blocks.mixtral_moe import MixtralExpert
+from mini_infer.models.blocks.mixtral_moe import MixtralExpert, PackedSwigluExperts
 
 if TYPE_CHECKING:
     from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
@@ -136,6 +143,8 @@ class HashRoutedMoEFFN(nn.Module):
         # scale the activation before `w2` (the reference's order) rather than
         # the expert output: `w2` then quantizes the scaled input.
         self.routing_weights_before_down_proj = act_quant is not None and act_quant.fp8_gemm_inputs
+        # Packed on the first grouped forward, see `_grouped_pack`.
+        self._expert_pack: PackedSwigluExperts | PackedFp4Experts | None = None
 
         # Shared expert(s): always-on MLP added to the routed sum. V4 uses one;
         # V2/V3 use two and we collapse them into a single MLP with a wider
@@ -180,11 +189,68 @@ class HashRoutedMoEFFN(nn.Module):
         # Cast weights to the working dtype for the per-expert weighted sum.
         per_token_weights = per_token_weights.to(flat_hidden_states.dtype)
 
-        # fp32 accumulator — matches the reference and keeps precision across
+        pack = self._grouped_pack(flat_hidden_states)
+        if pack is not None:
+            routed_accumulator = pack.run(
+                flat_hidden_states,
+                per_token_expert_indices,
+                per_token_weights,
+                num_experts=self.num_routed_experts,
+                expert_start=self.local_expert_start,
+                accumulate_dtype=torch.float32,
+                out_dtype=torch.float32,
+            )
+        else:
+            routed_accumulator = self._loop_experts(
+                flat_hidden_states, per_token_expert_indices, per_token_weights
+            )
+
+        # All-reduce the routed sum across ranks; no-op at world_size=1.
+        routed_accumulator = all_reduce_sum(routed_accumulator)
+        result = routed_accumulator.to(flat_hidden_states.dtype)
+
+        # Shared expert is replicated and produces the same value on every
+        # rank; add it AFTER the reduce so it isn't scaled by world_size.
+        if self.shared_experts is not None:
+            result = result + self.shared_experts(flat_hidden_states)
+
+        return result.view(original_shape)
+
+    def _grouped_pack(self, flat: torch.Tensor) -> PackedSwigluExperts | PackedFp4Experts | None:
+        """The packed experts when this forward takes the grouped path, else `None`.
+
+        The reference's FP8 GEMM-input round trip quantizes each expert's
+        inputs, which the grouped matmuls do not do, so it keeps the loop.
+        """
+        if self.routing_weights_before_down_proj or not supports_grouped_experts(flat.device):
+            return None
+        pack = self._expert_pack
+        if self.expert_dtype == "bf16":
+            bf16_pack = pack if isinstance(pack, PackedSwigluExperts) else None
+            self._expert_pack = PackedSwigluExperts.current(bf16_pack, self.experts)
+            return self._expert_pack
+        # The FP4 kernel rounds the dequantized weight to bf16 and multiplies
+        # in the activation dtype, which matches `FP4Expert` for 16-bit inputs.
+        if flat.dtype in (torch.bfloat16, torch.float16) and supports_block_fp4_grouped_mm(
+            flat.device
+        ):
+            fp4_pack = pack if isinstance(pack, PackedFp4Experts) else None
+            self._expert_pack = PackedFp4Experts.current(fp4_pack, self.experts)
+            return self._expert_pack
+        return None
+
+    def _loop_experts(
+        self,
+        flat_hidden_states: torch.Tensor,
+        per_token_expert_indices: torch.Tensor,
+        per_token_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-expert dispatch into an fp32 `(N, hidden)` sum of the local experts."""
+        # fp32 accumulator, as in the reference: it keeps precision across
         # the per-expert weighted sums.
         routed_accumulator = torch.zeros_like(flat_hidden_states, dtype=torch.float32)
 
-        # Loop only over experts this rank owns; the all-reduce below
+        # Loop only over experts this rank owns; the all-reduce in `forward`
         # accumulates partial sums across ranks.
         for local_idx in range(self.num_experts_per_rank):
             global_idx = self.local_expert_start + local_idx
@@ -206,14 +272,4 @@ class HashRoutedMoEFFN(nn.Module):
                     self.experts[local_idx](tokens_for_this_expert) * weights_for_this_expert
                 )
             routed_accumulator.index_add_(0, token_positions, weighted_expert_output.float())
-
-        # All-reduce the routed sum across ranks; no-op at world_size=1.
-        routed_accumulator = all_reduce_sum(routed_accumulator)
-        result = routed_accumulator.to(flat_hidden_states.dtype)
-
-        # Shared expert is replicated and produces the same value on every
-        # rank; add it AFTER the reduce so it isn't scaled by world_size.
-        if self.shared_experts is not None:
-            result = result + self.shared_experts(flat_hidden_states)
-
-        return result.view(original_shape)
+        return routed_accumulator

@@ -11,7 +11,8 @@ The weights must be stacked per expert: `gate_up` `(E, G, in)` and `down`
 `(E, out, I)`. `G` is `I` for a plain MLP and `2I` for a gated one with the
 gate rows first. Plain tensors (bf16) go through `functional.grouped_mm`;
 `BlockFp8Weight`s (e4m3 with 128x128 block scales) go through the Triton
-kernel of `fp8_grouped_kernel.py`.
+kernel of `fp8_grouped_kernel.py`, and `BlockFp4Weight`s (packed e2m1 with
+one scale per row and 32 columns) through `fp4_grouped_kernel.py`.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import torch
 from torch.nn import functional
 
 from mini_infer.device import is_hopper_or_newer_device
+from mini_infer.models.blocks.fp4_grouped_kernel import block_fp4_grouped_mm
 from mini_infer.models.blocks.fp8_grouped_kernel import block_fp8_grouped_mm
 
 # Runtime toggle for benchmarking. When True, `supports_grouped_experts`
@@ -60,9 +62,32 @@ class BlockFp8Weight:
         return self.weight.shape
 
 
+@dataclass(frozen=True)
+class BlockFp4Weight:
+    """Stacked packed-FP4 expert weights for `grouped_expert_mlp`.
+
+    `packed` is `(E, N, K / 2)` bytes, each holding two e2m1 values (the low
+    nibble first), and `scale` its fp32 scale per row and `block` columns,
+    `(E, N, K / block)`.
+    """
+
+    packed: torch.Tensor
+    scale: torch.Tensor
+    block: int
+
+    @property
+    def shape(self) -> torch.Size:
+        """`(E, N, K)`, the shape of the dequantized weights."""
+        experts, rows, half_cols = self.packed.shape
+        return torch.Size((experts, rows, half_cols * 2))
+
+
+ExpertWeight = torch.Tensor | BlockFp8Weight | BlockFp4Weight
+
+
 def _grouped_matmul(
     rows: torch.Tensor,
-    weight: torch.Tensor | BlockFp8Weight,
+    weight: ExpertWeight,
     offs: torch.Tensor,
     row_experts: torch.Tensor,
 ) -> torch.Tensor:
@@ -76,6 +101,15 @@ def _grouped_matmul(
             row_experts=row_experts,
             group_ends=offs,
         )
+    if isinstance(weight, BlockFp4Weight):
+        return block_fp4_grouped_mm(
+            rows,
+            weight.packed,
+            weight.scale,
+            block=weight.block,
+            row_experts=row_experts,
+            group_ends=offs,
+        )
     return functional.grouped_mm(rows, weight.transpose(-2, -1), offs=offs)
 
 
@@ -83,13 +117,14 @@ def grouped_expert_mlp(
     x: torch.Tensor,
     topk_indices: torch.Tensor,
     topk_weights: torch.Tensor,
-    gate_up: torch.Tensor | BlockFp8Weight,
-    down: torch.Tensor | BlockFp8Weight,
+    gate_up: ExpertWeight,
+    down: ExpertWeight,
     activation: Callable[[torch.Tensor], torch.Tensor],
     *,
     num_experts: int,
     expert_start: int = 0,
     accumulate_dtype: torch.dtype | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Weighted sum of each token's routed experts, `(T, in)` -> `(T, out)`.
 
@@ -99,12 +134,14 @@ def grouped_expert_mlp(
     larger than `E` (expert parallelism), pairs routed to other ranks add
     zero, as in the per-expert loop. `activation` maps the first projection
     `(rows, G)` to `(rows, I)`. The weighted sum over a token's k experts
-    runs in `accumulate_dtype` (default `x.dtype`); the result is `x.dtype`.
+    runs in `accumulate_dtype` (default `x.dtype`). The result has
+    `out_dtype` (default `x.dtype`).
     """
     tokens, top_k = topk_indices.shape
     num_local = gate_up.shape[0]
+    result_dtype = out_dtype or x.dtype
     if tokens == 0:
-        return x.new_zeros(0, down.shape[1])
+        return x.new_zeros(0, down.shape[1], dtype=result_dtype)
     acc_dtype = accumulate_dtype or x.dtype
 
     local_ids = topk_indices.reshape(-1)
@@ -129,4 +166,4 @@ def grouped_expert_mlp(
         # Rows past the last group are never written by the grouped matmul.
         weighted = torch.where((sorted_ids < num_local)[:, None], weighted, 0)
     per_pair = torch.empty_like(weighted).index_copy_(0, order, weighted)
-    return per_pair.view(tokens, top_k, -1).sum(dim=1).to(x.dtype)
+    return per_pair.view(tokens, top_k, -1).sum(dim=1).to(result_dtype)

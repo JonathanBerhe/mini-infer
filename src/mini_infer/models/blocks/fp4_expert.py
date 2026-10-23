@@ -15,23 +15,27 @@ experts stay FP4.
 stored as buffers (not Parameters: inference-only, and packed int8 is not
 a valid autograd dtype). `forward` dequantizes each weight to the
 activation dtype transiently, runs the SwiGLU, and lets the BF16 copy
-free. This is the correctness-first path: it materializes the full weight
-per call, so it is slower than a fused FP4 GEMM (the performance
-follow-up) but never holds more than one expert's BF16 weights at once.
+free. It materializes the full weight per call, but never holds more than
+one expert's BF16 weights at once.
 
 Math is identical to `MixtralExpert` once dequantized: matching
 `MixtralExpert(x)` on the dequantized weights is the parity contract.
+
+On Hopper and newer GPUs, `PackedFp4Experts` stacks a layer's experts and runs
+them through the Triton grouped kernel of `fp4_grouped_kernel.py`, which
+dequantizes in registers with the same rounding as `forward`.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
 from torch.nn import functional
 
 from mini_infer.models.blocks.activations import expert_swiglu
+from mini_infer.models.blocks.grouped_experts import BlockFp4Weight, grouped_expert_mlp
 from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16
 
 if TYPE_CHECKING:
@@ -56,6 +60,13 @@ class FP4Expert(nn.Module):
     `swiglu_limit > 0` clamps the gate and up projections before the SiLU,
     like DeepSeek-V4's experts (see `activations.clamped_swiglu`).
     """
+
+    w1_packed: torch.Tensor
+    w2_packed: torch.Tensor
+    w3_packed: torch.Tensor
+    w1_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w3_scale: torch.Tensor
 
     def __init__(
         self,
@@ -119,3 +130,100 @@ class FP4Expert(nn.Module):
             hidden = hidden * routing_weights
         out: torch.Tensor = functional.linear(gemm_input(hidden), w2)
         return out
+
+
+class PackedFp4Experts:
+    """The weights of a list of `FP4Expert`s, stacked for `grouped_expert_mlp`.
+
+    The FP4 counterpart of `PackedFp8Experts`: building one copies every
+    expert's packed `w1` and `w3` (with their scales) into one `(E, 2I, in/2)`
+    byte tensor and its `w2` into one `(E, out, I/2)` tensor, then points the
+    experts' own buffers at slices of the stacks. The weights stay packed, the
+    experts still work on their own, and `state_dict` keys do not change. The
+    scales cover one row each, so `w1` and `w3` always stack. When a loader
+    gives a weight or a scale new storage, `matches` detects it and `current`
+    packs again.
+    """
+
+    def __init__(self, experts: nn.ModuleList) -> None:
+        members = [cast(FP4Expert, expert) for expert in experts]
+        first = members[0]
+        block, inter = first.block_size, first.intermediate_size
+        hidden = first.hidden_size
+        device = first.w1_packed.device
+        count = len(members)
+        # Outside inference mode, as in `PackedSwigluExperts`.
+        with torch.no_grad(), torch.inference_mode(False):
+            gate_up = torch.empty(count, 2 * inter, hidden // 2, dtype=torch.int8, device=device)
+            gate_up_scale = torch.empty(count, 2 * inter, hidden // block, device=device)
+            down = torch.empty(count, hidden, inter // 2, dtype=torch.int8, device=device)
+            down_scale = torch.empty(count, hidden, inter // block, device=device)
+            for idx, expert in enumerate(members):
+                gate_up[idx, :inter].copy_(expert.w1_packed)
+                gate_up[idx, inter:].copy_(expert.w3_packed)
+                gate_up_scale[idx, :inter].copy_(expert.w1_scale)
+                gate_up_scale[idx, inter:].copy_(expert.w3_scale)
+                down[idx].copy_(expert.w2_packed)
+                down_scale[idx].copy_(expert.w2_scale)
+                expert.w1_packed = gate_up[idx, :inter]
+                expert.w3_packed = gate_up[idx, inter:]
+                expert.w1_scale = gate_up_scale[idx, :inter]
+                expert.w3_scale = gate_up_scale[idx, inter:]
+                expert.w2_packed = down[idx]
+                expert.w2_scale = down_scale[idx]
+        self.gate_up = BlockFp4Weight(gate_up, gate_up_scale, block)
+        self.down = BlockFp4Weight(down, down_scale, block)
+        self._inter = inter
+        self._combine = first._activation
+        self._pointers = self._storage(experts)
+
+    @staticmethod
+    def _storage(experts: nn.ModuleList) -> tuple[int, ...]:
+        first = cast(FP4Expert, experts[0])
+        last = cast(FP4Expert, experts[-1])
+        return (
+            first.w1_packed.data_ptr(),
+            first.w1_scale.data_ptr(),
+            last.w2_packed.data_ptr(),
+            last.w2_scale.data_ptr(),
+        )
+
+    @staticmethod
+    def current(pack: PackedFp4Experts | None, experts: nn.ModuleList) -> PackedFp4Experts:
+        """`pack` if it still backs `experts`, else a fresh pack of them."""
+        if pack is not None and pack.matches(experts):
+            return pack
+        return PackedFp4Experts(experts)
+
+    def matches(self, experts: nn.ModuleList) -> bool:
+        """Whether the experts' buffers still live in this pack's stacks."""
+        return self._storage(experts) == self._pointers
+
+    def _activation(self, gate_up: torch.Tensor) -> torch.Tensor:
+        out: torch.Tensor = self._combine(gate_up[:, : self._inter], gate_up[:, self._inter :])
+        return out
+
+    def run(
+        self,
+        x: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        num_experts: int,
+        expert_start: int,
+        accumulate_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """`grouped_expert_mlp` over the packed experts; see that function."""
+        return grouped_expert_mlp(
+            x,
+            topk_indices,
+            topk_weights,
+            self.gate_up,
+            self.down,
+            self._activation,
+            num_experts=num_experts,
+            expert_start=expert_start,
+            accumulate_dtype=accumulate_dtype,
+            out_dtype=out_dtype,
+        )
