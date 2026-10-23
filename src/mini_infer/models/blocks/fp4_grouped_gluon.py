@@ -73,7 +73,9 @@ _BLACKWELL_TILES: tuple[tuple[float, GluonTiles], ...] = (
     (float("inf"), (128, 128, 128, 4, 4, True)),
 )
 # Up to this many mean rows per expert, the default path keeps the Triton
-# kernel on sm100.
+# kernel. On the V4-Flash layer, the H100 Triton kernel is faster at 24 mean
+# rows (1024 tokens) and slower at 48.
+_HOPPER_MIN_MEAN_ROWS = 32
 _BLACKWELL_MIN_MEAN_ROWS = _BLACKWELL_TILES[0][0]
 # The columns that share one scale. The decode loads one scale per row and group.
 _SCALE_BLOCK = 32
@@ -109,7 +111,8 @@ def gluon_tiles(
 
     `num_experts` counts the experts of all ranks, so the rows over all
     experts give the mean rows of a local expert. With `by_default`, the
-    sm100 kernel runs only above `_BLACKWELL_MIN_MEAN_ROWS` mean rows.
+    kernels run only above `_HOPPER_MIN_MEAN_ROWS` (sm90) or
+    `_BLACKWELL_MIN_MEAN_ROWS` (sm100) mean rows.
     """
     if not _GLUON_AVAILABLE:
         return None
@@ -118,7 +121,8 @@ def gluon_tiles(
         return None
     num_rows, k_dim = rows.shape
     mean_rows = num_rows / max(num_experts, 1)
-    if by_default and not hopper and mean_rows <= _BLACKWELL_MIN_MEAN_ROWS:
+    min_mean_rows = _HOPPER_MIN_MEAN_ROWS if hopper else _BLACKWELL_MIN_MEAN_ROWS
+    if by_default and mean_rows <= min_mean_rows:
         return None
     tiles = _TILES_FOR_BENCH or default_tiles(mean_rows, rows.device)
     block_k, warps = tiles[2:4]

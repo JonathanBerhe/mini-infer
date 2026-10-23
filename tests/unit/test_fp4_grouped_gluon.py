@@ -328,14 +328,16 @@ def test_gluon_needs_contiguous_scales(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     ("blackwell", "num_rows", "local_experts", "tiles"),
     [
-        # sm90 runs the Gluon kernel at every size, with a tile for the mean
-        # rows per expert.
-        (False, 512, 256, fp4_grouped_gluon._HOPPER_TILES[0][1]),
+        # sm90 runs the Gluon kernel above 32 mean rows per expert, with a
+        # tile for the mean rows.
+        (False, 6144, 256, None),
+        (False, 12288, 256, fp4_grouped_gluon._HOPPER_TILES[0][1]),
         (False, 32768, 256, fp4_grouped_gluon._HOPPER_TILES[1][1]),
         (False, 98304, 256, fp4_grouped_gluon._HOPPER_TILES[2][1]),
         # Expert parallelism over 8 ranks: 32 local experts, but the rows
         # are the rows of all 256 experts.
-        (False, 8192, 32, fp4_grouped_gluon._HOPPER_TILES[0][1]),
+        (False, 8192, 32, None),
+        (False, 12288, 32, fp4_grouped_gluon._HOPPER_TILES[0][1]),
         # sm100 runs it above 64 mean rows per expert.
         (True, 16384, 256, None),
         (True, 98304, 256, fp4_grouped_gluon._BLACKWELL_TILES[1][1]),
