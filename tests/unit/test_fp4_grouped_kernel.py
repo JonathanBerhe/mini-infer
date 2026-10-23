@@ -67,6 +67,8 @@ def test_kernel_matches_dequantized_matmul(
     expert_tiles: bool | None,
 ) -> None:
     device = _device()
+    # This test is for the Triton kernel. The Gluon kernels have their own.
+    monkeypatch.setattr(fp4_grouped_kernel, "_GLUON_FOR_BENCH", False)
     monkeypatch.setattr(fp4_grouped_kernel, "_PER_SEGMENT_FOR_BENCH", per_segment)
     monkeypatch.setattr(fp4_grouped_kernel, "_EXPERT_TILES_FOR_BENCH", expert_tiles)
     generator = torch.Generator().manual_seed(0)
