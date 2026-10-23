@@ -61,8 +61,9 @@ Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
   V4-Flash layer 20 to 66 times faster than the per-expert loop up to 1024
   tokens on the H100. On the B200 it is 28 to 50 times faster. The FP4 layer
   is then faster than the bf16 layer up to 1024 tokens on both GPUs. It is
-  1.28 (H100) and 1.55 (B200) times slower at 16384 tokens. The section
-  "FP4 experts" has the details.
+  1.28 (H100) and 1.55 (B200) times slower at 16384 tokens. On the real
+  V4-Flash with two B200 GPUs, prefill of 2021 tokens is 7.1 times faster.
+  The section "FP4 experts" has the details.
 - The grouped path is slower in three places: batch-1 graph decode on the
   B200 (3.6 percent), eager decode at small batches, and Mixtral at 16384
   tokens on the B200 (0.88x). The section "Where the grouped path is
@@ -883,6 +884,36 @@ rows, (128, 256, 64, 8, 3), stays on both GPUs. It is the fastest at 4096
 and 16384 tokens on the H100 and within 2.5 percent of the fastest on the
 B200.
 
-No real V4-Flash checkpoint was measured with this path. It needs two B200
-GPUs.
+### Real model: DeepSeek-V4-Flash on 2x B200
+
+On 2026-10-23 we loaded the real `deepseek-ai/DeepSeek-V4-Flash` on two
+B200 GPUs with tensor parallelism, 128 experts per GPU
+(`scripts/modal_v4_flash_generate.py --compare-paths`). That image had
+PyTorch 2.10.0 and Triton 3.6.0. The script loads the model once and runs
+both MoE paths on it. All 43 MoE layers ran on the FP4 kernel, and the two
+GPUs generated the same tokens.
+
+Eager milliseconds, without a CUDA graph:
+
+| workload | loop | grouped | speedup |
+|---|---:|---:|---:|
+| prefill of 2021 tokens of `scripts/data/technical_passage.md` | 3286.9 | 463.7 | 7.09x |
+| prompt "The capital of France is", then 32 greedy tokens | 12912.4 | 4176.6 | 3.09x |
+
+The second row includes the prefill of the 6-token prompt.
+
+Last-token logits, grouped path against the loop:
+
+| prompt | cosine | max abs diff | same top token |
+|---|---:|---:|---|
+| "The capital of France is" (6 tokens) | 0.99976 | 0.875 | yes |
+| the passage (2021 tokens) | 0.99935 | 1.6875 | yes |
+
+The greedy outputs match for 20 tokens. Both write "Paris. It is one of
+the most famous cities in the world. Paris is known for its beautiful".
+Then the grouped path writes "architecture, art, and culture" and the loop
+writes "landmarks like the Eiffel Tower". The two paths add in a different
+order, so their bf16 roundings differ. We did not measure the logit gap
+at the token where they part. On Nemotron, the bf16 paths of ADR-036 had a
+prefill logit cosine of 0.9994 to 0.9995.
 
