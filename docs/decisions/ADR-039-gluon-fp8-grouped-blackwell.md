@@ -139,8 +139,8 @@ registers.
 ## Update 2026-10-23: the profile and a fourth stage
 
 We profiled the kernel with Nsight Compute on one B200 at 16384 tokens
-([raw output](../benchmarks/data/moe-grouped-fp8-ncu-b200.txt)). The
-kernel was not limited by the issue rate:
+([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)). The kernel was
+not limited by the issue rate:
 
 - The tensor cores were busy in 49 percent of the cycles. In bf16
   `grouped_mm` they were busy in 96 percent.
@@ -156,10 +156,8 @@ dequantized weight tile in about half of its time. A stage stays busy from
 its copy through the dequantization and the multiply. With 3 stages, the
 copy warp cannot run far enough ahead.
 
-We tried two fixes
-([raw output](../benchmarks/data/moe-grouped-fp8-rings-b200.txt)). The GPU
-clock changes with power, so Nsight Compute counted the cycles of each
-projection at 16384 tokens:
+We tried two fixes. The GPU clock changes with power, so Nsight Compute
+counted the cycles of each projection at 16384 tokens:
 
 | stages | gate-up cycles | tensor cores busy | down cycles |
 |---|---:|---:|---:|
@@ -184,9 +182,8 @@ Consequences:
 - With more tensor-core work, the clock fell from 1.66 to about 1.50 GHz.
   The B200 keeps its power limit this way. So 12 to 14 percent fewer cycles
   gave only 4 to 5 percent less time for each projection.
-- In a `--fp8-gluon` run with the new tile
-  ([raw output](../benchmarks/data/moe-grouped-fp8-gluon-b200-stages.txt)),
-  the layer took 6.60, 11.02 and 20.66 ms at 4096, 8192 and 16384 tokens.
+- In a `--fp8-gluon` run with the new tile, the layer took 6.60, 11.02 and
+  20.66 ms at 4096, 8192 and 16384 tokens.
   That is 1.25, 1.30 and 1.29 times faster than the Triton expert tiles.
   The tile sweep of the same run compares 3 and 4 stages. The fourth stage
   made the layer 7.7 percent faster at 4096 tokens and 3.6 percent faster
