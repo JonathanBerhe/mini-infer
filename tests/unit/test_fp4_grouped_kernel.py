@@ -45,13 +45,17 @@ def _atol(device: str, want: torch.Tensor) -> float:
     return share * float(want.abs().max())
 
 
-@pytest.mark.parametrize("per_segment", [None, False, True], ids=["default", "tiles", "segments"])
+@pytest.mark.parametrize(
+    ("per_segment", "expert_tiles"),
+    [(None, None), (False, False), (True, None), (False, None)],
+    ids=["default", "row-tiles", "segments", "expert-tiles"],
+)
 @pytest.mark.parametrize(
     ("counts", "off_rank", "power_of_two_scales"),
     [
         ([3, 0, 17, 1, 9], 0, False),  # tiles span several experts, a group over 16 rows
         ([3, 0, 17, 1, 9], 4, True),  # rows routed to other ranks; e8m0-style scales
-        ([100, 0, 150, 60, 1], 0, False),  # over 256 rows: the per-tile configuration
+        ([100, 0, 150, 60, 1], 0, False),  # over 256 rows: the large-tile configuration
     ],
 )
 def test_kernel_matches_dequantized_matmul(
@@ -60,9 +64,11 @@ def test_kernel_matches_dequantized_matmul(
     off_rank: int,
     power_of_two_scales: bool,
     per_segment: bool | None,
+    expert_tiles: bool | None,
 ) -> None:
     device = _device()
     monkeypatch.setattr(fp4_grouped_kernel, "_PER_SEGMENT_FOR_BENCH", per_segment)
+    monkeypatch.setattr(fp4_grouped_kernel, "_EXPERT_TILES_FOR_BENCH", expert_tiles)
     generator = torch.Generator().manual_seed(0)
     num_experts, n_dim, k_dim, block = len(counts), 48, 96, 32
     packed = torch.randint(
@@ -113,7 +119,8 @@ def test_kernel_rejects_a_k_the_scale_block_does_not_divide() -> None:
 
 
 @pytest.mark.parametrize("routing_mode", ["score_topk", "hash"])
-@pytest.mark.parametrize("tokens", [1, 5, 40])
+# 100 tokens give 300 (token, expert) rows: the expert tiles.
+@pytest.mark.parametrize("tokens", [1, 5, 40, 100])
 def test_fp4_moe_grouped_matches_loop(
     monkeypatch: pytest.MonkeyPatch, tokens: int, routing_mode: str
 ) -> None:

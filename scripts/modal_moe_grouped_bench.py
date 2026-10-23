@@ -622,7 +622,7 @@ def fp8_kernel_bench(
 # DeepSeek-V4-Flash's routed MoE (config.json): hidden 4096, expert width
 # 2048, 256 experts, top-6, sqrtsoftplus scores, route scale 1.5, one shared
 # expert, swiglu_limit 10, FP4 experts with one e8m0 scale per 32 columns.
-V4_FLASH_MOE = {
+V4_FLASH_MOE: dict[str, Any] = {
     "hidden": 4096,
     "inter": 2048,
     "experts": 256,
@@ -631,24 +631,33 @@ V4_FLASH_MOE = {
     "route_scale": 1.5,
     "swiglu_limit": 10.0,
 }
-# FP4 tiles to sweep as ((BLOCK_M, BLOCK_N, BLOCK_K, warps, stages), per segment).
+# FP4 tiles to sweep as ((BLOCK_M, BLOCK_N, BLOCK_K, warps, stages), split).
+# The split is "segment" (one program per expert segment), "expert" (one
+# program per tile of one expert's rows) or "row" (row tiles across experts).
 FP4_SMALL_TILES = [
-    ((16, 64, 64, 4, 3), True),
-    ((16, 64, 128, 4, 3), True),
-    ((16, 128, 64, 4, 3), True),
-    ((16, 128, 128, 4, 3), True),
-    ((32, 64, 128, 4, 3), True),
+    ((16, 64, 64, 4, 3), "segment"),
+    ((16, 64, 128, 4, 3), "segment"),
+    ((16, 128, 64, 4, 3), "segment"),
+    ((16, 128, 128, 4, 3), "segment"),
+    ((32, 64, 128, 4, 3), "segment"),
 ]
 FP4_LARGE_TILES = [
-    ((64, 128, 64, 4, 4), False),
-    ((64, 128, 128, 4, 3), False),
-    ((128, 128, 64, 4, 4), False),
-    ((64, 256, 64, 8, 3), False),
-    ((128, 256, 64, 8, 3), False),
-    ((64, 128, 64, 4, 4), True),
-    ((64, 128, 128, 4, 3), True),
-    ((128, 256, 64, 8, 3), True),
+    ((64, 128, 64, 4, 4), "expert"),
+    ((64, 128, 128, 4, 3), "expert"),
+    ((128, 128, 64, 4, 4), "expert"),
+    ((128, 128, 128, 8, 3), "expert"),
+    ((64, 256, 64, 8, 3), "expert"),
+    ((128, 256, 64, 8, 3), "expert"),
+    ((64, 128, 64, 4, 4), "row"),
+    ((128, 256, 64, 8, 3), "row"),
+    ((64, 128, 64, 4, 4), "segment"),
 ]
+# Bench hook values of `fp4_grouped_kernel` for each split.
+FP4_SPLITS: dict[str, dict[str, Any]] = {
+    "segment": {"_PER_SEGMENT_FOR_BENCH": True, "_EXPERT_TILES_FOR_BENCH": None},
+    "expert": {"_PER_SEGMENT_FOR_BENCH": False, "_EXPERT_TILES_FOR_BENCH": True},
+    "row": {"_PER_SEGMENT_FOR_BENCH": False, "_EXPERT_TILES_FOR_BENCH": False},
+}
 
 
 def _build_v4_moe(spec: dict[str, Any], device: str, dtype: Any, *, fp4: bool) -> Any:
@@ -687,7 +696,7 @@ def _fp4_sweep(
     device: str,
     dtype: Any,
     *,
-    tile_list: list[tuple[tuple[int, int, int, int, int], bool]],
+    tile_list: list[tuple[tuple[int, int, int, int, int], str]],
     token_counts: list[int],
     title: str,
 ) -> list[str]:
@@ -706,20 +715,19 @@ def _fp4_sweep(
         tokens: torch.randn(1, tokens, hidden, device=device, dtype=dtype)
         for tokens in token_counts
     }
-    for tiles, per_segment in tile_list:
-        kernel._TILES_FOR_BENCH = tiles
-        kernel._PER_SEGMENT_FOR_BENCH = per_segment
+    for tiles, split in tile_list:
         cells = []
         try:
-            with _grouped(True), torch.inference_mode():
+            with (
+                _hooks(kernel, _TILES_FOR_BENCH=tiles, **FP4_SPLITS[split]),
+                _grouped(True),
+                torch.inference_mode(),
+            ):
                 for tokens in token_counts:
                     cells.append(f"{_time_ms(partial(layer, inputs[tokens]), device):11.3f}")
         except Exception as exc:
             cells.append(f"failed: {exc!r}"[:120])
-        finally:
-            kernel._TILES_FOR_BENCH = None
-            kernel._PER_SEGMENT_FOR_BENCH = None
-        label = f"{', '.join(map(str, tiles))}, {'segment' if per_segment else 'tile'}"
+        label = f"{', '.join(map(str, tiles))}, {split}"
         lines.append(f"   {label:>49} | " + " | ".join(cells))
     return lines
 
