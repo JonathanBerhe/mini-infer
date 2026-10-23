@@ -1,0 +1,40 @@
+Ring experiment of the sm100 Gluon kernel, one B200, 2026-10-23. The experiment code (not kept)
+gave the row tiles and the weight tiles rings of their own, each with its own copy warp. With
+early release, the dequantization warps free a weight stage after they read it. Without it, the
+completion of the multiply frees it. Ring = (row stages, weight stages, early release).
+(3, 3, False) behaves like the kernel before (one ring of 3 stages).
+
+# Part 1: --fp8-rings bench, eager layer and do_bench of each projection alone
+gpu=NVIDIA B200 cc=(10, 0) torch=2.14.1+cu130 cuda=13.0 triton=3.8.0
+
+## GPU unit tests
+    @pytest.mark.requires_cuda
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [44] tests/unit/test_fp8_grouped_gluon.py:143: needs an sm90 GPU
+87 passed, 44 skipped, 4 warnings in 25.61s
+
+## sm100 rings of the Gluon kernel, tile 128, 128, 128, 4, 3, True (GLM-5.3, FP8 experts, eager wall ms per forward; alone: do_bench ms at 16384 tokens)
+   rows, weights, early |    1024 tok |    4096 tok |   16384 tok | same as Triton | gate_up alone | down alone
+                 triton |       3.738 |       8.423 |      26.934
+            3, 3, False |       4.247 |       6.806 |      20.971 |            yes |         8.605 |      4.303
+            4, 4, False |       3.783 |       6.440 |      20.323 |            yes |         9.115 |      4.190
+             3, 3, True |       3.909 |       6.550 |      20.824 |            yes |         8.733 |      4.238
+             4, 4, True |       3.790 |       6.457 |      20.170 |            yes |         8.390 |      4.205
+             3, 6, True |       3.866 |       6.450 |      20.383 |            yes |         8.482 |      4.189
+             4, 5, True |       3.842 |       6.414 |      20.338 |            yes |         8.290 |      4.205
+             2, 8, True |       4.165 |       6.534 |      21.700 |            yes |         9.023 |      4.165
+             3, 7, True |       3.929 |       6.701 |      21.024 |            yes |         7.539 |      4.377
+
+# Part 2: ncu --clock-control none, two projections at 16384 tokens, median of 3 launches
+# Mcyc = sm__cycles_elapsed.max (clock-independent), tensor = sm__pipe_tensor_cycles_active %
+ring 3 3 0       | gate_up  12.22 Mcyc  7.300 ms tensor  50.4% clock 1.66 GHz | down   6.39 Mcyc  3.761 ms tensor  48.3% clock 1.68 GHz
+ring 4 4 0       | gate_up  10.53 Mcyc  7.009 ms tensor  58.4% clock 1.49 GHz | down   5.59 Mcyc  3.579 ms tensor  55.1% clock 1.54 GHz
+ring 3 3 1       | gate_up  11.05 Mcyc  7.208 ms tensor  55.6% clock 1.52 GHz | down   5.81 Mcyc  3.648 ms tensor  53.0% clock 1.57 GHz
+ring 4 4 1       | gate_up  10.48 Mcyc  6.931 ms tensor  58.6% clock 1.50 GHz | down   5.61 Mcyc  3.576 ms tensor  55.1% clock 1.55 GHz
+ring 3 6 1       | gate_up  10.74 Mcyc  7.024 ms tensor  57.2% clock 1.52 GHz | down   5.70 Mcyc  3.590 ms tensor  54.1% clock 1.57 GHz
+ring 4 5 1       | gate_up  10.46 Mcyc  6.981 ms tensor  58.7% clock 1.49 GHz | down   5.57 Mcyc  3.575 ms tensor  55.3% clock 1.54 GHz
+ring 2 8 1       | gate_up  12.18 Mcyc  7.822 ms tensor  50.4% clock 1.55 GHz | down   5.88 Mcyc  3.742 ms tensor  52.2% clock 1.56 GHz
+ring 3 7 1       | gate_up  11.06 Mcyc  7.295 ms tensor  55.4% clock 1.51 GHz | down   5.89 Mcyc  3.719 ms tensor  52.2% clock 1.57 GHz
+bf16 grouped_mm | down     3.50 Mcyc  2.746 ms tensor  97.3% clock 1.26 GHz (one launch of the CUTLASS 2-SM 256x256 kernel. The other bf16 rows were cut from the captured output.)

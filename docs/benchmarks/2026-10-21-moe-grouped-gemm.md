@@ -676,7 +676,8 @@ Gluon tiles, eager milliseconds per forward:
 | 128, 256, 64, 4, 3 | 5.574 | 6.166 | 7.494 | 20.783 |
 | 128, 256, 128, 4, 2 | 5.986 | 6.630 | 7.906 | 21.764 |
 
-The default above 64 mean rows is (128, 128, 128, 4, 3). It is within 1
+The default above 64 mean rows was (128, 128, 128, 4, 3), and it has 4
+stages since the profile below. It is within 1
 percent of the fastest tile at 4096 tokens and within 2 percent at 16384
 tokens. The tile with 256 token rows has one accumulator, so the store of
 a tile stalls the next multiply. It is the fastest at 16384 tokens but 9
@@ -715,4 +716,60 @@ H100 ([raw output](data/moe-grouped-fp8-gluon-h100-review.txt)).
 - No fix touched the bf16 layer, and it still moved by up to 3 percent
   between the same runs. For example, it took 18.989 against 18.413 ms on
   the B200 at 16384 tokens.
+
+### Profile of the B200 kernel and a fourth stage
+
+On 2026-10-22 we profiled both projections at 16384 tokens with Nsight
+Compute 2025.3.1 on one B200
+([raw output](data/moe-grouped-fp8-ncu-b200.txt)). The container cannot
+lock the GPU clocks, so the profile ran with `--clock-control none`. The
+Gluon kernel had the tile (128, 128, 128, 4, 3):
+
+| gate-up projection | Gluon | Triton expert tiles | bf16 `grouped_mm` |
+|---|---:|---:|---:|
+| duration (ms) | 7.44 | 10.68 | 6.18 |
+| SM clock (GHz) | 1.66 | 1.83 | 1.12 |
+| tensor cores busy | 49% | 31% | 96% |
+| issue slots busy | 40% | 37% | 4% |
+| DRAM busy | 16% | 41% | 60% |
+| L2 hit rate | 80% | 33% | 44% |
+
+The stall samples of the Gluon kernel show where its warps wait. The copy
+warp waited for a free stage in about 90 percent of its time. The
+dequantization warps waited for a copy in about 18 percent of their time.
+The MMA warp waited for a dequantized weight tile in about half of its
+time. A stage stays busy from its copy through the dequantization and the
+multiply, so 3 stages were too few.
+
+On 2026-10-23 we tried two fixes on one B200
+([raw output](data/moe-grouped-fp8-rings-b200.txt)). The first is a fourth
+stage. The second gives the weight tiles and the tiles of token rows rings
+of their own. Nsight
+Compute counted the cycles of each projection, which do not depend on the
+clock. A fourth stage saved 12 to 14 percent of the cycles. The best split
+rings saved less than 1 percent more, so only the fourth stage stays
+([ADR-039](../decisions/ADR-039-gluon-fp8-grouped-blackwell.md), update).
+
+Then a `--fp8-gluon` run with the new default tile passed all 87 GPU tests
+([raw output](data/moe-grouped-fp8-gluon-b200-stages.txt)). Eager
+milliseconds per forward:
+
+| tokens | Triton expert tiles | Gluon, 4 stages | speedup | bf16 |
+|---:|---:|---:|---:|---:|
+| 4096 | 8.229 | 6.601 | 1.25x | 6.958 |
+| 8192 | 14.336 | 11.024 | 1.30x | |
+| 16384 | 26.566 | 20.656 | 1.29x | 19.160 |
+
+The FP8 layer is 1.05 times faster than the bf16 layer at 4096 tokens and
+1.08 times slower at 16384 tokens. Before the fourth stage it was 1.15
+times slower. The tile sweep of the same run compares 3 and 4 stages. The
+fourth stage made the layer 7.7 percent faster at 4096 tokens (6.962 to
+6.428 ms). At 16384 tokens it made the layer 3.6 percent faster (20.926 to
+20.166 ms). The outputs stayed bit-identical to the Triton kernel.
+
+More tensor-core work also lowers the clock. In the cycle counts, the clock
+fell from 1.66 to about 1.50 GHz, so fewer cycles gave a smaller gain in
+time. bf16 `grouped_mm` keeps its tensor cores busy 96 to 97 percent of the
+time at 1.1 to 1.3 GHz. Both kernels multiply in bf16, so the power limit
+holds the FP8 layer near the speed of the bf16 layer.
 
