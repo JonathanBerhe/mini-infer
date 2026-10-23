@@ -342,11 +342,11 @@ def test_gluon_needs_contiguous_scales(monkeypatch: pytest.MonkeyPatch) -> None:
         # are the rows of all 256 experts.
         (False, 8192, 32, None),
         (False, 12288, 32, fp4_grouped_gluon._HOPPER_TILES[0][1]),
-        # sm100 runs it above 64 mean rows per expert.
-        (True, 16384, 256, None),
-        (True, 32768, 256, fp4_grouped_gluon._BLACKWELL_TILES[1][1]),
-        (True, 98304, 256, fp4_grouped_gluon._BLACKWELL_TILES[2][1]),
-        (True, 16384, 32, None),
+        # sm100 runs it above 16 mean rows per expert.
+        (True, 4096, 256, None),
+        (True, 6144, 256, fp4_grouped_gluon._BLACKWELL_TILES[0][1]),
+        (True, 98304, 256, fp4_grouped_gluon._BLACKWELL_TILES[1][1]),
+        (True, 4096, 32, None),
     ],
 )
 def test_default_tiles_follow_the_mean_rows_of_all_experts(

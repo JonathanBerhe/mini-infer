@@ -70,15 +70,15 @@ _HOPPER_TILES: tuple[tuple[float, GluonTiles], ...] = (
     (float("inf"), (128, 256, 64, 8, 3, True)),
 )
 _BLACKWELL_TILES: tuple[tuple[float, GluonTiles], ...] = (
-    (64, (128, 64, 64, 8, 4, True)),
-    (192, (128, 128, 64, 8, 4, True)),
-    (float("inf"), (128, 256, 64, 8, 3, True)),
+    (192, (128, 128, 128, 8, 4, True)),
+    (float("inf"), (128, 256, 64, 8, 4, True)),
 )
 # Up to this many mean rows per expert, the default path keeps the Triton
 # kernel. On the V4-Flash layer, the H100 Triton kernel is faster at 24 mean
-# rows (1024 tokens) and slower at 48.
+# rows (1024 tokens) and slower at 48. On the B200 the Gluon kernel is
+# already faster at 24.
 _HOPPER_MIN_MEAN_ROWS = 32
-_BLACKWELL_MIN_MEAN_ROWS = _BLACKWELL_TILES[0][0]
+_BLACKWELL_MIN_MEAN_ROWS = 16
 # The columns that share one scale. The decode loads one scale per row and group.
 _SCALE_BLOCK = 32
 # Bench hook, not a public API: force a tile.
