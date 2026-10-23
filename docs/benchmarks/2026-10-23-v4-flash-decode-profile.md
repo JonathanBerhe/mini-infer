@@ -38,6 +38,10 @@ what to optimize first.
 - A CUDA graph of the full decode step is the first thing to do. It removes
   the host time from the step, which takes it from 120 ms to about 33 to
   36 ms (an estimate).
+- Measured on 2026-10-24 ([ADR-042](../decisions/ADR-042-cuda-graph-v4-decode.md)):
+  the step replays from a CUDA graph in 34.2 ms (6 tokens) and 34.7 ms
+  (2,021 tokens), with the same tokens as the eager step. The section "CUDA
+  graph of the decode step" has the details.
 
 ## Per-step time
 
@@ -173,6 +177,40 @@ earlier test. That test ran in this same host-bound eager mode. After the
 graph, attention GPU time is the largest part of the step, so that result
 needs a new measurement.
 
+## CUDA graph of the decode step
+
+Date: 2026-10-24, engine at `6b39ffb` (branch `feat/v4-decode-cuda-graph`).
+[ADR-042](../decisions/ADR-042-cuda-graph-v4-decode.md) makes the ragged
+decode step capturable. The profile mode with `--cuda-graph` captures that
+step in a `DecodeCudaGraph` at batch 1 on both ranks, copies the prefilled
+state into the graph's cache, and replays the same number of steps as the
+eager run. Both modes ran in the same container.
+
+| Measure | 6-token context | 2,021-token context |
+|---|---:|---:|
+| Eager step, no profiler (median of 16) | 67.8 ms | 78.5 ms |
+| CUDA graph step, no profiler (median of 16) | 34.2 ms | 34.7 ms |
+| Speedup | 1.98x | 2.26x |
+| Graph step, min to max | 34.2 to 34.3 ms | 34.6 to 34.7 ms |
+| Graph step, GPU busy (profiled) | 34.4 to 34.7 ms | 34.6 to 34.8 ms |
+| GPU operations per step, eager / graph | 9,026 / 11,881 | 9,087 / 11,882 |
+| Tokens equal to the eager step | 33 of 33 | 33 of 33 |
+
+- The eager step took 67.8 ms here and 120.0 ms in the first run of this
+  report, with the same code. The host time under the profiler halved
+  between the two containers, so the host CPU sets the eager speed. The
+  graph step does not depend on it.
+- The graph step is now bound by the GPU work. Without the profiler it takes
+  34.2 ms, and under the profiler the GPU is busy for 34.4 to 34.7 ms of it.
+- The graph runs the ragged decode step, which does more GPU work than the
+  eager single-request step: about 2,850 more operations and 6 ms more GPU
+  time. The full `torch.cat` of the sliding window and the compressed
+  history in each layer adds about 2.5 ms. Row-indexed writes
+  (`index_elementwise_kernel`, 442 against 89 per step) and the masks add
+  most of the rest.
+- At batch 1 the graph decodes about 29 tokens per second, against 15 for
+  the eager step of the same run.
+
 ## How it is measured
 
 For each context, each rank prefills the context and runs 8 warm-up decode
@@ -218,6 +256,10 @@ the packed FP4 experts.
 
 ```bash
 uv run modal run scripts/modal_v4_flash_generate.py --profile-decode
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).
