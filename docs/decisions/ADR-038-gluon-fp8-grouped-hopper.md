@@ -115,10 +115,9 @@ together. With warp specialization, different warps do different jobs.
   expert-tile split of the Triton kernel (ADR-037, update). On the H100 it
   gives 60 to 70 percent of the Gluon gain at 1024 to 4096 tokens and 23
   percent at 16384 tokens. From 1024 tokens the Gluon kernel stays 1.16 to
-  1.30 times faster than it in the
-  [`--fp8-expert-tiles` run](../benchmarks/data/moe-grouped-fp8-expert-tiles-h100.txt).
-  A [later `--fp8-gluon` run](../benchmarks/data/moe-grouped-fp8-gluon-h100-expert-tiles.txt)
-  gives 1.17 to 1.33.
+  1.30 times faster than it in the `--fp8-expert-tiles` run. A later
+  `--fp8-gluon` run gives 1.17 to 1.33
+  ([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)).
 - **Wait for each `wgmma`, as Triton does.** It is safe without the
   two-step loop, but the dequantization then runs while the tensor cores
   are idle.

@@ -68,7 +68,8 @@ registers.
    mean counts only the local experts, expert parallelism makes it too high
    by the number of ranks. Then the Gluon kernel also runs
    below 64 real mean rows. The tile has 128 weight rows, 128 token rows, K
-   steps of 128, and 3 stages. The conditions of ADR-038 on Triton and on
+   steps of 128, and 3 stages (4 since the update below). The conditions of
+   ADR-038 on Triton and on
    the operands apply too, except the even number of K steps.
 7. **Tests.** The compile tests build each sm100 tile on the CPU through
    the launcher's argument binding, so they compile the same binary that
@@ -116,7 +117,8 @@ registers.
   starts instructions. We estimate that the issue rate of the
   dequantization on the CUDA cores sets the limit. The dequantization needs
   about 460 instructions per warp and K step, against about 512 cycles for
-  the multiply of the same step. We did not profile it.
+  the multiply of the same step. We did not profile it. A later profile
+  showed that this estimate was wrong (see the update below).
 - The outputs of the two kernels are bit-identical at every measured size.
 - The first version wrote 2 bytes per store. With the same tile, the
   16-byte stores made the layer 1 to 6 percent faster from 4096 tokens.
@@ -133,3 +135,68 @@ registers.
   registers, so the register fault of ADR-038 cannot occur here.
 - There are three FP8 grouped kernels to maintain: Triton for all GPUs,
   Gluon for sm90, Gluon for sm100.
+
+## Update 2026-10-23: the profile and a fourth stage
+
+We profiled the kernel with Nsight Compute on one B200 at 16384 tokens
+([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)). The kernel was
+not limited by the issue rate:
+
+- The tensor cores were busy in 49 percent of the cycles. In bf16
+  `grouped_mm` they were busy in 96 percent.
+- The warps started an instruction in 40 percent of the cycles. The integer
+  and FMA units were 25 to 29 percent busy.
+- DRAM was 16 to 18 percent busy, and 78 to 80 percent of the reads hit
+  the L2 cache.
+
+The stall samples show where the warps wait. The copy warp waited for a
+free stage in about 90 percent of its time. The dequantization warps waited
+for a copy in about 18 percent of their time. The MMA warp waited for a
+dequantized weight tile in about half of its time. A stage stays busy from
+its copy through the dequantization and the multiply. With 3 stages, the
+copy warp cannot run far enough ahead.
+
+We tried two fixes. The GPU clock changes with power, so Nsight Compute
+counted the cycles of each projection at 16384 tokens:
+
+| stages | gate-up cycles | tensor cores busy | down cycles |
+|---|---:|---:|---:|
+| 3 (before) | 12.22 M | 50.4% | 6.39 M |
+| 4 | 10.53 M | 58.4% | 5.59 M |
+| split rings: 4 for rows, 5 for weights | 10.46 M | 58.7% | 5.57 M |
+
+- **A fourth stage.** It uses 196 KB of shared memory, and it saved 12 to
+  14 percent of the cycles.
+- **Split rings.** The weight tiles and the tiles of token rows got rings of
+  their own, each with its own copy warp. The dequantization warps freed a
+  weight stage right after they read it. With 3 stages for the rows, this
+  saved 9 to 10 percent of the cycles. With 4 stages for the rows, it saved
+  less than 1 percent more than the fourth stage alone.
+
+Decision: the default sm100 tile now has 4 stages. The split rings need a
+second copy warp, two more barrier rings and a second way to free a stage.
+That code gave less than 1 percent, so we did not keep it.
+
+Consequences:
+
+- With more tensor-core work, the clock fell from 1.66 to about 1.50 GHz.
+  The B200 keeps its power limit this way. So 12 to 14 percent fewer cycles
+  gave only 4 to 5 percent less time for each projection.
+- In a `--fp8-gluon` run with the new tile, the layer took 6.60, 11.02 and
+  20.66 ms at 4096, 8192 and 16384 tokens.
+  That is 1.25, 1.30 and 1.29 times faster than the Triton expert tiles.
+  The tile sweep of the same run compares 3 and 4 stages. The fourth stage
+  made the layer 7.7 percent faster at 4096 tokens and 3.6 percent faster
+  at 16384 tokens.
+- Against the bf16 layer in the same run, the FP8 layer is 1.05 times
+  faster at 4096 tokens. At 16384 tokens it is 1.08 times slower, against
+  1.15 times slower before.
+- bf16 `grouped_mm` uses the 2-CTA form of `tcgen05`. It kept the tensor
+  cores busy in 97 percent of the cycles, at 1.26 GHz. Both kernels
+  multiply in bf16, so the power limit caps the FP8 layer near the speed of
+  the bf16 layer. The 2-CTA form stays the next option to get closer.
+- All 87 GPU tests passed with the new tile, and the outputs stayed
+  bit-identical to the Triton kernel.
+- In the same sweep, the tile with 8 dequantization warps and 4 stages was
+  6 and 3 percent faster than the Triton expert tiles at 256 and 1024
+  tokens. One run is not enough to move the threshold of 64 mean rows.

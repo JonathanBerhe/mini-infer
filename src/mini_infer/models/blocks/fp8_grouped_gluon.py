@@ -89,10 +89,12 @@ _HOPPER_TILES: tuple[tuple[float, GluonTiles], ...] = (
 )
 # On sm100, `num_warps` counts the dequantization warps. The kernel also has
 # a copy warp, an MMA warp and 4 store warps, and ignores the last field.
-# Picked from a sweep on a B200.
+# Picked from a sweep on a B200. A stage stays busy from its copy through the
+# dequantization and the multiply, so the large tile takes a fourth stage
+# (196 KB of shared memory): the tensor cores then wait less for the copies.
 _BLACKWELL_TILES: tuple[tuple[float, GluonTiles], ...] = (
     (64, (128, 64, 64, 8, 4, True)),
-    (float("inf"), (128, 128, 128, 4, 3, True)),
+    (float("inf"), (128, 128, 128, 4, 4, True)),
 )
 # Up to the first Blackwell tile's limit, the Triton kernel's expert tiles are
 # as fast, so the default path keeps them there.
