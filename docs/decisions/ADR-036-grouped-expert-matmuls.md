@@ -102,6 +102,8 @@ different matmul for each group of rows.
   `hasattr`, and `tests/unit/test_grouped_experts.py` runs it on the CPU
   against a token-by-token reference.
 - Block-FP8 experts (`Fp8Expert`) got a Triton grouped kernel
-  ([ADR-037](ADR-037-block-fp8-grouped-kernel.md)). FP4-resident experts
-  (`FP4Expert`), Inkling, Kimi Linear and the DeepSeek-V4 hash-routed block
-  keep their loops.
+  ([ADR-037](ADR-037-block-fp8-grouped-kernel.md)). The DeepSeek-V4
+  hash-routed block takes the grouped path with bf16 experts and with
+  FP4-resident experts (`FP4Expert`), the second through a Triton kernel
+  ([ADR-040](ADR-040-fp4-grouped-kernel.md)). Inkling and Kimi Linear keep
+  their loops.

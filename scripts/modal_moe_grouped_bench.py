@@ -40,7 +40,9 @@ operands. On an H100 or a B200, `--fp8-gluon` runs the unit tests and then
 compares the Gluon kernels of `fp8_grouped_gluon.py` with the Triton one
 (`fp8_gluon_bench`). `--fp8-expert-tiles` compares the Triton kernel's row
 tiles with tiles of one expert each, on any GPU (`fp8_expert_tiles_bench`).
-`--tests-only` runs only the unit tests of step 0.
+`--fp4` runs the unit tests and the DeepSeek-V4-Flash routed MoE with FP4
+experts, loop against grouped (`fp4_bench`). `--tests-only` runs only the
+unit tests of step 0.
 Add `--out-dir <dir>` to keep the report and traces there (default: a new
 temporary directory). Dry run with tiny sizes on this machine (needs
 the Nemotron 3 Nano 4B tokenizer in the local Hugging Face cache; the FP8
@@ -86,6 +88,8 @@ _GPU_TESTS = [
     "tests/unit/test_fp8_grouped_kernel.py",
     "tests/unit/test_fp8_grouped_gluon.py",
     "tests/unit/test_grouped_experts.py",
+    "tests/unit/test_fp4_grouped_kernel.py",
+    "tests/unit/test_fp4_grouped.py",
 ]
 # A deadlocked kernel never returns. The tests stop after this many seconds.
 _GPU_TESTS_TIMEOUT = 900
@@ -600,6 +604,229 @@ def fp8_kernel_bench(
     with _grouped(True):
         for tokens in token_counts:
             x = torch.randn(1, tokens, target["hidden"], device=device, dtype=dtype)
+            with torch.inference_mode():
+                eager = _time_ms(partial(layer, x), device)
+            replay: float | str = "-"
+            if cuda and tokens in graph_tokens:
+                try:
+                    replay = _graph_ms(layer, x, device)
+                except Exception as exc:
+                    replay = f"failed: {exc!r}"[:80]
+            lines.append(f"{tokens:>9} | {eager:9.3f} | {_fmt(replay)}")
+    del layer
+    if cuda:
+        torch.cuda.empty_cache()
+    return lines
+
+
+# DeepSeek-V4-Flash's routed MoE (config.json): hidden 4096, expert width
+# 2048, 256 experts, top-6, sqrtsoftplus scores, route scale 1.5, one shared
+# expert, swiglu_limit 10, FP4 experts with one e8m0 scale per 32 columns.
+V4_FLASH_MOE: dict[str, Any] = {
+    "hidden": 4096,
+    "inter": 2048,
+    "experts": 256,
+    "top_k": 6,
+    "score_func": "softplus_sqrt",
+    "route_scale": 1.5,
+    "swiglu_limit": 10.0,
+}
+# FP4 tiles to sweep as ((BLOCK_M, BLOCK_N, BLOCK_K, warps, stages), split).
+# The split is "segment" (one program per expert segment), "expert" (one
+# program per tile of one expert's rows) or "row" (row tiles across experts).
+FP4_SMALL_TILES = [
+    ((16, 64, 64, 4, 3), "segment"),
+    ((16, 64, 128, 4, 3), "segment"),
+    ((16, 128, 64, 4, 3), "segment"),
+    ((16, 128, 128, 4, 3), "segment"),
+    ((32, 64, 128, 4, 3), "segment"),
+]
+FP4_LARGE_TILES = [
+    ((64, 128, 64, 4, 4), "expert"),
+    ((64, 128, 128, 4, 3), "expert"),
+    ((128, 128, 64, 4, 4), "expert"),
+    ((128, 128, 128, 8, 3), "expert"),
+    ((64, 256, 64, 8, 3), "expert"),
+    ((64, 256, 128, 8, 3), "expert"),
+    ((128, 256, 64, 8, 3), "expert"),
+    ((128, 256, 128, 8, 3), "expert"),
+    ((128, 256, 64, 8, 3), "row"),
+    ((64, 128, 64, 4, 4), "segment"),
+]
+# Bench hook values of `fp4_grouped_kernel` for each split.
+FP4_SPLITS: dict[str, dict[str, Any]] = {
+    "segment": {"_PER_SEGMENT_FOR_BENCH": True, "_EXPERT_TILES_FOR_BENCH": None},
+    "expert": {"_PER_SEGMENT_FOR_BENCH": False, "_EXPERT_TILES_FOR_BENCH": True},
+    "row": {"_PER_SEGMENT_FOR_BENCH": False, "_EXPERT_TILES_FOR_BENCH": False},
+}
+
+
+def _build_v4_moe(spec: dict[str, Any], device: str, dtype: Any, *, fp4: bool) -> Any:
+    """A V4-Flash routed MoE layer with random weights; FP4 experts get e8m0-style scales."""
+    import torch
+
+    from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
+
+    with _build_on(device, dtype):
+        layer = HashRoutedMoEFFN(
+            hidden_size=spec["hidden"],
+            intermediate_size=spec["inter"],
+            num_routed_experts=spec["experts"],
+            num_activated_experts=spec["top_k"],
+            routing_mode="score_topk",
+            score_func=spec["score_func"],
+            route_scale=spec["route_scale"],
+            n_shared_experts=1,
+            expert_dtype="fp4" if fp4 else "bf16",
+            swiglu_limit=spec["swiglu_limit"],
+        ).eval()
+        if fp4:
+            with torch.no_grad():
+                for expert in layer.experts:
+                    for name in ("w1", "w2", "w3"):
+                        packed = getattr(expert, f"{name}_packed")
+                        packed.copy_(torch.randint(-128, 128, packed.shape, dtype=torch.int8))
+                        scale = getattr(expert, f"{name}_scale")
+                        scale.copy_(torch.exp2(torch.randint(-8, -5, scale.shape).float()))
+    return layer
+
+
+def _fp4_sweep(
+    layer: Any,
+    hidden: int,
+    device: str,
+    dtype: Any,
+    *,
+    tile_list: list[tuple[tuple[int, int, int, int, int], str]],
+    token_counts: list[int],
+    title: str,
+) -> list[str]:
+    """The grouped FP4 layer with each tile and split of the Triton kernel."""
+    import torch
+
+    from mini_infer.models.blocks import fp4_grouped_kernel as kernel
+
+    lines = [
+        "",
+        f"## FP4 kernel tiles, {title} (wall ms per forward)",
+        "   BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, split | "
+        + " | ".join(f"{tokens:>7} tok" for tokens in token_counts),
+    ]
+    inputs = {
+        tokens: torch.randn(1, tokens, hidden, device=device, dtype=dtype)
+        for tokens in token_counts
+    }
+    for tiles, split in tile_list:
+        cells = []
+        try:
+            with (
+                _hooks(kernel, _TILES_FOR_BENCH=tiles, **FP4_SPLITS[split]),
+                _grouped(True),
+                torch.inference_mode(),
+            ):
+                for tokens in token_counts:
+                    cells.append(f"{_time_ms(partial(layer, inputs[tokens]), device):11.3f}")
+        except Exception as exc:
+            cells.append(f"failed: {exc!r}"[:120])
+        label = f"{', '.join(map(str, tiles))}, {split}"
+        lines.append(f"   {label:>49} | " + " | ".join(cells))
+    return lines
+
+
+def fp4_bench(
+    device: str, dtype: Any, *, traces: dict[str, bytes], shrink: bool = False
+) -> list[str]:
+    """The V4-Flash routed MoE with FP4 experts: the loop against the grouped kernel.
+
+    Wall time of both paths, CUDA graph replays of the grouped path, profiles,
+    a tile sweep with both splits, and the same layer with bf16 experts on
+    `grouped_mm` as the target. `shrink` makes it tiny for the interpreter.
+    """
+    import torch
+
+    spec = dict(V4_FLASH_MOE)
+    token_counts, graph_tokens, profile_tokens = LAYER_TOKENS, GRAPH_TOKENS, PROFILE_TOKENS
+    if shrink:
+        spec.update(hidden=128, inter=64, experts=8, top_k=2)
+        token_counts, graph_tokens, profile_tokens = [1, 16], [], [4]
+    cuda = device.startswith("cuda")
+    torch.manual_seed(0)
+    layer = _build_v4_moe(spec, device, dtype, fp4=True)
+    lines = [
+        f"## V4-Flash routed MoE, FP4 experts (hidden {spec['hidden']}, expert width "
+        f"{spec['inter']}, {spec['experts']} experts, top-{spec['top_k']})",
+        "wall ms per forward; the loop cannot run in a CUDA graph",
+        "   tokens |      loop |   grouped |  speedup | rel diff | graph grouped",
+    ]
+    wall: dict[tuple[int, bool], float] = {}
+    for tokens in token_counts:
+        x = torch.randn(1, tokens, spec["hidden"], device=device, dtype=dtype)
+        outs = {}
+        with torch.inference_mode():
+            for enabled in (False, True):
+                with _grouped(enabled):
+                    wall[tokens, enabled] = _time_ms(partial(layer, x), device)
+                    outs[enabled] = layer(x).float()
+        rel = float((outs[True] - outs[False]).norm() / outs[False].norm().clamp_min(1e-30))
+        graph: float | str = "-"
+        if cuda and tokens in graph_tokens:
+            try:
+                with _grouped(True):
+                    graph = _graph_ms(layer, x, device)
+            except Exception as exc:
+                graph = "failed"
+                lines.append(f"   capture failed: {exc!r}"[:300])
+        lines.append(
+            f"{tokens:>9} | {wall[tokens, False]:9.3f} | {wall[tokens, True]:9.3f} | "
+            f"{wall[tokens, False] / wall[tokens, True]:7.2f}x | {rel:8.1e} | {_fmt(graph):>13}"
+        )
+
+    lines += ["", "## Profile, loop against grouped"]
+    for tokens in profile_tokens:
+        x = torch.randn(1, tokens, spec["hidden"], device=device, dtype=dtype)
+        for enabled in (False, True):
+            with _grouped(enabled):
+                ms = wall.get((tokens, enabled))
+                if ms is None:
+                    with torch.inference_mode():
+                        ms = _time_ms(partial(layer, x), device)
+                label = "grouped" if enabled else "loop"
+                lines += _profile(
+                    layer, x, device, wall_ms=ms, name=f"v4_fp4_{tokens}tok_{label}", traces=traces
+                )
+    if cuda:
+        lines += _fp4_sweep(
+            layer,
+            spec["hidden"],
+            device,
+            dtype,
+            tile_list=FP4_SMALL_TILES,
+            token_counts=[1, 4, 16],
+            title="decode sizes",
+        )
+        lines += _fp4_sweep(
+            layer,
+            spec["hidden"],
+            device,
+            dtype,
+            tile_list=FP4_LARGE_TILES,
+            token_counts=[256, 1024, 4096, 16384],
+            title="prefill sizes",
+        )
+    del layer
+    if cuda:
+        torch.cuda.empty_cache()
+
+    lines += [
+        "",
+        "## Target: the same layer with bf16 experts on grouped_mm (wall ms per forward)",
+        "   tokens |     eager |     graph",
+    ]
+    torch.manual_seed(0)
+    layer = _build_v4_moe(spec, device, dtype, fp4=False)
+    with _grouped(True):
+        for tokens in token_counts:
+            x = torch.randn(1, tokens, spec["hidden"], device=device, dtype=dtype)
             with torch.inference_mode():
                 eager = _time_ms(partial(layer, x), device)
             replay: float | str = "-"
@@ -1165,6 +1392,7 @@ def moe_grouped_bench(
     fp8_gluon: bool = False,
     fp8_expert_tiles: bool = False,
     tests_only: bool = False,
+    fp4: bool = False,
 ) -> dict[str, Any]:
     import subprocess
     import sys
@@ -1204,6 +1432,9 @@ def moe_grouped_bench(
         lines += tests.stdout.splitlines()[-40:]
         return {"report": "\n".join(lines), "traces": traces}
 
+    if fp4:
+        lines += fp4_bench("cuda", torch.bfloat16, traces=traces)
+        return {"report": "\n".join(lines), "traces": traces}
     if fp8_gluon:
         lines += fp8_gluon_bench("cuda", torch.bfloat16, _REMOTE_FIXTURES, traces=traces)
         return {"report": "\n".join(lines), "traces": traces}
@@ -1250,6 +1481,7 @@ def main(
     fp8_gluon: bool = False,
     fp8_expert_tiles: bool = False,
     tests_only: bool = False,
+    fp4: bool = False,
 ) -> None:
     result = moe_grouped_bench.remote(
         fp8_only=fp8_only,
@@ -1258,6 +1490,7 @@ def main(
         fp8_gluon=fp8_gluon,
         fp8_expert_tiles=fp8_expert_tiles,
         tests_only=tests_only,
+        fp4=fp4,
     )
     print(result["report"])
     print(f"\nreport and traces in {_save(result, out_dir)}")
