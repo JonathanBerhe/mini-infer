@@ -139,64 +139,47 @@ def _checkpoint(rank: int, msg: str) -> None:
 
 
 def _run_one_rank(rank: int, world_size: int, prompt: str, max_new_tokens: int) -> dict:
-    """Per-rank container work: init PG, load V4-Flash, greedy-generate."""
+    """Per-rank container work: load V4-Flash, greedy-generate."""
     import torch
-    import torch.distributed as dist
 
-    from mini_infer.distributed.group import destroy_distributed, init_distributed
     from mini_infer.engine.state_cache_generator import StateCacheGenerator
     from mini_infer.engine.tokenizer import Tokenizer
     from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
 
-    _checkpoint(rank, "entering _run_one_rank; calling init_distributed (nccl)...")
-    init_distributed(
-        world_size=world_size,
-        rank=rank,
-        backend="nccl",
-        master_addr="127.0.0.1",
-        master_port=29500,
+    torch.cuda.set_device(rank)
+    device = f"cuda:{rank}"
+    # from_checkpoint reads the raw config.json, builds on meta, runs
+    # load_weights (per-rank TP slicing falls out here), and rebuilds the
+    # rotary buffer. The download + load of ~158 GB is the slow step; if a
+    # run hangs, it hangs inside this call.
+    _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    _checkpoint(rank, "load_weights done; building tokenizer + generator...")
+
+    tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
+    generator = StateCacheGenerator(model, tokenizer)
+
+    prompt_ids = tokenizer.encode(prompt)
+    _checkpoint(
+        rank,
+        f"prompt encoded ({len(prompt_ids)} tokens); greedy-generating {max_new_tokens} tokens...",
     )
-    try:
-        torch.cuda.set_device(rank)
-        device = f"cuda:{rank}"
-        # from_checkpoint reads the raw config.json, builds on meta, runs
-        # load_weights (per-rank TP slicing falls out here), and rebuilds the
-        # rotary buffer. The download + load of ~158 GB is the slow step; if a
-        # run hangs, it hangs inside this call.
-        _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
-        model = DeepseekV4ForCausalLM.from_checkpoint(
-            _MODEL_NAME, device=device, dtype=torch.bfloat16
+    with torch.inference_mode():
+        generated_ids = generator.generate_ids(
+            prompt_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
         )
-        _checkpoint(rank, "load_weights done; building tokenizer + generator...")
-
-        tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
-        generator = StateCacheGenerator(model, tokenizer)
-
-        prompt_ids = tokenizer.encode(prompt)
-        _checkpoint(
-            rank,
-            f"prompt encoded ({len(prompt_ids)} tokens); greedy-generating "
-            f"{max_new_tokens} tokens...",
-        )
-        with torch.inference_mode():
-            generated_ids = generator.generate_ids(
-                prompt_ids,
-                max_new_tokens=max_new_tokens,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        generated_text = tokenizer.decode(generated_ids)
-        _checkpoint(rank, f"generation done ({len(generated_ids)} tokens).")
-        return {
-            "rank": rank,
-            "world_size": world_size,
-            "n_prompt_tokens": len(prompt_ids),
-            "n_generated": len(generated_ids),
-            "generated_ids": generated_ids,
-            "generated_text": generated_text,
-        }
-    finally:
-        if dist.is_available() and dist.is_initialized():
-            destroy_distributed()
+    generated_text = tokenizer.decode(generated_ids)
+    _checkpoint(rank, f"generation done ({len(generated_ids)} tokens).")
+    return {
+        "rank": rank,
+        "world_size": world_size,
+        "n_prompt_tokens": len(prompt_ids),
+        "n_generated": len(generated_ids),
+        "generated_ids": generated_ids,
+        "generated_text": generated_text,
+    }
 
 
 def _compare_one_rank(
@@ -214,9 +197,7 @@ def _compare_one_rank(
     import time
 
     import torch
-    import torch.distributed as dist
 
-    from mini_infer.distributed.group import destroy_distributed, init_distributed
     from mini_infer.engine.state_cache_generator import StateCacheGenerator
     from mini_infer.engine.tokenizer import Tokenizer
     from mini_infer.models.blocks import grouped_experts
@@ -225,104 +206,90 @@ def _compare_one_rank(
     from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
     from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
 
-    init_distributed(
-        world_size=world_size,
-        rank=rank,
-        backend="nccl",
-        master_addr="127.0.0.1",
-        master_port=29500,
-    )
-    try:
-        if device is None:
-            torch.cuda.set_device(rank)
-            device = f"cuda:{rank}"
-        if not (
-            grouped_experts.supports_grouped_experts(device)
-            and supports_block_fp4_grouped_mm(device)
-        ):
-            raise RuntimeError("the grouped FP4 path does not run on this device")
-        _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
-        model = DeepseekV4ForCausalLM.from_checkpoint(
-            _MODEL_NAME, device=device, dtype=torch.bfloat16
+    if device is None:
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+    if not (
+        grouped_experts.supports_grouped_experts(device) and supports_block_fp4_grouped_mm(device)
+    ):
+        raise RuntimeError("the grouped FP4 path does not run on this device")
+    _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
+    generator = StateCacheGenerator(model, tokenizer)
+    moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
+    prompt_ids = tokenizer.encode(prompt)
+    passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
+
+    def last_logits(ids: list[int]) -> Any:
+        cache = model.build_state_cache(
+            max_seq_len=len(ids), batch_size=1, device=device, dtype=torch.bfloat16
         )
-        tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
-        generator = StateCacheGenerator(model, tokenizer)
-        moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
-        prompt_ids = tokenizer.encode(prompt)
-        passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
+        input_ids = torch.tensor([ids], device=device, dtype=torch.long)
+        with torch.inference_mode():
+            logits = model.forward_prefill_with_cache(input_ids, state_cache=cache)
+        return logits[0, -1].float()
 
-        def last_logits(ids: list[int]) -> Any:
-            cache = model.build_state_cache(
-                max_seq_len=len(ids), batch_size=1, device=device, dtype=torch.bfloat16
+    def timed_ms(fn: Any) -> tuple[Any, float]:
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        out = fn()
+        torch.cuda.synchronize()
+        return out, (time.perf_counter() - start) * 1e3
+
+    runs: dict[str, dict[str, Any]] = {}
+    packed_layers = 0
+    for path, disabled in (("grouped", False), ("loop", True)):
+        grouped_experts._DISABLED_FOR_BENCH = disabled
+        _checkpoint(rank, f"{path} path: prefill and generate...")
+        short = last_logits(prompt_ids)
+        last_logits(passage_ids)  # warm-up: Triton compiles its kernels here
+        long, prefill_ms = timed_ms(lambda: last_logits(passage_ids))
+        ids, generate_ms = timed_ms(
+            lambda: generator.generate_ids(
+                prompt_ids, max_new_tokens=max_new_tokens, eos_token_id=tokenizer.eos_token_id
             )
-            input_ids = torch.tensor([ids], device=device, dtype=torch.long)
-            with torch.inference_mode():
-                logits = model.forward_prefill_with_cache(input_ids, state_cache=cache)
-            return logits[0, -1].float()
-
-        def timed_ms(fn: Any) -> tuple[Any, float]:
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            out = fn()
-            torch.cuda.synchronize()
-            return out, (time.perf_counter() - start) * 1e3
-
-        runs: dict[str, dict[str, Any]] = {}
-        packed_layers = 0
-        for path, disabled in (("grouped", False), ("loop", True)):
-            grouped_experts._DISABLED_FOR_BENCH = disabled
-            _checkpoint(rank, f"{path} path: prefill and generate...")
-            short = last_logits(prompt_ids)
-            last_logits(passage_ids)  # warm-up: Triton compiles its kernels here
-            long, prefill_ms = timed_ms(lambda: last_logits(passage_ids))
-            ids, generate_ms = timed_ms(
-                lambda: generator.generate_ids(
-                    prompt_ids, max_new_tokens=max_new_tokens, eos_token_id=tokenizer.eos_token_id
-                )
+        )
+        if path == "grouped":
+            packed_layers = sum(
+                isinstance(block._expert_pack, PackedFp4Experts) for block in moe_blocks
             )
-            if path == "grouped":
-                packed_layers = sum(
-                    isinstance(block._expert_pack, PackedFp4Experts) for block in moe_blocks
-                )
-            runs[path] = {
-                "short": short,
-                "long": long,
-                "prefill_ms": prefill_ms,
-                "generate_ms": generate_ms,
-                "ids": ids,
-                "text": tokenizer.decode(ids),
-            }
-        grouped_experts._DISABLED_FOR_BENCH = False
-
-        grouped, loop = runs["grouped"], runs["loop"]
-        pairs = enumerate(zip(grouped["ids"], loop["ids"], strict=False))
-        diverge = next((i for i, (a, b) in pairs if a != b), None)
-
-        def agreement(key: str) -> dict[str, Any]:
-            a, b = grouped[key], loop[key]
-            return {
-                "cosine": float(torch.nn.functional.cosine_similarity(a, b, dim=0)),
-                "max_abs_diff": float((a - b).abs().max()),
-                "same_argmax": bool(a.argmax() == b.argmax()),
-            }
-
-        return {
-            "rank": rank,
-            "moe_layers": len(moe_blocks),
-            "packed_fp4_layers": packed_layers,
-            "prompt_tokens": len(prompt_ids),
-            "passage_tokens": len(passage_ids),
-            "short_logits": agreement("short"),
-            "long_logits": agreement("long"),
-            "first_divergence": diverge,
-            "generated": {path: run["ids"] for path, run in runs.items()},
-            "text": {path: run["text"] for path, run in runs.items()},
-            "prefill_ms": {path: run["prefill_ms"] for path, run in runs.items()},
-            "generate_ms": {path: run["generate_ms"] for path, run in runs.items()},
+        runs[path] = {
+            "short": short,
+            "long": long,
+            "prefill_ms": prefill_ms,
+            "generate_ms": generate_ms,
+            "ids": ids,
+            "text": tokenizer.decode(ids),
         }
-    finally:
-        if dist.is_available() and dist.is_initialized():
-            destroy_distributed()
+    grouped_experts._DISABLED_FOR_BENCH = False
+
+    grouped, loop = runs["grouped"], runs["loop"]
+    pairs = enumerate(zip(grouped["ids"], loop["ids"], strict=False))
+    diverge = next((i for i, (a, b) in pairs if a != b), None)
+
+    def agreement(key: str) -> dict[str, Any]:
+        a, b = grouped[key], loop[key]
+        return {
+            "cosine": float(torch.nn.functional.cosine_similarity(a, b, dim=0)),
+            "max_abs_diff": float((a - b).abs().max()),
+            "same_argmax": bool(a.argmax() == b.argmax()),
+        }
+
+    return {
+        "rank": rank,
+        "moe_layers": len(moe_blocks),
+        "packed_fp4_layers": packed_layers,
+        "prompt_tokens": len(prompt_ids),
+        "passage_tokens": len(passage_ids),
+        "short_logits": agreement("short"),
+        "long_logits": agreement("long"),
+        "first_divergence": diverge,
+        "generated": {path: run["ids"] for path, run in runs.items()},
+        "text": {path: run["text"] for path, run in runs.items()},
+        "prefill_ms": {path: run["prefill_ms"] for path, run in runs.items()},
+        "generate_ms": {path: run["generate_ms"] for path, run in runs.items()},
+    }
 
 
 def _profile_label(model: Any, name: str) -> str:
@@ -620,6 +587,7 @@ def _profile_one_rank(
     dry run passes `"cpu"`.
     """
     import functools
+    import gc
     import gzip
     import json
     import tempfile
@@ -627,9 +595,7 @@ def _profile_one_rank(
     import warnings
 
     import torch
-    import torch.distributed as dist
 
-    from mini_infer.distributed.group import destroy_distributed, init_distributed
     from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph
     from mini_infer.engine.sampler import SamplingParams, sample
     from mini_infer.engine.tokenizer import Tokenizer
@@ -637,190 +603,201 @@ def _profile_one_rank(
     from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
     from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
 
-    init_distributed(
-        world_size=world_size,
-        rank=rank,
-        backend="nccl",
-        master_addr="127.0.0.1",
-        master_port=29500,
-    )
-    try:
-        if device is None:
-            torch.cuda.set_device(rank)
-            device = f"cuda:{rank}"
-        on_cuda = torch.device(device).type == "cuda"
-        _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
-        model = DeepseekV4ForCausalLM.from_checkpoint(
-            _MODEL_NAME, device=device, dtype=torch.bfloat16
-        )
-        tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
-        greedy = SamplingParams(temperature=0.0)
-        contexts = {
-            "prompt": tokenizer.encode(prompt),
-            "passage": tokenizer.encode(passage)[:_PASSAGE_TOKENS],
-        }
+    if device is None:
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+    on_cuda = torch.device(device).type == "cuda"
+    _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
+    greedy = SamplingParams(temperature=0.0)
+    contexts = {
+        "prompt": tokenizer.encode(prompt),
+        "passage": tokenizer.encode(passage)[:_PASSAGE_TOKENS],
+    }
 
-        def synchronize() -> None:
-            if on_cuda:
-                torch.cuda.synchronize()
+    def synchronize() -> None:
+        if on_cuda:
+            torch.cuda.synchronize()
 
-        def sample_into(tokens: list[int], logits: torch.Tensor, labelled: bool) -> None:
-            if labelled:
-                with torch.profiler.record_function("sampling"):
-                    tokens.append(sample(logits[0, -1], greedy))
-            else:
+    def sample_into(tokens: list[int], logits: torch.Tensor, labelled: bool) -> None:
+        if labelled:
+            with torch.profiler.record_function("sampling"):
                 tokens.append(sample(logits[0, -1], greedy))
+        else:
+            tokens.append(sample(logits[0, -1], greedy))
 
-        # One decode step as `StateCacheGenerator` runs it: forward, sample, advance.
-        def step(cache: Any, tokens: list[int], labelled: bool = False) -> None:
-            token = torch.tensor([[tokens[-1]]], device=device, dtype=torch.long)
-            with torch.inference_mode():
-                step_logits = model.forward_decode_with_cache(
-                    token, start_pos=cache.start_pos, state_cache=cache
-                )
-                sample_into(tokens, step_logits, labelled)
-            cache.advance_start_pos(1)
+    # One decode step as `StateCacheGenerator` runs it: forward, sample, advance.
+    def step(cache: Any, tokens: list[int], labelled: bool = False) -> None:
+        token = torch.tensor([[tokens[-1]]], device=device, dtype=torch.long)
+        with torch.inference_mode():
+            step_logits = model.forward_decode_with_cache(
+                token, start_pos=cache.start_pos, state_cache=cache
+            )
+            sample_into(tokens, step_logits, labelled)
+        cache.advance_start_pos(1)
 
-        # One decode step replayed from the graph; the host inputs are copied in.
-        def graph_step(
-            graph: DecodeCudaGraph, cache: Any, tokens: list[int], labelled: bool = False
-        ) -> None:
-            cache.check_capacity(cache.start_pos + 1)
-            logits = graph.replay(torch.tensor([[tokens[-1]]]), torch.tensor([cache.start_pos]))
-            sample_into(tokens, logits, labelled)
-            cache.advance_start_pos(1)
+    # One decode step replayed from the graph; the host inputs are copied in.
+    def graph_step(
+        graph: DecodeCudaGraph, cache: Any, tokens: list[int], labelled: bool = False
+    ) -> None:
+        cache.check_capacity(cache.start_pos + 1)
+        logits = graph.replay(torch.tensor([[tokens[-1]]]), torch.tensor([cache.start_pos]))
+        sample_into(tokens, logits, labelled)
+        cache.advance_start_pos(1)
 
-        def prefill(ids: list[int], n_steps: int) -> tuple[Any, list[int]]:
-            cache = model.build_state_cache(
+    def prefill(ids: list[int], n_steps: int) -> tuple[Any, list[int]]:
+        cache = model.build_state_cache(
+            max_seq_len=len(ids) + n_steps + 1,
+            batch_size=1,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        with torch.inference_mode():
+            logits = model.forward_prefill_with_cache(
+                torch.tensor([ids], device=device, dtype=torch.long), state_cache=cache
+            )
+        cache.advance_start_pos(len(ids))
+        return cache, [sample(logits[0, -1], greedy)]
+
+    def timed(run_step: Callable[..., None]) -> list[float]:
+        """Warm up, then the wall time of each timed step in ms."""
+        for _ in range(_WARMUP_STEPS):
+            run_step()
+        synchronize()
+        step_ms = []
+        for _ in range(_TIMED_STEPS):
+            start = time.perf_counter()
+            run_step()  # ends in the `.item()` of greedy sampling, a host sync
+            step_ms.append((time.perf_counter() - start) * 1e3)
+        return step_ms
+
+    def profiled(run_step: Callable[..., None], entry: dict[str, Any], labels: bool) -> None:
+        """Run the profiled steps; rank 0 profiles them and adds the tables to `entry`."""
+        if rank != 0:
+            for _ in range(_PROFILED_STEPS):
+                run_step()
+            return
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if on_cuda:
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        restore = _label_modules(model) if labels else None
+        try:
+            with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
+                for _ in range(_PROFILED_STEPS):
+                    with torch.profiler.record_function(_STEP_LABEL):
+                        run_step(labelled=True)
+                synchronize()
+        finally:
+            if restore is not None:
+                restore()
+        _checkpoint(rank, "reducing the trace...")
+        trace_path = Path(tempfile.mkdtemp(prefix="v4-decode-")) / "trace.json"
+        prof.export_chrome_trace(str(trace_path))
+        trace_bytes = trace_path.read_bytes()
+        entry["profile"] = _summarize_decode_trace(json.loads(trace_bytes)["traceEvents"])
+        if keep_trace:
+            entry["trace_gz"] = gzip.compress(trace_bytes)
+
+    n_steps = _WARMUP_STEPS + _TIMED_STEPS + _SYNC_CHECK_STEPS + _PROFILED_STEPS
+    results: dict[str, Any] = {"rank": rank, "contexts": {}}
+    for context, ids in contexts.items():
+        _checkpoint(rank, f"{context}: prefill {len(ids)} tokens, then decode...")
+        cache, tokens = prefill(ids, n_steps)
+        run_step = functools.partial(step, cache, tokens)
+        entry: dict[str, Any] = {"context_tokens": len(ids), "step_ms": timed(run_step)}
+
+        if rank == 0 and on_cuda:
+            torch.cuda.set_sync_debug_mode("warn")
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                for _ in range(_SYNC_CHECK_STEPS):
+                    run_step()
+        finally:
+            if rank == 0 and on_cuda:
+                torch.cuda.set_sync_debug_mode("default")
+        sync_lines: dict[str, int] = {}
+        for warning in caught:
+            if "synchroniz" in str(warning.message):
+                where = f"{warning.filename.rpartition('mini_infer/')[2]}:{warning.lineno}"
+                sync_lines[where] = sync_lines.get(where, 0) + 1
+        entry["sync_lines"] = sorted(
+            ((where, n / _SYNC_CHECK_STEPS) for where, n in sync_lines.items()),
+            key=lambda item: -item[1],
+        )
+        profiled(run_step, entry, labels=True)
+        entry["text"] = tokenizer.decode(tokens)
+        del run_step, cache
+
+        if cuda_graph:
+            # Capture first: warmup and capture write into the cache rows.
+            _checkpoint(rank, f"{context}: capture the decode step in a CUDA graph...")
+            graph_cache = model.build_state_cache(
                 max_seq_len=len(ids) + n_steps + 1,
                 batch_size=1,
                 device=device,
                 dtype=torch.bfloat16,
             )
-            with torch.inference_mode():
-                logits = model.forward_prefill_with_cache(
-                    torch.tensor([ids], device=device, dtype=torch.long), state_cache=cache
-                )
-            cache.advance_start_pos(len(ids))
-            return cache, [sample(logits[0, -1], greedy)]
-
-        def timed(run_step: Callable[..., None]) -> list[float]:
-            """Warm up, then the wall time of each timed step in ms."""
-            for _ in range(_WARMUP_STEPS):
-                run_step()
+            graph = DecodeCudaGraph(model, graph_cache, batch_size=1, device=device)
+            prefilled, graph_tokens = prefill(ids, n_steps)
+            graph_cache.copy_row_from(prefilled, src_row=0, dst_row=0)
+            graph_cache.advance_start_pos(len(ids))
+            del prefilled
+            run_graph = functools.partial(graph_step, graph, graph_cache, graph_tokens)
+            graph_entry: dict[str, Any] = {"step_ms": timed(run_graph)}
+            for _ in range(_SYNC_CHECK_STEPS):
+                run_graph()
+            profiled(run_graph, graph_entry, labels=False)
+            pairs = enumerate(zip(tokens, graph_tokens, strict=True))
+            graph_entry["first_divergence"] = next((i for i, (a, b) in pairs if a != b), None)
+            graph_entry["text"] = tokenizer.decode(graph_tokens)
+            entry["graph"] = graph_entry
+            # The graph holds captured NCCL work; free it before the process
+            # group goes away, which can otherwise hang.
+            del run_graph, graph, graph_cache
+            gc.collect()
             synchronize()
-            step_ms = []
-            for _ in range(_TIMED_STEPS):
-                start = time.perf_counter()
-                run_step()  # ends in the `.item()` of greedy sampling, a host sync
-                step_ms.append((time.perf_counter() - start) * 1e3)
-            return step_ms
+        results["contexts"][context] = entry
 
-        def profiled(run_step: Callable[..., None], entry: dict[str, Any], labels: bool) -> None:
-            """Run the profiled steps; rank 0 profiles them and adds the tables to `entry`."""
-            if rank != 0:
-                for _ in range(_PROFILED_STEPS):
-                    run_step()
-                return
-            activities = [torch.profiler.ProfilerActivity.CPU]
-            if on_cuda:
-                activities.append(torch.profiler.ProfilerActivity.CUDA)
-            restore = _label_modules(model) if labels else None
-            try:
-                with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
-                    for _ in range(_PROFILED_STEPS):
-                        with torch.profiler.record_function(_STEP_LABEL):
-                            run_step(labelled=True)
-                    synchronize()
-            finally:
-                if restore is not None:
-                    restore()
-            _checkpoint(rank, "reducing the trace...")
-            trace_path = Path(tempfile.mkdtemp(prefix="v4-decode-")) / "trace.json"
-            prof.export_chrome_trace(str(trace_path))
-            trace_bytes = trace_path.read_bytes()
-            entry["profile"] = _summarize_decode_trace(json.loads(trace_bytes)["traceEvents"])
-            if keep_trace:
-                entry["trace_gz"] = gzip.compress(trace_bytes)
-
-        n_steps = _WARMUP_STEPS + _TIMED_STEPS + _SYNC_CHECK_STEPS + _PROFILED_STEPS
-        results: dict[str, Any] = {"rank": rank, "contexts": {}}
-        for context, ids in contexts.items():
-            _checkpoint(rank, f"{context}: prefill {len(ids)} tokens, then decode...")
-            cache, tokens = prefill(ids, n_steps)
-            run_step = functools.partial(step, cache, tokens)
-            entry: dict[str, Any] = {"context_tokens": len(ids), "step_ms": timed(run_step)}
-
-            if rank == 0 and on_cuda:
-                torch.cuda.set_sync_debug_mode("warn")
-            try:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    for _ in range(_SYNC_CHECK_STEPS):
-                        run_step()
-            finally:
-                if rank == 0 and on_cuda:
-                    torch.cuda.set_sync_debug_mode("default")
-            sync_lines: dict[str, int] = {}
-            for warning in caught:
-                if "synchroniz" in str(warning.message):
-                    where = f"{warning.filename.rpartition('mini_infer/')[2]}:{warning.lineno}"
-                    sync_lines[where] = sync_lines.get(where, 0) + 1
-            entry["sync_lines"] = sorted(
-                ((where, n / _SYNC_CHECK_STEPS) for where, n in sync_lines.items()),
-                key=lambda item: -item[1],
-            )
-            profiled(run_step, entry, labels=True)
-            entry["text"] = tokenizer.decode(tokens)
-            del cache
-
-            if cuda_graph:
-                # Capture first: warmup and capture write into the cache rows.
-                _checkpoint(rank, f"{context}: capture the decode step in a CUDA graph...")
-                graph_cache = model.build_state_cache(
-                    max_seq_len=len(ids) + n_steps + 1,
-                    batch_size=1,
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
-                graph = DecodeCudaGraph(model, graph_cache, batch_size=1, device=device)
-                prefilled, graph_tokens = prefill(ids, n_steps)
-                graph_cache.copy_row_from(prefilled, src_row=0, dst_row=0)
-                graph_cache.advance_start_pos(len(ids))
-                del prefilled
-                run_graph = functools.partial(graph_step, graph, graph_cache, graph_tokens)
-                graph_entry: dict[str, Any] = {"step_ms": timed(run_graph)}
-                for _ in range(_SYNC_CHECK_STEPS):
-                    run_graph()
-                profiled(run_graph, graph_entry, labels=False)
-                pairs = enumerate(zip(tokens, graph_tokens, strict=True))
-                graph_entry["first_divergence"] = next((i for i, (a, b) in pairs if a != b), None)
-                graph_entry["text"] = tokenizer.decode(graph_tokens)
-                entry["graph"] = graph_entry
-                del graph, graph_cache
-            results["contexts"][context] = entry
-
-        moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
-        results["moe_layers"] = len(moe_blocks)
-        results["packed_fp4_layers"] = sum(
-            isinstance(block._expert_pack, PackedFp4Experts) for block in moe_blocks
-        )
-        return results
-    finally:
-        if dist.is_available() and dist.is_initialized():
-            destroy_distributed()
+    moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
+    results["moe_layers"] = len(moe_blocks)
+    results["packed_fp4_layers"] = sum(
+        isinstance(block._expert_pack, PackedFp4Experts) for block in moe_blocks
+    )
+    return results
 
 
 def _child_entry(
     rank: int, world_size: int, worker: Callable[..., dict], kwargs: dict, queue
 ) -> None:
-    """Module-level entry-point for `mp.spawn` workers (must be picklable)."""
+    """Module-level entry-point for `mp.spawn` workers (must be picklable).
+
+    Owns the process group: it sends the result before it destroys the group,
+    so a teardown that hangs cannot hold back the result. `_spawn_ranks`
+    stops a process that is still alive 10 s after both results arrived.
+    """
+    import torch.distributed as dist
+
+    from mini_infer.distributed.group import destroy_distributed, init_distributed
+
     try:
+        _checkpoint(rank, "calling init_distributed (nccl)...")
+        init_distributed(
+            world_size=world_size,
+            rank=rank,
+            backend="nccl",
+            master_addr="127.0.0.1",
+            master_port=29500,
+        )
         queue.put(("ok", worker(rank, world_size, **kwargs)))
     except Exception:
         import traceback
 
         queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}"))
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            destroy_distributed()
 
 
 def _spawn_ranks(worker: Callable[..., dict], **kwargs: Any) -> list[dict]:
@@ -896,8 +873,8 @@ def compare_moe_paths(prompt: str, max_new_tokens: int, passage: str) -> dict:
 @app.function(
     image=image,
     gpu=_GPU,
-    # A warm-cache load plus the profile takes a few minutes; this caps a hang.
-    timeout=1200,
+    # A warm-cache load plus the profile takes about 5 minutes; this caps a hang.
+    timeout=900,
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
