@@ -4,8 +4,8 @@ Date: 2026-10-21
 Hardware: one NVIDIA H100 80GB HBM3 and one NVIDIA B200, bf16, PyTorch
 2.14.1 with CUDA 13.0, Triton 3.8.0
 Workloads: one MoE layer with random weights at the sizes of Nemotron 3.5
-Lightning 30B-A3B, Mixtral 8x7B and GLM-5.3 (with bf16 and with block-FP8
-experts). The real `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
+Lightning 30B-A3B, Mixtral 8x7B, GLM-5.3 (with bf16 and with block-FP8
+experts) and DeepSeek-V4-Flash (with bf16 and with FP4 experts). The real `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`
 (revision `a9904d2`), with prefill on `scripts/data/technical_passage.md`
 Engine: mini-infer with the grouped expert paths of
 [ADR-036](../decisions/ADR-036-grouped-expert-matmuls.md) (bf16),
@@ -13,9 +13,11 @@ Engine: mini-infer with the grouped expert paths of
 [ADR-038](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) (block FP8 in
 Gluon on the H100) and
 [ADR-039](../decisions/ADR-039-gluon-fp8-grouped-blackwell.md) (block FP8
-in Gluon on the B200)
+in Gluon on the B200) and
+[ADR-040](../decisions/ADR-040-fp4-grouped-kernel.md) (FP4)
 Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
-`--fp8-tiles`, `--fp8-gluon` and `--fp8-expert-tiles` for the FP8 runs)
+`--fp8-tiles`, `--fp8-gluon` and `--fp8-expert-tiles` for the FP8 runs,
+`--fp4` for the FP4 runs)
 
 ## Result
 
@@ -55,6 +57,12 @@ Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
   FP8 layer is then 1.04 times faster than the bf16 layer at 4096 tokens
   and 1.15 times slower at 16384 tokens. The section "Gluon kernel for the
   B200" has the details.
+- DeepSeek-V4-Flash keeps its experts in FP4. A Triton kernel makes the
+  V4-Flash layer 20 to 66 times faster than the per-expert loop up to 1024
+  tokens on the H100. On the B200 it is 28 to 50 times faster. The FP4 layer
+  is then faster than the bf16 layer up to 1024 tokens on both GPUs. It is
+  1.28 (H100) and 1.55 (B200) times slower at 16384 tokens. The section
+  "FP4 experts" has the details.
 - The grouped path is slower in three places: batch-1 graph decode on the
   B200 (3.6 percent), eager decode at small batches, and Mixtral at 16384
   tokens on the B200 (0.88x). The section "Where the grouped path is
@@ -745,4 +753,136 @@ fell from 1.66 to about 1.50 GHz, so fewer cycles gave a smaller gain in
 time. bf16 `grouped_mm` keeps its tensor cores busy 96 to 97 percent of the
 time at 1.1 to 1.3 GHz. Both kernels multiply in bf16, so the power limit
 holds the FP8 layer near the speed of the bf16 layer.
+
+## FP4 experts
+
+DeepSeek-V4-Flash keeps its routed experts in FP4: e2m1 values, two per
+byte, with one scale per row and 32 columns. The layer has hidden size
+4096, expert width 2048, 256 experts, top-6 routing with sqrt-softplus
+scores, and one shared expert. The FP4 weights are random, with
+power-of-two scales as in the checkpoint.
+
+"Loop" is the per-expert loop of the V4 block. It dequantizes each expert
+that got tokens to bf16. "Grouped" is the Triton kernel of
+[ADR-040](../decisions/ADR-040-fp4-grouped-kernel.md). "bf16" is the same
+layer with bf16 experts on `grouped_mm`. We ran one process per GPU on
+2026-10-23 (`--fp4`). The H100 run first passed 144 GPU tests, and the B200
+run passed 115.
+
+H100, milliseconds per forward:
+
+| tokens | loop | grouped | speedup | grouped, graph | bf16 | bf16, graph |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 17.779 | 0.891 | 19.95x | 0.199 | 0.981 | 0.293 |
+| 4 | 33.982 | 0.918 | 37.04x | 0.403 | 1.058 | 0.632 |
+| 16 | 96.809 | 1.474 | 65.68x | 1.073 | 2.110 | 1.669 |
+| 64 | 208.922 | 3.607 | 57.93x | 3.052 | 4.117 | 3.740 |
+| 256 | 264.826 | 4.434 | 59.73x | | 5.246 | |
+| 1024 | 266.679 | 4.992 | 53.42x | | 5.734 | |
+| 4096 | 266.385 | 7.391 | 36.04x | | 7.621 | |
+| 16384 | 272.767 | 25.582 | 10.66x | | 20.012 | |
+
+B200, milliseconds per forward:
+
+| tokens | loop | grouped | speedup | grouped, graph | bf16 | bf16, graph |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 9.533 | 0.340 | 28.05x | 0.218 | 0.347 | 0.223 |
+| 4 | 17.395 | 0.449 | 38.73x | 0.328 | 0.529 | 0.389 |
+| 16 | 45.322 | 0.898 | 50.48x | 0.775 | 1.096 | 0.998 |
+| 64 | 103.182 | 2.185 | 47.21x | 2.026 | 2.323 | 2.180 |
+| 256 | 132.314 | 2.736 | 48.36x | | 3.265 | |
+| 1024 | 133.651 | 3.067 | 43.58x | | 3.595 | |
+| 4096 | 134.342 | 5.370 | 25.02x | | 4.901 | |
+| 16384 | 139.285 | 18.568 | 7.50x | | 11.981 | |
+
+The loop does not fit in a CUDA graph. The FP4 layer is faster than the
+bf16 layer up to 1024 tokens on both GPUs, in a CUDA graph by 1.02 to 1.57
+times. At 4096 tokens it is 1.03 times faster on the H100 and 1.10 times
+slower on the B200. At 16384 tokens it is 1.28 (H100) and 1.55 (B200)
+times slower. The outputs of the two paths differ by a relative 2.6e-3 to
+2.8e-3.
+
+These runs used the earlier tile tables. The section "FP4 splits and
+tiles" gives the two tiles that changed after the sweep. In the sweep, the
+new tiles are 1.4 to 5.1 percent faster.
+
+In the profile at 4 tokens, the loop ran 2434 to 2529 GPU operations and
+325 to 328 host syncs per forward. The grouped layer ran 46 operations and
+no host syncs. At 2048 tokens the loop ran about 14,370 operations and 1024
+host syncs, and the grouped layer 84 or 85 operations and none. There the
+kernel took 4.64 ms of 6.01 ms of GPU time on the H100, and 3.34 ms of
+4.49 ms on the B200.
+
+### First and second FP4 decode
+
+The first version of the kernel computed each bf16 value with a compare
+and select for the small e2m1 codes. It also loaded the scale of each
+weight on its own. In a run earlier on 2026-10-23 with the same tiles, it
+made the FP4 layer 3 to 10 times slower than the bf16 layer. The second
+version (ADR-040, decision 2) loads one scale per row and 32 columns, and
+it decodes with bit moves into an fp32.
+
+Milliseconds per forward, in a CUDA graph up to 64 tokens and eager from
+256 tokens:
+
+| tokens | H100 first | H100 second | speedup | B200 first | B200 second | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.931 | 0.199 | 4.68x | 1.158 | 0.218 | 5.31x |
+| 4 | 3.050 | 0.403 | 7.57x | 3.255 | 0.328 | 9.92x |
+| 16 | 11.188 | 1.073 | 10.43x | 9.551 | 0.775 | 12.32x |
+| 64 | 40.034 | 3.052 | 13.12x | 26.112 | 2.026 | 12.89x |
+| 256 | 51.571 | 4.434 | 11.63x | 34.351 | 2.736 | 12.55x |
+| 1024 | 52.295 | 4.992 | 10.48x | 34.766 | 3.067 | 11.34x |
+| 4096 | 47.004 | 7.391 | 6.36x | 32.518 | 5.370 | 6.06x |
+| 16384 | 160.159 | 25.582 | 6.26x | 112.896 | 18.568 | 6.08x |
+
+We compiled both versions for sm90 without a GPU, with the argument facts
+of a V4 launch (unit strides, 16-byte alignment). Then we counted the
+instructions of the K loop, per thread and K step:
+
+| tile | version | instructions | registers | spill reloads | global loads |
+|---|---|---:|---:|---:|---:|
+| 128, 256, 64, 8, 3 | first | 1450 | 255 | 62 | 72 |
+| 128, 256, 64, 8, 3 | second | 532 | 219 | 0 | 8 |
+| 16, 64, 128, 4, 3 | first | 1319 | 254 | 0 | 70 |
+| 16, 64, 128, 4, 3 | second | 533 | 80 | 0 | 6 |
+
+64 of the first version's global loads per step are scale loads, one per
+weight. The time fell more than the instruction count, up to 13 times
+against 2.7 times. The decode tile did not spill in the first version. It
+still got 4.7 to 13 times faster, so the spills are not the main cause. We
+did not profile the share of the scale loads.
+
+### FP4 splits and tiles
+
+Prefill sweep, eager milliseconds per forward. "expert" is one tile of one
+expert's rows, "row" a row tile across experts, "segment" the decode split:
+
+| tile, split | H100 256 tok | 1024 | 4096 | 16384 | B200 256 tok | 1024 | 4096 | 16384 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64, 128, 64, 4, 4, expert | 4.454 | 4.973 | 9.898 | 32.836 | 2.779 | 3.122 | 6.603 | 22.444 |
+| 64, 128, 128, 4, 3, expert | 4.522 | 5.119 | 10.216 | 33.334 | 3.176 | 3.525 | 7.418 | 24.480 |
+| 128, 128, 64, 4, 4, expert | 5.331 | 5.832 | 8.349 | 27.629 | 3.642 | 3.961 | 5.243 | 19.156 |
+| 128, 128, 128, 8, 3, expert | 6.159 | 6.648 | 8.626 | 28.747 | 4.086 | 4.411 | 5.727 | 19.861 |
+| 64, 256, 64, 8, 3, expert | 4.442 | 4.998 | 9.858 | 31.716 | 2.970 | 3.284 | 6.951 | 22.993 |
+| 64, 256, 128, 8, 3, expert | 4.855 | 5.472 | 10.864 | 34.583 | 3.511 | 3.847 | 8.054 | 26.344 |
+| 128, 256, 64, 8, 3, expert | 5.385 | 5.979 | 7.515 | 25.450 | 3.756 | 4.079 | 5.370 | 18.528 |
+| 128, 256, 128, 8, 3, expert | 5.859 | 6.486 | 8.158 | 27.354 | 3.603 | 3.929 | 5.286 | 18.157 |
+| 128, 256, 64, 8, 3, row | 7.423 | 6.814 | 10.502 | 27.742 | 5.557 | 4.904 | 7.643 | 19.926 |
+| 64, 128, 64, 4, 4, segment | 4.413 | 5.508 | 13.180 | 45.555 | 2.911 | 4.882 | 15.897 | 60.478 |
+
+With the same tile, the expert tiles are 1.09 to 1.40 times faster than
+the row tiles on the H100. On the B200 they are 1.08 to 1.48 times faster.
+
+Two tiles changed. On the H100, the tile for 257 to 8192 rows is now
+(64, 128, 64, 4, 4). At 256 and 1024 tokens it is 1.5 and 2.9 percent
+faster than (64, 128, 128, 4, 3). The H100 and the B200 now share it. On
+the B200, the decode tile is now (16, 64, 64, 4, 3). At 1, 4 and 16 tokens
+it is 1.4 to 5.1 percent faster than (16, 128, 64, 4, 3). The tile for more than 8192
+rows, (128, 256, 64, 8, 3), stays on both GPUs. It is the fastest at 4096
+and 16384 tokens on the H100 and within 2.5 percent of the fastest on the
+B200.
+
+No real V4-Flash checkpoint was measured with this path. It needs two B200
+GPUs.
 
