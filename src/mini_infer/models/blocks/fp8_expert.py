@@ -13,8 +13,8 @@ activation dtype, runs the SwiGLU, and lets the transient BF16 copy free. Math
 matches `MixtralExpert` on the dequantized weights (the parity contract).
 
 On Hopper and newer GPUs, `PackedFp8Experts` stacks a layer's experts and runs
-them through the Triton grouped kernel of `fp8_grouped_kernel.py`, which
-dequantizes in registers with the same rounding as `forward`.
+them through `fp8_grouped_kernel.block_fp8_grouped_mm`. Its Triton and Gluon
+kernels dequantize with the same rounding as `forward`.
 """
 
 from __future__ import annotations

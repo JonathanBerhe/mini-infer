@@ -89,6 +89,8 @@ NVFP4 (the dispatch table in PyTorch's `GroupedBlas.cpp`). It does not take
   That is two kernels to own (Hopper `wgmma`, Blackwell `tcgen05`), and
   Gluon does not run under Triton's interpreter, so every debugging step
   needs a GPU. It waits for a measured need.
+  [ADR-038](ADR-038-gluon-fp8-grouped-hopper.md) adds a Gluon kernel for
+  the H100 above 256 rows.
 
 ## Consequences
 
@@ -110,10 +112,46 @@ NVFP4 (the dispatch table in PyTorch's `GroupedBlas.cpp`). It does not take
   layer with bf16 experts on `grouped_mm`, the FP8 layer is 1.05 to 2.0
   times faster up to 256 tokens and about equal at 1024. From 4096 tokens
   it is 1.26 to 1.46 times slower: the kernel dequantizes on the CUDA cores
-  and multiplies in bf16, without TMA or warp specialization.
+  and multiplies in bf16, without TMA or warp specialization. On the H100,
+  ADR-038 closes this gap.
 - The outputs differ from the loop by a relative 3.8e-3, because the loop
   adds the 8 expert outputs into a bf16 tensor one at a time. bf16 experts
   show the same effect (3.3e-3). Against fp32 math with the same routing,
   the routed-expert output has a relative error of 5.4e-3 to 5.5e-3.
 - No real FP8 checkpoint was measured end to end. The GLM-5.x and
   MiniMax-M3 FP8 checkpoints need 4 to 8 GPUs.
+
+## Update 2026-10-22: tiles of one expert each
+
+The per-row-tile split of decision 2 gives a program rows of several
+experts. A program walks the shared dimension K of the matmul in a loop,
+the K loop. With row tiles, it runs the whole K loop once for each expert
+of its rows. For more than 256 rows, the default split now gives each
+program one tile of one expert. This split cuts the rows of each expert
+into tiles of `BLOCK_M`.
+
+A few small GPU operations count the tiles of each expert. A binary search
+over those counts finds the expert of a program. Nothing reads back to the
+host. The row tiles stay as a bench option. The test of decision 8 now
+covers all three splits (per segment, row tiles, expert tiles), each with
+both operand orders.
+
+We measured the GLM-5.3 layer in one process per GPU
+([benchmark](../benchmarks/2026-10-21-moe-grouped-gemm.md)):
+
+- On the B200, the expert tiles are 1.08 to 1.42 times faster than the row
+  tiles from 64 to 16384 tokens. With them, the FP8 layer is faster than
+  the bf16 layer at 1024 tokens (4.02 against 5.12 ms). But it is still
+  1.20 and 1.40 times slower at 4096 and 16384 tokens.
+- On the H100, the expert tiles are 1.06 to 1.31 times faster than the row
+  tiles.
+- If the Triton version and the operands fit (ADR-038, decision 8), the
+  default path calls a Gluon kernel above 256 rows. On the H100 (sm90)
+  it calls the Gluon kernel at every such size. On the B200 (sm100) it
+  calls it only above 64 mean rows per expert
+  ([ADR-039](ADR-039-gluon-fp8-grouped-blackwell.md)). The expert tiles run
+  in all other cases with more than 256 rows.
+- The outputs of the two splits are bit-identical.
+- The Blackwell tile for 257 to 8192 rows changes from (64, 128, 64, 4, 4)
+  to (64, 256, 64, 8, 3), the fastest expert tile at 1024 tokens in the
+  sweep.

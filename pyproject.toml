@@ -80,6 +80,10 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 "src/mini_infer/models/blocks/gdn_decode_kernel.py" = ["N803"]
 "src/mini_infer/models/blocks/fp8_grouped_kernel.py" = ["N803"]
 "src/mini_infer/models/blocks/fp4_grouped_kernel.py" = ["N803"]
+# Gluon kernels also name their constexpr locals in uppercase and build
+# buffer shapes by list concatenation, which the Gluon frontend parses. A
+# Gluon aggregate's constructor is a method without `self`.
+"src/mini_infer/models/blocks/fp8_grouped_gluon.py" = ["N803", "N805", "N806", "RUF005"]
 # `Depends(...)` in default args is the canonical FastAPI dependency-injection
 # idiom; B008 flags it as a "function call in default", which is the point.
 "src/mini_infer/api/server.py" = ["B008"]

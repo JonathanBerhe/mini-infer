@@ -10,9 +10,11 @@ to the host, so the same code also runs inside a captured CUDA graph.
 The weights must be stacked per expert: `gate_up` `(E, G, in)` and `down`
 `(E, out, I)`. `G` is `I` for a plain MLP and `2I` for a gated one with the
 gate rows first. Plain tensors (bf16) go through `functional.grouped_mm`;
-`BlockFp8Weight`s (e4m3 with 128x128 block scales) go through the Triton
-kernel of `fp8_grouped_kernel.py`, and `BlockFp4Weight`s (packed e2m1 with
-one scale per row and 32 columns) through `fp4_grouped_kernel.py`.
+`BlockFp8Weight`s (e4m3 with 128x128 block scales) go through
+`fp8_grouped_kernel.block_fp8_grouped_mm`, a Triton kernel or, for many rows
+on sm90 and sm100, a Gluon kernel. `BlockFp4Weight`s (packed e2m1 with one
+scale per row and 32 columns) go through the Triton kernel of
+`fp4_grouped_kernel.py`.
 """
 
 from __future__ import annotations
@@ -90,6 +92,7 @@ def _grouped_matmul(
     weight: ExpertWeight,
     offs: torch.Tensor,
     row_experts: torch.Tensor,
+    num_experts: int,
 ) -> torch.Tensor:
     """`(M, K)` sorted rows times their expert's `(N, K)` weight, `-> (M, N)`."""
     if isinstance(weight, BlockFp8Weight):
@@ -100,6 +103,7 @@ def _grouped_matmul(
             block=weight.block,
             row_experts=row_experts,
             group_ends=offs,
+            num_experts=num_experts,
         )
     if isinstance(weight, BlockFp4Weight):
         return block_fp4_grouped_mm(
@@ -158,8 +162,8 @@ def grouped_expert_mlp(
     offs = torch.searchsorted(sorted_ids, bounds, right=True).to(torch.int32)
 
     rows = x.index_select(0, order // top_k)
-    hidden = activation(_grouped_matmul(rows, gate_up, offs, sorted_ids))
-    out_rows = _grouped_matmul(hidden, down, offs, sorted_ids)
+    hidden = activation(_grouped_matmul(rows, gate_up, offs, sorted_ids, num_experts))
+    out_rows = _grouped_matmul(hidden, down, offs, sorted_ids, num_experts)
 
     weighted = out_rows.to(acc_dtype) * topk_weights.reshape(-1)[order].to(acc_dtype)[:, None]
     if partial:

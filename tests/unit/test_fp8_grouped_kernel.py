@@ -48,9 +48,25 @@ def _fp8(shape: tuple[int, ...]) -> torch.Tensor:
 
 
 @pytest.mark.parametrize(
-    ("per_segment", "swap_ab"),
-    [(None, None), (False, False), (False, True), (True, False), (True, True)],
-    ids=["default", "tiles", "tiles-swapped", "segments", "segments-swapped"],
+    ("per_segment", "swap_ab", "expert_tiles"),
+    [
+        (None, None, None),
+        (False, False, False),
+        (False, True, False),
+        (True, False, None),
+        (True, True, None),
+        (False, False, None),
+        (False, True, None),
+    ],
+    ids=[
+        "default",
+        "row-tiles",
+        "row-tiles-swapped",
+        "segments",
+        "segments-swapped",
+        "expert-tiles",
+        "expert-tiles-swapped",
+    ],
 )
 @pytest.mark.parametrize(
     ("counts", "off_rank"),
@@ -66,10 +82,14 @@ def test_kernel_matches_dequantized_matmul(
     off_rank: int,
     per_segment: bool | None,
     swap_ab: bool | None,
+    expert_tiles: bool | None,
 ) -> None:
     device = _device()
+    # This test is for the Triton kernel. The Gluon kernels have their own.
+    monkeypatch.setattr(fp8_grouped_kernel, "_GLUON_FOR_BENCH", False)
     monkeypatch.setattr(fp8_grouped_kernel, "_PER_SEGMENT_FOR_BENCH", per_segment)
     monkeypatch.setattr(fp8_grouped_kernel, "_SWAP_AB_FOR_BENCH", swap_ab)
+    monkeypatch.setattr(fp8_grouped_kernel, "_EXPERT_TILES_FOR_BENCH", expert_tiles)
     torch.manual_seed(0)
     num_experts, n_dim, k_dim, block = len(counts), 48, 96, 16
     weight = _fp8((num_experts, n_dim, k_dim))
@@ -140,7 +160,9 @@ def _fp8_glm(hidden: int, inter: int, experts: int, top_k: int) -> GlmMoeFFN:
     return moe
 
 
-@pytest.mark.parametrize("tokens", [1, 5, 40])
+# 200 tokens give 400 (token, expert) rows: the expert tiles, or a Gluon kernel
+# on sm90 and sm100.
+@pytest.mark.parametrize("tokens", [1, 5, 40, 200])
 def test_fp8_glm_grouped_matches_loop(monkeypatch: pytest.MonkeyPatch, tokens: int) -> None:
     device = _device()
     moe = _fp8_glm(hidden=128, inter=128, experts=8, top_k=2).to(device)

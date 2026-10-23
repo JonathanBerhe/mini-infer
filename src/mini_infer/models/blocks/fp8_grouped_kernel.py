@@ -21,13 +21,20 @@ Two ways to split the work, both without a host sync:
   per column tile. A program runs only where a segment starts: the first
   row of an expert's group, then every `BLOCK_M` rows after it. Each
   segment gets its own program, so the experts of a batch load in parallel.
-- Per row tile, for many rows (prefill). One program computes a
-  `(BLOCK_M, BLOCK_N)` tile. Its rows can belong to several experts, so it
-  walks them in order and masks the rows of the other experts. A grid of one
-  program per row would be mostly idle here.
+- Per expert tile, for many rows (prefill). The kernel cuts the rows of
+  each expert into tiles of `BLOCK_M` and counts them on the GPU. Each
+  program takes one tile of one expert. A grid of one program per row
+  leaves most programs without work here.
+
+A third split, per row tile, stays for benchmarks: a program takes
+`BLOCK_M` sorted rows that can belong to several experts and runs the K
+loop once for each of them.
 
 Rows routed to another rank's experts (expert parallelism) sort after the
 local groups and get zeros.
+
+For many rows on sm90 and sm100, `block_fp8_grouped_mm` calls a Gluon
+kernel of `fp8_grouped_gluon.py` when one takes the operands.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ import os
 import torch
 
 from mini_infer.device import is_blackwell_device, is_cuda_device
+from mini_infer.models.blocks import fp8_grouped_gluon
 
 try:
     import triton
@@ -53,8 +61,8 @@ except ImportError:  # macOS / no-CUDA installs typically lack triton
 Tiles = tuple[int, int, int, int, int]
 
 # Tiles as (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) for three batch
-# sizes: per segment up to `_SMALL_ROWS` rows, per row tile up to
-# `_MEDIUM_ROWS`, and per row tile above. Picked from tile sweeps of the
+# sizes: per segment up to `_SMALL_ROWS` rows, per expert tile up to
+# `_MEDIUM_ROWS`, and per expert tile above. Picked from tile sweeps of the
 # GLM-5.3 layer on an H100 and a B200
 # (`docs/benchmarks/2026-10-21-moe-grouped-gemm.md`). The two GPUs agree on
 # the largest batches only.
@@ -65,15 +73,21 @@ _HOPPER_TILES: tuple[Tiles, Tiles, Tiles] = (
 )
 _BLACKWELL_TILES: tuple[Tiles, Tiles, Tiles] = (
     (16, 128, 64, 4, 3),
-    (64, 128, 64, 4, 4),
+    (64, 256, 64, 8, 3),
     (128, 256, 64, 8, 3),
 )
 _SMALL_ROWS = 256
 _MEDIUM_ROWS = 8192
-# Bench hooks, not a public API: force a tile, the operand order, or the split.
+# Bench hooks, not a public API: force a tile, the operand order, the split,
+# or the Gluon kernel (True: also for few rows, and an error when no Gluon
+# kernel takes the operands. False: never).
 _TILES_FOR_BENCH: Tiles | None = None
 _SWAP_AB_FOR_BENCH: bool | None = None
 _PER_SEGMENT_FOR_BENCH: bool | None = None
+_GLUON_FOR_BENCH: bool | None = None
+# Bench hook: False splits many rows into row tiles that span experts, not
+# into tiles of one expert each (the default).
+_EXPERT_TILES_FOR_BENCH: bool | None = None
 
 
 def supports_block_fp8_grouped_mm(device: torch.device | str) -> bool:
@@ -167,6 +181,14 @@ if _TRITON_AVAILABLE:
                 acc = _dot(a, w_deq, acc, DOT_IN_FP32)
         return acc
 
+    @triton.jit
+    def _group_rows(group_end_ptr, group, num_groups, rows):  # type: ignore[no-untyped-def]
+        """First and end row of group `group`. Group `num_groups` is the off-rank tail."""
+        previous_end = tl.load(group_end_ptr + tl.maximum(group - 1, 0))
+        own_end = tl.load(group_end_ptr + tl.minimum(group, num_groups - 1))
+        start = tl.where(group > 0, previous_end, 0)
+        return start, tl.where(group < num_groups, own_end, rows)
+
     @triton.jit  # type: ignore[untyped-decorator]
     def _block_fp8_grouped_mm_kernel(  # type: ignore[no-untyped-def]
         a_ptr,
@@ -174,6 +196,7 @@ if _TRITON_AVAILABLE:
         s_ptr,
         row_expert_ptr,
         group_end_ptr,
+        tile_end_ptr,
         out_ptr,
         rows,
         n_dim,
@@ -194,6 +217,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         PER_SEGMENT: tl.constexpr,
+        EXPERT_TILES: tl.constexpr,
         SWAP_AB: tl.constexpr,
         DOT_IN_FP32: tl.constexpr,
     ):
@@ -204,25 +228,40 @@ if _TRITON_AVAILABLE:
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        if PER_SEGMENT:
-            start = tl.program_id(0)
-            expert = tl.load(row_expert_ptr + start).to(tl.int32)
-            on_rank = expert < num_groups
-            safe = tl.minimum(expert, num_groups - 1)
-            previous_end = tl.load(group_end_ptr + tl.maximum(safe - 1, 0))
-            own_start = tl.where(safe > 0, previous_end, 0)
-            # Off-rank rows form one last group, from the end of the local ones.
-            group_start = tl.where(on_rank, own_start, tl.load(group_end_ptr + num_groups - 1))
-            group_end = tl.where(on_rank, tl.load(group_end_ptr + safe), rows)
-            leads = (start - group_start) % BLOCK_M == 0
+        if EXPERT_TILES or PER_SEGMENT:
+            if EXPERT_TILES:
+                # `tile_end_ptr[g]` is the end of group g's row tiles. Group
+                # `num_groups` holds the off-rank rows, whose tiles store zeros.
+                tile = tl.program_id(0)
+                active = tile < tl.load(tile_end_ptr + num_groups)
+                # The first group whose tiles end after this one.
+                group = 0
+                high = num_groups
+                while group < high:
+                    middle = (group + high) // 2
+                    before = tl.load(tile_end_ptr + middle) <= tile
+                    group = tl.where(before, middle + 1, group)
+                    high = tl.where(before, high, middle)
+                previous = tl.maximum(group - 1, 0)
+                first_tile = tl.where(group > 0, tl.load(tile_end_ptr + previous), 0)
+                group_start, group_end = _group_rows(group_end_ptr, group, num_groups, rows)
+                start = group_start + (tile - first_tile) * BLOCK_M
+            else:
+                start = tl.program_id(0)
+                # Off-rank rows (expert `num_groups` or more) form one last group.
+                expert = tl.load(row_expert_ptr + start).to(tl.int32)
+                group = tl.minimum(expert, num_groups)
+                group_start, group_end = _group_rows(group_end_ptr, group, num_groups, rows)
+                # A program runs only where a segment starts.
+                active = (start - group_start) % BLOCK_M == 0
             row_end = tl.minimum(start + BLOCK_M, group_end)
             offs_m = start + tl.arange(0, BLOCK_M)
-            if leads & on_rank:
+            if active & (group < num_groups):
                 acc = _expert_rows_dot(
                     acc,
                     a_ptr,
-                    w_ptr + safe.to(tl.int64) * stride_we,
-                    s_ptr + safe.to(tl.int64) * stride_se,
+                    w_ptr + tl.cast(group, tl.int64) * stride_we,
+                    s_ptr + tl.cast(group, tl.int64) * stride_se,
                     offs_m,
                     start,
                     row_end,
@@ -240,7 +279,7 @@ if _TRITON_AVAILABLE:
                     SWAP_AB,
                     DOT_IN_FP32,
                 )
-            row_mask = leads & (offs_m < row_end)
+            row_mask = active & (offs_m < row_end)
         else:
             tile_start = tl.program_id(0) * BLOCK_M
             tile_end = tl.minimum(tile_start + BLOCK_M, rows)
@@ -301,6 +340,7 @@ def block_fp8_grouped_mm(
     block: int,
     row_experts: torch.Tensor,
     group_ends: torch.Tensor,
+    num_experts: int | None = None,
 ) -> torch.Tensor:
     """`rows @ dequant(weight[e]).T` for each row's expert `e`, `(M, K)` -> `(M, N)`.
 
@@ -309,6 +349,10 @@ def block_fp8_grouped_mm(
     row whose expert is `E` or more (another rank's expert) gives zeros.
     `weight` is `(E, N, K)` `float8_e4m3fn` and `scale` its fp32 block scale
     `(E, ceil(N / block), ceil(K / block))`. The result has `rows.dtype`.
+
+    `num_experts` counts the experts of all ranks (default `E`). The Gluon
+    kernels pick their tile from the mean rows per expert over all of them,
+    and they need int32 `group_ends`. Other operands run the Triton kernel.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("block_fp8_grouped_mm needs Triton")
@@ -320,15 +364,44 @@ def block_fp8_grouped_mm(
         raise ValueError(f"rows have K={k_dim} but weight has K={weight_k}")
     if block < 16 or block & (block - 1):
         raise ValueError(f"block={block} must be a power of two of at least 16")
+    small = num_rows <= _SMALL_ROWS
+    per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
+    force_gluon = _GLUON_FOR_BENCH
+    if force_gluon or (force_gluon is None and not per_segment):
+        gluon_tiles = fp8_grouped_gluon.gluon_tiles(
+            rows,
+            weight,
+            block,
+            group_ends,
+            num_experts=num_experts or num_groups,
+            by_default=force_gluon is None,
+        )
+        if gluon_tiles is not None:
+            return fp8_grouped_gluon.gluon_block_fp8_grouped_mm(
+                rows, weight, scale, block=block, group_ends=group_ends, tiles=gluon_tiles
+            )
+        if force_gluon:
+            raise ValueError("_GLUON_FOR_BENCH is set, but no Gluon kernel takes these operands")
     out = torch.empty(num_rows, n_dim, dtype=rows.dtype, device=rows.device)
     if num_rows == 0:
         return out
-    small = num_rows <= _SMALL_ROWS
-    per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
     swap_ab = True if _SWAP_AB_FOR_BENCH is None else _SWAP_AB_FOR_BENCH
     tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows)
     block_m, block_n, tile_k, warps, stages = tiles
-    rows_grid = num_rows if per_segment else triton.cdiv(num_rows, block_m)
+    expert_tiles = not per_segment and _EXPERT_TILES_FOR_BENCH is not False
+    tile_ends = group_ends
+    if expert_tiles:
+        # Row tiles per group, the off-rank tail last, counted on the GPU.
+        counts = torch.diff(
+            group_ends,
+            prepend=group_ends.new_zeros(1),
+            append=group_ends.new_full((1,), num_rows),
+        )
+        tile_ends = torch.cumsum((counts + (block_m - 1)) // block_m, 0, dtype=torch.int32)
+        # At most one partial tile per group and one for the tail.
+        rows_grid = triton.cdiv(num_rows, block_m) + num_groups + 1
+    else:
+        rows_grid = num_rows if per_segment else triton.cdiv(num_rows, block_m)
     grid = (rows_grid, triton.cdiv(n_dim, block_n))
     weight_bytes = weight.view(torch.uint8)
     _block_fp8_grouped_mm_kernel[grid](
@@ -337,6 +410,7 @@ def block_fp8_grouped_mm(
         scale,
         row_experts,
         group_ends,
+        tile_ends,
         out,
         num_rows,
         n_dim,
@@ -358,6 +432,7 @@ def block_fp8_grouped_mm(
         # A power of two no larger than the scale block, so it divides it.
         BLOCK_K=min(tile_k, block),
         PER_SEGMENT=per_segment,
+        EXPERT_TILES=expert_tiles,
         SWAP_AB=swap_ab,
         # Triton's interpreter computes a bf16 `tl.dot` wrongly. bf16 products
         # are exact in fp32, so an fp32 dot gives the same result there.
