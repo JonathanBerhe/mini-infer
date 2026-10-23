@@ -6,11 +6,12 @@ This kernel runs the experts of a layer as one grouped matmul over the
 (token, expert) pairs that `grouped_expert_mlp` sorted by expert, without
 dequantizing a whole expert in memory.
 
-A program loads one expert's packed weight tile, unpacks the nibbles, turns
-each e2m1 code into its bf16 value with integer operations, multiplies by
-the block scale in fp32 and rounds to bf16, as `dequantize_nvfp4_to_bf16`
-does. The tile is the left operand of a bf16 tensor-core dot
-(`out.T = W @ rows.T`), as in `fp8_grouped_kernel.py`.
+A program loads one expert's packed weight tile and one scale per row and
+32 columns. It unpacks the nibbles and moves each e2m1 code's bits into an
+fp32 (its value times 2^-126). Then it multiplies by 2^126 and the scale in
+fp32 and rounds to bf16, as `dequantize_nvfp4_to_bf16` does. The tile is the
+left operand of a bf16 tensor-core dot (`out.T = W @ rows.T`), as in
+`fp8_grouped_kernel.py`. The decode, not the dot, sets the kernel's speed.
 
 The work splits as in the FP8 kernel: one program per expert segment up to
 `_SMALL_ROWS` rows (decode), one program per tile of one expert's rows above
@@ -42,15 +43,15 @@ Tiles = tuple[int, int, int, int, int]
 
 # Tiles as (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) for three batch
 # sizes: per segment up to `_SMALL_ROWS` rows, per expert tile up to
-# `_MEDIUM_ROWS`, and per expert tile above. BLOCK_K is a multiple of the scale
-# block. Start from the FP8 kernel's tables; the V4-Flash sweep sets them.
+# `_MEDIUM_ROWS`, and per expert tile above. BLOCK_K and the scale block nest.
+# Sweeps of the DeepSeek-V4-Flash MoE layer on an H100 and a B200 set them.
 _HOPPER_TILES: tuple[Tiles, Tiles, Tiles] = (
     (16, 64, 128, 4, 3),
-    (64, 128, 128, 4, 3),
+    (64, 128, 64, 4, 4),
     (128, 256, 64, 8, 3),
 )
 _BLACKWELL_TILES: tuple[Tiles, Tiles, Tiles] = (
-    (16, 128, 64, 4, 3),
+    (16, 64, 64, 4, 3),
     (64, 128, 64, 4, 4),
     (128, 256, 64, 8, 3),
 )
@@ -86,19 +87,17 @@ def tiles_for(device: torch.device, num_rows: int) -> Tiles:
 if _TRITON_AVAILABLE:
 
     @triton.jit
-    def _e2m1_to_bf16(code):  # type: ignore[no-untyped-def]
-        """4-bit e2m1 codes (in int32) to their exact bf16 values.
+    def _e2m1_times_tiny(code):  # type: ignore[no-untyped-def]
+        """4-bit e2m1 codes (in int32) to fp32, each its exact value times 2^-126.
 
         e2m1 has a sign bit, 2 exponent bits and 1 mantissa bit:
-        0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives. A normal code maps to
-        bf16 exponent `exp + 126`; the subnormal 0.5 is bf16 `0x3F00`.
+        0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives. Its exponent and
+        mantissa bits go to the low end of the fp32 exponent field and the top
+        of the mantissa. A normal code then reads as `2^(e - 127) (1 + m / 2)`
+        and a subnormal one as `m 2^-127`, both 2^-126 times the e2m1 value.
         """
-        sign = (code >> 3) & 1
-        exp = (code >> 1) & 3
-        man = code & 1
-        normal = ((exp + 126) << 7) | (man << 6)
-        bits = tl.where(exp == 0, man * 0x3F00, normal) | (sign << 15)
-        return bits.to(tl.int16).to(tl.bfloat16, bitcast=True)
+        bits = ((code & 7) << 22) | ((code & 8) << 28)
+        return bits.to(tl.float32, bitcast=True)
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _fp4_weight_tile(  # type: ignore[no-untyped-def]
@@ -115,24 +114,33 @@ if _TRITON_AVAILABLE:
         SBLOCK: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        """`(BLOCK_N, BLOCK_K)` dequantized weight tile, starting at column `k_start`."""
-        offs_byte = k_start // 2 + tl.arange(0, BLOCK_K // 2)
-        byte_ok = offs_byte < k_dim // 2
+        """`(BLOCK_N, BLOCK_K)` dequantized weight tile, starting at column `k_start`.
+
+        The tile is `(BLOCK_N, groups, cols)`, with `cols` columns that share
+        one scale per row. Each scale loads once and broadcasts.
+        """
+        cols: tl.constexpr = BLOCK_K if BLOCK_K < SBLOCK else SBLOCK
+        groups: tl.constexpr = BLOCK_K // cols
+        offs_group = k_start + tl.arange(0, groups) * cols
+        group_ok = offs_group < k_dim
+        offs_byte = offs_group[:, None] // 2 + tl.arange(0, cols // 2)[None, :]
         packed = tl.load(
-            w_base + offs_n[:, None] * stride_wn + offs_byte[None, :] * stride_wk,
-            mask=n_ok[:, None] & byte_ok[None, :],
+            w_base + offs_n[:, None, None] * stride_wn + offs_byte[None, :, :] * stride_wk,
+            mask=n_ok[:, None, None] & group_ok[None, :, None],
             other=0,
         ).to(tl.int32)
-        # Element 2j is the low nibble of byte j, element 2j + 1 the high one.
-        codes = tl.join(packed & 0xF, (packed >> 4) & 0xF)
-        codes = tl.reshape(codes, (codes.shape[0], BLOCK_K))
-        offs_k = k_start + tl.arange(0, BLOCK_K)
         scale = tl.load(
-            s_base + offs_n[:, None] * stride_sn + (offs_k[None, :] // SBLOCK) * stride_sk,
-            mask=n_ok[:, None] & (offs_k < k_dim)[None, :],
+            s_base + offs_n[:, None] * stride_sn + (offs_group[None, :] // SBLOCK) * stride_sk,
+            mask=n_ok[:, None] & group_ok[None, :],
             other=0.0,
         )
-        return (_e2m1_to_bf16(codes).to(tl.float32) * scale).to(tl.bfloat16)
+        # Element 2j is the low nibble of byte j, element 2j + 1 the high one.
+        codes = tl.join(packed & 0xF, packed >> 4)
+        codes = tl.reshape(codes, (codes.shape[0], groups, cols))
+        # Multiplying by 2^126 is exact, so the product rounds once, as in
+        # `dequantize_nvfp4_to_bf16`.
+        values = _e2m1_times_tiny(codes) * 8.507059173023462e37 * scale[:, :, None]
+        return tl.reshape(values, (values.shape[0], BLOCK_K)).to(tl.bfloat16)
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _fp4_rows_dot(  # type: ignore[no-untyped-def]

@@ -105,6 +105,36 @@ def test_kernel_matches_dequantized_matmul(
     torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=_atol(device, want))
 
 
+def test_kernel_with_a_scale_block_wider_than_the_tile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tile of 64 columns inside a scale block of 128 uses one scale per row."""
+    device = _device()
+    monkeypatch.setattr(fp4_grouped_kernel, "_TILES_FOR_BENCH", (16, 32, 64, 4, 2))
+    generator = torch.Generator().manual_seed(3)
+    counts, n_dim, k_dim, block = [5, 0, 11], 32, 256, 128
+    packed = torch.randint(-128, 128, (3, n_dim, k_dim // 2), dtype=torch.int8, generator=generator)
+    scale = torch.rand(3, n_dim, k_dim // block, generator=generator) * 0.02 + 0.01
+    row_experts = torch.repeat_interleave(torch.arange(3), torch.tensor(counts))
+    rows = torch.randn(len(row_experts), k_dim, generator=generator).bfloat16()
+
+    got = block_fp4_grouped_mm(
+        rows.to(device),
+        packed.to(device),
+        scale.to(device),
+        block=block,
+        row_experts=row_experts.to(device),
+        group_ends=torch.tensor(counts).cumsum(0).to(torch.int32).to(device),
+    ).cpu()
+
+    want = torch.stack(
+        [
+            rows[row].float()
+            @ dequantize_nvfp4_to_bf16(packed[e], scale[e], block_size=block).float().T
+            for row, e in enumerate(row_experts.tolist())
+        ]
+    )
+    torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=_atol(device, want))
+
+
 def test_kernel_rejects_a_k_the_scale_block_does_not_divide() -> None:
     device = _device()
     with pytest.raises(ValueError, match="dividing K"):
