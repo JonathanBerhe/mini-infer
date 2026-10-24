@@ -46,6 +46,12 @@ traces; keep them out of the repository. With `--cuda-graph`, each context
 also replays the ragged decode step from a CUDA graph (`DecodeCudaGraph`),
 times and profiles those steps, and compares their tokens with the eager ones.
 
+`--profile-batch` profiles the ragged decode step that the continuous-batching
+server runs, at each batch size of `--batch-sizes` (default 1 and 16). Each
+row prefills its own slice of the passage. The eager step runs with every
+module labelled, so its trace splits the GPU time by part of the model, and
+a CUDA graph of the same step is timed and profiled next to it.
+
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_generate.py
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_generate.py \
@@ -54,6 +60,7 @@ Run with:
     uv run modal run scripts/modal_v4_flash_generate.py --profile-decode \
         --trace-dir /tmp/v4-traces
     uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
+    uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
 """
 
 import os
@@ -80,6 +87,10 @@ _WARMUP_STEPS = 8
 _TIMED_STEPS = 16
 _SYNC_CHECK_STEPS = 4
 _PROFILED_STEPS = 4
+# `--profile-batch`: the cache size of the continuous-batching server bench,
+# and the prompt length of row 0 (row `b` adds 8 tokens per row).
+_BATCH_MAX_SEQ_LEN = 1024
+_BATCH_PROMPT_TOKENS = 24
 # The profiler range around each profiled decode step.
 _STEP_LABEL = "decode_step"
 # Decode methods that run outside `Module.__call__`, so module hooks miss them.
@@ -566,6 +577,76 @@ def _summarize_decode_trace(events: list[dict], top: int = 25) -> dict[str, Any]
     }
 
 
+def _time_steps(run_step: Callable[..., None], on_cuda: bool) -> list[float]:
+    """Run `_WARMUP_STEPS` steps, then return the wall time of `_TIMED_STEPS` steps in ms.
+
+    Each step ends when greedy sampling reads its tokens back to the host, so
+    the time covers the whole step.
+    """
+    import time
+
+    import torch
+
+    for _ in range(_WARMUP_STEPS):
+        run_step()
+    if on_cuda:
+        torch.cuda.synchronize()
+    step_ms = []
+    for _ in range(_TIMED_STEPS):
+        start = time.perf_counter()
+        run_step()
+        step_ms.append((time.perf_counter() - start) * 1e3)
+    return step_ms
+
+
+def _profile_steps(
+    run_step: Callable[..., None],
+    entry: dict[str, Any],
+    *,
+    rank: int,
+    on_cuda: bool,
+    keep_trace: bool,
+    model: Any = None,
+) -> None:
+    """Run `_PROFILED_STEPS` steps; rank 0 profiles them and adds the tables to `entry`.
+
+    Other ranks run the same steps unprofiled, because each step all-reduces
+    across the ranks. With `model`, every module call and decode method of
+    the model gets its own profiler range (`_label_modules`).
+    """
+    import gzip
+    import json
+    import tempfile
+
+    import torch
+
+    if rank != 0:
+        for _ in range(_PROFILED_STEPS):
+            run_step()
+        return
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if on_cuda:
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    restore = _label_modules(model) if model is not None else None
+    try:
+        with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
+            for _ in range(_PROFILED_STEPS):
+                with torch.profiler.record_function(_STEP_LABEL):
+                    run_step(labelled=True)
+            if on_cuda:
+                torch.cuda.synchronize()
+    finally:
+        if restore is not None:
+            restore()
+    _checkpoint(rank, "reducing the trace...")
+    trace_path = Path(tempfile.mkdtemp(prefix="v4-decode-")) / "trace.json"
+    prof.export_chrome_trace(str(trace_path))
+    trace_bytes = trace_path.read_bytes()
+    entry["profile"] = _summarize_decode_trace(json.loads(trace_bytes)["traceEvents"])
+    if keep_trace:
+        entry["trace_gz"] = gzip.compress(trace_bytes)
+
+
 def _profile_one_rank(
     rank: int,
     world_size: int,
@@ -588,10 +669,6 @@ def _profile_one_rank(
     """
     import functools
     import gc
-    import gzip
-    import json
-    import tempfile
-    import time
     import warnings
 
     import torch
@@ -660,44 +737,15 @@ def _profile_one_rank(
         cache.advance_start_pos(len(ids))
         return cache, [sample(logits[0, -1], greedy)]
 
-    def timed(run_step: Callable[..., None]) -> list[float]:
-        """Warm up, then the wall time of each timed step in ms."""
-        for _ in range(_WARMUP_STEPS):
-            run_step()
-        synchronize()
-        step_ms = []
-        for _ in range(_TIMED_STEPS):
-            start = time.perf_counter()
-            run_step()  # ends in the `.item()` of greedy sampling, a host sync
-            step_ms.append((time.perf_counter() - start) * 1e3)
-        return step_ms
-
     def profiled(run_step: Callable[..., None], entry: dict[str, Any], labels: bool) -> None:
-        """Run the profiled steps; rank 0 profiles them and adds the tables to `entry`."""
-        if rank != 0:
-            for _ in range(_PROFILED_STEPS):
-                run_step()
-            return
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if on_cuda:
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        restore = _label_modules(model) if labels else None
-        try:
-            with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
-                for _ in range(_PROFILED_STEPS):
-                    with torch.profiler.record_function(_STEP_LABEL):
-                        run_step(labelled=True)
-                synchronize()
-        finally:
-            if restore is not None:
-                restore()
-        _checkpoint(rank, "reducing the trace...")
-        trace_path = Path(tempfile.mkdtemp(prefix="v4-decode-")) / "trace.json"
-        prof.export_chrome_trace(str(trace_path))
-        trace_bytes = trace_path.read_bytes()
-        entry["profile"] = _summarize_decode_trace(json.loads(trace_bytes)["traceEvents"])
-        if keep_trace:
-            entry["trace_gz"] = gzip.compress(trace_bytes)
+        _profile_steps(
+            run_step,
+            entry,
+            rank=rank,
+            on_cuda=on_cuda,
+            keep_trace=keep_trace,
+            model=model if labels else None,
+        )
 
     n_steps = _WARMUP_STEPS + _TIMED_STEPS + _SYNC_CHECK_STEPS + _PROFILED_STEPS
     results: dict[str, Any] = {"rank": rank, "contexts": {}}
@@ -705,7 +753,10 @@ def _profile_one_rank(
         _checkpoint(rank, f"{context}: prefill {len(ids)} tokens, then decode...")
         cache, tokens = prefill(ids, n_steps)
         run_step = functools.partial(step, cache, tokens)
-        entry: dict[str, Any] = {"context_tokens": len(ids), "step_ms": timed(run_step)}
+        entry: dict[str, Any] = {
+            "context_tokens": len(ids),
+            "step_ms": _time_steps(run_step, on_cuda),
+        }
 
         if rank == 0 and on_cuda:
             torch.cuda.set_sync_debug_mode("warn")
@@ -745,7 +796,7 @@ def _profile_one_rank(
             graph_cache.advance_start_pos(len(ids))
             del prefilled
             run_graph = functools.partial(graph_step, graph, graph_cache, graph_tokens)
-            graph_entry: dict[str, Any] = {"step_ms": timed(run_graph)}
+            graph_entry: dict[str, Any] = {"step_ms": _time_steps(run_graph, on_cuda)}
             for _ in range(_SYNC_CHECK_STEPS):
                 run_graph()
             profiled(run_graph, graph_entry, labels=False)
@@ -765,6 +816,141 @@ def _profile_one_rank(
     results["packed_fp4_layers"] = sum(
         isinstance(block._expert_pack, PackedFp4Experts) for block in moe_blocks
     )
+    return results
+
+
+def _profile_batch_one_rank(
+    rank: int,
+    world_size: int,
+    passage: str,
+    batch_sizes: list[int],
+    keep_trace: bool,
+    device: str | None = None,
+) -> dict[str, Any]:
+    """Per-rank work of `--profile-batch`: the ragged decode step at each batch size.
+
+    Row `b` of a batch prefills its own slice of the passage, of
+    `_BATCH_PROMPT_TOKENS + 8 * b` tokens, so the rows sit at different
+    positions. For each batch size, the eager ragged step runs with every
+    module labelled, which splits its GPU time by part of the model. Then a
+    `DecodeCudaGraph` of the same step runs on a second cache: it is timed and
+    profiled, and its tokens are compared with the eager ones. The graph
+    replays the kernels of the eager step, so the eager split also splits the
+    graph. Rank 0 profiles; rank 1 runs the same steps. `device` defaults to
+    this rank's GPU. A CPU dry run passes `"cpu"`.
+    """
+    import functools
+    import gc
+
+    import torch
+
+    from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph
+    from mini_infer.engine.tokenizer import Tokenizer
+    from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    if device is None:
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+    on_cuda = torch.device(device).type == "cuda"
+    _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    passage_ids = Tokenizer.from_pretrained(_MODEL_NAME).encode(passage)
+
+    def new_cache(batch_size: int) -> Any:
+        return model.build_state_cache(
+            max_seq_len=_BATCH_MAX_SEQ_LEN,
+            batch_size=batch_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+    def prefill_rows(cache: Any, prompts: list[list[int]]) -> list[list[int]]:
+        """Prefill each prompt in its own row; the first token of each row."""
+        tokens = []
+        for row, ids in enumerate(prompts):
+            single = new_cache(1)
+            with torch.inference_mode():
+                logits = model.forward_prefill_with_cache(
+                    torch.tensor([ids], device=device, dtype=torch.long), state_cache=single
+                )
+            cache.copy_row_from(single, src_row=0, dst_row=row)
+            tokens.append([int(logits[0, -1].argmax())])
+        return tokens
+
+    def sample_rows(tokens: list[list[int]], logits: torch.Tensor, labelled: bool) -> None:
+        if labelled:
+            with torch.profiler.record_function("sampling"):
+                next_tokens = logits[:, -1, :].argmax(dim=-1).tolist()
+        else:
+            next_tokens = logits[:, -1, :].argmax(dim=-1).tolist()
+        for row, token in enumerate(next_tokens):
+            tokens[row].append(token)
+
+    # One ragged decode step, as the continuous-batching server runs it.
+    def eager_step(
+        cache: Any, tokens: list[list[int]], start: list[int], labelled: bool = False
+    ) -> None:
+        positions = [first + len(row) - 1 for first, row in zip(start, tokens, strict=True)]
+        with torch.inference_mode():
+            logits = model.forward_decode_with_cache_ragged(
+                torch.tensor([[row[-1]] for row in tokens], device=device, dtype=torch.long),
+                positions=torch.tensor(positions, device=device, dtype=torch.long),
+                state_cache=cache,
+            )
+            sample_rows(tokens, logits, labelled)
+
+    # The same step replayed from the graph; the host inputs are copied in.
+    def graph_step(
+        graph: DecodeCudaGraph,
+        cache: Any,
+        tokens: list[list[int]],
+        start: list[int],
+        labelled: bool = False,
+    ) -> None:
+        positions = [first + len(row) - 1 for first, row in zip(start, tokens, strict=True)]
+        cache.check_capacity(max(positions) + 1)
+        logits = graph.replay(
+            torch.tensor([[row[-1]] for row in tokens], dtype=torch.long),
+            torch.tensor(positions, dtype=torch.long),
+        )
+        sample_rows(tokens, logits, labelled)
+
+    profile = functools.partial(_profile_steps, rank=rank, on_cuda=on_cuda, keep_trace=keep_trace)
+    results: dict[str, Any] = {"rank": rank, "batches": {}}
+    for batch_size in batch_sizes:
+        prompts = [
+            passage_ids[64 * row : 64 * row + _BATCH_PROMPT_TOKENS + 8 * row]
+            for row in range(batch_size)
+        ]
+        start = [len(ids) for ids in prompts]
+        _checkpoint(rank, f"batch {batch_size}: eager ragged step...")
+        cache = new_cache(batch_size)
+        tokens = prefill_rows(cache, prompts)
+        run_eager = functools.partial(eager_step, cache, tokens, start)
+        eager: dict[str, Any] = {"step_ms": _time_steps(run_eager, on_cuda)}
+        profile(run_eager, eager, model=model)
+        del run_eager, cache
+
+        # Capture first: warmup and capture write into the cache rows.
+        _checkpoint(rank, f"batch {batch_size}: capture the step in a CUDA graph...")
+        graph_cache = new_cache(batch_size)
+        graph = DecodeCudaGraph(model, graph_cache, batch_size=batch_size, device=device)
+        graph_tokens = prefill_rows(graph_cache, prompts)
+        run_graph = functools.partial(graph_step, graph, graph_cache, graph_tokens, start)
+        graph_entry: dict[str, Any] = {"step_ms": _time_steps(run_graph, on_cuda)}
+        profile(run_graph, graph_entry)
+        graph_entry["same_tokens_as_eager"] = graph_tokens == tokens
+        # The graph holds captured NCCL work; free it before the process group
+        # goes away, which can otherwise hang.
+        del run_graph, graph, graph_cache
+        gc.collect()
+        if on_cuda:
+            torch.cuda.synchronize()
+        results["batches"][batch_size] = {
+            "prompt_tokens": start,
+            "eager": eager,
+            "graph": graph_entry,
+        }
     return results
 
 
@@ -886,6 +1072,21 @@ def decode_profile(prompt: str, passage: str, keep_trace: bool, cuda_graph: bool
         passage=passage,
         keep_trace=keep_trace,
         cuda_graph=cuda_graph,
+    )
+
+
+@app.function(
+    image=image,
+    gpu=_GPU,
+    # A warm-cache load plus two batch sizes takes about 5 minutes; this caps a hang.
+    timeout=900,
+    secrets=_SECRETS,
+    volumes={"/root/.cache/huggingface": _HF_CACHE},
+)
+def batch_profile(passage: str, batch_sizes: list[int], keep_trace: bool) -> list[dict]:
+    """Eager and graph ragged decode steps per batch size; see `_profile_batch_one_rank`."""
+    return _spawn_ranks(
+        _profile_batch_one_rank, passage=passage, batch_sizes=batch_sizes, keep_trace=keep_trace
     )
 
 
@@ -1016,6 +1217,69 @@ def _print_profile(per_rank: list[dict], trace_dir: str) -> None:
                 print(f"{mode} trace saved to {path} ({size} MiB)")
 
 
+def _print_batch_profile(per_rank: list[dict], trace_dir: str) -> None:
+    """Print the tables of `--profile-batch`, and save the traces to `trace_dir` if set."""
+    import statistics
+
+    batches = per_rank[0]["batches"]
+    sizes = sorted(batches, key=int)
+    print("\nper step: eager ragged step against its CUDA graph (rank 0 profiles)")
+    print(
+        f"{'batch':>5} {'eager ms':>8} {'graph ms':>8} {'graph busy':>10} "
+        f"{'eager ops':>9} {'graph ops':>9}  same tokens"
+    )
+    for size in sizes:
+        eager, graph = batches[size]["eager"], batches[size]["graph"]
+
+        def ops(entry: dict) -> float:
+            steps = entry["profile"]["steps"]
+            return statistics.mean(s["kernels"] + s["memcpys"] + s["memsets"] for s in steps)
+
+        busy = statistics.mean(s["gpu_busy_ms"] for s in graph["profile"]["steps"])
+        print(
+            f"{size:>5} {statistics.median(eager['step_ms']):8.1f} "
+            f"{statistics.median(graph['step_ms']):8.1f} {busy:10.2f} "
+            f"{ops(eager):9.0f} {ops(graph):9.0f}  {graph['same_tokens_as_eager']}"
+        )
+
+    by_size = {
+        size: {row["key"]: row for row in batches[size]["eager"]["profile"]["categories"]}
+        for size in sizes
+    }
+    first, last = sizes[0], sizes[-1]
+    print(f"\neager GPU ms per step by part of the model (batch {first} against {last}):")
+    print(f"{'category':<20} " + " ".join(f"{'b' + str(s):>8}" for s in sizes) + f" {'delta':>8}")
+    for category in sorted(by_size[last], key=lambda c: -by_size[last][c]["gpu_ms"]):
+        values = [by_size[s].get(category, {"gpu_ms": 0.0})["gpu_ms"] for s in sizes]
+        print(
+            f"{category:<20} "
+            + " ".join(f"{v:8.2f}" for v in values)
+            + f" {values[-1] - values[0]:8.2f}"
+        )
+    for size in (first, last):
+        print(f"\ntop profiler ranges by eager GPU time, batch {size}:")
+        for row in batches[size]["eager"]["profile"]["labels"][:15]:
+            label, category = row["key"]
+            print(f"{row['gpu_ms']:8.3f} ms {row['kernels']:7.1f} ops  {label} [{category}]")
+        print(f"\ntop kernels by eager GPU time, batch {size}:")
+        for row in batches[size]["eager"]["profile"]["kernels"][:15]:
+            kernel, op = row["key"]
+            count = f"{row['kernels']:7.1f}x"
+            print(f"{row['gpu_ms']:8.3f} ms {count}  {kernel} ({op}) [{row['category']}]")
+        print(f"\ntop kernels by graph GPU time, batch {size}:")
+        for row in batches[size]["graph"]["profile"]["kernels"][:10]:
+            kernel, _ = row["key"]
+            print(f"{row['gpu_ms']:8.3f} ms {row['kernels']:7.1f}x  {kernel}")
+    for size in sizes:
+        for mode in ("eager", "graph"):
+            holder = batches[size][mode]
+            if trace_dir and "trace_gz" in holder:
+                path = Path(trace_dir) / f"v4-flash-batch{size}-{mode}.json.gz"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(holder["trace_gz"])
+                print(f"{mode} trace of batch {size} saved to {path}")
+
+
 @app.local_entrypoint()
 def main(
     prompt: str = "The capital of France is",
@@ -1023,8 +1287,15 @@ def main(
     compare_paths: bool = False,
     profile_decode: bool = False,
     cuda_graph: bool = False,
+    profile_batch: bool = False,
+    batch_sizes: str = "1,16",
     trace_dir: str = "",
 ) -> None:
+    if profile_batch:
+        sizes = [int(size) for size in batch_sizes.split(",")]
+        per_rank = batch_profile.remote(_PASSAGE.read_text(), sizes, bool(trace_dir))
+        _print_batch_profile(per_rank, trace_dir)
+        return
     if profile_decode:
         per_rank = decode_profile.remote(prompt, _PASSAGE.read_text(), bool(trace_dir), cuda_graph)
         _print_profile(per_rank, trace_dir)
