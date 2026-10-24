@@ -55,8 +55,8 @@ few microseconds to start and end, whatever it computes.
   before the cast, so it rounds differently from the HF order, and its
   reduction order differs too. It gives no bit equality either, and less
   control over the casts.
-- **On for every model.** Each model's outputs would change in the last
-  bit, so each needs its own check. This ADR checks DeepSeek-V4 only.
+- **On for every model.** Each model's outputs change in the last bit
+  then, so each needs its own check. This ADR checks DeepSeek-V4 only.
 
 ## Consequences
 
