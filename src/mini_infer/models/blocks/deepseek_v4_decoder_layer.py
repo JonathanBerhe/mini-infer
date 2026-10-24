@@ -419,7 +419,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         layer_idx: int,
         token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        n_compressed_max: int | None = None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Ragged single-token decode: B requests, each at its own `positions[b]`.
@@ -427,7 +426,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         Per-request counterpart of `forward_decode`. Identical residual / FFN /
         Hyper-Connections structure (those are position-independent); only the
         attention call switches to `forward_decode_ragged`, threading
-        `positions` and the per-layer `n_compressed_max`.
+        `positions`.
         """
         attn = self.self_attn
         if self.use_hyper_connections:
@@ -440,7 +439,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     layer_idx=layer_idx,
                     token_position_embeddings=token_position_embeddings,
                     block_position_embeddings=block_position_embeddings,
-                    n_compressed_max=n_compressed_max,
                 )
 
             return self._forward_hc(
@@ -460,7 +458,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_idx=layer_idx,
             token_position_embeddings=token_position_embeddings,
             block_position_embeddings=block_position_embeddings,
-            n_compressed_max=n_compressed_max,
         )
         hidden_state = residual + x
 

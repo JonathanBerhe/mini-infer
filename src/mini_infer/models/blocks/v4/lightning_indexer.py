@@ -55,10 +55,24 @@ from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4.act_quant import SimulatedActQuant
-from mini_infer.models.blocks.v4.compressor import TokenLevelCompressor
+from mini_infer.models.blocks.v4.compressor import TokenLevelCompressor, write_flushed_blocks
 
 if TYPE_CHECKING:
     from mini_infer.cache.state_cache import _IndexerState
+
+
+def _topk_lower_index_on_ties(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`scores.topk(k)` along the last dim, where equal scores go to the lower index.
+
+    `torch.topk` leaves the order of equal values open, and it changes with the
+    width of the input. The two decode steps score different widths: the scalar
+    step the valid prefix, the ragged step the whole buffer. So exact ties (for
+    example blocks whose ReLU zeroed every head, which score 0) could pick
+    other blocks in each, and a request's tokens would depend on the cache size
+    and the batch. A stable sort breaks the ties by index in both.
+    """
+    values, indices = torch.sort(scores, dim=-1, descending=True, stable=True)
+    return values[..., :k], indices[..., :k]
 
 
 class LightningIndexer(nn.Module):
@@ -426,7 +440,8 @@ class LightningIndexer(nn.Module):
         # index_score: (B, 1, n_valid_compressed) — replicated.
 
         actual_top_k = min(self.top_k, n_valid_compressed)
-        topk_local_idxs = index_score.topk(actual_top_k, dim=-1)[1]  # (B, 1, actual_top_k)
+        # (B, 1, actual_top_k); the lower block wins a tie, as in the ragged step.
+        topk_local_idxs = _topk_lower_index_on_ties(index_score, actual_top_k)[1]
         topk_absolute: torch.Tensor = (topk_local_idxs + compressed_offset).to(torch.int64)
         return topk_absolute
 
@@ -440,24 +455,24 @@ class LightningIndexer(nn.Module):
         token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         compressed_offset: int,
-        n_compressed_max: int,
     ) -> torch.Tensor:
         """Ragged top-k pick: `(B, 1, actual_top_k)`, each row at its own position.
 
         Per-request counterpart of `forward_decode_step`. Drives the indexer's
         own compressor per row (flushing only the rows that close a block),
-        scores every row's Q against the compressed history up to
-        `n_compressed_max`, masks each row's not-yet-valid blocks to `-inf`, and
-        takes `min(top_k, n_compressed_max)` per row. A selected slot whose score
-        is `-inf` (a row with fewer valid blocks than the shared width) is mapped
-        to `-1` so the attention kernel ignores it.
+        scores every row's Q against the whole compressed history buffer, masks
+        each row's not-yet-valid blocks to `-inf`, and takes
+        `min(top_k, max_n_compressed)` per row. A selected slot whose score is
+        `-inf` (a row with fewer valid blocks than that width) is mapped to
+        `-1` so the attention kernel ignores it.
 
-        `actual_top_k = min(top_k, n_compressed_max)` is uniform across rows; a
+        `actual_top_k` is uniform across rows and fixed by the buffer size; a
         row with fewer real blocks simply gets `-1` padding in its tail, which is
         equivalent (for the downstream softmax) to the scalar path's narrower
-        per-request width.
+        per-request width. The step has no host sync and no data-dependent
+        shape, so a CUDA graph can capture it.
         """
-        batch_size, seqlen, _ = hidden_state.shape
+        seqlen = hidden_state.shape[1]
         if seqlen != 1:
             raise ValueError(f"forward_decode_step_ragged expects seqlen=1, got {seqlen}")
         compression_ratio = self.compressor.compression_ratio
@@ -472,22 +487,12 @@ class LightningIndexer(nn.Module):
             cmp_score_state=indexer_state.cmp_score_state,
             block_position_embeddings=block_position_embeddings,
         )
-        if bool(flush_mask.any()):
-            rows = torch.arange(batch_size, device=device)
-            write_slots = positions[flush_mask] // compression_ratio
-            if int(write_slots.max()) >= indexer_state.compressed_kv.shape[1]:
-                raise RuntimeError(
-                    f"indexer compressed history overflow at block {int(write_slots.max())}; "
-                    "raise max_n_compressed"
-                )
-            indexer_state.compressed_kv[rows[flush_mask], write_slots] = (
-                compressed[flush_mask].squeeze(1).to(indexer_state.compressed_kv.dtype)
-            )
+        write_flushed_blocks(
+            indexer_state.compressed_kv, compressed, flush_mask, positions, compression_ratio
+        )
 
-        if n_compressed_max == 0:
-            return torch.empty((batch_size, 1, 0), dtype=torch.int64, device=device)
-
-        compressed_keys = indexer_state.compressed_kv[:, :n_compressed_max]
+        compressed_keys = indexer_state.compressed_kv
+        n_compressed_max = compressed_keys.shape[1]
         per_token_head_weights = self.weights_proj(hidden_state) * self._weight_scale
         per_head_score = relu(torch.einsum("bthd,bkd->bthk", q.float(), compressed_keys.float()))
         local_index_score = (per_head_score * per_token_head_weights.unsqueeze(-1)).sum(dim=2)
@@ -502,8 +507,7 @@ class LightningIndexer(nn.Module):
         index_score = index_score.masked_fill(~valid.unsqueeze(1), float("-inf"))
 
         actual_top_k = min(self.top_k, n_compressed_max)
-        topk_values, topk_local_idxs = index_score.topk(actual_top_k, dim=-1)
+        topk_values, topk_local_idxs = _topk_lower_index_on_ties(index_score, actual_top_k)
         topk_absolute = (topk_local_idxs + compressed_offset).to(torch.int64)
         # A selected slot with -inf score is padding (row had fewer valid blocks).
-        neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
-        return torch.where(torch.isneginf(topk_values), neg_one, topk_absolute)
+        return torch.where(torch.isneginf(topk_values), -1, topk_absolute)
