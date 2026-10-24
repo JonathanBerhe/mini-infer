@@ -585,7 +585,11 @@ class TokenLevelCompressor(nn.Module):
                 flushed, cmp_score_state[:, m:], cmp_score_state[:, :m]
             )
         else:
-            softmax_weights = cmp_score_state.softmax(dim=1)
+            # The softmax runs over the slots, as `.softmax(dim=1)` would, but on
+            # the last dim: there PyTorch spreads it over many thread blocks. Over
+            # dim 1 an HCA block (128 slots) took about 116 µs per layer on a
+            # B200, and this step computes it at every token, not only on flush.
+            softmax_weights = cmp_score_state.transpose(1, 2).softmax(dim=-1).transpose(1, 2)
             compressed = (cmp_kv_state * softmax_weights).sum(dim=1, keepdim=True)
 
         compressed = self.norm(compressed.to(hidden_state.dtype))
