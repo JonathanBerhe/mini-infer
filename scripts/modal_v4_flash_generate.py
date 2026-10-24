@@ -971,7 +971,7 @@ def _compare_w4a8_one_rank(
     batch_sizes: list[int],
     device: str | None = None,
 ) -> dict[str, Any]:
-    """Per-rank work of `--compare-w4a8`: bf16 against e4m3 inputs for the FP4 experts.
+    """Per-rank work of `--compare-fp8-activations`: bf16 against e4m3 inputs for the FP4 experts.
 
     One load. For each mode, the MoE blocks' `fp8_activations` is set (ADR-043;
     a real run sets `DeepseekV4Config.fp4_fp8_activations`), then:
@@ -1435,7 +1435,7 @@ def _print_batch_profile(per_rank: list[dict], trace_dir: str) -> None:
 
 
 def _print_w4a8(per_rank: list[dict]) -> None:
-    """Print the tables of `--compare-w4a8`."""
+    """Print the tables of `--compare-fp8-activations`."""
     import math
 
     rank0 = per_rank[0]
