@@ -128,6 +128,7 @@ def _grouped_matmul(
             block=weight.block,
             row_experts=row_experts,
             group_ends=offs,
+            num_experts=num_experts,
         )
     return functional.grouped_mm(rows, weight.transpose(-2, -1), offs=offs)
 
