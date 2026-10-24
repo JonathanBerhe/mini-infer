@@ -667,6 +667,23 @@ def test_fp4_fp8_activations_default_to_auto_and_need_fp4_experts() -> None:
         dataclasses.replace(_make_moe_hybrid_config(), fp4_fp8_activations=True)
 
 
+@pytest.mark.parametrize("fused", [True, False])
+def test_fused_rms_norm_reaches_every_norm(fused: bool) -> None:
+    """ADR-045: the config switch sets every RMSNorm and every attention q-norm."""
+    from mini_infer.models.blocks.csa import CSAAttention
+    from mini_infer.models.blocks.hca import HCAAttention
+    from mini_infer.models.blocks.rmsnorm import RMSNorm
+
+    assert DeepseekV4Config.fused_rms_norm  # on by default
+    cfg = dataclasses.replace(_make_moe_hybrid_config(), fused_rms_norm=fused)
+    modules = list(DeepseekV4ForCausalLM(cfg).modules())
+    norms = [m for m in modules if isinstance(m, RMSNorm)]
+    attention = [m for m in modules if isinstance(m, CSAAttention | HCAAttention)]
+    assert norms and attention
+    assert all(norm.fused is fused for norm in norms)
+    assert all(block.fused_q_norm is fused for block in attention)
+
+
 @pytest.mark.parametrize("expert_dtype", ["bf16", "fp4"])
 def test_moe_swiglu_limit_reaches_every_expert(expert_dtype: str) -> None:
     """`moe_swiglu_limit` clamps routed and shared experts alike; 0 keeps plain SwiGLU."""
