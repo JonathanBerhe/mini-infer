@@ -22,6 +22,7 @@ from mini_infer.models.blocks.fp4_expert import PackedFp4Experts
 from mini_infer.models.blocks.fp4_grouped_kernel import (
     block_fp4_grouped_mm,
     quantize_e4m3_rows,
+    supports_native_w4a8,
     to_e8m0,
 )
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
@@ -287,11 +288,15 @@ def test_fp4_moe_grouped_matches_loop(
     torch.testing.assert_close(grouped.float(), looped.float(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("fp8_activations", [True, None])
 @pytest.mark.parametrize("tokens", [1, 5, 100])
 def test_fp4_moe_fp8_activations_stay_near_the_bf16_loop(
-    monkeypatch: pytest.MonkeyPatch, tokens: int
+    monkeypatch: pytest.MonkeyPatch, tokens: int, fp8_activations: bool | None
 ) -> None:
-    """W4A8 rounds each expert input to e4m3; the rest of the math is the bf16 path's."""
+    """W4A8 rounds each expert input to e4m3; the rest of the math is the bf16 path's.
+
+    None (auto) takes W4A8 only on a GPU that runs it natively (sm100).
+    """
     device = _device()
     torch.manual_seed(1)
     moe = HashRoutedMoEFFN(
@@ -303,7 +308,7 @@ def test_fp4_moe_fp8_activations_stay_near_the_bf16_loop(
         n_shared_experts=1,
         expert_dtype="fp4",
         swiglu_limit=10.0,
-        fp8_activations=True,
+        fp8_activations=fp8_activations,
     ).eval()
     generator = torch.Generator().manual_seed(2)
     with torch.no_grad():
@@ -325,8 +330,10 @@ def test_fp4_moe_fp8_activations_stay_near_the_bf16_loop(
     with torch.no_grad():
         grouped = moe(hidden).float()
     pack = moe._expert_pack
-    assert isinstance(pack, PackedFp4Experts) and pack.fp8_activations
-    assert pack.gate_up.e8m0_scale is not None and pack.down.e8m0_scale is not None
+    w4a8 = fp8_activations or supports_native_w4a8(device)
+    assert isinstance(pack, PackedFp4Experts) and pack.fp8_activations is w4a8
+    assert (pack.gate_up.e8m0_scale is not None) is w4a8
+    assert (pack.down.e8m0_scale is not None) is w4a8
     error = float((grouped - looped).norm() / looped.norm())
     # About 2^-5 per e4m3 rounding. The interpreter's faulty e4m3 cast (see
     # the quantizer test) adds a few values off by up to 2x.

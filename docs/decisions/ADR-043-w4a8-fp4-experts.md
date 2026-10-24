@@ -1,7 +1,7 @@
-# ADR-043: Opt-in W4A8 for the FP4 MoE experts
+# ADR-043: W4A8 for the FP4 MoE experts on Blackwell
 
 Date: 2026-10-24
-Status: Accepted (opt-in, off by default)
+Status: Accepted (on by default on sm100)
 
 ## Context
 
@@ -61,23 +61,29 @@ inputs.
    scales. The block of 32 matches the weight scales and is finer than the
    reference's 128.
 4. **e8m0 weight scales next to the fp32 ones.** `PackedFp4Experts` keeps a
-   byte copy of each scale when the mode is on (`to_e8m0`). It refuses a
-   scale that is not a power of two. The V4 checkpoints store e8m0 scales,
-   so the copy is exact.
-5. **Opt in.** `DeepseekV4Config.fp4_fp8_activations` (default False) turns
-   the mode on for every routed-expert block. It needs `expert_dtype="fp4"`.
-   Only the grouped path changes: the per-expert loop keeps bf16 inputs.
+   byte copy of each scale when the mode is on. The V4 checkpoints store
+   e8m0 scales, so the copy is exact.
+5. **On by default where it is native.** `DeepseekV4Config.fp4_fp8_activations`
+   is None by default, which means auto. Auto turns the mode on where
+   `supports_native_w4a8(device)` is true (sm100: B200, B300) and every
+   expert scale is a power of two. Elsewhere, or with other scales, the
+   experts keep bf16 inputs. True forces the mode and raises on a scale that
+   is not a power of two. False keeps bf16 inputs. Only the grouped path
+   changes: the per-expert loop keeps bf16 inputs. The pack checks the
+   scales once, when it is built, so a forward does not read them back.
 
 ## Alternatives Considered
 
 - **A cheaper bf16 decode.** An fp16 decode, other tiles and splits along K
   gained 12% at most at 16 tokens in the probe. The decode instructions
   stay.
-- **Turn it on by default now.** The FP8 inputs change the numbers of every
-  expert matmul. In the probe, the largest error of one projection against
-  an fp32 reference on the bf16 inputs grew from 0.3% to 2.6% of the
-  largest output. The real-model check below decides the default, in a
-  separate change.
+- **Keep it opt-in.** The FP8 inputs change the numbers of every expert
+  matmul. In the probe, the largest error of one projection against an fp32
+  reference on the bf16 inputs grew from 0.3% to 2.6% of the largest
+  output. But on the real model the passage perplexity and the greedy
+  tokens did not get worse (below), so the default follows the speed.
+- **On by default on every GPU.** Hopper emulates `tl.dot_scaled`, and the
+  emulation costs more instructions per weight than the bf16 decode (below).
 - **`torch.nn.functional.scaled_grouped_mm`.** It takes MXFP4 weights only
   with MXFP4 inputs, which lose more than e4m3 inputs, and it runs only on
   Blackwell.
@@ -110,11 +116,16 @@ the passage.
   layer, 86 per step, and its time is inside these numbers.
 - At batch 1 the step is 0.8 ms faster (1.02x). The FP4 kernel takes only
   about 3.6 ms of a batch-1 step.
-- The default stays off in this change.
+- Every V4 run on a B200 with the released checkpoint now takes e4m3 expert
+  inputs: the two-GPU server, the serving script and the profile modes.
+  `scripts/modal_v4_flash_generate.py --compare-paths` sets bf16 inputs on
+  both paths, so it still compares the grouped path with the loop alone.
 - On Hopper the mode does more work per weight than the bf16 decode. The
   emulated `tl.dot_scaled` costs 9.9 to 15.3 instructions per weight in the
   sm90 K loop, against 8.3 to 8.5 for the bf16 decode. The H100 tests pass,
-  but no H100 timing exists. Keep the mode off on Hopper.
+  but no H100 timing exists. Auto keeps the mode off there.
+- Test models with random scales keep bf16 inputs under auto, because their
+  scales are not powers of two.
 - `tests/unit/test_fp4_grouped_kernel.py` checks the quantizer scales, the
   W4A8 kernel against fp32 math on its own e4m3 inputs for both row splits,
   and a full MoE layer against the bf16 loop.

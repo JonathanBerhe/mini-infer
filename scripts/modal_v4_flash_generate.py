@@ -55,7 +55,8 @@ a CUDA graph of the same step is timed and profiled next to it.
 `--compare-fp8-activations` runs the FP4 experts with bf16 inputs and then with
 e4m3 inputs (W4A8, ADR-043) on one load, and reports the passage perplexity,
 the argmax agreement, the greedy tokens and the graph step time per batch
-size of each.
+size of each. `--compare-paths` keeps bf16 inputs on both paths. The other
+modes run the model's default, which is e4m3 inputs on a B200.
 
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_generate.py
@@ -238,6 +239,10 @@ def _compare_one_rank(
     tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
     generator = StateCacheGenerator(model, tokenizer)
     moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
+    # The loop keeps bf16 inputs, so the grouped path does too: this compares
+    # the two matmul paths, and `--compare-fp8-activations` the input precision.
+    for block in moe_blocks:
+        block.fp8_activations = False
     prompt_ids = tokenizer.encode(prompt)
     passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
 
@@ -974,7 +979,8 @@ def _compare_w4a8_one_rank(
     """Per-rank work of `--compare-fp8-activations`: bf16 against e4m3 inputs for the FP4 experts.
 
     One load. For each mode, the MoE blocks' `fp8_activations` is set (ADR-043;
-    a real run sets `DeepseekV4Config.fp4_fp8_activations`), then:
+    the model's own setting comes from `DeepseekV4Config.fp4_fp8_activations`
+    and is restored at the end), then:
       - the passage prefills once; its next-token NLL gives a perplexity, and
         the argmax at every position is kept to compare the modes;
       - a `DecodeCudaGraph` at batch 1 greedy-decodes the prompt;
@@ -1001,6 +1007,7 @@ def _compare_w4a8_one_rank(
     model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
     tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
     moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
+    settings = [block.fp8_activations for block in moe_blocks]
     prompt_ids = tokenizer.encode(prompt)
     passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
 
@@ -1076,8 +1083,8 @@ def _compare_w4a8_one_rank(
             _, step_ms = graph_decode(prompts, _WARMUP_STEPS + _TIMED_STEPS)
             entry["step_ms"][batch_size] = statistics.median(step_ms[_WARMUP_STEPS:])
         results["modes"][mode] = entry
-    for block in moe_blocks:
-        block.fp8_activations = False
+    for block, setting in zip(moe_blocks, settings, strict=True):
+        block.fp8_activations = setting
     bf16, w4a8 = results["modes"]["bf16"], results["modes"]["w4a8"]
     pairs = enumerate(zip(bf16["greedy"][0], w4a8["greedy"][0], strict=True))
     results["first_divergence"] = next((i for i, (a, b) in pairs if a != b), None)

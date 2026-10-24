@@ -45,7 +45,10 @@ from mini_infer.distributed.comm import all_reduce_sum
 from mini_infer.distributed.linear import _split_size
 from mini_infer.models.blocks.activations import expert_swiglu
 from mini_infer.models.blocks.fp4_expert import FP4Expert, PackedFp4Experts
-from mini_infer.models.blocks.fp4_grouped_kernel import supports_block_fp4_grouped_mm
+from mini_infer.models.blocks.fp4_grouped_kernel import (
+    supports_block_fp4_grouped_mm,
+    supports_native_w4a8,
+)
 from mini_infer.models.blocks.grouped_experts import supports_grouped_experts
 from mini_infer.models.blocks.hash_routed_gate import (
     HashRoutedGate,
@@ -77,7 +80,7 @@ class HashRoutedMoEFFN(nn.Module):
         expert_dtype: str = "bf16",
         act_quant: SimulatedActQuant | None = None,
         swiglu_limit: float = 0.0,
-        fp8_activations: bool = False,
+        fp8_activations: bool | None = False,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -123,6 +126,8 @@ class HashRoutedMoEFFN(nn.Module):
         self.swiglu_limit = swiglu_limit
         # W4A8 for the grouped FP4 experts (ADR-043): each projection's input is
         # quantized to e4m3 with e8m0 scales per 32 columns. The loop keeps bf16.
+        # None turns it on where it is native (`supports_native_w4a8`) and every
+        # expert scale is a power of two.
         if fp8_activations and expert_dtype != "fp4":
             raise ValueError("fp8_activations needs expert_dtype='fp4'")
         self.fp8_activations = fp8_activations
@@ -246,8 +251,11 @@ class HashRoutedMoEFFN(nn.Module):
             self._expert_pack = PackedSwigluExperts.current(bf16_pack, self.experts)
             return self._expert_pack
         fp4_pack = pack if isinstance(pack, PackedFp4Experts) else None
+        fp8_activations = self.fp8_activations
+        if fp8_activations is None and not supports_native_w4a8(flat.device):
+            fp8_activations = False
         self._expert_pack = PackedFp4Experts.current(
-            fp4_pack, self.experts, fp8_activations=self.fp8_activations
+            fp4_pack, self.experts, fp8_activations=fp8_activations
         )
         return self._expert_pack
 

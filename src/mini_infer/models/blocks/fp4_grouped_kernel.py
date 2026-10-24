@@ -33,7 +33,7 @@ import os
 
 import torch
 
-from mini_infer.device import is_blackwell_device, is_cuda_device
+from mini_infer.device import is_blackwell_device, is_cuda_device, is_datacenter_blackwell_device
 
 try:
     import triton
@@ -89,6 +89,15 @@ _EXPERT_TILES_FOR_BENCH: bool | None = None
 def supports_block_fp4_grouped_mm(device: torch.device | str) -> bool:
     """Whether `block_fp4_grouped_mm` can run on this device."""
     return _TRITON_AVAILABLE and is_cuda_device(device)
+
+
+def supports_native_w4a8(device: torch.device | str) -> bool:
+    """Whether the W4A8 mode runs on native MX tensor cores here (sm100: B200, B300).
+
+    Elsewhere Triton emulates `tl.dot_scaled`, which costs more instructions
+    per weight than the bf16 decode (ADR-043).
+    """
+    return _TRITON_AVAILABLE and is_datacenter_blackwell_device(device)
 
 
 @functools.cache
@@ -481,17 +490,25 @@ def quantize_e4m3_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, s
 
 
-def to_e8m0(scale: torch.Tensor) -> torch.Tensor:
+def e8m0_scales(scale: torch.Tensor) -> torch.Tensor | None:
     """fp32 power-of-two scales as e8m0 bytes (their exponent fields).
 
-    Raises if a scale is not a positive normal power of two, since e8m0 holds
+    `None` if a scale is not a positive normal power of two, since e8m0 holds
     nothing else. This check reads the scales back to the host once.
     """
     bits = scale.contiguous().view(torch.int32)
     exponent = (bits >> 23) & 0xFF
     if bool(((bits & 0x807FFFFF) != 0).any() | (exponent == 0).any() | (exponent == 0xFF).any()):
-        raise ValueError("e8m0 scales need every FP4 scale to be a positive power of two")
+        return None
     return exponent.to(torch.uint8)
+
+
+def to_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """`e8m0_scales`, but raises if a scale is not a positive power of two."""
+    exponents = e8m0_scales(scale)
+    if exponents is None:
+        raise ValueError("e8m0 scales need every FP4 scale to be a positive power of two")
+    return exponents
 
 
 def block_fp4_grouped_mm(

@@ -107,7 +107,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # V4 `swiglu_limit`: clamp every expert's gate/up projections (0 = off).
         moe_swiglu_limit: float = 0.0,
         # W4A8 for grouped FP4 experts (ADR-043); see `DeepseekV4Config`.
-        fp4_fp8_activations: bool = False,
+        fp4_fp8_activations: bool | None = None,
         # Hyper-Connections knobs. Defaults disable HC -> vanilla pre-norm
         # residuals are used.
         use_hyper_connections: bool = False,

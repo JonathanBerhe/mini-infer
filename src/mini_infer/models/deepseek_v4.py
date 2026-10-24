@@ -401,9 +401,11 @@ class DeepseekV4Config:
     # W4A8 for the FP4 routed experts on the grouped path (ADR-043): quantize
     # each projection's input to e4m3 with one power-of-two scale per 32
     # columns, so `tl.dot_scaled` takes the packed weights without a software
-    # decode. Fast on Blackwell. Off (default): bf16 inputs. Needs
-    # `expert_dtype="fp4"` and power-of-two expert scales.
-    fp4_fp8_activations: bool = False
+    # decode. None (default): on where the tensor cores run it natively
+    # (sm100) and every expert scale is a power of two, else bf16 inputs.
+    # True forces it (and needs `expert_dtype="fp4"` and power-of-two scales).
+    # False keeps bf16 inputs.
+    fp4_fp8_activations: bool | None = None
     # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
     # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
     # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
@@ -634,8 +636,8 @@ class DeepseekV4Config:
             n_shared_experts=int(_pick("n_shared_experts", default_value=0)),
             expert_dtype=_detect_expert_dtype(cfg_dict, _pick("expert_dtype", default_value=None)),
             moe_swiglu_limit=float(_pick("moe_swiglu_limit", "swiglu_limit", default_value=0.0)),
-            # Not part of the HF schema: off unless a caller's config dict opts in.
-            fp4_fp8_activations=bool(_pick("fp4_fp8_activations", default_value=False)),
+            # Not part of the HF schema: auto unless a caller's config dict sets it.
+            fp4_fp8_activations=_pick("fp4_fp8_activations", default_value=None),
             # Hyper-Connections. V4-Flash sets `hc_mult=4`.
             use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
             hc_mult=int(_pick("hc_mult", default_value=0)),

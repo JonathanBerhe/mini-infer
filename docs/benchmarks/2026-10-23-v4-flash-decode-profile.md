@@ -282,8 +282,8 @@ memory reads.
 
 ## FP8 expert inputs at batch 16
 
-[ADR-043](../decisions/ADR-043-w4a8-fp4-experts.md) adds an opt-in mode
-that quantizes the expert inputs to e4m3 and runs the FP4 matmuls on the
+[ADR-043](../decisions/ADR-043-w4a8-fp4-experts.md) adds a mode that
+quantizes the expert inputs to e4m3 and runs the FP4 matmuls on the
 Blackwell tensor cores without the software decode.
 `scripts/modal_v4_flash_generate.py --compare-fp8-activations` runs both
 modes on one load:
@@ -298,8 +298,8 @@ The two modes give the same 33 greedy tokens and the same next token at
 95.1% of the passage positions. The bf16 step at batch 16 is 2.1 ms faster
 than in the section above. Between the two runs, the only change to the
 bf16 path is the HCA compressor softmax, which now runs over the last
-dimension. Above, that softmax cost 2.3 ms per step. The mode stays off by
-default.
+dimension. Above, that softmax cost 2.3 ms per step. The mode is now on by
+default on sm100 GPUs such as the B200.
 
 ## How it is measured
 
