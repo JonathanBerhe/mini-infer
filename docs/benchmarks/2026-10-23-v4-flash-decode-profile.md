@@ -326,6 +326,28 @@ load, with the FP4 experts on W4A8:
 The outputs are bit-identical: the same NLL, the same last logits and the
 same 33 greedy tokens.
 
+## RMS norms
+
+The same traces show 1,916 copy kernels per step at batch 16 (5.3 ms),
+almost all dtype casts, and about half of them inside RMS norms. A step
+runs 235 `RMSNorm` calls of 8 kernels each (3.5 ms at batch 1, 5.2 ms at
+batch 16) and 43 per-head q-norms of 7 kernels each (about 0.7 ms).
+
+[ADR-045](../decisions/ADR-045-fused-rms-norm.md) runs each norm as one
+Triton kernel. Its sum runs in another order than PyTorch's, so it is not
+bit-identical. `scripts/modal_v4_flash_generate.py --compare-fused-norm`
+runs both on one load, with W4A8 and the fused RoPE:
+
+| Measure | PyTorch norms | Fused kernel |
+|---|---:|---:|
+| Passage perplexity (2,048 tokens) | 7.845 | 7.874 |
+| Graph step, batch 1 | 30.2 ms | 27.1 ms |
+| Graph step, batch 16 | 41.9 ms | 37.0 ms |
+
+The perplexity is 0.37% higher, within the 1% bar of ADR-043. The 33
+greedy tokens are the same, and the next token agrees at 95.0% of the
+passage positions.
+
 ## How it is measured
 
 For each context, each rank prefills the context and runs 8 warm-up decode
@@ -391,6 +413,10 @@ uv run modal run scripts/modal_v4_flash_generate.py --compare-fp8-activations
 
 ```bash
 uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-rope
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-norm
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).
