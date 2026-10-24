@@ -67,6 +67,33 @@ parts of that design.
 
 ## Consequences
 
+Measured on 2x B200, real V4-Flash, in one container
+(`scripts/modal_v4_flash_cb_bench.py --host-gap`). The container ran the
+same benchmark twice: first with the package of commit e18778b, which has the
+probe but the old sampling and broadcast, then with this change. Each batch
+size serves greedy requests of 64 tokens through the scheduler, after an
+untimed round. The worst gap is the largest of the 63 decode steps. Each
+other value is their median.
+
+| Batch | Host gap, before | Host gap, after | Worst gap, before | Worst gap, after | Step, before | Step, after |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.65 ms | 0.41 ms | 4.61 ms | 0.59 ms | 27.53 ms | 27.37 ms |
+| 8 | 1.19 ms | 0.56 ms | 4.41 ms | 0.76 ms | 35.89 ms | 35.39 ms |
+| 16 | 1.65 ms | 0.65 ms | 2.13 ms | 0.99 ms | 41.15 ms | 40.13 ms |
+
+- The host gap was already small: the graph replay was 96% of the step at
+  batch 16. The change takes 1.0 ms off the gap at batch 16, so the step is
+  2.5% faster (388.8 to 398.7 tokens per second). At batch 1 the step is
+  0.6% faster.
+- The worst gap goes from 4.6 ms to below 1 ms.
+- The replay time does not change (39.46 and 39.49 ms at batch 16). The GPU
+  work of the step is now the only large part. The replay times are not
+  comparable with ADR-045, which timed another script and workload.
+- The digest of all generated tokens is the same before and after at every
+  batch size.
+- This run does not split the remaining 0.4 to 0.65 ms of gap. It holds the
+  one host sync, the bookkeeping of the scheduler (it decodes the text of
+  each request every step), the gloo broadcast and the input copies.
 - A steady decode step now has one host sync on the leader: the copy of the
   sampled ids. The follower has none. The prefill of a new request and the
   eager (no graph) step keep their syncs.
@@ -83,4 +110,3 @@ parts of that design.
   idle for longer than the timeout can lose its follower.
 - The single-GPU `StateCacheContinuousScheduler` still samples one row at a
   time. `sample_batch` can replace that loop too.
-- No GPU run measured the host gap for this ADR yet.
