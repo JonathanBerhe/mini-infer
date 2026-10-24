@@ -18,6 +18,10 @@ The work splits as in the FP8 kernel: one program per expert segment up to
 (prefill). A third split, per row tile across experts, stays for benchmarks.
 Rows routed to another rank's experts sort after the local groups and get
 zeros.
+
+On sm90 and sm100, many rows go to the Gluon kernels of
+`fp4_grouped_gluon.py` when one takes the operands. They decode a weight
+tile while the tensor cores multiply the previous one.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import os
 import torch
 
 from mini_infer.device import is_blackwell_device, is_cuda_device
+from mini_infer.models.blocks import fp4_grouped_gluon
 
 try:
     import triton
@@ -63,6 +68,9 @@ _PER_SEGMENT_FOR_BENCH: bool | None = None
 # Bench hook: False splits many rows into row tiles that span experts, not
 # into tiles of one expert each (the default).
 _EXPERT_TILES_FOR_BENCH: bool | None = None
+# Bench hook: True forces a Gluon kernel (and fails when none takes the
+# operands), False keeps the Triton kernel, None picks by default.
+_GLUON_FOR_BENCH: bool | None = None
 
 
 def supports_block_fp4_grouped_mm(device: torch.device | str) -> bool:
@@ -360,6 +368,7 @@ def block_fp4_grouped_mm(
     block: int,
     row_experts: torch.Tensor,
     group_ends: torch.Tensor,
+    num_experts: int | None = None,
 ) -> torch.Tensor:
     """`rows @ dequant(packed[e]).T` for each row's expert `e`, `(M, K)` -> `(M, N)`.
 
@@ -369,6 +378,9 @@ def block_fp4_grouped_mm(
     `packed` is `(E, N, K / 2)` bytes of e2m1 pairs (low nibble first) and
     `scale` its fp32 scale per row and `block` columns, `(E, N, K / block)`.
     The result has `rows.dtype`.
+
+    `num_experts` counts the experts of all ranks (default `E`). The Gluon
+    kernels pick their tile from the mean rows per expert over all of them.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("block_fp4_grouped_mm needs Triton")
@@ -385,6 +397,23 @@ def block_fp4_grouped_mm(
         return out
     small = num_rows <= _SMALL_ROWS
     per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
+    force_gluon = _GLUON_FOR_BENCH
+    if force_gluon or (force_gluon is None and not per_segment):
+        gluon_tiles = fp4_grouped_gluon.gluon_tiles(
+            rows,
+            packed,
+            scale,
+            block,
+            group_ends,
+            num_experts=num_experts or num_groups,
+            by_default=force_gluon is None,
+        )
+        if gluon_tiles is not None:
+            return fp4_grouped_gluon.gluon_block_fp4_grouped_mm(
+                rows, packed, scale, group_ends=group_ends, tiles=gluon_tiles
+            )
+        if force_gluon:
+            raise ValueError("_GLUON_FOR_BENCH is set, but no Gluon kernel takes these operands")
     tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows)
     block_m, block_n, block_k, warps, stages = tiles
     if block_k % block and block % block_k:

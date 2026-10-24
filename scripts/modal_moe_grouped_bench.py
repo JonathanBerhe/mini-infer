@@ -41,8 +41,9 @@ compares the Gluon kernels of `fp8_grouped_gluon.py` with the Triton one
 (`fp8_gluon_bench`). `--fp8-expert-tiles` compares the Triton kernel's row
 tiles with tiles of one expert each, on any GPU (`fp8_expert_tiles_bench`).
 `--fp4` runs the unit tests and the DeepSeek-V4-Flash routed MoE with FP4
-experts, loop against grouped (`fp4_bench`). `--tests-only` runs only the
-unit tests of step 0.
+experts, loop against grouped (`fp4_bench`). `--fp4-gluon` compares the
+Gluon kernels of `fp4_grouped_gluon.py` with the FP4 Triton kernel on that
+layer (`fp4_gluon_bench`). `--tests-only` runs only the unit tests of step 0.
 Add `--out-dir <dir>` to keep the report and traces there (default: a new
 temporary directory). Dry run with tiny sizes on this machine (needs
 the Nemotron 3 Nano 4B tokenizer in the local Hugging Face cache; the FP8
@@ -89,6 +90,7 @@ _GPU_TESTS = [
     "tests/unit/test_fp8_grouped_gluon.py",
     "tests/unit/test_grouped_experts.py",
     "tests/unit/test_fp4_grouped_kernel.py",
+    "tests/unit/test_fp4_grouped_gluon.py",
     "tests/unit/test_fp4_grouped.py",
 ]
 # A deadlocked kernel never returns. The tests stop after this many seconds.
@@ -816,8 +818,18 @@ def fp4_bench(
     del layer
     if cuda:
         torch.cuda.empty_cache()
+    lines += _v4_bf16_target(spec, device, dtype, token_counts, graph_tokens)
+    return lines
 
-    lines += [
+
+def _v4_bf16_target(
+    spec: dict[str, Any], device: str, dtype: Any, token_counts: list[int], graph_tokens: list[int]
+) -> list[str]:
+    """The V4-Flash layer with bf16 experts on `grouped_mm`, eager and as a graph replay."""
+    import torch
+
+    cuda = device.startswith("cuda")
+    lines = [
         "",
         "## Target: the same layer with bf16 experts on grouped_mm (wall ms per forward)",
         "   tokens |     eager |     graph",
@@ -840,6 +852,196 @@ def fp4_bench(
     if cuda:
         torch.cuda.empty_cache()
     return lines
+
+
+# The FP4 Gluon kernels against the FP4 Triton kernel (`--fp4-gluon`).
+FP4_GLUON_TOKENS = [256, 1024, 2048, 4096, 8192, 16384]
+FP4_GLUON_SWEEP_TOKENS = [1024, 4096, 16384]
+# (BLOCK_W, BLOCK_T, BLOCK_K, warps, stages, warp specialization).
+FP4_GLUON_TILES = [
+    (128, 64, 64, 4, 4, True),
+    (128, 128, 64, 8, 4, True),
+    (128, 128, 128, 8, 3, True),
+    (128, 256, 64, 8, 3, True),
+    (128, 256, 64, 8, 4, True),
+    (128, 256, 128, 8, 2, True),
+]
+# On sm100 `warps` counts the dequantization warps: one warpgroup (4) or two
+# that take turns on the K steps (8).
+FP4_GLUON_BLACKWELL_TILES = [
+    (128, 128, 128, 4, 4, True),
+    (128, 128, 64, 8, 4, True),
+    (128, 128, 128, 8, 4, True),
+    (128, 256, 64, 4, 3, True),
+    (128, 256, 64, 8, 3, True),
+    (128, 256, 64, 8, 4, True),
+]
+# The best Triton tile at 16384 tokens in the 2026-10-23 profile on a B200.
+FP4_TRITON_LARGE_TILE = (256, 128, 64, 8, 4)
+
+
+def _fp4_kernels_alone(spec: dict[str, Any], device: str, tokens: int) -> list[str]:
+    """Both projections of the V4-Flash layer alone at `tokens`, per kernel.
+
+    Random routing over the experts, CUDA-event milliseconds (median of 10).
+    """
+    import torch
+    from torch.nn import functional
+
+    from mini_infer.models.blocks import fp4_grouped_kernel as kernel
+
+    torch.manual_seed(0)
+    experts, hidden, inter, top_k = (spec[key] for key in ("experts", "hidden", "inter", "top_k"))
+    sorted_ids = torch.randint(0, experts, (tokens * top_k,), device=device).sort().values
+    bounds = torch.arange(experts, device=device)
+    group_ends = torch.searchsorted(sorted_ids, bounds, right=True).to(torch.int32)
+    x = torch.randn(tokens * top_k, hidden, device=device, dtype=torch.bfloat16)
+    h = torch.randn(tokens * top_k, inter, device=device, dtype=torch.bfloat16)
+
+    def fp4(n_dim: int, k_dim: int) -> tuple[Any, Any]:
+        packed = torch.randint(-128, 128, (experts, n_dim, k_dim // 2), dtype=torch.int8)
+        scale = torch.exp2(torch.randint(-8, -5, (experts, n_dim, k_dim // 32)).float())
+        return packed.to(device), scale.to(device)
+
+    gate_up, down = fp4(2 * inter, hidden), fp4(hidden, inter)
+
+    def fp4_pair(gluon: bool, tiles: Any = None) -> Any:
+        def run() -> Any:
+            with _hooks(kernel, _GLUON_FOR_BENCH=gluon, _TILES_FOR_BENCH=tiles):
+                for rows, (packed, scale) in ((x, gate_up), (h, down)):
+                    kernel.block_fp4_grouped_mm(
+                        rows,
+                        packed,
+                        scale,
+                        block=32,
+                        row_experts=sorted_ids,
+                        group_ends=group_ends,
+                    )
+
+        return run
+
+    runs = {
+        "triton default": fp4_pair(False),
+        "triton " + ",".join(map(str, FP4_TRITON_LARGE_TILE)): fp4_pair(
+            False, FP4_TRITON_LARGE_TILE
+        ),
+        "gluon default": fp4_pair(True),
+    }
+    w_gate_up = torch.randn(experts, 2 * inter, hidden, device=device, dtype=torch.bfloat16)
+    w_down = torch.randn(experts, hidden, inter, device=device, dtype=torch.bfloat16)
+
+    def bf16() -> None:
+        functional.grouped_mm(x, w_gate_up.transpose(-2, -1), offs=group_ends)
+        functional.grouped_mm(h, w_down.transpose(-2, -1), offs=group_ends)
+
+    runs["bf16 grouped_mm"] = bf16
+    flops = 2 * tokens * top_k * (2 * inter * hidden + hidden * inter)
+    lines = [
+        "",
+        f"## Both projections alone at {tokens} tokens (CUDA-event ms, median of 10)",
+        "   kernel                         |        ms |  TFLOPS",
+    ]
+    for label, fn in runs.items():
+        try:
+            fn()
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            times = []
+            for _ in range(10):
+                start.record()
+                fn()
+                end.record()
+                torch.cuda.synchronize()
+                times.append(start.elapsed_time(end))
+            ms = sorted(times)[len(times) // 2]
+            lines.append(f"   {label:<30} | {ms:9.3f} | {flops / ms / 1e9:7.0f}")
+        except Exception as exc:
+            lines.append(f"   {label:<30} | failed: {exc!r}"[:160])
+    return lines
+
+
+def fp4_gluon_bench(device: str, dtype: Any, *, traces: dict[str, bytes]) -> list[str]:
+    """The V4-Flash layer with FP4 experts: the Gluon kernels against the Triton kernel.
+
+    It times the layer eager with Triton, with Gluon and on the default
+    path. Then it times both projections alone at 16384 tokens, profiles
+    both kernels at 4096 tokens, sweeps the Gluon tiles, and times the bf16
+    layer on `grouped_mm`.
+    """
+    import torch
+
+    from mini_infer.device import is_datacenter_blackwell_device
+    from mini_infer.models.blocks import fp4_grouped_gluon
+    from mini_infer.models.blocks import fp4_grouped_kernel as kernel
+
+    blackwell = is_datacenter_blackwell_device(device)
+    spec = dict(V4_FLASH_MOE)
+    torch.manual_seed(0)
+    layer = _build_v4_moe(spec, device, dtype, fp4=True)
+    lines = [
+        f"## FP4 layer, Triton against Gluon (V4-Flash: hidden {spec['hidden']}, expert width "
+        f"{spec['inter']}, {spec['experts']} experts, top-{spec['top_k']})",
+        "eager wall ms per forward; rel diff is Gluon against Triton",
+        "   tokens |    triton |     gluon |   default | gluon tile             | "
+        "speedup | rel diff",
+    ]
+    inputs = {
+        tokens: torch.randn(1, tokens, spec["hidden"], device=device, dtype=dtype)
+        for tokens in FP4_GLUON_TOKENS
+    }
+    for tokens in FP4_GLUON_TOKENS:
+        x = inputs[tokens]
+        tiles = fp4_grouped_gluon.default_tiles(
+            tokens * spec["top_k"] / spec["experts"], torch.device(device)
+        )
+        wall: dict[str, float] = {}
+        outs: dict[str, Any] = {}
+        with torch.inference_mode(), _grouped(True):
+            for label, gluon in (("triton", False), ("gluon", True), ("default", None)):
+                with _hooks(kernel, _GLUON_FOR_BENCH=gluon):
+                    wall[label] = _time_ms(partial(layer, x), device)
+                    outs[label] = layer(x).float()
+        base = outs["triton"]
+        rel = float((outs["gluon"] - base).norm() / base.norm().clamp_min(1e-30))
+        lines.append(
+            f"{tokens:>9} | {wall['triton']:9.3f} | {wall['gluon']:9.3f} | "
+            f"{wall['default']:9.3f} | {', '.join(map(str, tiles)):<22} | "
+            f"{wall['triton'] / wall['gluon']:6.2f}x | {rel:8.1e}"
+        )
+
+    lines += _fp4_kernels_alone(spec, device, FP4_GLUON_TOKENS[-1])
+
+    lines += ["", "## Profile at 4096 tokens, Triton against Gluon"]
+    for label, gluon in (("triton", False), ("gluon", True)):
+        with _hooks(kernel, _GLUON_FOR_BENCH=gluon), _grouped(True):
+            with torch.inference_mode():
+                ms = _time_ms(partial(layer, inputs[4096]), device)
+            name = f"v4_fp4_4096tok_{label}"
+            lines += _profile(layer, inputs[4096], device, wall_ms=ms, name=name, traces=traces)
+
+    lines += [
+        "",
+        "## Gluon tiles (eager wall ms per forward)",
+        "   BLOCK_W, BLOCK_T, BLOCK_K, warps, stages, ws | "
+        + " | ".join(f"{tokens:>7} tok" for tokens in FP4_GLUON_SWEEP_TOKENS),
+    ]
+    for tiles in FP4_GLUON_BLACKWELL_TILES if blackwell else FP4_GLUON_TILES:
+        cells = []
+        try:
+            with (
+                torch.inference_mode(),
+                _grouped(True),
+                _hooks(kernel, _GLUON_FOR_BENCH=True),
+                _hooks(fp4_grouped_gluon, _TILES_FOR_BENCH=tiles),
+            ):
+                for tokens in FP4_GLUON_SWEEP_TOKENS:
+                    cells.append(f"{_time_ms(partial(layer, inputs[tokens]), device):11.3f}")
+        except Exception as exc:
+            cells.append(f"failed: {exc!r}"[:120])
+        label = ", ".join(map(str, tiles))
+        lines.append(f"   {label:>44} | " + " | ".join(cells))
+    del layer
+    torch.cuda.empty_cache()
+    return lines + _v4_bf16_target(spec, device, dtype, FP4_GLUON_TOKENS, [])
 
 
 # The Gluon kernels (sm90 and sm100) against the Triton kernel (`--fp8-gluon`).
@@ -1393,6 +1595,7 @@ def moe_grouped_bench(
     fp8_expert_tiles: bool = False,
     tests_only: bool = False,
     fp4: bool = False,
+    fp4_gluon: bool = False,
 ) -> dict[str, Any]:
     import subprocess
     import sys
@@ -1434,6 +1637,9 @@ def moe_grouped_bench(
 
     if fp4:
         lines += fp4_bench("cuda", torch.bfloat16, traces=traces)
+        return {"report": "\n".join(lines), "traces": traces}
+    if fp4_gluon:
+        lines += fp4_gluon_bench("cuda", torch.bfloat16, traces=traces)
         return {"report": "\n".join(lines), "traces": traces}
     if fp8_gluon:
         lines += fp8_gluon_bench("cuda", torch.bfloat16, _REMOTE_FIXTURES, traces=traces)
@@ -1482,6 +1688,7 @@ def main(
     fp8_expert_tiles: bool = False,
     tests_only: bool = False,
     fp4: bool = False,
+    fp4_gluon: bool = False,
 ) -> None:
     result = moe_grouped_bench.remote(
         fp8_only=fp8_only,
@@ -1491,6 +1698,7 @@ def main(
         fp8_expert_tiles=fp8_expert_tiles,
         tests_only=tests_only,
         fp4=fp4,
+        fp4_gluon=fp4_gluon,
     )
     print(result["report"])
     print(f"\nreport and traces in {_save(result, out_dir)}")

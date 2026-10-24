@@ -13,11 +13,12 @@ Engine: mini-infer with the grouped expert paths of
 [ADR-038](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) (block FP8 in
 Gluon on the H100) and
 [ADR-039](../decisions/ADR-039-gluon-fp8-grouped-blackwell.md) (block FP8
-in Gluon on the B200) and
-[ADR-040](../decisions/ADR-040-fp4-grouped-kernel.md) (FP4)
+in Gluon on the B200),
+[ADR-040](../decisions/ADR-040-fp4-grouped-kernel.md) (FP4) and
+[ADR-041](../decisions/ADR-041-gluon-fp4-grouped.md) (FP4 in Gluon)
 Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
 `--fp8-tiles`, `--fp8-gluon` and `--fp8-expert-tiles` for the FP8 runs,
-`--fp4` for the FP4 runs)
+`--fp4` and `--fp4-gluon` for the FP4 runs)
 
 ## Result
 
@@ -64,6 +65,11 @@ Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
   1.28 (H100) and 1.55 (B200) times slower at 16384 tokens. On the real
   V4-Flash with two B200 GPUs, prefill of 2021 tokens is 7.1 times faster.
   The section "FP4 experts" has the details.
+- Gluon kernels for the FP4 experts decode one weight tile while the
+  tensor cores multiply the previous one. At 16384 tokens the FP4 layer is
+  then 1.07 (H100) and 1.13 (B200) times slower than the bf16 layer. At
+  2048 and 4096 tokens it is 1.09 to 1.24 times faster. The section "Gluon
+  kernels for FP4" has the details.
 - The grouped path is slower in three places: batch-1 graph decode on the
   B200 (3.6 percent), eager decode at small batches, and Mixtral at 16384
   tokens on the B200 (0.88x). The section "Where the grouped path is
@@ -916,4 +922,99 @@ writes "landmarks like the Eiffel Tower". The two paths add in a different
 order, so their bf16 roundings differ. We did not measure the logit gap
 at the token where they part. On Nemotron, the bf16 paths of ADR-036 had a
 prefill logit cosine of 0.9994 to 0.9995.
+
+### Gluon kernels for FP4
+
+On 2026-10-23 we profiled the FP4 Triton kernel at 16384 tokens with
+Nsight Compute, on one H100 and one B200. The profile timed both
+projections with random routing, as the layer runs them. Then we built the
+Gluon kernels of [ADR-041](../decisions/ADR-041-gluon-fp4-grouped.md) and
+ran `--fp4-gluon` three times on the B200 and twice on the H100.
+
+Both projections alone at 16384 tokens, before the Gluon kernels.
+Milliseconds are CUDA-event times. Cycles and busy shares come from Nsight
+Compute. The B200 lowers its clock under tensor load, so cycles compare
+kernels better than milliseconds:
+
+| GPU | kernel | ms | M cycles | tensor cores busy | issue slots busy |
+|---|---|---:|---:|---:|---:|
+| B200 | Triton, default tile | 11.60 | 21.1 | 22 to 23% | 44 to 46% |
+| B200 | Triton, tile 256, 128, 64, 8, 4 | 9.16 | 15.8 | 33 to 36% | 44 to 46% |
+| B200 | bf16 `grouped_mm` | 4.79 | 6.5 | 95 to 97% | 5 to 8% |
+| H100 | Triton, default tile | 15.63 | 28.2 | 37 to 39% | 41% |
+| H100 | bf16 `grouped_mm` | 9.85 | 14.6 | 83 to 86% | 11 to 12% |
+
+The Triton kernel decodes a weight tile and then multiplies it, and one
+program fills an SM. On the H100 no tile of the sweep beat the default.
+
+The first Gluon version made the layer 1.25 (B200) and 1.17 (H100) times
+faster than Triton at 16384 tokens. Its profile showed one limit on each
+GPU:
+
+| GPU | first Gluon kernel | M cycles | tensor cores busy | main wait |
+|---|---|---:|---:|---|
+| B200 | one dequantization warpgroup | 13.1 to 14.2 | 34 to 43% | the MMA warp waits for decoded tiles |
+| H100 | decode into the `wgmma` register operand | 19.9 | 61 to 64% | single-byte shared-memory loads |
+
+On the B200 the dequantization warps almost never waited, so one warpgroup
+decoded too slowly. On the H100 the operand layout scatters a thread's
+bytes, so the decode issued 33 single-byte loads per K step. The second
+version added a second dequantization warpgroup on the B200. On the H100
+it decodes 16 bytes per thread into shared memory, and the `wgmma` reads
+the tile from there. Its outputs stayed bit-identical to the Triton kernel
+on both GPUs. The final runs passed 197 GPU tests on the H100 and 167 on
+the B200.
+
+The layer with the final kernels, eager milliseconds per forward:
+
+| tokens | H100 Triton | H100 Gluon | H100 bf16 | B200 Triton | B200 Gluon | B200 bf16 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 4.178 | 4.287 | 4.996 | 2.985 | 2.622 | 3.197 |
+| 1024 | 4.592 | 4.798 | 5.528 | 3.344 | 2.950 | 3.638 |
+| 2048 | 6.111 | 5.334 | 6.184 | 4.654 | 3.315 | 4.124 |
+| 4096 | 7.332 | 6.901 | 7.521 | 5.424 | 4.041 | 4.949 |
+| 8192 | 14.105 | 13.234 | 10.471 | 10.258 | 7.759 | 6.433 |
+| 16384 | 25.783 | 20.743 | 19.343 | 18.386 | 13.651 | 12.040 |
+
+The default path takes the Gluon kernel on the B200 at all these sizes. On
+the H100 it keeps the Triton kernel up to 32 mean rows per expert, so at
+256 and 1024 tokens. At 16384 tokens the FP4 layer is now 1.07 (H100) and
+1.13 (B200) times slower than the bf16 layer. With the Triton kernel it was
+1.32 and 1.57 times slower.
+
+Both projections alone at 16384 tokens with the final kernels (CUDA-event
+milliseconds):
+
+| kernel | H100 | B200 |
+|---|---:|---:|
+| Triton, default tile | 15.967 | 11.622 |
+| Triton, tile 256, 128, 64, 8, 4 | 16.444 | 9.316 |
+| Gluon, default tile | 11.222 | 7.004 |
+| bf16 `grouped_mm` | 9.153 | 4.709 |
+
+The Gluon tile sweep, eager milliseconds per forward. On the B200 `warps`
+counts the dequantization warps (4 is one warpgroup, 8 is two):
+
+| GPU | tile | 1024 tok | 4096 | 16384 |
+|---|---|---:|---:|---:|
+| H100 | 128, 64, 64, 4, 4 | 4.863 | 9.923 | 32.872 |
+| H100 | 128, 128, 64, 8, 4 | 5.233 | 6.867 | 23.879 |
+| H100 | 128, 128, 128, 8, 3 | 5.285 | 6.923 | 24.243 |
+| H100 | 128, 256, 64, 8, 3 | 6.908 | 8.362 | 20.815 |
+| H100 | 128, 256, 64, 8, 4 | 6.591 | 8.137 | 21.005 |
+| B200 | 128, 128, 128, 4, 4 | 3.323 | 4.396 | 14.690 |
+| B200 | 128, 128, 64, 8, 4 | 3.550 | 4.690 | 15.492 |
+| B200 | 128, 128, 128, 8, 4 | 3.069 | 4.175 | 14.068 |
+| B200 | 128, 256, 64, 8, 3 | 4.394 | 5.589 | 14.105 |
+| B200 | 128, 256, 64, 8, 4 | 4.246 | 5.528 | 13.835 |
+
+On the B200, two dequantization warpgroups are 1.04 to 1.08 times faster
+than one with the tile (128, 128, 128). The B200 table now takes that tile
+up to 192 mean rows per expert and (128, 256, 64, 8, 4) above. The H100
+table keeps its tiles.
+
+At 16384 tokens the layer is compute-bound. Both layers multiply in bf16,
+and the FP4 layer also decodes its weights. So these kernels can approach
+the bf16 layer at large batches but not pass it. On the B200, bf16
+`grouped_mm` keeps its tensor cores busy 98 percent of the time.
 
