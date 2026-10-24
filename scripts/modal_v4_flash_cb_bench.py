@@ -18,11 +18,20 @@ graph of its decode step (`cuda_graph=True`, ADR-042) at each batch size of
 `--batch-sizes`. For each, the leader prefills the batch, then times each
 decode step. The two modes must produce the same tokens.
 
+`--host-gap` serves greedy requests through the HTTP-facing scheduler
+(`TensorParallelStateCacheContinuousScheduler`) with the graph on, at each
+batch size of `--batch-sizes`. The server times each replay and the host gap
+between replays (`time_decode=True`). The gap holds the work of the host
+between two steps: sampling, bookkeeping, the broadcast to the follower and
+the input copies. The run prints a digest of the generated tokens, so that
+two runs of different code can show that they generate the same tokens.
+
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_cb_bench.py
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_cb_bench.py \
         --num-requests 16 --max-new-tokens 64
     uv run modal run scripts/modal_v4_flash_cb_bench.py --cuda-graph --batch-sizes 1,8,16
+    uv run modal run scripts/modal_v4_flash_cb_bench.py --host-gap --batch-sizes 1,8,16
 """
 
 import os
@@ -237,6 +246,101 @@ def _graph_one_rank(
     return {"rows": rows} if rank == 0 else None
 
 
+def _host_gap_one_rank(
+    rank: int,
+    world_size: int,
+    prompts: list[str],
+    max_new_tokens: int,
+    max_seq_len: int,
+    batch_sizes: list[int],
+) -> dict | None:
+    """Per-rank work of `--host-gap`: time the serving loop per batch size.
+
+    Every rank builds a graphed server with `time_decode=True` for each batch
+    size, in the same order. Rank 0 serves `batch_size` greedy requests
+    through the scheduler twice: an untimed round of 8 tokens, then a timed
+    round of `max_new_tokens`. Followers mirror.
+    """
+    import hashlib
+    import json
+    import statistics
+
+    import torch
+
+    from mini_infer.engine.sampler import SamplingParams
+    from mini_infer.engine.tokenizer import Tokenizer
+    from mini_infer.engine.tp_state_cache_continuous_server import (
+        TensorParallelStateCacheContinuousServer,
+    )
+    from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
+    from mini_infer.scheduler import Request, TensorParallelStateCacheContinuousScheduler
+
+    torch.cuda.set_device(rank)
+    device = f"cuda:{rank}"
+    print(f"[rank {rank}] loading V4-Flash shard onto {device}...", flush=True)
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    tokenizer = Tokenizer.from_pretrained(_MODEL_NAME) if rank == 0 else None
+
+    def serve(
+        scheduler: TensorParallelStateCacheContinuousScheduler, batch: list[str], max_tokens: int
+    ) -> list[list[int]]:
+        """Submit every prompt of `batch` at once, wait for all; the generated tokens."""
+        handles = [
+            scheduler.submit(
+                Request(
+                    prompt=prompt,
+                    sampling_params=SamplingParams(temperature=0.0),
+                    max_tokens=max_tokens,
+                )
+            )
+            for prompt in batch
+        ]
+        return [handle.wait().tokens for handle in handles]
+
+    rows = []
+    for batch_size in batch_sizes:
+        print(f"[rank {rank}] batch {batch_size}...", flush=True)
+        server = TensorParallelStateCacheContinuousServer(
+            model,
+            tokenizer,
+            device=device,
+            dtype=torch.bfloat16,
+            max_batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            cuda_graph=True,
+            time_decode=True,
+        )
+        if rank != 0:
+            server.run_follower_loop()
+            continue
+        scheduler = TensorParallelStateCacheContinuousScheduler(server)
+        scheduler.start()
+        try:
+            serve(scheduler, prompts[:batch_size], 8)  # warmup (untimed)
+            server.decode_timings()
+            tokens = serve(scheduler, prompts[:batch_size], max_new_tokens)
+            # Every request is done, so the engine thread records no more steps.
+            steps = server.decode_timings()
+        finally:
+            scheduler.stop()  # also releases the follower
+        gaps = [step.gap_ms for step in steps if step.gap_ms is not None]
+        walls = [step.wall_ms for step in steps if step.wall_ms is not None]
+        rows.append(
+            {
+                "batch_size": batch_size,
+                "steps": len(steps),
+                "median_replay_ms": statistics.median(step.forward_ms for step in steps),
+                "median_gap_ms": statistics.median(gaps),
+                "max_gap_ms": max(gaps),
+                "median_wall_ms": statistics.median(walls),
+                "tokens_per_sec": batch_size * 1e3 / statistics.median(walls),
+                "tokens_digest": hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16],
+                "text": tokenizer.decode(tokens[0]) if tokenizer is not None else "",
+            }
+        )
+    return {"rows": rows} if rank == 0 else None
+
+
 def _child_entry(
     rank: int, world_size: int, worker: Callable[..., dict | None], kwargs: dict, queue
 ) -> None:
@@ -329,13 +433,50 @@ def graph_bench(prompts: list[str], max_new_tokens: int, batch_sizes: list[int])
     )
 
 
+@app.function(
+    image=image,
+    gpu=_GPU,
+    # A warm-cache load plus three batch sizes takes about 5 minutes; this caps a hang.
+    timeout=900,
+    secrets=_SECRETS,
+    volumes={"/root/.cache/huggingface": _HF_CACHE},
+)
+def host_gap_bench(prompts: list[str], max_new_tokens: int, batch_sizes: list[int]) -> dict:
+    return _spawn_ranks(
+        _host_gap_one_rank,
+        prompts=prompts,
+        max_new_tokens=max_new_tokens,
+        max_seq_len=_MAX_SEQ_LEN,
+        batch_sizes=batch_sizes,
+    )
+
+
 @app.local_entrypoint()
 def main(
     num_requests: int = 16,
     max_new_tokens: int = 64,
     cuda_graph: bool = False,
+    host_gap: bool = False,
     batch_sizes: str = "1,8,16",
 ) -> None:
+    if host_gap:
+        sizes = [int(size) for size in batch_sizes.split(",")]
+        prompts = [_PROMPTS[i % len(_PROMPTS)] for i in range(max(sizes))]
+        gap_result = host_gap_bench.remote(prompts, max_new_tokens, sizes)
+        print("\n=== V4-Flash TP serving loop, replay time and host gap (2x B200) ===")
+        print(
+            f"{'batch':>5} {'steps':>5} {'replay ms':>9} {'gap ms':>7} {'max gap':>7} "
+            f"{'wall ms':>7} {'tok/s':>7} digest"
+        )
+        for row in gap_result["rows"]:
+            print(
+                f"{row['batch_size']:5d} {row['steps']:5d} {row['median_replay_ms']:9.2f} "
+                f"{row['median_gap_ms']:7.2f} {row['max_gap_ms']:7.2f} "
+                f"{row['median_wall_ms']:7.2f} {row['tokens_per_sec']:7.1f} "
+                f"{row['tokens_digest']}"
+            )
+            print(f"      first request: {row['text']!r}")
+        return
     if cuda_graph:
         sizes = [int(size) for size in batch_sizes.split(",")]
         prompts = [_PROMPTS[i % len(_PROMPTS)] for i in range(max(sizes))]

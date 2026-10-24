@@ -16,6 +16,9 @@ also provides `can_capture_decode(device) -> bool`.
 Warmup and capture run the step for real, so they write into every row of
 the cache. Capture before any request is admitted; the scheduler's admission
 copies a full row over whatever the capture left there.
+
+A `DecodeStepTimer` passed as `timer` times each replay and the host gap
+between replays.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from typing import Any
 import torch
 
 from mini_infer.device import is_cuda_device
+from mini_infer.engine.decode_step_timer import DecodeStepTimer
 
 # Steps run eagerly on a side stream before capture, so that lazy
 # initialization (cuBLAS handles, kernel selection, allocator pools) happens
@@ -50,11 +54,13 @@ class DecodeCudaGraph:
         *,
         batch_size: int,
         device: torch.device | str,
+        timer: DecodeStepTimer | None = None,
     ) -> None:
         if not supports_decode_cuda_graph(model, device):
             raise ValueError(
                 f"{type(model).__name__} on {device} cannot decode through a CUDA graph"
             )
+        self._timer = timer
         self._input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self._positions = torch.zeros(batch_size, dtype=torch.long, device=device)
         main_stream = torch.cuda.current_stream(device)
@@ -70,14 +76,21 @@ class DecodeCudaGraph:
                 self._input_ids, self._positions, state_cache
             )
 
-    def replay(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def replay(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, *, non_blocking: bool = False
+    ) -> torch.Tensor:
         """Run the step for `(B, 1)` token ids and `(B,)` positions.
 
         The inputs may live on the host; they are copied into the graph's
-        static buffers. The returned logits are the graph's own output
-        buffer, which the next replay overwrites.
+        static buffers. Pass `non_blocking=True` with inputs in pinned host
+        memory, so the copies do not wait for the GPU. The returned logits
+        are the graph's own output buffer, which the next replay overwrites.
         """
-        self._input_ids.copy_(input_ids)
-        self._positions.copy_(positions)
-        self._graph.replay()
+        self._input_ids.copy_(input_ids, non_blocking=non_blocking)
+        self._positions.copy_(positions, non_blocking=non_blocking)
+        if self._timer is None:
+            self._graph.replay()
+        else:
+            with self._timer.step():
+                self._graph.replay()
         return self._logits

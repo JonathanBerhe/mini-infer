@@ -24,7 +24,7 @@ import queue
 import threading
 from collections.abc import Iterator
 
-from mini_infer.engine.sampler import sample
+from mini_infer.engine.sampler import SamplingParams, sample, sample_batch
 from mini_infer.engine.tp_state_cache_continuous_server import (
     TensorParallelStateCacheContinuousServer,
 )
@@ -40,6 +40,8 @@ from mini_infer.scheduler.request_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+_GREEDY = SamplingParams(temperature=0.0)
 
 
 @dataclasses.dataclass
@@ -233,10 +235,17 @@ class TensorParallelStateCacheContinuousScheduler:
                 input_tokens[slot_idx] = slot.next_token
                 positions[slot_idx] = slot.position
         logits = self._server.decode_batch(input_tokens, positions)
+        # One batched sample and one host sync for every row; a free row
+        # samples greedily and its token is dropped.
+        params = [
+            _GREEDY if slot is None else slot.request.request.sampling_params
+            for slot in self._slots
+        ]
+        next_tokens = sample_batch(logits[:, -1, :], params)
         for slot_idx in decode_slots:
             slot = self._slots[slot_idx]
             assert slot is not None
-            slot.next_token = sample(logits[slot_idx, -1, :], slot.request.request.sampling_params)
+            slot.next_token = next_tokens[slot_idx]
             slot.position += 1
 
     def _emit(self, running: RunningRequest, step: GenerationStep) -> None:

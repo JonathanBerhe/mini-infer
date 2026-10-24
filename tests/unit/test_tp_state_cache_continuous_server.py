@@ -10,6 +10,7 @@ measures a correct path.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from mini_infer.engine.decode_step_timer import DecodeStepTimer
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
 from mini_infer.engine.tp_state_cache_continuous_server import (
@@ -129,9 +131,16 @@ class _EagerGraph:
     instances: ClassVar[list[_EagerGraph]] = []
 
     def __init__(
-        self, model: DeepseekV4ForCausalLM, state_cache: object, *, batch_size: int, device: str
+        self,
+        model: DeepseekV4ForCausalLM,
+        state_cache: object,
+        *,
+        batch_size: int,
+        device: str,
+        timer: DecodeStepTimer | None = None,
     ) -> None:
         self._model, self._cache, self._device = model, state_cache, device
+        self._timer = timer
         self.replays = 0
         ids = torch.zeros(batch_size, 1, dtype=torch.long)
         positions = torch.zeros(batch_size, dtype=torch.long)
@@ -140,9 +149,12 @@ class _EagerGraph:
                 model.decode_step_static(ids, positions, state_cache)  # type: ignore[arg-type]
         _EagerGraph.instances.append(self)
 
-    def replay(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def replay(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, *, non_blocking: bool = False
+    ) -> torch.Tensor:
         self.replays += 1
-        with torch.inference_mode():
+        timed = self._timer.step() if self._timer is not None else contextlib.nullcontext()
+        with torch.inference_mode(), timed:
             return self._model.decode_step_static(
                 input_ids.to(self._device),
                 positions.to(self._device),
@@ -266,3 +278,75 @@ def test_tp_continuous_scheduler_matches_single_process(tmp_path: Path) -> None:
     assert results[0] == reference, (
         f"TP scheduler diverged from single-process:\n  TP:  {results[0]}\n  ref: {reference}"
     )
+
+
+def _one_rank_server(**kwargs: bool) -> TensorParallelStateCacheContinuousServer:
+    """A server with no followers (no process group), for the timing tests."""
+    torch.manual_seed(0)
+    model = DeepseekV4ForCausalLM(_make_tp_config()).eval()
+    return TensorParallelStateCacheContinuousServer(
+        model, max_batch_size=2, max_seq_len=64, device="cpu", dtype=torch.float32, **kwargs
+    )
+
+
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_time_decode_reports_each_decode_step(
+    monkeypatch: pytest.MonkeyPatch, cuda_graph: bool
+) -> None:
+    """One timing per decode step; the prefills before the first step leave it no gap."""
+    from mini_infer.engine import tp_state_cache_continuous_server as server_module
+
+    monkeypatch.setattr(server_module, "supports_decode_cuda_graph", lambda model, device: True)
+    monkeypatch.setattr(server_module, "DecodeCudaGraph", _EagerGraph)
+    server = _one_rank_server(cuda_graph=cuda_graph, time_decode=True)
+    server.generate_cohort([list(range(8)), list(range(5))], max_new_tokens=4)
+    steps = server.decode_timings()
+    assert len(steps) == 3  # the first token comes from the prefill
+    assert steps[0].gap_ms is None and steps[0].wall_ms is None
+    assert all(step.forward_ms > 0 for step in steps)
+    assert all(step.gap_ms is not None and step.gap_ms >= 0 for step in steps[1:])
+    assert server.decode_timings() == []
+
+
+def test_decode_timings_needs_time_decode() -> None:
+    with pytest.raises(RuntimeError, match="time_decode=True"):
+        _one_rank_server().decode_timings()
+
+
+def test_scheduler_samples_greedy_and_sampled_rows_in_one_batch() -> None:
+    """A sampled row in the batch leaves the greedy rows' tokens unchanged."""
+    server = _one_rank_server()
+    tokenizer = _VarLenTokenizer(server._model.cfg.vocab_size)
+    server._tokenizer = tokenizer  # type: ignore[assignment]
+    prompts = ["alpha", "beta!!"]
+    max_new_tokens = 6
+    gen = StateCacheGenerator(server._model)
+    reference = [
+        gen.generate_ids(tokenizer.encode(prompt), max_new_tokens=max_new_tokens)
+        for prompt in prompts
+    ]
+
+    scheduler = TensorParallelStateCacheContinuousScheduler(server)
+    scheduler.start()
+    try:
+        greedy, sampled = (
+            scheduler.submit(
+                Request(prompt=prompt, sampling_params=params, max_tokens=max_new_tokens)
+            )
+            for prompt, params in zip(
+                prompts,
+                [SamplingParams(temperature=0.0), SamplingParams(temperature=1.5, top_k=20)],
+                strict=True,
+            )
+        )
+        greedy_tokens, sampled_tokens = greedy.wait().tokens, sampled.wait().tokens
+    finally:
+        scheduler.stop()
+    assert greedy_tokens == reference[0]
+    assert len(sampled_tokens) == max_new_tokens
+
+
+def test_decode_batch_needs_one_entry_per_row() -> None:
+    server = _one_rank_server()
+    with pytest.raises(ValueError, match="needs 2 input tokens and positions"):
+        server.decode_batch([1], [4])
