@@ -149,7 +149,9 @@ class _EagerGraph:
                 model.decode_step_static(ids, positions, state_cache)  # type: ignore[arg-type]
         _EagerGraph.instances.append(self)
 
-    def replay(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def replay(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, *, non_blocking: bool = False
+    ) -> torch.Tensor:
         self.replays += 1
         timed = self._timer.step() if self._timer is not None else contextlib.nullcontext()
         with torch.inference_mode(), timed:
@@ -342,3 +344,9 @@ def test_scheduler_samples_greedy_and_sampled_rows_in_one_batch() -> None:
         scheduler.stop()
     assert greedy_tokens == reference[0]
     assert len(sampled_tokens) == max_new_tokens
+
+
+def test_decode_batch_needs_one_entry_per_row() -> None:
+    server = _one_rank_server()
+    with pytest.raises(ValueError, match="needs 2 input tokens and positions"):
+        server.decode_batch([1], [4])

@@ -13,14 +13,20 @@ whole batch's state:
     the forward on its own shard + replicated `StateCache`, so the all-reduce in
     the sharded layers completes and every rank's cache stays identical.
 
-Two broadcast ops:
-  - `("prefill", slot_idx, prompt_ids)`: all ranks prefill the prompt in a temp
-    one-row cache and copy that row into batched-cache row `slot_idx`.
-  - `("decode", input_tokens, positions)`: all ranks run one ragged decode step.
+Each op is one int64 message of a fixed shape,
+`[op, slot_idx, prompt length, input tokens (B), positions (B)]` for a batch of
+B rows. The leader broadcasts it on the CPU (gloo) group of `get_cpu_group()`,
+so the message stays in host memory and no GPU stream waits for it. Three ops:
+  - prefill: a second broadcast carries the prompt ids. All ranks prefill the
+    prompt in a temp one-row cache and copy that row into batched-cache row
+    `slot_idx`.
+  - decode: all ranks run one ragged decode step. On a CUDA device the message
+    is in pinned memory, so the copy of the inputs to the GPU does not wait.
+  - shutdown: the followers leave `run_follower_loop`.
 
 The leader samples (followers never do); with `gather_output=True` in the TP
 layers every rank computes identical logits, so a broadcast of the sampled token
-is unnecessary, it rides the next `("decode", ...)` op.
+is unnecessary, it rides the next decode op.
 
 With `cuda_graph=True`, every rank captures the decode step in a
 `DecodeCudaGraph` when the server is built, and each `("decode", ...)` op
@@ -43,7 +49,7 @@ import torch.distributed as dist
 
 from mini_infer.cache.state_cache import StateCache
 from mini_infer.device import is_cuda_device
-from mini_infer.distributed.group import get_rank, get_world_size
+from mini_infer.distributed.group import get_cpu_group, get_rank, get_world_size
 from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode_cuda_graph
 from mini_infer.engine.decode_step_timer import DecodeStepTimer, DecodeStepTiming
 from mini_infer.engine.sampler import SamplingParams, sample, sample_batch
@@ -53,6 +59,12 @@ from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM, build_state_cac
 logger = logging.getLogger(__name__)
 
 _LEADER_RANK = 0
+
+# The ops of a control message, and the length of its header.
+_OP_DECODE = 0
+_OP_PREFILL = 1
+_OP_SHUTDOWN = 2
+_HEADER_LEN = 3  # op, slot_idx, prompt length
 
 
 class TensorParallelStateCacheContinuousServer:
@@ -101,6 +113,10 @@ class TensorParallelStateCacheContinuousServer:
             device=self.device,
             dtype=self.dtype,
         )
+        # Every rank builds the server at the same point, so the first build
+        # can create the group.
+        self._control_group = get_cpu_group() if self.world_size > 1 else None
+        self._pin_messages = is_cuda_device(self.device)
         self._decode_timer = DecodeStepTimer(self.device) if time_decode else None
         # Capture before any prefill: warmup and capture write into every row.
         self._decode_graph = (
@@ -125,12 +141,32 @@ class TensorParallelStateCacheContinuousServer:
             raise ValueError("server has no tokenizer")
         return self._tokenizer
 
-    def _broadcast(self, obj: object) -> object:
-        if self.world_size == 1:
-            return obj  # no followers
-        holder = [obj]
-        dist.broadcast_object_list(holder, src=_LEADER_RANK)
-        return holder[0]
+    # ---- control messages (see the module docstring) ----
+
+    def _message(
+        self,
+        op: int,
+        *,
+        slot_idx: int = 0,
+        prompt_len: int = 0,
+        input_tokens: list[int] | None = None,
+        positions: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Leader: a control message, in pinned memory when the device is CUDA."""
+        padding = [0] * self.max_batch_size
+        values = [op, slot_idx, prompt_len, *(input_tokens or padding), *(positions or padding)]
+        return torch.tensor(values, dtype=torch.long, pin_memory=self._pin_messages)
+
+    def _empty_message(self) -> torch.Tensor:
+        """Follower: a buffer that receives one control message."""
+        return torch.empty(
+            _HEADER_LEN + 2 * self.max_batch_size, dtype=torch.long, pin_memory=self._pin_messages
+        )
+
+    def _broadcast(self, tensor: torch.Tensor) -> None:
+        """Send `tensor` from the leader, or receive into it on a follower."""
+        if self._control_group is not None:  # None: one rank, no followers
+            dist.broadcast(tensor, src=_LEADER_RANK, group=self._control_group)
 
     # ---- shared per-rank forwards (run on leader AND followers) ----
 
@@ -167,24 +203,25 @@ class TensorParallelStateCacheContinuousServer:
                 dst_layer.indexer.cmp_kv_state[dst] = src_layer.indexer.cmp_kv_state[0]
                 dst_layer.indexer.cmp_score_state[dst] = src_layer.indexer.cmp_score_state[0]
 
-    def _run_decode(self, input_tokens: list[int], positions: list[int]) -> torch.Tensor:
-        """One ragged decode step over the full batched cache. Returns logits.
+    def _run_decode(self, message: torch.Tensor) -> torch.Tensor:
+        """One ragged decode step over the full batched cache, with the inputs of
+        a decode `message`. Returns logits.
 
         From the graph, the logits are its output buffer, which the next
         replay overwrites.
         """
+        batch = self.max_batch_size
+        input_ids = message[_HEADER_LEN : _HEADER_LEN + batch].view(batch, 1)
+        positions = message[_HEADER_LEN + batch :]
         if self._decode_graph is not None:
-            # `positions` is a host list, so this check costs no device sync.
-            self._cache.check_capacity(max(positions) + 1)
-            return self._decode_graph.replay(
-                torch.tensor(input_tokens, dtype=torch.long).unsqueeze(1),
-                torch.tensor(positions, dtype=torch.long),
-            )
-        input_ids = torch.tensor(input_tokens, device=self.device, dtype=torch.long).unsqueeze(1)
-        position_tensor = torch.tensor(positions, device=self.device, dtype=torch.long)
+            # The message is on the host, so this check costs no device sync.
+            self._cache.check_capacity(int(positions.max()) + 1)
+            return self._decode_graph.replay(input_ids, positions, non_blocking=True)
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        positions = positions.to(self.device, non_blocking=True)
         with torch.inference_mode(), self._timed_step():
             return self._model.forward_decode_with_cache_ragged(
-                input_ids, positions=position_tensor, state_cache=self._cache
+                input_ids, positions=positions, state_cache=self._cache
             )
 
     def _timed_step(self) -> contextlib.AbstractContextManager[None]:
@@ -211,16 +248,26 @@ class TensorParallelStateCacheContinuousServer:
         A scheduler drives this (and `decode_batch`) to run dynamic continuous
         batching across ranks without owning the cache itself.
         """
-        self._broadcast(("prefill", slot_idx, prompt_ids))
+        self._broadcast(self._message(_OP_PREFILL, slot_idx=slot_idx, prompt_len=len(prompt_ids)))
+        self._broadcast(torch.tensor(prompt_ids, dtype=torch.long))
         logits = self._run_prefill(prompt_ids, slot_idx)
         assert logits is not None  # only None on followers, which never call this
         return logits
 
     def decode_batch(self, input_tokens: list[int], positions: list[int]) -> torch.Tensor:
         """Leader: run one ragged decode step over the whole batch, return logits
-        `(max_batch_size, 1, vocab)`. Broadcasts so followers mirror it."""
-        self._broadcast(("decode", input_tokens, positions))
-        return self._run_decode(input_tokens, positions)
+        `(max_batch_size, 1, vocab)`. Broadcasts so followers mirror it.
+
+        `input_tokens` and `positions` hold one entry per row of the batch.
+        """
+        if len(input_tokens) != self.max_batch_size or len(positions) != self.max_batch_size:
+            raise ValueError(
+                f"decode_batch needs {self.max_batch_size} input tokens and positions, got "
+                f"{len(input_tokens)} and {len(positions)}"
+            )
+        message = self._message(_OP_DECODE, input_tokens=input_tokens, positions=positions)
+        self._broadcast(message)
+        return self._run_decode(message)
 
     # ---- leader-driven cohort generation ----
 
@@ -293,18 +340,18 @@ class TensorParallelStateCacheContinuousServer:
         if self.is_leader:
             raise RuntimeError("run_follower_loop() is follower-only; the leader drives generation")
         while True:
-            message = self._broadcast(None)
-            assert isinstance(message, tuple)
-            op = message[0]
-            if op == "shutdown":
+            message = self._empty_message()
+            self._broadcast(message)
+            op, slot_idx, prompt_len = message[:_HEADER_LEN].tolist()
+            if op == _OP_SHUTDOWN:
                 self._release_decode_graph()
                 return
-            if op == "prefill":
-                _, slot_idx, prompt_ids = message
-                self._run_prefill(prompt_ids, slot_idx)
-            elif op == "decode":
-                _, input_tokens, positions = message
-                self._run_decode(input_tokens, positions)
+            if op == _OP_PREFILL:
+                prompt_ids = torch.empty(prompt_len, dtype=torch.long)
+                self._broadcast(prompt_ids)
+                self._run_prefill(prompt_ids.tolist(), slot_idx)
+            elif op == _OP_DECODE:
+                self._run_decode(message)
             else:
                 raise RuntimeError(f"unknown op broadcast to follower: {op!r}")
 
@@ -315,7 +362,7 @@ class TensorParallelStateCacheContinuousServer:
         destroyed after it. Later decode steps run eagerly.
         """
         if self.is_leader:
-            self._broadcast(("shutdown",))
+            self._broadcast(self._message(_OP_SHUTDOWN))
             self._release_decode_graph()
 
     def _release_decode_graph(self) -> None:
