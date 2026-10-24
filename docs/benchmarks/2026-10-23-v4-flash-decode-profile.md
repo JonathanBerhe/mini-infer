@@ -204,10 +204,11 @@ eager run. Both modes ran in the same container.
   34.2 ms, and under the profiler the GPU is busy for 34.4 to 34.7 ms of it.
 - The graph runs the ragged decode step, which does more GPU work than the
   eager single-request step: about 2,850 more operations and 6 ms more GPU
-  time. The full `torch.cat` of the sliding window and the compressed
-  history in each layer adds about 2.5 ms. Row-indexed writes
-  (`index_elementwise_kernel`, 442 against 89 per step) and the masks add
-  most of the rest.
+  time. Row-indexed writes (`index_elementwise_kernel`, 442 against 89 per
+  step) and the masks add most of it. The full `torch.cat` of the sliding
+  window and the compressed history in each layer costs little: about
+  0.14 ms per step at batch 16 with a 1,024-token cache (see "Partial RoPE"
+  below). An earlier version of this report gave it 2.5 ms by mistake.
 - At batch 1 the graph decodes about 29 tokens per second, against 15 for
   the eager step of the same run.
 
@@ -274,9 +275,9 @@ the layer glue count as unlabelled. The script now labels them.
   not the last one, so PyTorch runs it with very few thread blocks.
 
 For serving at batch 8 to 16, these are the largest items in order: the FP4
-kernel at a few rows per expert (up to about 11 ms), the HCA compressor
-softmax (about 2.3 ms), the full-width `torch.cat` of each layer (about
-2.5 ms, see above), and the fp32 MoE all-reduce (about 1 ms to gain at batch
+kernel at a few rows per expert (up to about 11 ms), the partial RoPE
+helper (5.2 ms, see "Partial RoPE" below), the HCA compressor softmax
+(about 2.3 ms), and the fp32 MoE all-reduce (about 1 ms to gain at batch
 16). e8m0 scales still do not help, because the kernel is not bound by its
 memory reads.
 
@@ -300,6 +301,30 @@ than in the section above. Between the two runs, the only change to the
 bf16 path is the HCA compressor softmax, which now runs over the last
 dimension. Above, that softmax cost 2.3 ms per step. The mode is now on by
 default on sm100 GPUs such as the B200.
+
+## Partial RoPE
+
+The batch traces of "Graph step at batch 16" also show where the small
+kernels of the step come from. `apply_partial_rope_last_n_dims`, which
+rotates the last 64 features of each head, runs as separate PyTorch ops: 212
+calls and 1,908 kernels per step. They take 3.6 ms of GPU time per step at
+batch 1 and 5.2 ms at batch 16. The full-width cat of the window and the
+compressed history, by contrast, takes about 0.14 ms at batch 16 with the
+1,024-token cache.
+
+[ADR-044](../decisions/ADR-044-fused-partial-rope.md) does each call in
+one Triton kernel with the same rounding.
+`scripts/modal_v4_flash_generate.py --compare-fused-rope` runs both on one
+load, with the FP4 experts on W4A8:
+
+| Measure | PyTorch partial RoPE | Fused kernel |
+|---|---:|---:|
+| Passage perplexity (2,048 tokens) | 7.845 | 7.845 |
+| Graph step, batch 1 | 33.5 ms | 30.5 ms |
+| Graph step, batch 16 | 46.1 ms | 41.9 ms |
+
+The outputs are bit-identical: the same NLL, the same last logits and the
+same 33 greedy tokens.
 
 ## How it is measured
 
@@ -362,6 +387,10 @@ uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-size
 
 ```bash
 uv run modal run scripts/modal_v4_flash_generate.py --compare-fp8-activations
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-rope
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).
