@@ -12,12 +12,18 @@ The leader/follower coordination and the ragged decode are already proven on CPU
 with gloo + a synthetic V4 (`tests/unit/test_tp_state_cache_continuous_server.py`);
 this confirms the same path on the real checkpoint and real NCCL.
 
+The server replays its decode step from a CUDA graph (`cuda_graph=True`,
+ADR-042), as the single-GPU HTTP server does for models that support it.
+`--eager` runs the decode step without the graph.
+
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_cb_serve.py
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_cb_serve.py --max-tokens 48
+    uv run modal run scripts/modal_v4_flash_cb_serve.py --eager
 """
 
 import os
+from typing import Any
 
 import modal
 
@@ -56,19 +62,26 @@ _PROMPTS = [
 
 
 def _run_one_rank(
-    rank: int, world_size: int, prompts: list[str], max_tokens: int, max_seq_len: int
+    rank: int,
+    world_size: int,
+    prompts: list[str],
+    max_tokens: int,
+    max_seq_len: int,
+    cuda_graph: bool,
+    device: str | None = None,
 ) -> dict | None:
-    """Per-rank work: load the shard; rank 0 serves concurrent requests, rank 1 follows."""
+    """Per-rank work: load the shard; rank 0 serves concurrent requests, rank 1 follows.
+
+    `device` defaults to this rank's GPU. A CPU dry run passes `"cpu"`.
+    """
     import concurrent.futures
     import time
 
     import torch
-    import torch.distributed as dist
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from mini_infer.api.server import _unhandled_exception_handler, completions
-    from mini_infer.distributed.group import destroy_distributed, init_distributed
     from mini_infer.engine.tokenizer import Tokenizer
     from mini_infer.engine.tp_state_cache_continuous_server import (
         TensorParallelStateCacheContinuousServer,
@@ -76,120 +89,147 @@ def _run_one_rank(
     from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
     from mini_infer.scheduler import TensorParallelStateCacheContinuousScheduler
 
-    print(f"[rank {rank}] init_distributed (nccl)...", flush=True)
-    init_distributed(
-        world_size=world_size, rank=rank, backend="nccl", master_addr="127.0.0.1", master_port=29500
-    )
-    try:
+    if device is None:
         torch.cuda.set_device(rank)
         device = f"cuda:{rank}"
-        print(f"[rank {rank}] loading V4-Flash shard onto {device}...", flush=True)
-        model = DeepseekV4ForCausalLM.from_checkpoint(
-            _MODEL_NAME, device=device, dtype=torch.bfloat16
-        )
-        tokenizer = Tokenizer.from_pretrained(_MODEL_NAME) if rank == 0 else None
-        server = TensorParallelStateCacheContinuousServer(
-            model,
-            tokenizer,
-            max_batch_size=len(prompts),
-            max_seq_len=max_seq_len,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        if rank != 0:
-            print(f"[rank {rank}] entering follower loop...", flush=True)
-            server.run_follower_loop()
-            print(f"[rank {rank}] follower loop done.", flush=True)
-            return None
+    print(f"[rank {rank}] loading V4-Flash shard onto {device}...", flush=True)
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    tokenizer = Tokenizer.from_pretrained(_MODEL_NAME) if rank == 0 else None
+    # With `cuda_graph`, every rank captures the decode step here, in lockstep.
+    server = TensorParallelStateCacheContinuousServer(
+        model,
+        tokenizer,
+        max_batch_size=len(prompts),
+        max_seq_len=max_seq_len,
+        device=device,
+        dtype=torch.bfloat16,
+        cuda_graph=cuda_graph,
+    )
+    if rank != 0:
+        print(f"[rank {rank}] entering follower loop...", flush=True)
+        server.run_follower_loop()
+        print(f"[rank {rank}] follower loop done.", flush=True)
+        return None
 
-        scheduler = TensorParallelStateCacheContinuousScheduler(server)
-        scheduler.start()
-        http_app = FastAPI()
-        http_app.add_api_route(
-            "/v1/completions", completions, methods=["POST"], response_model=None
+    scheduler = TensorParallelStateCacheContinuousScheduler(server)
+    scheduler.start()
+    http_app = FastAPI()
+    http_app.add_api_route("/v1/completions", completions, methods=["POST"], response_model=None)
+    http_app.add_exception_handler(Exception, _unhandled_exception_handler)
+    http_app.state.scheduler = scheduler
+    try:
+        print(
+            f"[rank 0] serving {len(prompts)} CONCURRENT requests (max_tokens={max_tokens}, "
+            f"cuda_graph={cuda_graph})...",
+            flush=True,
         )
-        http_app.add_exception_handler(Exception, _unhandled_exception_handler)
-        http_app.state.scheduler = scheduler
-        try:
-            print(
-                f"[rank 0] serving {len(prompts)} CONCURRENT requests (max_tokens={max_tokens})...",
-                flush=True,
-            )
-            with TestClient(http_app) as client:
+        with TestClient(http_app) as client:
 
-                def fire(prompt: str) -> dict:
-                    response = client.post(
-                        "/v1/completions",
-                        json={"model": _MODEL_NAME, "prompt": prompt, "max_tokens": max_tokens},
-                    )
-                    return {"status": response.status_code, "body": response.json()}
+            def fire(prompt: str) -> dict:
+                response = client.post(
+                    "/v1/completions",
+                    json={"model": _MODEL_NAME, "prompt": prompt, "max_tokens": max_tokens},
+                )
+                return {"status": response.status_code, "body": response.json()}
 
-                torch.cuda.synchronize(rank)
-                started = time.perf_counter()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
-                    responses = list(pool.map(fire, prompts))
-                elapsed = time.perf_counter() - started
-            # A non-200 body (for example the 503 for a dead engine thread) has
-            # no `choices`. Keep its `error` instead.
-            completions_out = [
-                {
-                    "prompt": p,
-                    "text": r["body"]["choices"][0]["text"] if r["status"] == 200 else None,
-                    "error": r["body"].get("error") if r["status"] != 200 else None,
-                    "status": r["status"],
-                }
-                for p, r in zip(prompts, responses, strict=True)
-            ]
-            print(f"[rank 0] all requests done in {elapsed:.2f}s.", flush=True)
-            return {
-                "elapsed_seconds": elapsed,
-                "num_requests": len(prompts),
-                "max_tokens": max_tokens,
-                "all_ok": all(r["status"] == 200 for r in responses),
-                "completions": completions_out,
+            if torch.device(device).type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+                responses = list(pool.map(fire, prompts))
+            elapsed = time.perf_counter() - started
+        # A non-200 body (for example the 503 for a dead engine thread) has
+        # no `choices`. Keep its `error` instead.
+        completions_out = [
+            {
+                "prompt": p,
+                "text": r["body"]["choices"][0]["text"] if r["status"] == 200 else None,
+                "error": r["body"].get("error") if r["status"] != 200 else None,
+                "status": r["status"],
             }
-        finally:
-            scheduler.stop()  # stops the engine and broadcasts shutdown so rank 1 exits
+            for p, r in zip(prompts, responses, strict=True)
+        ]
+        print(f"[rank 0] all requests done in {elapsed:.2f}s.", flush=True)
+        return {
+            "elapsed_seconds": elapsed,
+            "num_requests": len(prompts),
+            "max_tokens": max_tokens,
+            "cuda_graph": cuda_graph,
+            "all_ok": all(r["status"] == 200 for r in responses),
+            "completions": completions_out,
+        }
+    finally:
+        # Stops the engine and broadcasts shutdown, so rank 1 exits and every
+        # rank drops its decode graph before the process group goes away.
+        scheduler.stop()
+
+
+def _child_entry(rank: int, world_size: int, kwargs: dict[str, Any], queue) -> None:
+    """Module-level entry-point for `mp.spawn` workers (must be picklable).
+
+    Owns the process group: it sends the result before it destroys the group,
+    so a teardown that hangs cannot hold back the result.
+    """
+    import torch.distributed as dist
+
+    from mini_infer.distributed.group import destroy_distributed, init_distributed
+
+    try:
+        print(f"[rank {rank}] init_distributed (nccl)...", flush=True)
+        init_distributed(
+            world_size=world_size,
+            rank=rank,
+            backend="nccl",
+            master_addr="127.0.0.1",
+            master_port=29500,
+        )
+        queue.put(("ok", _run_one_rank(rank, world_size, **kwargs)))
+    except Exception:
+        import traceback
+
+        queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}"))
     finally:
         if dist.is_available() and dist.is_initialized():
             destroy_distributed()
 
 
-def _child_entry(rank, world_size, prompts, max_tokens, max_seq_len, queue) -> None:
-    try:
-        queue.put(("ok", _run_one_rank(rank, world_size, prompts, max_tokens, max_seq_len)))
-    except Exception:
-        import traceback
-
-        queue.put(("err", f"rank {rank} failed:\n{traceback.format_exc()}"))
-
-
 @app.function(
     image=image,
     gpu=_GPU,
-    timeout=1800,
+    # A warm-cache load plus the requests takes a few minutes; this caps a hang.
+    timeout=900,
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
-def serve(prompts: list[str], max_tokens: int) -> dict:
+def serve(prompts: list[str], max_tokens: int, cuda_graph: bool) -> dict:
     import torch.multiprocessing as mp
 
     world_size = 2
     ctx = mp.get_context("spawn")
     queue: mp.Queue = ctx.Queue()
+    kwargs = {
+        "prompts": prompts,
+        "max_tokens": max_tokens,
+        "max_seq_len": _MAX_SEQ_LEN,
+        "cuda_graph": cuda_graph,
+    }
     procs = [
-        ctx.Process(
-            target=_child_entry, args=(rank, world_size, prompts, max_tokens, _MAX_SEQ_LEN, queue)
-        )
+        ctx.Process(target=_child_entry, args=(rank, world_size, kwargs, queue))
         for rank in range(world_size)
     ]
     for p in procs:
         p.start()
+    results = []
     try:
-        results = [queue.get(timeout=1680) for _ in range(world_size)]
+        while len(results) < world_size:
+            results.append(queue.get(timeout=840))
+            if results[-1][0] == "err":
+                break  # the other rank can wait in a collective until the timeout
     finally:
         for p in procs:
             p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
     errors = [payload for status, payload in results if status == "err"]
     if errors:
         raise RuntimeError("\n".join(errors))
@@ -197,10 +237,13 @@ def serve(prompts: list[str], max_tokens: int) -> dict:
 
 
 @app.local_entrypoint()
-def main(max_tokens: int = 48) -> None:
-    result = serve.remote(_PROMPTS, max_tokens)
+def main(max_tokens: int = 48, eager: bool = False) -> None:
+    result = serve.remote(_PROMPTS, max_tokens, not eager)
     print("\n=== V4-Flash continuous batching over HTTP (2x B200, TP) ===")
-    print(f"{result['num_requests']} concurrent requests, max_tokens={result['max_tokens']}")
+    print(
+        f"{result['num_requests']} concurrent requests, max_tokens={result['max_tokens']}, "
+        f"cuda_graph={result['cuda_graph']}"
+    )
     print(f"all HTTP 200: {result['all_ok']}, wall: {result['elapsed_seconds']:.2f}s")
     for item in result["completions"]:
         print(f"  [{item['status']}] {item['prompt']!r} -> {item['text']!r}")

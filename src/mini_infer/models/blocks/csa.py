@@ -64,6 +64,7 @@ from mini_infer.models.blocks.v4 import (
     LightningIndexer,
     SimulatedActQuant,
     TokenLevelCompressor,
+    write_flushed_blocks,
 )
 
 if TYPE_CHECKING:
@@ -384,15 +385,14 @@ class CSAAttention(nn.Module):
         layer_idx: int,
         token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        n_compressed_max: int | None = None,
     ) -> torch.Tensor:
         """One ragged CSA decode step: B requests, each at its own `positions[b]`.
 
         Per-request counterpart of `forward_decode`: HCA-style SWA scatter + main
         overlap-compressor ragged step, plus the LightningIndexer's per-row masked
-        top-k pick over the compressed history. `n_compressed_max`
-        (= `max_b (positions[b] + 1) // m`) is the shared width of the valid
-        compressed prefix; the indexer masks each row's not-yet-valid blocks.
+        top-k pick over the whole compressed history buffer; the indexer masks
+        each row's not-yet-valid blocks. No host sync and no data-dependent
+        shape, so a CUDA graph can capture it.
         Returns `(B, 1, hidden_size)`; advances no counter.
         """
         batch_size, seqlen_in, _ = hidden_state.shape
@@ -445,19 +445,7 @@ class CSAAttention(nn.Module):
             cmp_score_state=layer_state.cmp_score_state,
             block_position_embeddings=block_position_embeddings,
         )
-        if bool(flush_mask.any()):
-            write_slots = positions[flush_mask] // m
-            if int(write_slots.max()) >= layer_state.compressed_kv.shape[1]:
-                raise RuntimeError(
-                    f"layer {layer_idx}: main compressed history overflow at block "
-                    f"{int(write_slots.max())}; raise max_n_compressed"
-                )
-            layer_state.compressed_kv[rows[flush_mask], write_slots] = (
-                flushed_main[flush_mask].squeeze(1).to(layer_state.compressed_kv.dtype)
-            )
-
-        if n_compressed_max is None:
-            n_compressed_max = int(((positions + 1) // m).max())
+        write_flushed_blocks(layer_state.compressed_kv, flushed_main, flush_mask, positions, m)
 
         # ---- Indexer ragged step: per-row masked top-k into the compressed history ----
         indexer_topk_idxs = self.indexer.forward_decode_step_ragged(
@@ -468,13 +456,10 @@ class CSAAttention(nn.Module):
             token_position_embeddings=token_position_embeddings,
             block_position_embeddings=block_position_embeddings,
             compressed_offset=window_size,
-            n_compressed_max=n_compressed_max,
         )  # (B, 1, actual_top_k)
 
         # ---- full_kv + per-row window indices, then one batched MQA-with-sink ----
-        full_kv = torch.cat(
-            [layer_state.swa_kv, layer_state.compressed_kv[:, :n_compressed_max]], dim=1
-        )
+        full_kv = torch.cat([layer_state.swa_kv, layer_state.compressed_kv], dim=1)
         window_topk_idxs = _build_window_decode_topk_idxs_ragged(
             window_size=window_size, positions=positions, device=hidden_state.device
         ).unsqueeze(1)  # (B, 1, n_win)
