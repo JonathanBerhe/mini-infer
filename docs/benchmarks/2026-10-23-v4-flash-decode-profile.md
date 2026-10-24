@@ -211,6 +211,21 @@ eager run. Both modes ran in the same container.
 - At batch 1 the graph decodes about 29 tokens per second, against 15 for
   the eager step of the same run.
 
+The two-GPU continuous-batching server with the graph
+(`TensorParallelStateCacheContinuousServer(cuda_graph=True)`), measured with
+`scripts/modal_v4_flash_cb_bench.py --cuda-graph` in one run. Each batch
+size times 63 greedy decode steps after 4 warm-up steps:
+
+| Batch | Eager ms/step | CUDA graph ms/step | Speedup | Tokens per second |
+|---:|---:|---:|---:|---:|
+| 1 | 172.8 | 35.7 | 4.84x | 5.8 to 28.0 |
+| 8 | 170.3 | 48.7 | 3.50x | 47 to 164 |
+| 16 | 169.8 | 57.3 | 2.96x | 94 to 279 |
+
+The graph tokens equal the eager tokens at every batch size. The eager step
+costs about 170 ms at every batch size, so the host sets it. The graph step
+grows by about 1.4 ms per extra request.
+
 ## How it is measured
 
 For each context, each rank prefills the context and runs 8 warm-up decode
@@ -260,6 +275,10 @@ uv run modal run scripts/modal_v4_flash_generate.py --profile-decode
 
 ```bash
 uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_cb_bench.py --cuda-graph --batch-sizes 1,8,16
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).

@@ -50,6 +50,13 @@ ragged step failed. It had these problems:
 4. **Keep the single-request path.** `forward_decode_with_cache`, which
    `StateCacheGenerator` drives, does not change. It still slices the history
    to the valid prefix.
+5. **Graph the two-GPU server too.**
+   `TensorParallelStateCacheContinuousServer(cuda_graph=True)` captures the
+   step on every rank when it is built, before any prefill, and replays it for
+   each decode op. The constructor runs on every rank in the same order, so
+   the all-reduces inside the capture line up. Shutdown drops the graph on
+   every rank, because a live graph that holds NCCL work can hang the process
+   group teardown. The flag is off by default.
 
 ## Alternatives Considered
 
@@ -95,5 +102,22 @@ Measured on 2x B200, real V4-Flash, batch 1, greedy, in one run
   batch 1 the eager step is bound by the host, so the extra work hides there.
 - A captured graph holds NCCL work. If a process destroys its process group
   while such a graph is alive, the teardown can hang. Free the graphs first.
-- The tensor-parallel server (`TensorParallelStateCacheContinuousServer`),
-  which serves V4-Flash on two GPUs, still runs the eager ragged step.
+
+The two-GPU server, measured on 2x B200 in one run
+(`scripts/modal_v4_flash_cb_bench.py --cuda-graph`), 63 timed greedy decode
+steps per batch size:
+
+| Batch | Eager ms/step | CUDA graph ms/step | Speedup | Tokens per second |
+|---:|---:|---:|---:|---:|
+| 1 | 172.8 | 35.7 | 4.84x | 5.8 to 28.0 |
+| 8 | 170.3 | 48.7 | 3.50x | 47 to 164 |
+| 16 | 169.8 | 57.3 | 2.96x | 94 to 279 |
+
+- The graph tokens equal the eager tokens at every batch size.
+- The eager step of the server costs about 170 ms at every batch size: the
+  host sets it. It is slower than the eager single-request step, because the
+  ragged step runs more kernels and every step also broadcasts its inputs to
+  the follower rank.
+- The graph step grows by about 1.4 ms per extra request. Each request picks
+  6 experts, so a larger batch reads more expert weights. This is an
+  inference from the numbers, not a profile.
