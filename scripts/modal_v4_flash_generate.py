@@ -52,6 +52,12 @@ row prefills its own slice of the passage. The eager step runs with every
 module labelled, so its trace splits the GPU time by part of the model, and
 a CUDA graph of the same step is timed and profiled next to it.
 
+`--compare-fp8-activations` runs the FP4 experts with bf16 inputs and then with
+e4m3 inputs (W4A8, ADR-043) on one load, and reports the passage perplexity,
+the argmax agreement, the greedy tokens and the graph step time per batch
+size of each. `--compare-paths` keeps bf16 inputs on both paths. The other
+modes run the model's default, which is e4m3 inputs on a B200.
+
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_generate.py
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_generate.py \
@@ -61,6 +67,7 @@ Run with:
         --trace-dir /tmp/v4-traces
     uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
     uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
+    uv run modal run scripts/modal_v4_flash_generate.py --compare-fp8-activations
 """
 
 import os
@@ -232,6 +239,10 @@ def _compare_one_rank(
     tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
     generator = StateCacheGenerator(model, tokenizer)
     moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
+    # The loop keeps bf16 inputs, so the grouped path does too: this compares
+    # the two matmul paths, and `--compare-fp8-activations` the input precision.
+    for block in moe_blocks:
+        block.fp8_activations = False
     prompt_ids = tokenizer.encode(prompt)
     passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
 
@@ -957,6 +968,138 @@ def _profile_batch_one_rank(
     return results
 
 
+def _compare_w4a8_one_rank(
+    rank: int,
+    world_size: int,
+    prompt: str,
+    passage: str,
+    batch_sizes: list[int],
+    device: str | None = None,
+) -> dict[str, Any]:
+    """Per-rank work of `--compare-fp8-activations`: bf16 against e4m3 inputs for the FP4 experts.
+
+    One load. For each mode, the MoE blocks' `fp8_activations` is set (ADR-043;
+    the model's own setting comes from `DeepseekV4Config.fp4_fp8_activations`
+    and is restored at the end), then:
+      - the passage prefills once; its next-token NLL gives a perplexity, and
+        the argmax at every position is kept to compare the modes;
+      - a `DecodeCudaGraph` at batch 1 greedy-decodes the prompt;
+      - a `DecodeCudaGraph` per batch size times its decode step, with row `b`
+        prefilling its own slice of the passage, as in `--profile-batch`.
+    `device` defaults to this rank's GPU. A CPU dry run passes `"cpu"`.
+    """
+    import gc
+    import statistics
+    import time
+
+    import torch
+
+    from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph
+    from mini_infer.engine.tokenizer import Tokenizer
+    from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
+    from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    if device is None:
+        torch.cuda.set_device(rank)
+        device = f"cuda:{rank}"
+    on_cuda = torch.device(device).type == "cuda"
+    _checkpoint(rank, f"loading real V4-Flash via from_checkpoint onto {device}...")
+    model = DeepseekV4ForCausalLM.from_checkpoint(_MODEL_NAME, device=device, dtype=torch.bfloat16)
+    tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
+    moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
+    settings = [block.fp8_activations for block in moe_blocks]
+    prompt_ids = tokenizer.encode(prompt)
+    passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
+
+    def synchronize() -> None:
+        if on_cuda:
+            torch.cuda.synchronize()
+
+    def new_cache(batch_size: int, max_seq_len: int = _BATCH_MAX_SEQ_LEN) -> Any:
+        return model.build_state_cache(
+            max_seq_len=max_seq_len, batch_size=batch_size, device=device, dtype=torch.bfloat16
+        )
+
+    def graph_decode(prompts: list[list[int]], steps: int) -> tuple[list[list[int]], list[float]]:
+        """Greedy-decode `steps` tokens per row from a graph; tokens and step times in ms."""
+        max_seq_len = max(len(ids) for ids in prompts) + steps + 1
+        cache = new_cache(len(prompts), max_seq_len)
+        # Capture first: warmup and capture write into the cache rows.
+        graph = DecodeCudaGraph(model, cache, batch_size=len(prompts), device=device)
+        tokens = []
+        for row, ids in enumerate(prompts):
+            single = new_cache(1, max_seq_len)
+            with torch.inference_mode():
+                logits = model.forward_prefill_with_cache(
+                    torch.tensor([ids], device=device, dtype=torch.long), state_cache=single
+                )
+            cache.copy_row_from(single, src_row=0, dst_row=row)
+            tokens.append([int(logits[0, -1].argmax())])
+        start = [len(ids) for ids in prompts]
+        step_ms = []
+        for _ in range(steps):
+            positions = [first + len(row) - 1 for first, row in zip(start, tokens, strict=True)]
+            began = time.perf_counter()
+            logits = graph.replay(
+                torch.tensor([[row[-1]] for row in tokens], dtype=torch.long),
+                torch.tensor(positions, dtype=torch.long),
+            )
+            for row, token in enumerate(logits[:, -1, :].argmax(dim=-1).tolist()):
+                tokens[row].append(token)
+            step_ms.append((time.perf_counter() - began) * 1e3)
+        # The graph holds captured NCCL work; free it before the process group goes.
+        del graph, cache
+        gc.collect()
+        synchronize()
+        return tokens, step_ms
+
+    results: dict[str, Any] = {"rank": rank, "moe_layers": len(moe_blocks), "modes": {}}
+    for mode in ("bf16", "w4a8"):
+        for block in moe_blocks:
+            block.fp8_activations = mode == "w4a8"
+        _checkpoint(rank, f"{mode}: passage perplexity...")
+        cache = new_cache(1, len(passage_ids))
+        with torch.inference_mode():
+            logits = model.forward_prefill_with_cache(
+                torch.tensor([passage_ids], device=device, dtype=torch.long), state_cache=cache
+            )[0, :-1].float()
+        targets = torch.tensor(passage_ids[1:], device=logits.device)
+        nll = float(torch.nn.functional.cross_entropy(logits, targets))
+        entry: dict[str, Any] = {
+            "nll": nll,
+            "argmax": logits.argmax(dim=-1).tolist(),
+            "top1": float((logits.argmax(dim=-1) == targets).float().mean()),
+            "last_logits": logits[-1].cpu(),
+        }
+        del logits, cache
+        _checkpoint(rank, f"{mode}: greedy decode and step times...")
+        entry["greedy"], _ = graph_decode([prompt_ids], 32)
+        entry["step_ms"] = {}
+        for batch_size in batch_sizes:
+            prompts = [
+                passage_ids[64 * row : 64 * row + _BATCH_PROMPT_TOKENS + 8 * row]
+                for row in range(batch_size)
+            ]
+            _, step_ms = graph_decode(prompts, _WARMUP_STEPS + _TIMED_STEPS)
+            entry["step_ms"][batch_size] = statistics.median(step_ms[_WARMUP_STEPS:])
+        results["modes"][mode] = entry
+    for block, setting in zip(moe_blocks, settings, strict=True):
+        block.fp8_activations = setting
+    bf16, w4a8 = results["modes"]["bf16"], results["modes"]["w4a8"]
+    pairs = enumerate(zip(bf16["greedy"][0], w4a8["greedy"][0], strict=True))
+    results["first_divergence"] = next((i for i, (a, b) in pairs if a != b), None)
+    results["argmax_agreement"] = statistics.mean(
+        a == b for a, b in zip(bf16["argmax"], w4a8["argmax"], strict=True)
+    )
+    results["last_logits_cosine"] = float(
+        torch.nn.functional.cosine_similarity(bf16["last_logits"], w4a8["last_logits"], dim=0)
+    )
+    for entry in results["modes"].values():
+        del entry["argmax"], entry["last_logits"]
+        entry["greedy_text"] = tokenizer.decode(entry["greedy"][0])
+    return results
+
+
 def _child_entry(
     rank: int, world_size: int, worker: Callable[..., dict], kwargs: dict, queue
 ) -> None:
@@ -1075,6 +1218,21 @@ def decode_profile(prompt: str, passage: str, keep_trace: bool, cuda_graph: bool
         passage=passage,
         keep_trace=keep_trace,
         cuda_graph=cuda_graph,
+    )
+
+
+@app.function(
+    image=image,
+    gpu=_GPU,
+    # A warm-cache load plus two batch sizes takes about 5 minutes; this caps a hang.
+    timeout=900,
+    secrets=_SECRETS,
+    volumes={"/root/.cache/huggingface": _HF_CACHE},
+)
+def compare_w4a8(prompt: str, passage: str, batch_sizes: list[int]) -> list[dict]:
+    """bf16 against e4m3 inputs for the FP4 experts; see `_compare_w4a8_one_rank`."""
+    return _spawn_ranks(
+        _compare_w4a8_one_rank, prompt=prompt, passage=passage, batch_sizes=batch_sizes
     )
 
 
@@ -1283,6 +1441,30 @@ def _print_batch_profile(per_rank: list[dict], trace_dir: str) -> None:
                 print(f"{mode} trace of batch {size} saved to {path}")
 
 
+def _print_w4a8(per_rank: list[dict]) -> None:
+    """Print the tables of `--compare-fp8-activations`."""
+    import math
+
+    rank0 = per_rank[0]
+    modes = rank0["modes"]
+    print(f"\nMoE layers: {rank0['moe_layers']}")
+    print(f"{'mode':<6} {'passage NLL':>11} {'perplexity':>10} {'top-1':>6}")
+    for mode, entry in modes.items():
+        print(f"{mode:<6} {entry['nll']:11.4f} {math.exp(entry['nll']):10.3f} {entry['top1']:6.1%}")
+    change = math.exp(modes["w4a8"]["nll"] - modes["bf16"]["nll"]) - 1
+    print(f"perplexity change with W4A8: {change:+.2%}")
+    print(f"argmax agreement over the passage: {rank0['argmax_agreement']:.1%}")
+    print(f"last-position logit cosine: {rank0['last_logits_cosine']:.5f}")
+    print(f"first differing greedy token (of 33): {rank0['first_divergence']}")
+    print("\ngraph decode step, median ms:")
+    for batch_size in modes["bf16"]["step_ms"]:
+        bf16 = modes["bf16"]["step_ms"][batch_size]
+        w4a8 = modes["w4a8"]["step_ms"][batch_size]
+        print(f"  batch {batch_size}: bf16 {bf16:.1f}, W4A8 {w4a8:.1f} ({bf16 / w4a8:.2f}x)")
+    for mode, entry in modes.items():
+        print(f"{mode} greedy text: {entry['greedy_text']!r}")
+
+
 @app.local_entrypoint()
 def main(
     prompt: str = "The capital of France is",
@@ -1292,8 +1474,13 @@ def main(
     cuda_graph: bool = False,
     profile_batch: bool = False,
     batch_sizes: str = "1,16",
+    compare_fp8_activations: bool = False,
     trace_dir: str = "",
 ) -> None:
+    if compare_fp8_activations:
+        sizes = [int(size) for size in batch_sizes.split(",")]
+        _print_w4a8(compare_w4a8.remote(prompt, _PASSAGE.read_text(), sizes))
+        return
     if profile_batch:
         sizes = [int(size) for size in batch_sizes.split(",")]
         per_rank = batch_profile.remote(_PASSAGE.read_text(), sizes, bool(trace_dir))

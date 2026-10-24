@@ -86,6 +86,61 @@ def _force_grouped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(hash_routed_moe_ffn, "supports_grouped_experts", lambda device: True)
 
 
+def _power_of_two_scales(experts: torch.nn.ModuleList) -> None:
+    """Round every scale to a power of two, as in V4's e8m0 checkpoints."""
+    with torch.no_grad():
+        for expert in experts:
+            for name in ("w1", "w2", "w3"):
+                scale = getattr(expert, f"{name}_scale")
+                scale.copy_(torch.exp2(torch.round(torch.log2(scale))))
+
+
+@pytest.mark.parametrize("power_of_two", [False, True])
+def test_fp4_pack_takes_fp8_inputs_only_when_the_scales_allow(power_of_two: bool) -> None:
+    """`fp8_activations=None` runs W4A8 only with e8m0 scales, and else keeps bf16 inputs."""
+    experts = _fp4_experts(2)
+    if power_of_two:
+        _power_of_two_scales(experts)
+    pack = PackedFp4Experts(experts, fp8_activations=None)
+    assert pack.fp8_activations is power_of_two
+    assert (pack.gate_up.e8m0_scale is not None) is power_of_two
+    assert (pack.down.e8m0_scale is not None) is power_of_two
+    if pack.down.e8m0_scale is not None:
+        torch.testing.assert_close(torch.exp2(pack.down.e8m0_scale.float() - 127), pack.down.scale)
+    else:
+        with pytest.raises(ValueError, match="power of two"):
+            PackedFp4Experts(experts, fp8_activations=True)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_auto_fp8_activations_need_a_native_gpu(
+    monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    """`fp8_activations=None` takes W4A8 only where `supports_native_w4a8` holds."""
+    moe = HashRoutedMoEFFN(
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        num_routed_experts=4,
+        num_activated_experts=2,
+        routing_mode="score_topk",
+        expert_dtype="fp4",
+        fp8_activations=None,
+    )
+    generator = torch.Generator().manual_seed(5)
+    for expert in moe.experts:
+        fill_fp4(expert, generator)  # type: ignore[arg-type]
+    _power_of_two_scales(moe.experts)
+    _force_grouped(monkeypatch)
+    monkeypatch.setattr(hash_routed_moe_ffn, "supports_block_fp4_grouped_mm", lambda device: True)
+    monkeypatch.setattr(hash_routed_moe_ffn, "supports_native_w4a8", lambda device: native)
+    rows = torch.zeros(3, HIDDEN, dtype=torch.bfloat16)
+    pack = moe._grouped_pack(rows)
+    assert isinstance(pack, PackedFp4Experts)
+    assert pack.fp8_activations is native
+    # The next forward reuses the pack: no new read-back of the scales.
+    assert moe._grouped_pack(rows) is pack
+
+
 @pytest.mark.parametrize("routing_mode", ["score_topk", "hash"])
 def test_bf16_experts_grouped_match_the_loop(
     monkeypatch: pytest.MonkeyPatch, routing_mode: str

@@ -14,7 +14,8 @@ gate rows first. Plain tensors (bf16) go through `functional.grouped_mm`;
 `fp8_grouped_kernel.block_fp8_grouped_mm`, a Triton kernel or, for many rows
 on sm90 and sm100, a Gluon kernel. `BlockFp4Weight`s (packed e2m1 with one
 scale per row and 32 columns) go through the Triton kernel of
-`fp4_grouped_kernel.py`.
+`fp4_grouped_kernel.py`, with bf16 inputs or, when they carry e8m0 scales,
+as W4A8 with e4m3 inputs.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import torch
 from torch.nn import functional
 
 from mini_infer.device import is_hopper_or_newer_device
-from mini_infer.models.blocks.fp4_grouped_kernel import block_fp4_grouped_mm
+from mini_infer.models.blocks.fp4_grouped_kernel import block_fp4_grouped_mm, quantize_e4m3_rows
 from mini_infer.models.blocks.fp8_grouped_kernel import block_fp8_grouped_mm
 
 # Runtime toggle for benchmarking. When True, `supports_grouped_experts`
@@ -70,12 +71,14 @@ class BlockFp4Weight:
 
     `packed` is `(E, N, K / 2)` bytes, each holding two e2m1 values (the low
     nibble first), and `scale` its fp32 scale per row and `block` columns,
-    `(E, N, K / block)`.
+    `(E, N, K / block)`. With `e8m0_scale`, the same scales as e8m0 bytes,
+    the matmuls run W4A8: each input is quantized to e4m3 first (ADR-043).
     """
 
     packed: torch.Tensor
     scale: torch.Tensor
     block: int
+    e8m0_scale: torch.Tensor | None = None
 
     @property
     def shape(self) -> torch.Size:
@@ -106,6 +109,18 @@ def _grouped_matmul(
             num_experts=num_experts,
         )
     if isinstance(weight, BlockFp4Weight):
+        if weight.e8m0_scale is not None:
+            quantized, act_scale = quantize_e4m3_rows(rows)
+            return block_fp4_grouped_mm(
+                quantized,
+                weight.packed,
+                weight.e8m0_scale,
+                block=weight.block,
+                row_experts=row_experts,
+                group_ends=offs,
+                act_scale=act_scale,
+                out_dtype=rows.dtype,
+            )
         return block_fp4_grouped_mm(
             rows,
             weight.packed,

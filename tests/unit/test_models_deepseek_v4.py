@@ -655,6 +655,18 @@ def test_moe_fp4_expert_dtype_builds_fp4_routed_experts() -> None:
         assert isinstance(layer.mlp.shared_experts, MixtralExpert)
 
 
+def test_fp4_fp8_activations_default_to_auto_and_need_fp4_experts() -> None:
+    """None (auto, ADR-043) reaches every MoE block. Forcing W4A8 needs FP4 experts."""
+    from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
+
+    cfg = _make_moe_hybrid_config(expert_dtype="fp4")
+    assert cfg.fp4_fp8_activations is None
+    blocks = [m for m in DeepseekV4ForCausalLM(cfg).modules() if isinstance(m, HashRoutedMoEFFN)]
+    assert blocks and all(block.fp8_activations is None for block in blocks)
+    with pytest.raises(ValueError, match="expert_dtype='fp4'"):
+        dataclasses.replace(_make_moe_hybrid_config(), fp4_fp8_activations=True)
+
+
 @pytest.mark.parametrize("expert_dtype", ["bf16", "fp4"])
 def test_moe_swiglu_limit_reaches_every_expert(expert_dtype: str) -> None:
     """`moe_swiglu_limit` clamps routed and shared experts alike; 0 keeps plain SwiGLU."""

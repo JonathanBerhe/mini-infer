@@ -106,6 +106,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         expert_dtype: str = "bf16",
         # V4 `swiglu_limit`: clamp every expert's gate/up projections (0 = off).
         moe_swiglu_limit: float = 0.0,
+        # W4A8 for grouped FP4 experts (ADR-043); see `DeepseekV4Config`.
+        fp4_fp8_activations: bool | None = None,
         # Hyper-Connections knobs. Defaults disable HC -> vanilla pre-norm
         # residuals are used.
         use_hyper_connections: bool = False,
@@ -212,6 +214,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 expert_dtype=expert_dtype,
                 act_quant=act_quant,
                 swiglu_limit=moe_swiglu_limit,
+                fp8_activations=fp4_fp8_activations,
             )
         else:  # pragma: no cover — Literal already constrains this
             raise ValueError(f"unknown ffn_type={ffn_type!r}")
