@@ -19,7 +19,12 @@ pytest.importorskip("triton")
 
 from mini_infer.models.blocks import fp4_grouped_kernel, hash_routed_moe_ffn
 from mini_infer.models.blocks.fp4_expert import PackedFp4Experts
-from mini_infer.models.blocks.fp4_grouped_kernel import block_fp4_grouped_mm
+from mini_infer.models.blocks.fp4_grouped_kernel import (
+    block_fp4_grouped_mm,
+    quantize_e4m3_rows,
+    supports_native_w4a8,
+    to_e8m0,
+)
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16
 from tests.unit.test_fp4_grouped import fill_fp4
@@ -101,6 +106,96 @@ def test_kernel_matches_dequantized_matmul(
             continue
         deq = dequantize_nvfp4_to_bf16(packed[expert], scale[expert], block_size=block)
         want[row] = rows[row].float() @ deq.float().T
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=_atol(device, want))
+
+
+def test_e4m3_rows_take_the_smallest_power_of_two_scale_per_block() -> None:
+    device = _device()
+    generator = torch.Generator().manual_seed(0)
+    magnitude = torch.exp2(torch.randint(-12, 6, (5, 8, 1), generator=generator).float())
+    x = (torch.randn(5, 8, 32, generator=generator) * magnitude).view(5, 256)
+    x[1, :32] = 0.0  # an all-zero block
+    x = x.bfloat16()
+
+    q, s = quantize_e4m3_rows(x.to(device))
+
+    blocks = x.float().view(5, 8, 32)
+    mantissa, exponent = torch.frexp(blocks.abs().amax(-1) / 448.0)
+    # The smallest power of two at least amax / 448, as an e8m0 byte.
+    want = (exponent - (mantissa == 0.5).int() + 127).clamp(1, 253)
+    want[1, 0] = 1
+    assert s.dtype == torch.uint8 and q.dtype == torch.float8_e4m3fn
+    assert torch.equal(s.cpu().int(), want.int())
+    if device != "cuda":
+        # Triton's interpreter casts fp32 to e4m3 wrongly: it drops the carry
+        # at a binade edge (31.625 becomes 16) and rounds ties away from zero.
+        return
+    # The power-of-two scale is exact, so the values are PyTorch's e4m3 cast.
+    scaled = blocks * torch.exp2(127 - s.cpu().float())[..., None]
+    want_q = scaled.to(torch.float8_e4m3fn).view(5, 256)
+    assert torch.equal(q.cpu().view(torch.uint8), want_q.view(torch.uint8))
+
+
+def test_e8m0_scales_reject_scales_that_are_not_powers_of_two() -> None:
+    assert to_e8m0(torch.tensor([0.25, 1.0, 2.0**-20])).tolist() == [125, 127, 107]
+    for bad in (0.3, -0.25, 0.0):
+        with pytest.raises(ValueError, match="power of two"):
+            to_e8m0(torch.tensor([0.25, bad]))
+
+
+@pytest.mark.parametrize(
+    ("per_segment", "expert_tiles"),
+    [(None, None), (True, None), (False, None)],
+    ids=["default", "segments", "expert-tiles"],
+)
+@pytest.mark.parametrize(("counts", "off_rank"), [([3, 0, 17, 1, 9], 4), ([100, 0, 150, 60, 1], 0)])
+def test_w4a8_kernel_matches_fp32_math_on_its_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    counts: list[int],
+    off_rank: int,
+    per_segment: bool | None,
+    expert_tiles: bool | None,
+) -> None:
+    """W4A8: e4m3 rows times e2m1 weights, both scaled by e8m0, summed in fp32."""
+    device = _device()
+    monkeypatch.setattr(fp4_grouped_kernel, "_PER_SEGMENT_FOR_BENCH", per_segment)
+    monkeypatch.setattr(fp4_grouped_kernel, "_EXPERT_TILES_FOR_BENCH", expert_tiles)
+    generator = torch.Generator().manual_seed(0)
+    num_experts, n_dim, k_dim, block = len(counts), 48, 96, 32
+    packed = torch.randint(
+        -128, 128, (num_experts, n_dim, k_dim // 2), dtype=torch.int8, generator=generator
+    )
+    scale = torch.exp2(torch.randint(-8, -5, (num_experts, n_dim, k_dim // block)).float())
+    row_experts = torch.cat(
+        [
+            torch.repeat_interleave(torch.arange(num_experts), torch.tensor(counts)),
+            torch.full((off_rank,), num_experts),
+        ]
+    )
+    group_ends = torch.tensor(counts).cumsum(0).to(torch.int32)
+    rows = torch.randn(len(row_experts), k_dim, generator=generator).bfloat16()
+    q, act_scale = quantize_e4m3_rows(rows.to(device))
+
+    got = block_fp4_grouped_mm(
+        q,
+        packed.to(device),
+        to_e8m0(scale).to(device),
+        block=block,
+        row_experts=row_experts.to(device),
+        group_ends=group_ends.to(device),
+        act_scale=act_scale,
+        out_dtype=torch.bfloat16,
+    ).cpu()
+
+    q_rows = q.cpu().float().view(len(row_experts), -1, block)
+    q_rows = (q_rows * torch.exp2(act_scale.cpu().float() - 127)[..., None]).view(-1, k_dim)
+    want = torch.zeros(len(row_experts), n_dim)
+    for row, expert in enumerate(row_experts.tolist()):
+        if expert >= num_experts:
+            continue
+        deq = dequantize_nvfp4_to_bf16(packed[expert], scale[expert], block_size=block)
+        want[row] = q_rows[row] @ deq.float().T
     assert got.dtype == torch.bfloat16
     torch.testing.assert_close(got.float(), want, rtol=1e-2, atol=_atol(device, want))
 
@@ -191,3 +286,67 @@ def test_fp4_moe_grouped_matches_loop(
         grouped = moe(hidden, input_ids)
     assert isinstance(moe._expert_pack, PackedFp4Experts)
     torch.testing.assert_close(grouped.float(), looped.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("fp8_activations", [True, None])
+@pytest.mark.parametrize("tokens", [1, 5, 100])
+def test_fp4_moe_fp8_activations_stay_near_the_bf16_loop(
+    monkeypatch: pytest.MonkeyPatch, tokens: int, fp8_activations: bool | None
+) -> None:
+    """W4A8 rounds each expert input to e4m3; the rest of the math is the bf16 path's.
+
+    None (auto) takes W4A8 only on a GPU that runs it natively (sm100).
+    """
+    device = _device()
+    torch.manual_seed(1)
+    moe = HashRoutedMoEFFN(
+        hidden_size=128,
+        intermediate_size=64,
+        num_routed_experts=8,
+        num_activated_experts=3,
+        routing_mode="score_topk",
+        n_shared_experts=1,
+        expert_dtype="fp4",
+        swiglu_limit=10.0,
+        fp8_activations=fp8_activations,
+    ).eval()
+    generator = torch.Generator().manual_seed(2)
+    with torch.no_grad():
+        for expert in moe.experts:
+            fill_fp4(expert, generator)  # type: ignore[arg-type]
+            for name in ("w1", "w2", "w3"):  # e8m0 holds powers of two only
+                scale = getattr(expert, f"{name}_scale")
+                scale.copy_(torch.exp2(torch.round(torch.log2(scale))))
+    assert moe.shared_experts is not None
+    moe.shared_experts.to(torch.bfloat16)
+    moe.to(device)
+    hidden = torch.randn(1, tokens, 128, device=device).bfloat16()
+
+    monkeypatch.setattr(hash_routed_moe_ffn, "supports_grouped_experts", lambda device: False)
+    with torch.no_grad():
+        looped = moe(hidden).float()
+    monkeypatch.setattr(hash_routed_moe_ffn, "supports_grouped_experts", lambda device: True)
+    monkeypatch.setattr(hash_routed_moe_ffn, "supports_block_fp4_grouped_mm", lambda device: True)
+    with torch.no_grad():
+        grouped = moe(hidden).float()
+    pack = moe._expert_pack
+    w4a8 = fp8_activations or supports_native_w4a8(device)
+    assert isinstance(pack, PackedFp4Experts) and pack.fp8_activations is w4a8
+    assert (pack.gate_up.e8m0_scale is not None) is w4a8
+    assert (pack.down.e8m0_scale is not None) is w4a8
+    error = float((grouped - looped).norm() / looped.norm())
+    # About 2^-5 per e4m3 rounding. The interpreter's faulty e4m3 cast (see
+    # the quantizer test) adds a few values off by up to 2x.
+    assert error < (0.05 if device == "cuda" else 0.1), error
+
+
+def test_fp8_activations_need_fp4_experts() -> None:
+    with pytest.raises(ValueError, match="expert_dtype='fp4'"):
+        HashRoutedMoEFFN(
+            hidden_size=128,
+            intermediate_size=64,
+            num_routed_experts=8,
+            num_activated_experts=3,
+            routing_mode="score_topk",
+            fp8_activations=True,
+        )
