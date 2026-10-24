@@ -19,11 +19,16 @@ The work splits as in the FP8 kernel: one program per expert segment up to
 Rows routed to another rank's experts sort after the local groups and get
 zeros.
 
+On sm90 and sm100, many rows go to the Gluon kernels of
+`fp4_grouped_gluon.py` when one takes the operands. They decode a weight
+tile while the tensor cores multiply the previous one.
+
 With `act_scale`, the kernel runs W4A8 (ADR-043): the rows are e4m3 with one
 power-of-two (e8m0) scale per 32 columns (`quantize_e4m3_rows`), the weight
 scales are e8m0 too, and `tl.dot_scaled` multiplies the packed e2m1 bytes
 without a software decode. Blackwell tensor cores take these operands
-natively; other GPUs emulate them.
+natively; other GPUs emulate them. The Gluon kernels take bf16 rows only, so
+W4A8 always runs in this Triton kernel.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ import os
 import torch
 
 from mini_infer.device import is_blackwell_device, is_cuda_device, is_datacenter_blackwell_device
+from mini_infer.models.blocks import fp4_grouped_gluon
 
 try:
     import triton
@@ -84,6 +90,9 @@ _PER_SEGMENT_FOR_BENCH: bool | None = None
 # Bench hook: False splits many rows into row tiles that span experts, not
 # into tiles of one expert each (the default).
 _EXPERT_TILES_FOR_BENCH: bool | None = None
+# Bench hook: True forces a Gluon kernel (and fails when none takes the
+# operands), False keeps the Triton kernel, None picks by default.
+_GLUON_FOR_BENCH: bool | None = None
 
 
 def supports_block_fp4_grouped_mm(device: torch.device | str) -> bool:
@@ -519,6 +528,7 @@ def block_fp4_grouped_mm(
     block: int,
     row_experts: torch.Tensor,
     group_ends: torch.Tensor,
+    num_experts: int | None = None,
     act_scale: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
@@ -531,9 +541,13 @@ def block_fp4_grouped_mm(
     `scale` its fp32 scale per row and `block` columns, `(E, N, K / block)`.
     The result has `out_dtype` (default `rows.dtype`).
 
+    `num_experts` counts the experts of all ranks (default `E`). The Gluon
+    kernels pick their tile from the mean rows per expert over all of them.
+
     With `act_scale`, the product is W4A8: `rows` are `float8_e4m3fn` with
     the e8m0 scale bytes `act_scale` `(M, K / 32)` (`quantize_e4m3_rows`),
-    and `scale` holds e8m0 bytes too, with `block` 32.
+    and `scale` holds e8m0 bytes too, with `block` 32. The Gluon kernels do
+    not take these operands, nor an `out_dtype` other than `rows.dtype`.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("block_fp4_grouped_mm needs Triton")
@@ -556,6 +570,27 @@ def block_fp4_grouped_mm(
         return out
     small = num_rows <= _SMALL_ROWS
     per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
+    force_gluon = _GLUON_FOR_BENCH
+    # The Gluon kernels take bf16 rows into a result of the same dtype only.
+    gluon_takes = not w4a8 and out.dtype == rows.dtype
+    if force_gluon or (force_gluon is None and not per_segment and gluon_takes):
+        gluon_tiles = None
+        if gluon_takes:
+            gluon_tiles = fp4_grouped_gluon.gluon_tiles(
+                rows,
+                packed,
+                scale,
+                block,
+                group_ends,
+                num_experts=num_experts or num_groups,
+                by_default=force_gluon is None,
+            )
+        if gluon_tiles is not None:
+            return fp4_grouped_gluon.gluon_block_fp4_grouped_mm(
+                rows, packed, scale, group_ends=group_ends, tiles=gluon_tiles
+            )
+        if force_gluon:
+            raise ValueError("_GLUON_FOR_BENCH is set, but no Gluon kernel takes these operands")
     tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows, w4a8=w4a8)
     block_m, block_n, block_k, warps, stages = tiles
     if block_k % block and block % block_k:
