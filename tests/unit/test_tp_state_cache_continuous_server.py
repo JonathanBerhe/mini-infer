@@ -309,3 +309,36 @@ def test_time_decode_reports_each_decode_step(
 def test_decode_timings_needs_time_decode() -> None:
     with pytest.raises(RuntimeError, match="time_decode=True"):
         _one_rank_server().decode_timings()
+
+
+def test_scheduler_samples_greedy_and_sampled_rows_in_one_batch() -> None:
+    """A sampled row in the batch leaves the greedy rows' tokens unchanged."""
+    server = _one_rank_server()
+    tokenizer = _VarLenTokenizer(server._model.cfg.vocab_size)
+    server._tokenizer = tokenizer  # type: ignore[assignment]
+    prompts = ["alpha", "beta!!"]
+    max_new_tokens = 6
+    gen = StateCacheGenerator(server._model)
+    reference = [
+        gen.generate_ids(tokenizer.encode(prompt), max_new_tokens=max_new_tokens)
+        for prompt in prompts
+    ]
+
+    scheduler = TensorParallelStateCacheContinuousScheduler(server)
+    scheduler.start()
+    try:
+        greedy, sampled = (
+            scheduler.submit(
+                Request(prompt=prompt, sampling_params=params, max_tokens=max_new_tokens)
+            )
+            for prompt, params in zip(
+                prompts,
+                [SamplingParams(temperature=0.0), SamplingParams(temperature=1.5, top_k=20)],
+                strict=True,
+            )
+        )
+        greedy_tokens, sampled_tokens = greedy.wait().tokens, sampled.wait().tokens
+    finally:
+        scheduler.stop()
+    assert greedy_tokens == reference[0]
+    assert len(sampled_tokens) == max_new_tokens

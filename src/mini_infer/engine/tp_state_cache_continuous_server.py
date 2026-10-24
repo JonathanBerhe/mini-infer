@@ -46,7 +46,7 @@ from mini_infer.device import is_cuda_device
 from mini_infer.distributed.group import get_rank, get_world_size
 from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode_cuda_graph
 from mini_infer.engine.decode_step_timer import DecodeStepTimer, DecodeStepTiming
-from mini_infer.engine.sampler import SamplingParams, sample
+from mini_infer.engine.sampler import SamplingParams, sample, sample_batch
 from mini_infer.engine.tokenizer import Tokenizer
 from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM, build_state_cache_layer_specs
 
@@ -281,8 +281,10 @@ class TensorParallelStateCacheContinuousServer:
                 input_tokens[slot_idx] = next_tokens[slot_idx]
                 decode_positions[slot_idx] = positions[slot_idx]
             logits = self.decode_batch(input_tokens, decode_positions)
+            # Every row is greedy, so one argmax and one host sync serve the batch.
+            row_tokens = sample_batch(logits[:, -1, :], [params] * self.max_batch_size)
             for slot_idx in decode_slots:
-                next_tokens[slot_idx] = sample(logits[slot_idx, -1, :], params)
+                next_tokens[slot_idx] = row_tokens[slot_idx]
                 positions[slot_idx] += 1
         return outputs
 
