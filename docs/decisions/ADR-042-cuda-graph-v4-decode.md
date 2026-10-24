@@ -122,7 +122,7 @@ steps per batch size:
   6 experts, so a larger batch reads more expert weights. This is an
   inference from the numbers, not a profile.
 - The two-GPU serving script (`scripts/modal_v4_flash_cb_serve.py`) builds
-  the server with the graph on; `--eager` turns it off. With the graph, 6
+  the server with the graph on, and `--eager` turns it off. With the graph, 6
   concurrent HTTP requests of 48 tokens each finished in 2.75 s, prefill
   included. All returned HTTP 200 with coherent text, and both ranks shut
   down cleanly.
