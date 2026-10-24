@@ -57,7 +57,8 @@ e4m3 inputs (W4A8, ADR-043) on one load, and reports the passage perplexity,
 the argmax agreement, the greedy tokens and the graph step time per batch
 size of each. `--compare-fused-rope` does the same with the partial RoPE of
 PyTorch and then of the Triton kernel, whose outputs are bit-identical.
-`--compare-paths` keeps bf16 inputs on both paths. The other modes run the
+`--compare-fused-norm` does it with the RMS norms of PyTorch and then of the
+Triton kernel (ADR-045). `--compare-paths` keeps bf16 inputs on both paths. The other modes run the
 model's default, which is e4m3 inputs on a B200.
 
 Run with:
@@ -71,6 +72,7 @@ Run with:
     uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
     uv run modal run scripts/modal_v4_flash_generate.py --compare-fp8-activations
     uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-rope
+    uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-norm
 """
 
 import os
@@ -976,6 +978,8 @@ _COMPARED_MODES = {
     "fp8-activations": ("bf16", "w4a8"),
     # `--compare-fused-rope`: the PyTorch partial RoPE against the Triton kernel.
     "fused-rope": ("torch", "fused"),
+    # `--compare-fused-norm`: the PyTorch RMS norms against the Triton kernel.
+    "fused-norm": ("torch", "fused"),
 }
 
 
@@ -988,12 +992,13 @@ def _compare_modes_one_rank(
     feature: str,
     device: str | None = None,
 ) -> dict[str, Any]:
-    """Per-rank work of `--compare-fp8-activations` and `--compare-fused-rope`.
+    """Per-rank work of the `--compare-*` modes of `_COMPARED_MODES`.
 
-    One load, two modes of `feature` (see `_COMPARED_MODES`). For
-    `fp8-activations` the MoE blocks' `fp8_activations` is set (ADR-043; the
-    model's own setting is restored at the end). For `fused-rope` the partial
-    RoPE kernel's bench hook turns it off, then on. For each mode:
+    One load, two modes of `feature`. For `fp8-activations` the MoE blocks'
+    `fp8_activations` is set (ADR-043). For `fused-rope` the partial RoPE
+    kernel's bench hook turns it off, then on. For `fused-norm` every RMSNorm's
+    `fused` and every attention's `fused_q_norm` turn off, then on (ADR-045).
+    The model's own settings are restored at the end. For each mode:
       - the passage prefills once; its next-token NLL gives a perplexity, and
         the argmax at every position is kept to compare the modes;
       - a `DecodeCudaGraph` at batch 1 greedy-decodes the prompt;
@@ -1012,6 +1017,7 @@ def _compare_modes_one_rank(
     from mini_infer.engine.tokenizer import Tokenizer
     from mini_infer.models.blocks import partial_rope_kernel
     from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
+    from mini_infer.models.blocks.rmsnorm import RMSNorm
     from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
 
     if device is None:
@@ -1023,6 +1029,10 @@ def _compare_modes_one_rank(
     tokenizer = Tokenizer.from_pretrained(_MODEL_NAME)
     moe_blocks = [m for m in model.modules() if isinstance(m, HashRoutedMoEFFN)]
     settings = [block.fp8_activations for block in moe_blocks]
+    # ADR-045's switches: `fused` on every RMSNorm, `fused_q_norm` on attention.
+    norms = [m for m in model.modules() if isinstance(m, RMSNorm)]
+    q_norms = [m for m in model.modules() if hasattr(m, "fused_q_norm")]
+    norm_settings = [m.fused for m in norms] + [m.fused_q_norm for m in q_norms]
     prompt_ids = tokenizer.encode(prompt)
     passage_ids = tokenizer.encode(passage)[:_PASSAGE_TOKENS]
 
@@ -1068,12 +1078,20 @@ def _compare_modes_one_rank(
         synchronize()
         return tokens, step_ms
 
+    def set_norms(fused: list[bool]) -> None:
+        for module, setting in zip(norms, fused[: len(norms)], strict=True):
+            module.fused = setting
+        for module, setting in zip(q_norms, fused[len(norms) :], strict=True):
+            module.fused_q_norm = setting
+
     def set_mode(mode: str) -> None:
         if feature == "fp8-activations":
             for block in moe_blocks:
                 block.fp8_activations = mode == "w4a8"
-        else:
+        elif feature == "fused-rope":
             partial_rope_kernel._DISABLED_FOR_BENCH = mode == "torch"
+        else:
+            set_norms([mode == "fused"] * len(norm_settings))
 
     base_mode, other_mode = _COMPARED_MODES[feature]
     results: dict[str, Any] = {"rank": rank, "moe_layers": len(moe_blocks), "modes": {}}
@@ -1108,6 +1126,7 @@ def _compare_modes_one_rank(
     for block, setting in zip(moe_blocks, settings, strict=True):
         block.fp8_activations = setting
     partial_rope_kernel._DISABLED_FOR_BENCH = False
+    set_norms(norm_settings)
     base, other = results["modes"][base_mode], results["modes"][other_mode]
     pairs = enumerate(zip(base["greedy"][0], other["greedy"][0], strict=True))
     results["first_divergence"] = next((i for i, (a, b) in pairs if a != b), None)
@@ -1470,7 +1489,7 @@ def _print_batch_profile(per_rank: list[dict], trace_dir: str) -> None:
 
 
 def _print_mode_comparison(per_rank: list[dict], feature: str) -> None:
-    """Print the tables of `--compare-fp8-activations` or `--compare-fused-rope`."""
+    """Print the tables of a `--compare-*` mode of `_COMPARED_MODES`."""
     import math
 
     base_mode, other_mode = _COMPARED_MODES[feature]
@@ -1509,11 +1528,17 @@ def main(
     batch_sizes: str = "1,16",
     compare_fp8_activations: bool = False,
     compare_fused_rope: bool = False,
+    compare_fused_norm: bool = False,
     trace_dir: str = "",
 ) -> None:
-    if compare_fp8_activations or compare_fused_rope:
+    chosen = {
+        "fp8-activations": compare_fp8_activations,
+        "fused-rope": compare_fused_rope,
+        "fused-norm": compare_fused_norm,
+    }
+    if any(chosen.values()):
         sizes = [int(size) for size in batch_sizes.split(",")]
-        feature = "fp8-activations" if compare_fp8_activations else "fused-rope"
+        feature = next(name for name, on in chosen.items() if on)
         per_rank = compare_modes.remote(prompt, _PASSAGE.read_text(), sizes, feature)
         _print_mode_comparison(per_rank, feature)
         return

@@ -93,6 +93,7 @@ _GPU_TESTS = [
     "tests/unit/test_fp4_grouped_gluon.py",
     "tests/unit/test_fp4_grouped.py",
     "tests/unit/test_partial_rope_kernel.py",
+    "tests/unit/test_rms_norm_kernel.py",
     "tests/unit/test_v4_cuda_graph_decode.py",
     "tests/unit/test_cuda_graph_decode.py",
 ]

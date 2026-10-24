@@ -66,11 +66,14 @@ from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.distributed.loader import load_state_dict_with_tp
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
+from mini_infer.models.blocks.csa import CSAAttention
 from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
 from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
+from mini_infer.models.blocks.hca import HCAAttention
 from mini_infer.models.blocks.hyper_connections import HCHeadReduction
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding
+from mini_infer.models.blocks.swa import SWAAttention
 from mini_infer.models.blocks.v4.act_quant import ScaleFormat, SimulatedActQuant
 
 # HF V4 -> mini-infer renames. Same MoE expert structure as V2/V3 (the
@@ -406,6 +409,10 @@ class DeepseekV4Config:
     # True forces it (and needs `expert_dtype="fp4"` and power-of-two scales).
     # False keeps bf16 inputs.
     fp4_fp8_activations: bool | None = None
+    # One Triton kernel per RMS norm on CUDA (ADR-045): every `RMSNorm` and
+    # the per-head q-norm of the attention. Its sum runs in another order than
+    # PyTorch's, so a few outputs differ in the last bit. False keeps PyTorch.
+    fused_rms_norm: bool = True
     # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
     # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
     # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
@@ -638,6 +645,7 @@ class DeepseekV4Config:
             moe_swiglu_limit=float(_pick("moe_swiglu_limit", "swiglu_limit", default_value=0.0)),
             # Not part of the HF schema: auto unless a caller's config dict sets it.
             fp4_fp8_activations=_pick("fp4_fp8_activations", default_value=None),
+            fused_rms_norm=bool(_pick("fused_rms_norm", default_value=True)),
             # Hyper-Connections. V4-Flash sets `hc_mult=4`.
             use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
             hc_mult=int(_pick("hc_mult", default_value=0)),
@@ -732,6 +740,12 @@ class _DeepseekV4InnerModel(nn.Module):
             [self._build_layer(cfg, layer_idx) for layer_idx in range(cfg.num_hidden_layers)]
         )
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        # ADR-045: the norms of every block run as one Triton kernel on CUDA.
+        for module in self.modules():
+            if isinstance(module, RMSNorm):
+                module.fused = cfg.fused_rms_norm
+            elif isinstance(module, CSAAttention | HCAAttention | SWAAttention):
+                module.fused_q_norm = cfg.fused_rms_norm
 
     @staticmethod
     def _build_layer(cfg: DeepseekV4Config, layer_idx: int) -> DeepseekV4DecoderLayer:

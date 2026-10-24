@@ -48,7 +48,7 @@ from mini_infer.models.blocks.hca import (
     _build_window_decode_topk_idxs_ragged,
     _build_window_topk_idxs,
 )
-from mini_infer.models.blocks.rmsnorm import RMSNorm
+from mini_infer.models.blocks.rmsnorm import RMSNorm, head_rms_norm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4 import (
     AttentionSink,
@@ -101,6 +101,9 @@ class SWAAttention(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.window_size = window_size
         self.rms_norm_eps = rms_norm_eps
+        # One Triton kernel for the per-head q-norm on CUDA (ADR-045). The model
+        # sets it from `DeepseekV4Config.fused_rms_norm`.
+        self.fused_q_norm = False
         # Reference QAT round trip (FP8 on the non-RoPE dims) for the window
         # KV; `None` keeps it at full precision.
         if act_quant is not None:
@@ -169,9 +172,7 @@ class SWAAttention(nn.Module):
         q = self.q_a_layernorm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q).view(bsz, seqlen, n_h_local, c)
         # Per-head q-norm: rsqrt(mean(q^2)) without learnable weight.
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_t, sin_t = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rope_dim)
@@ -242,9 +243,7 @@ class SWAAttention(nn.Module):
         # ---- Q low-rank + per-head q-norm + partial RoPE ----
         q = self.q_a_layernorm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q).view(bsz, seqlen, n_h_local, c)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_t, sin_t = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rope_dim)
@@ -323,9 +322,7 @@ class SWAAttention(nn.Module):
         # ---- Q ----
         q = self.q_a_layernorm(self.q_a_proj(hidden_state))
         q = self.q_b_proj(q).view(bsz, 1, n_h_local, c)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_t, sin_t = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rope_dim)
@@ -394,9 +391,7 @@ class SWAAttention(nn.Module):
 
         q = self.q_a_layernorm(self.q_a_proj(hidden_state))
         q = self.q_b_proj(q).view(bsz, 1, n_h_local, c)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_t, sin_t = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rope_dim)

@@ -56,7 +56,7 @@ from mini_infer.models.blocks.hca import (
     _build_window_decode_topk_idxs_ragged,
     _build_window_topk_idxs,
 )
-from mini_infer.models.blocks.rmsnorm import RMSNorm
+from mini_infer.models.blocks.rmsnorm import RMSNorm, head_rms_norm
 from mini_infer.models.blocks.rope import apply_partial_rope_last_n_dims
 from mini_infer.models.blocks.v4 import (
     AttentionSink,
@@ -116,6 +116,9 @@ class CSAAttention(nn.Module):
         self.window_size = window_size
         self.compression_ratio = compression_ratio
         self.rms_norm_eps = rms_norm_eps
+        # One Triton kernel for the per-head q-norm on CUDA (ADR-045). The model
+        # sets it from `DeepseekV4Config.fused_rms_norm`.
+        self.fused_q_norm = False
         # Reference QAT round trips: FP8 on the window and compressed KV's
         # non-RoPE dims, Hadamard + FP4 inside the indexer. `None` skips them.
         if act_quant is not None:
@@ -196,9 +199,7 @@ class CSAAttention(nn.Module):
 
         # ---- Full Q + per-head q-norm (no scale) + partial RoPE (per-rank slice) ----
         q = self.q_b_proj(q_lora_latent).view(bsz, seqlen, n_h_local, c)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_t, sin_t = token_position_embeddings
         if rd > 0:
             q = apply_partial_rope_last_n_dims(q, cos_t, sin_t, rd)
@@ -289,9 +290,7 @@ class CSAAttention(nn.Module):
 
         # ---- Full Q + per-head q-norm + partial RoPE (per-rank head slice) ----
         q = self.q_b_proj(q_lora_latent).view(batch_size, seqlen, num_heads_local, kv_head_dim)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_for_tokens, sin_for_tokens = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_for_tokens, sin_for_tokens, rope_dim)
@@ -418,9 +417,7 @@ class CSAAttention(nn.Module):
         # ---- Q low-rank latent (shared with the indexer), full Q, q-norm, RoPE ----
         q_lora_latent = self.q_a_layernorm(self.q_a_proj(hidden_state))
         q = self.q_b_proj(q_lora_latent).view(batch_size, 1, num_heads_local, kv_head_dim)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_for_token, sin_for_token = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, rope_dim)
@@ -541,9 +538,7 @@ class CSAAttention(nn.Module):
 
         # ---- Full Q + per-head q-norm (no scale) + partial RoPE (per-rank slice) ----
         q = self.q_b_proj(q_lora_latent).view(batch_size, 1, num_heads_local, kv_head_dim)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_norm_eps).to(
-            q.dtype
-        )
+        q = head_rms_norm(q, self.rms_norm_eps, fused=self.fused_q_norm)
         cos_for_token, sin_for_token = token_position_embeddings
         if rope_dim > 0:
             q = apply_partial_rope_last_n_dims(q, cos_for_token, sin_for_token, rope_dim)
