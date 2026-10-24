@@ -77,6 +77,7 @@ class HashRoutedMoEFFN(nn.Module):
         expert_dtype: str = "bf16",
         act_quant: SimulatedActQuant | None = None,
         swiglu_limit: float = 0.0,
+        fp8_activations: bool = False,
     ) -> None:
         super().__init__()
         from mini_infer.distributed.group import get_rank, get_world_size
@@ -120,6 +121,11 @@ class HashRoutedMoEFFN(nn.Module):
         # V4's `swiglu_limit`: every expert (routed and shared) clamps its gate
         # and up projections before the SiLU. 0 keeps plain SwiGLU.
         self.swiglu_limit = swiglu_limit
+        # W4A8 for the grouped FP4 experts (ADR-043): each projection's input is
+        # quantized to e4m3 with e8m0 scales per 32 columns. The loop keeps bf16.
+        if fp8_activations and expert_dtype != "fp4":
+            raise ValueError("fp8_activations needs expert_dtype='fp4'")
+        self.fp8_activations = fp8_activations
         activation = expert_swiglu(swiglu_limit)
         routed_experts: list[nn.Module] = []
         for _ in range(num_experts_per_rank):
@@ -240,7 +246,9 @@ class HashRoutedMoEFFN(nn.Module):
             self._expert_pack = PackedSwigluExperts.current(bf16_pack, self.experts)
             return self._expert_pack
         fp4_pack = pack if isinstance(pack, PackedFp4Experts) else None
-        self._expert_pack = PackedFp4Experts.current(fp4_pack, self.experts)
+        self._expert_pack = PackedFp4Experts.current(
+            fp4_pack, self.experts, fp8_activations=self.fp8_activations
+        )
         return self._expert_pack
 
     def _loop_experts(

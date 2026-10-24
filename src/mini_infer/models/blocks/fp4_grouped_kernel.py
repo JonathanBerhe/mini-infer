@@ -18,6 +18,12 @@ The work splits as in the FP8 kernel: one program per expert segment up to
 (prefill). A third split, per row tile across experts, stays for benchmarks.
 Rows routed to another rank's experts sort after the local groups and get
 zeros.
+
+With `act_scale`, the kernel runs W4A8 (ADR-043): the rows are e4m3 with one
+power-of-two (e8m0) scale per 32 columns (`quantize_e4m3_rows`), the weight
+scales are e8m0 too, and `tl.dot_scaled` multiplies the packed e2m1 bytes
+without a software decode. Blackwell tensor cores take these operands
+natively; other GPUs emulate them.
 """
 
 from __future__ import annotations
@@ -55,8 +61,23 @@ _BLACKWELL_TILES: tuple[Tiles, Tiles, Tiles] = (
     (64, 128, 64, 4, 4),
     (128, 256, 64, 8, 3),
 )
+# W4A8 tiles. Blackwell's native MMA needs 128 weight rows (BLOCK_N) per tile.
+# Other GPUs emulate the e2m1 operand with more instructions per weight than
+# the bf16 path; their tiles only avoid register spills.
+_W4A8_BLACKWELL_TILES: tuple[Tiles, Tiles, Tiles] = (
+    (16, 128, 256, 8, 3),
+    (64, 128, 256, 8, 3),
+    (128, 128, 256, 8, 3),
+)
+_W4A8_OTHER_TILES: tuple[Tiles, Tiles, Tiles] = (
+    (16, 64, 128, 4, 3),
+    (64, 128, 64, 8, 3),
+    (128, 128, 64, 8, 3),
+)
 _SMALL_ROWS = 256
 _MEDIUM_ROWS = 8192
+# The block of one e8m0 scale in W4A8, for weights and activations alike.
+MX_BLOCK = 32
 # Bench hooks, not a public API: force a tile or the split.
 _TILES_FOR_BENCH: Tiles | None = None
 _PER_SEGMENT_FOR_BENCH: bool | None = None
@@ -71,14 +92,17 @@ def supports_block_fp4_grouped_mm(device: torch.device | str) -> bool:
 
 
 @functools.cache
-def _tile_table(device: torch.device) -> tuple[Tiles, Tiles, Tiles]:
+def _tile_table(device: torch.device, w4a8: bool) -> tuple[Tiles, Tiles, Tiles]:
     """The tiles for this GPU family; Hopper's off CUDA (the interpreter)."""
-    return _BLACKWELL_TILES if is_blackwell_device(device) else _HOPPER_TILES
+    blackwell = is_blackwell_device(device)
+    if w4a8:
+        return _W4A8_BLACKWELL_TILES if blackwell else _W4A8_OTHER_TILES
+    return _BLACKWELL_TILES if blackwell else _HOPPER_TILES
 
 
-def tiles_for(device: torch.device, num_rows: int) -> Tiles:
+def tiles_for(device: torch.device, num_rows: int, *, w4a8: bool = False) -> Tiles:
     """The tile `block_fp4_grouped_mm` uses for `num_rows` rows on `device`."""
-    small, medium, large = _tile_table(device)
+    small, medium, large = _tile_table(device, w4a8)
     if num_rows <= _SMALL_ROWS:
         return small
     return medium if num_rows <= _MEDIUM_ROWS else large
@@ -148,6 +172,7 @@ if _TRITON_AVAILABLE:
         a_ptr,
         w_base,
         s_base,
+        as_ptr,
         offs_m,
         row_start,
         row_end,
@@ -160,37 +185,67 @@ if _TRITON_AVAILABLE:
         stride_wk,
         stride_sn,
         stride_sk,
+        stride_asm,
+        stride_ask,
         SBLOCK: tl.constexpr,
         BLOCK_K: tl.constexpr,
         DOT_IN_FP32: tl.constexpr,
+        W4A8: tl.constexpr,
     ):
         """Add rows `[row_start, row_end)` times one expert's weights to `acc` (transposed)."""
         in_rows = (offs_m >= row_start) & (offs_m < row_end)
         for k_start in range(0, k_dim, BLOCK_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
-            w = _fp4_weight_tile(
-                w_base,
-                s_base,
-                offs_n,
-                n_ok,
-                k_start,
-                k_dim,
-                stride_wn,
-                stride_wk,
-                stride_sn,
-                stride_sk,
-                SBLOCK,
-                BLOCK_K,
-            )
-            a_t = tl.load(
-                a_ptr + offs_m[None, :] * stride_am + offs_k[:, None] * stride_ak,
-                mask=(offs_k < k_dim)[:, None] & in_rows[None, :],
-                other=0.0,
-            )
-            if DOT_IN_FP32:
-                acc = tl.dot(w.to(tl.float32), a_t.to(tl.float32), acc, input_precision="ieee")
+            if W4A8:
+                # Packed bytes and e8m0 scales go to `tl.dot_scaled` as they are.
+                offs_byte = k_start // 2 + tl.arange(0, BLOCK_K // 2)
+                packed = tl.load(
+                    w_base + offs_n[:, None] * stride_wn + offs_byte[None, :] * stride_wk,
+                    mask=n_ok[:, None] & (offs_byte < k_dim // 2)[None, :],
+                    other=0,
+                )
+                offs_s = k_start // SBLOCK + tl.arange(0, BLOCK_K // SBLOCK)
+                s_ok = offs_s < k_dim // SBLOCK
+                w_scale = tl.load(
+                    s_base + offs_n[:, None] * stride_sn + offs_s[None, :] * stride_sk,
+                    mask=n_ok[:, None] & s_ok[None, :],
+                    other=0,
+                )
+                a_t = tl.load(
+                    a_ptr + offs_m[None, :] * stride_am + offs_k[:, None] * stride_ak,
+                    mask=(offs_k < k_dim)[:, None] & in_rows[None, :],
+                    other=0.0,
+                )
+                a_scale = tl.load(
+                    as_ptr + offs_m[:, None] * stride_asm + offs_s[None, :] * stride_ask,
+                    mask=in_rows[:, None] & s_ok[None, :],
+                    other=0,
+                )
+                acc = tl.dot_scaled(packed, w_scale, "e2m1", a_t, a_scale, "e4m3", acc)
             else:
-                acc = tl.dot(w.to(a_t.dtype), a_t, acc)
+                w = _fp4_weight_tile(
+                    w_base,
+                    s_base,
+                    offs_n,
+                    n_ok,
+                    k_start,
+                    k_dim,
+                    stride_wn,
+                    stride_wk,
+                    stride_sn,
+                    stride_sk,
+                    SBLOCK,
+                    BLOCK_K,
+                )
+                a_t = tl.load(
+                    a_ptr + offs_m[None, :] * stride_am + offs_k[:, None] * stride_ak,
+                    mask=(offs_k < k_dim)[:, None] & in_rows[None, :],
+                    other=0.0,
+                )
+                if DOT_IN_FP32:
+                    acc = tl.dot(w.to(tl.float32), a_t.to(tl.float32), acc, input_precision="ieee")
+                else:
+                    acc = tl.dot(w.to(a_t.dtype), a_t, acc)
         return acc
 
     @triton.jit  # type: ignore[untyped-decorator]
@@ -198,6 +253,7 @@ if _TRITON_AVAILABLE:
         a_ptr,
         w_ptr,
         s_ptr,
+        as_ptr,
         row_expert_ptr,
         group_end_ptr,
         tile_end_ptr,
@@ -214,6 +270,8 @@ if _TRITON_AVAILABLE:
         stride_se,
         stride_sn,
         stride_sk,
+        stride_asm,
+        stride_ask,
         stride_om,
         stride_on,
         SBLOCK: tl.constexpr,
@@ -223,6 +281,7 @@ if _TRITON_AVAILABLE:
         PER_SEGMENT: tl.constexpr,
         EXPERT_TILES: tl.constexpr,
         DOT_IN_FP32: tl.constexpr,
+        W4A8: tl.constexpr,
     ):
         offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
         n_ok = offs_n < n_dim
@@ -255,6 +314,7 @@ if _TRITON_AVAILABLE:
                     a_ptr,
                     w_ptr + tl.cast(group, tl.int64) * stride_we,
                     s_ptr + tl.cast(group, tl.int64) * stride_se,
+                    as_ptr,
                     offs_m,
                     start,
                     row_end,
@@ -267,9 +327,12 @@ if _TRITON_AVAILABLE:
                     stride_wk,
                     stride_sn,
                     stride_sk,
+                    stride_asm,
+                    stride_ask,
                     SBLOCK,
                     BLOCK_K,
                     DOT_IN_FP32,
+                    W4A8,
                 )
             row_mask = in_range & (offs_m < row_end)
         elif PER_SEGMENT:
@@ -291,6 +354,7 @@ if _TRITON_AVAILABLE:
                     a_ptr,
                     w_ptr + safe.to(tl.int64) * stride_we,
                     s_ptr + safe.to(tl.int64) * stride_se,
+                    as_ptr,
                     offs_m,
                     start,
                     row_end,
@@ -303,9 +367,12 @@ if _TRITON_AVAILABLE:
                     stride_wk,
                     stride_sn,
                     stride_sk,
+                    stride_asm,
+                    stride_ask,
                     SBLOCK,
                     BLOCK_K,
                     DOT_IN_FP32,
+                    W4A8,
                 )
             row_mask = leads & (offs_m < row_end)
         else:
@@ -326,6 +393,7 @@ if _TRITON_AVAILABLE:
                         a_ptr,
                         w_ptr + safe.to(tl.int64) * stride_we,
                         s_ptr + safe.to(tl.int64) * stride_se,
+                        as_ptr,
                         offs_m,
                         row,
                         segment_end,
@@ -338,9 +406,12 @@ if _TRITON_AVAILABLE:
                         stride_wk,
                         stride_sn,
                         stride_sk,
+                        stride_asm,
+                        stride_ask,
                         SBLOCK,
                         BLOCK_K,
                         DOT_IN_FP32,
+                        W4A8,
                     )
                 row = segment_end
             row_mask = offs_m < rows
@@ -352,6 +423,77 @@ if _TRITON_AVAILABLE:
         )
 
 
+if _TRITON_AVAILABLE:
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _quantize_e4m3_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        q_ptr,
+        s_ptr,
+        k_dim,
+        stride_xm,
+        stride_qm,
+        stride_sm,
+        GROUP: tl.constexpr,
+        GROUPS: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offs_g = tl.program_id(1) * GROUPS + tl.arange(0, GROUPS)
+        offs = offs_g[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+        ok = offs < k_dim
+        x = tl.load(x_ptr + row * stride_xm + offs, mask=ok, other=0.0).to(tl.float32)
+        # The smallest power of two `2^(e - 127)` with amax / 2^(e - 127) <= 448,
+        # e4m3's largest value: the exponent of amax / 448, plus one unless
+        # that is a power of two already. 1 <= e <= 253 keeps 2^(127 - e) normal.
+        bits = (tl.max(tl.abs(x), axis=1) / 448.0).to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        exponent = tl.minimum(tl.maximum(exponent, 1), 253)
+        inverse = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+        q = (x * inverse[:, None]).to(tl.float8e4nv)
+        tl.store(q_ptr + row * stride_qm + offs, q, mask=ok)
+        tl.store(
+            s_ptr + row * stride_sm + offs_g, exponent.to(tl.uint8), mask=offs_g * GROUP < k_dim
+        )
+
+
+def quantize_e4m3_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(M, K)` rows to e4m3 with one e8m0 scale per `MX_BLOCK` columns.
+
+    Each block's scale is the smallest power of two that keeps the block
+    within e4m3's range (448), so the scaling is exact and only the e4m3
+    rounding changes the values. Returns `(float8_e4m3fn (M, K), uint8 (M, K / 32))`,
+    where a scale byte `e` stands for `2^(e - 127)`.
+    """
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("quantize_e4m3_rows needs Triton")
+    num_rows, k_dim = x.shape
+    if k_dim % MX_BLOCK:
+        raise ValueError(f"K={k_dim} must be a multiple of {MX_BLOCK}")
+    q = torch.empty(num_rows, k_dim, dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty(num_rows, k_dim // MX_BLOCK, dtype=torch.uint8, device=x.device)
+    if num_rows == 0:
+        return q, s
+    groups = 16
+    grid = (num_rows, triton.cdiv(k_dim // MX_BLOCK, groups))
+    _quantize_e4m3_kernel[grid](
+        x, q, s, k_dim, x.stride(0), q.stride(0), s.stride(0), GROUP=MX_BLOCK, GROUPS=groups
+    )
+    return q, s
+
+
+def to_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """fp32 power-of-two scales as e8m0 bytes (their exponent fields).
+
+    Raises if a scale is not a positive normal power of two, since e8m0 holds
+    nothing else. This check reads the scales back to the host once.
+    """
+    bits = scale.contiguous().view(torch.int32)
+    exponent = (bits >> 23) & 0xFF
+    if bool(((bits & 0x807FFFFF) != 0).any() | (exponent == 0).any() | (exponent == 0xFF).any()):
+        raise ValueError("e8m0 scales need every FP4 scale to be a positive power of two")
+    return exponent.to(torch.uint8)
+
+
 def block_fp4_grouped_mm(
     rows: torch.Tensor,
     packed: torch.Tensor,
@@ -360,6 +502,8 @@ def block_fp4_grouped_mm(
     block: int,
     row_experts: torch.Tensor,
     group_ends: torch.Tensor,
+    act_scale: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """`rows @ dequant(packed[e]).T` for each row's expert `e`, `(M, K)` -> `(M, N)`.
 
@@ -368,7 +512,11 @@ def block_fp4_grouped_mm(
     row whose expert is `E` or more (another rank's expert) gives zeros.
     `packed` is `(E, N, K / 2)` bytes of e2m1 pairs (low nibble first) and
     `scale` its fp32 scale per row and `block` columns, `(E, N, K / block)`.
-    The result has `rows.dtype`.
+    The result has `out_dtype` (default `rows.dtype`).
+
+    With `act_scale`, the product is W4A8: `rows` are `float8_e4m3fn` with
+    the e8m0 scale bytes `act_scale` `(M, K / 32)` (`quantize_e4m3_rows`),
+    and `scale` holds e8m0 bytes too, with `block` 32.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("block_fp4_grouped_mm needs Triton")
@@ -380,12 +528,18 @@ def block_fp4_grouped_mm(
         raise ValueError(f"rows have K={k_dim} but packed weights hold K={half_k * 2}")
     if block < 2 or block & (block - 1) or k_dim % block:
         raise ValueError(f"block={block} must be a power of two dividing K={k_dim}")
-    out = torch.empty(num_rows, n_dim, dtype=rows.dtype, device=rows.device)
+    w4a8 = act_scale is not None
+    if w4a8 and (block != MX_BLOCK or scale.dtype != torch.uint8):
+        raise ValueError(
+            f"W4A8 needs e8m0 (uint8) weight scales per {MX_BLOCK} columns, "
+            f"got block={block} and {scale.dtype}"
+        )
+    out = torch.empty(num_rows, n_dim, dtype=out_dtype or rows.dtype, device=rows.device)
     if num_rows == 0:
         return out
     small = num_rows <= _SMALL_ROWS
     per_segment = small if _PER_SEGMENT_FOR_BENCH is None else _PER_SEGMENT_FOR_BENCH
-    tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows)
+    tiles = _TILES_FOR_BENCH or tiles_for(rows.device, num_rows, w4a8=w4a8)
     block_m, block_n, block_k, warps, stages = tiles
     if block_k % block and block % block_k:
         raise ValueError(f"BLOCK_K={block_k} and the scale block {block} must nest")
@@ -402,10 +556,13 @@ def block_fp4_grouped_mm(
         rows_grid = num_rows if per_segment else triton.cdiv(num_rows, block_m)
     grid = (rows_grid, triton.cdiv(n_dim, block_n))
     packed_bytes = packed.view(torch.uint8)
+    # Without W4A8 the kernel never reads `act_scale`; any tensor fills the slot.
+    act = act_scale if act_scale is not None else scale
     _block_fp4_grouped_mm_kernel[grid](
         rows,
         packed_bytes,
         scale,
+        act,
         row_experts,
         group_ends,
         tile_ends,
@@ -422,6 +579,8 @@ def block_fp4_grouped_mm(
         scale.stride(0),
         scale.stride(1),
         scale.stride(2),
+        act.stride(0),
+        act.stride(-1),
         out.stride(0),
         out.stride(1),
         SBLOCK=block,
@@ -433,6 +592,7 @@ def block_fp4_grouped_mm(
         # Triton's interpreter computes a bf16 `tl.dot` wrongly. bf16 products
         # are exact in fp32, so an fp32 dot gives the same result there.
         DOT_IN_FP32=os.environ.get("TRITON_INTERPRET") == "1",
+        W4A8=w4a8,
         num_warps=warps,
         num_stages=stages,
     )

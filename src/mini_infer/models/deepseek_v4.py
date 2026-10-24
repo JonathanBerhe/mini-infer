@@ -398,6 +398,12 @@ class DeepseekV4Config:
     # `[-limit, limit]` before the SiLU. 0 disables the clamp. Released V4
     # configs set 10.
     moe_swiglu_limit: float = 0.0
+    # W4A8 for the FP4 routed experts on the grouped path (ADR-043): quantize
+    # each projection's input to e4m3 with one power-of-two scale per 32
+    # columns, so `tl.dot_scaled` takes the packed weights without a software
+    # decode. Fast on Blackwell. Off (default): bf16 inputs. Needs
+    # `expert_dtype="fp4"` and power-of-two expert scales.
+    fp4_fp8_activations: bool = False
     # Hyper-Connections (V4 paper §2.5). Defaults disable HC -> vanilla
     # pre-norm residuals, hidden state stays `(B, T, dim)`. When enabled,
     # the embedding output is expanded to `(B, T, hc_mult, dim)`, every
@@ -459,6 +465,8 @@ class DeepseekV4Config:
                 )
         if self.moe_swiglu_limit < 0:
             raise ValueError(f"moe_swiglu_limit must be >= 0; got {self.moe_swiglu_limit}")
+        if self.fp4_fp8_activations and not (self.use_moe_ffn and self.expert_dtype == "fp4"):
+            raise ValueError("fp4_fp8_activations=True requires MoE FFNs with expert_dtype='fp4'")
         if self.use_hyper_connections and self.hc_mult <= 0:
             raise ValueError(f"use_hyper_connections=True requires hc_mult > 0; got {self.hc_mult}")
         if self.act_quant_scale_fmt not in ("ue8m0", None):
@@ -626,6 +634,8 @@ class DeepseekV4Config:
             n_shared_experts=int(_pick("n_shared_experts", default_value=0)),
             expert_dtype=_detect_expert_dtype(cfg_dict, _pick("expert_dtype", default_value=None)),
             moe_swiglu_limit=float(_pick("moe_swiglu_limit", "swiglu_limit", default_value=0.0)),
+            # Not part of the HF schema: off unless a caller's config dict opts in.
+            fp4_fp8_activations=bool(_pick("fp4_fp8_activations", default_value=False)),
             # Hyper-Connections. V4-Flash sets `hc_mult=4`.
             use_hyper_connections=bool(_pick("hc_mult", default_value=0) > 0),
             hc_mult=int(_pick("hc_mult", default_value=0)),
@@ -761,6 +771,7 @@ class _DeepseekV4InnerModel(nn.Module):
                 n_shared_experts=cfg.n_shared_experts,
                 expert_dtype=cfg.expert_dtype,
                 moe_swiglu_limit=cfg.moe_swiglu_limit,
+                fp4_fp8_activations=cfg.fp4_fp8_activations,
             )
         if cfg.use_hyper_connections:
             layer_kwargs.update(

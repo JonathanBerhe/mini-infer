@@ -35,6 +35,7 @@ from torch import nn
 from torch.nn import functional
 
 from mini_infer.models.blocks.activations import expert_swiglu
+from mini_infer.models.blocks.fp4_grouped_kernel import to_e8m0
 from mini_infer.models.blocks.grouped_experts import BlockFp4Weight, grouped_expert_mlp
 from mini_infer.quant.nvfp4 import dequantize_nvfp4_to_bf16
 
@@ -143,9 +144,13 @@ class PackedFp4Experts:
     scales cover one row each, so `w1` and `w3` always stack. When a loader
     gives a weight or a scale new storage, `matches` detects it and `current`
     packs again.
+
+    With `fp8_activations`, the pack also keeps the scales as e8m0 bytes, so
+    the matmuls run W4A8 (ADR-043). That needs every scale to be a power of
+    two, as in DeepSeek-V4's checkpoints, and costs one byte per 32 weights.
     """
 
-    def __init__(self, experts: nn.ModuleList) -> None:
+    def __init__(self, experts: nn.ModuleList, *, fp8_activations: bool = False) -> None:
         members = [cast(FP4Expert, expert) for expert in experts]
         first = members[0]
         block, inter = first.block_size, first.intermediate_size
@@ -171,8 +176,13 @@ class PackedFp4Experts:
                 expert.w3_scale = gate_up_scale[idx, inter:]
                 expert.w2_packed = down[idx]
                 expert.w2_scale = down_scale[idx]
-        self.gate_up = BlockFp4Weight(gate_up, gate_up_scale, block)
-        self.down = BlockFp4Weight(down, down_scale, block)
+        self.fp8_activations = fp8_activations
+        self.gate_up = BlockFp4Weight(
+            gate_up, gate_up_scale, block, to_e8m0(gate_up_scale) if fp8_activations else None
+        )
+        self.down = BlockFp4Weight(
+            down, down_scale, block, to_e8m0(down_scale) if fp8_activations else None
+        )
         self._inter = inter
         self._combine = first._activation
         self._pointers = self._storage(experts)
@@ -189,11 +199,13 @@ class PackedFp4Experts:
         )
 
     @staticmethod
-    def current(pack: PackedFp4Experts | None, experts: nn.ModuleList) -> PackedFp4Experts:
-        """`pack` if it still backs `experts`, else a fresh pack of them."""
-        if pack is not None and pack.matches(experts):
+    def current(
+        pack: PackedFp4Experts | None, experts: nn.ModuleList, *, fp8_activations: bool = False
+    ) -> PackedFp4Experts:
+        """`pack` if it still backs `experts` in the same mode, else a fresh pack of them."""
+        if pack is not None and pack.matches(experts) and pack.fp8_activations == fp8_activations:
             return pack
-        return PackedFp4Experts(experts)
+        return PackedFp4Experts(experts, fp8_activations=fp8_activations)
 
     def matches(self, experts: nn.ModuleList) -> bool:
         """Whether the experts' buffers still live in this pack's stacks."""
