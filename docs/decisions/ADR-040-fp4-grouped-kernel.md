@@ -87,6 +87,7 @@ MXFP4 activations, and only on Blackwell.
 - **Gluon.** As for FP8, it means two kernels to own, and Gluon does not
   run under Triton's interpreter. The FP4 layer is already faster than the
   bf16 layer up to 1024 tokens on both GPUs.
+  [ADR-041](ADR-041-gluon-fp4-grouped.md) adds Gluon kernels for many rows.
 
 ## Consequences
 
