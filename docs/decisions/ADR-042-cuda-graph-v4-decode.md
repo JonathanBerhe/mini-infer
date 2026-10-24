@@ -92,11 +92,12 @@ Measured on 2x B200, real V4-Flash, batch 1, greedy, in one run
   the eager step of the same run.
 - The static step runs about 11,900 GPU operations (kernels and copies) and
   35 ms of GPU work, against about 9,000 operations and 29 ms for the eager
-  single-request step. The full
-  `torch.cat` of the window and the history in each layer adds about 2.5 ms.
-  The row-indexed writes and the masks add the rest. One buffer per layer for
-  the window and the history, and fewer index kernels, are the next levers,
-  then the kernel fusion of the report.
+  single-request step. The row-indexed writes and the masks add most of
+  that. A first version of this note gave about 2.5 ms to the full
+  `torch.cat` of the window and the history in each layer. That was wrong:
+  [ADR-044](ADR-044-fused-partial-rope.md) measured the cat at about 0.14 ms
+  per step at batch 16 with a 1,024-token cache. The partial RoPE helper,
+  3.6 to 5.2 ms per step, was the larger lever.
 - The eager ragged step now does the full-width work as well. With a large
   `max_seq_len` and short requests, it spends more GPU time than before. At
   batch 1 the eager step is bound by the host, so the extra work hides there.
