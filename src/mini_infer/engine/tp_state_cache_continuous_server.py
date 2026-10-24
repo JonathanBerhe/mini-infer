@@ -21,17 +21,26 @@ Two broadcast ops:
 The leader samples (followers never do); with `gather_output=True` in the TP
 layers every rank computes identical logits, so a broadcast of the sampled token
 is unnecessary, it rides the next `("decode", ...)` op.
+
+With `cuda_graph=True`, every rank captures the decode step in a
+`DecodeCudaGraph` when the server is built, and each `("decode", ...)` op
+replays it. The constructor runs on every rank in the same order, so the
+all-reduces inside the capture line up. Shutdown drops the graph on every rank,
+because a live graph that holds NCCL work can hang the process group teardown.
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 
 import torch
 import torch.distributed as dist
 
 from mini_infer.cache.state_cache import StateCache
+from mini_infer.device import is_cuda_device
 from mini_infer.distributed.group import get_rank, get_world_size
+from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode_cuda_graph
 from mini_infer.engine.sampler import SamplingParams, sample
 from mini_infer.engine.tokenizer import Tokenizer
 from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM, build_state_cache_layer_specs
@@ -46,7 +55,8 @@ class TensorParallelStateCacheContinuousServer:
 
     Construct one on every rank with that rank's sharded model. The leader drives
     `generate_cohort`; followers call `run_follower_loop`. Requires
-    `init_distributed` already active.
+    `init_distributed` already active. Pass `cuda_graph=True` on every rank to
+    replay the decode step from a CUDA graph (see the module docstring).
     """
 
     def __init__(
@@ -58,6 +68,7 @@ class TensorParallelStateCacheContinuousServer:
         max_seq_len: int,
         device: str | None = None,
         dtype: torch.dtype | None = None,
+        cuda_graph: bool = False,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
@@ -72,11 +83,22 @@ class TensorParallelStateCacheContinuousServer:
         self.world_size = get_world_size()
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
+        if cuda_graph and not supports_decode_cuda_graph(model, self.device):
+            raise ValueError(
+                f"cuda_graph=True needs a CUDA device and a model with a capturable decode "
+                f"step; got {type(model).__name__} on {self.device}"
+            )
         self._cache = StateCache(
             build_state_cache_layer_specs(model.cfg, max_seq_len=max_seq_len),
             batch_size=max_batch_size,
             device=self.device,
             dtype=self.dtype,
+        )
+        # Capture before any prefill: warmup and capture write into every row.
+        self._decode_graph = (
+            DecodeCudaGraph(model, self._cache, batch_size=max_batch_size, device=self.device)
+            if cuda_graph
+            else None
         )
 
     @property
@@ -128,7 +150,18 @@ class TensorParallelStateCacheContinuousServer:
                 dst_layer.indexer.cmp_score_state[dst] = src_layer.indexer.cmp_score_state[0]
 
     def _run_decode(self, input_tokens: list[int], positions: list[int]) -> torch.Tensor:
-        """One ragged decode step over the full batched cache. Returns logits."""
+        """One ragged decode step over the full batched cache. Returns logits.
+
+        From the graph, the logits are its output buffer, which the next
+        replay overwrites.
+        """
+        if self._decode_graph is not None:
+            # `positions` is a host list, so this check costs no device sync.
+            self._cache.check_capacity(max(positions) + 1)
+            return self._decode_graph.replay(
+                torch.tensor(input_tokens, dtype=torch.long).unsqueeze(1),
+                torch.tensor(positions, dtype=torch.long),
+            )
         input_ids = torch.tensor(input_tokens, device=self.device, dtype=torch.long).unsqueeze(1)
         position_tensor = torch.tensor(positions, device=self.device, dtype=torch.long)
         with torch.inference_mode():
@@ -230,6 +263,7 @@ class TensorParallelStateCacheContinuousServer:
             assert isinstance(message, tuple)
             op = message[0]
             if op == "shutdown":
+                self._release_decode_graph()
                 return
             if op == "prefill":
                 _, slot_idx, prompt_ids = message
@@ -241,6 +275,20 @@ class TensorParallelStateCacheContinuousServer:
                 raise RuntimeError(f"unknown op broadcast to follower: {op!r}")
 
     def shutdown(self) -> None:
-        """Leader-only: tell the followers to leave `run_follower_loop`."""
+        """Leader-only: tell the followers to leave `run_follower_loop`.
+
+        Every rank drops its decode graph here, so the process group can be
+        destroyed after it. Later decode steps run eagerly.
+        """
         if self.is_leader:
             self._broadcast(("shutdown",))
+            self._release_decode_graph()
+
+    def _release_decode_graph(self) -> None:
+        """Free the decode graph and wait for the GPU to finish its work."""
+        if self._decode_graph is None:
+            return
+        self._decode_graph = None
+        gc.collect()
+        if is_cuda_device(self.device):
+            torch.cuda.synchronize(self.device)

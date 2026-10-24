@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import torch
@@ -120,6 +121,89 @@ def test_tp_continuous_matches_single_process(tmp_path: Path) -> None:
         f"TP cohort diverged from single-process:\n  TP:  {results[0]}\n  ref: {reference}"
     )
     assert all(len(tokens) == max_new_tokens for tokens in reference)
+
+
+class _EagerGraph:
+    """CPU stand-in for `DecodeCudaGraph`: the same warmup writes, then eager replays."""
+
+    instances: ClassVar[list[_EagerGraph]] = []
+
+    def __init__(
+        self, model: DeepseekV4ForCausalLM, state_cache: object, *, batch_size: int, device: str
+    ) -> None:
+        self._model, self._cache, self._device = model, state_cache, device
+        self.replays = 0
+        ids = torch.zeros(batch_size, 1, dtype=torch.long)
+        positions = torch.zeros(batch_size, dtype=torch.long)
+        with torch.inference_mode():
+            for _ in range(3):  # two warmup steps and the capture
+                model.decode_step_static(ids, positions, state_cache)  # type: ignore[arg-type]
+        _EagerGraph.instances.append(self)
+
+    def replay(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        self.replays += 1
+        with torch.inference_mode():
+            return self._model.decode_step_static(
+                input_ids.to(self._device),
+                positions.to(self._device),
+                self._cache,  # type: ignore[arg-type]
+            )
+
+
+def _tp_graph_cohort_target(
+    rank: int, world_size: int, checkpoint_dir: str, prompts: list[list[int]], max_new_tokens: int
+) -> tuple[list[list[int]] | None, list[int], bool]:
+    """Per-rank cohort with the decode step replayed from the stand-in graph.
+
+    Returns the tokens (leader only), the replay count of each graph this rank
+    built, and whether shutdown dropped the graph.
+    """
+    from mini_infer.engine import tp_state_cache_continuous_server as server_module
+
+    server_module.supports_decode_cuda_graph = lambda model, device: True  # type: ignore[assignment]
+    server_module.DecodeCudaGraph = _EagerGraph  # type: ignore[assignment, misc]
+    model = DeepseekV4ForCausalLM.from_checkpoint(checkpoint_dir, device="cpu", dtype=torch.float32)
+    server = TensorParallelStateCacheContinuousServer(
+        model,
+        max_batch_size=len(prompts),
+        max_seq_len=64,
+        device="cpu",
+        dtype=torch.float32,
+        cuda_graph=True,
+    )
+    tokens = None
+    if server.is_leader:
+        tokens = server.generate_cohort(prompts, max_new_tokens=max_new_tokens)
+        server.shutdown()
+    else:
+        server.run_follower_loop()
+    replays = [graph.replays for graph in _EagerGraph.instances]
+    return tokens, replays, server._decode_graph is None
+
+
+@pytest.mark.skipif(not is_multi_process_available(), reason="multi-process / gloo unavailable")
+def test_tp_continuous_replays_the_decode_graph_on_every_rank(tmp_path: Path) -> None:
+    """Every rank captures at build time, replays each decode step, and drops the graph."""
+    cfg = _make_tp_config()
+    _write_synthetic_checkpoint(tmp_path, cfg)
+    prompts = [list(range(8)), list(range(2, 18)), list(range(24))]
+    max_new_tokens = 6
+
+    reference_model = DeepseekV4ForCausalLM.from_checkpoint(
+        str(tmp_path), device="cpu", dtype=torch.float32
+    )
+    gen = StateCacheGenerator(reference_model)
+    reference = [gen.generate_ids(prompt, max_new_tokens=max_new_tokens) for prompt in prompts]
+
+    results = run_multi_process(
+        2, _tp_graph_cohort_target, str(tmp_path), prompts, max_new_tokens, timeout_sec=180.0
+    )
+    (leader_tokens, leader_replays, leader_released) = results[0]
+    (_, follower_replays, follower_released) = results[1]
+    assert leader_tokens == reference
+    # One graph per rank, one replay per decode step (the first token comes from prefill).
+    assert leader_replays == follower_replays == [max_new_tokens - 1]
+    assert leader_released and follower_released
 
 
 def _tp_scheduler_target(
