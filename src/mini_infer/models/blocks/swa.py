@@ -368,17 +368,16 @@ class SWAAttention(nn.Module):
         layer_idx: int,
         token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        n_compressed_max: int | None = None,
     ) -> torch.Tensor:
         """One ragged SWA decode step: B requests, each at its own `positions[b]`.
 
         Per-request counterpart of `forward_decode`. SWA is window-only, so
-        `block_position_embeddings` and `n_compressed_max` are ignored (accepted
-        for call-site parity with HCA/CSA so a model can dispatch all three layer
-        types uniformly). Scatters each row's new KV to `swa_kv[b, pos[b] % n_win]`
-        and attends each row's own circular window.
+        `block_position_embeddings` is ignored (accepted for call-site parity
+        with HCA/CSA so a model can dispatch all three layer types uniformly).
+        Scatters each row's new KV to `swa_kv[b, pos[b] % n_win]` and attends
+        each row's own circular window.
         """
-        del block_position_embeddings, n_compressed_max  # SWA: window only, never flushes
+        del block_position_embeddings  # SWA: window only, never flushes
         bsz, seqlen_in, _ = hidden_state.shape
         if seqlen_in != 1:
             raise ValueError(f"forward_decode_ragged expects seqlen=1, got {seqlen_in}")

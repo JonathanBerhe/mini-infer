@@ -38,6 +38,10 @@ not by memory bandwidth.
    Only the Qwen hybrid declares support today. DeepSeek-V4 and Kimi Linear
    keep the eager path.
 
+   Note (2026-10-24): DeepSeek-V4 declares support since
+   [ADR-042](ADR-042-cuda-graph-v4-decode.md), where its MoE blocks run
+   grouped matmuls.
+
 ## Alternatives Considered
 
 - **`torch.compile(mode="reduce-overhead")`.** It would fuse the element-wise

@@ -76,6 +76,7 @@ from mini_infer.models.blocks.v4 import (
     GroupedOutputProjection,
     SimulatedActQuant,
     TokenLevelCompressor,
+    write_flushed_blocks,
 )
 
 if TYPE_CHECKING:
@@ -183,12 +184,11 @@ def _build_window_decode_topk_idxs_ragged(
     """
     positions = positions.to(torch.int64)
     pos_col = positions.unsqueeze(1)  # (B, 1)
-    neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
     window_j = torch.arange(window_size, device=device, dtype=torch.int64).unsqueeze(0)  # (1, win)
     pos_mod = (positions % window_size).unsqueeze(1)  # (B, 1)
     full = pos_col >= (window_size - 1)  # (B, 1)
     full_idx = (pos_mod + 1 + window_j) % window_size  # (B, win)
-    partial_idx = torch.where(window_j <= pos_col, window_j, neg_one)  # (B, win)
+    partial_idx = torch.where(window_j <= pos_col, window_j, -1)  # (B, win)
     return torch.where(full, full_idx, partial_idx)  # (B, win)
 
 
@@ -211,13 +211,12 @@ def _build_hca_decode_topk_idxs_ragged(
     `n_compressed_max` so every row shares one tensor width.
     """
     positions = positions.to(torch.int64)
-    neg_one = torch.tensor(-1, device=device, dtype=torch.int64)
     window_idxs = _build_window_decode_topk_idxs_ragged(
         window_size=window_size, positions=positions, device=device
     )
     n_valid = (positions + 1) // compression_ratio  # (B,)
     cmp_k = torch.arange(n_compressed_max, device=device, dtype=torch.int64).unsqueeze(0)
-    cmp_idxs = torch.where(cmp_k < n_valid.unsqueeze(1), cmp_k + compressed_offset, neg_one)
+    cmp_idxs = torch.where(cmp_k < n_valid.unsqueeze(1), cmp_k + compressed_offset, -1)
     return torch.cat([window_idxs, cmp_idxs], dim=1).to(torch.int64)
 
 
@@ -710,7 +709,6 @@ class HCAAttention(nn.Module):
         layer_idx: int,
         token_position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        n_compressed_max: int | None = None,
     ) -> torch.Tensor:
         """One ragged decode step: B requests, each at its own `positions[b]`.
 
@@ -718,7 +716,10 @@ class HCAAttention(nn.Module):
         row's own SWA slot (`positions[b] % n_win`), runs the ragged compressor
         (which flushes only the rows that close a block this step), and builds
         per-row gather indices so one batched MQA-with-sink serves the whole
-        cohort even though the rows sit at different positions.
+        cohort even though the rows sit at different positions. The attention
+        spans the whole compressed history buffer, with each row's not-yet-valid
+        blocks masked, so the step has no host sync and no data-dependent shape
+        and a CUDA graph can capture it.
 
         Args mirror `forward_decode`, except `start_pos: int` becomes
         `positions: (B,) int64` and the RoPE tensors are genuinely per-row:
@@ -727,9 +728,6 @@ class HCAAttention(nn.Module):
             block_position_embeddings: `(cos, sin)`, each `(B, 1, rope_head_dim)`
                 for each row's block position `(positions // m) * m`. Required
                 iff `rope_head_dim > 0`; non-flushing rows ignore their entry.
-            n_compressed_max: optional precomputed `max_b((positions[b] + 1) // m)`.
-                The scheduler tracks positions on the host and passes it to avoid
-                a device sync; omitted (e.g. in tests) it is derived with `.max()`.
 
         Returns `(B, 1, hidden_size)`. Does NOT advance any counter; the caller
         owns `positions`.
@@ -775,21 +773,11 @@ class HCAAttention(nn.Module):
             cmp_score_state=state.cmp_score_state,
             block_position_embeddings=block_position_embeddings,
         )
-        if bool(flush_mask.any()):
-            write_slots = positions[flush_mask] // m
-            if int(write_slots.max()) >= state.compressed_kv.shape[1]:
-                raise RuntimeError(
-                    f"layer {layer_idx}: compressed history overflow at block "
-                    f"{int(write_slots.max())}; raise max_n_compressed"
-                )
-            state.compressed_kv[rows[flush_mask], write_slots] = (
-                compressed[flush_mask].squeeze(1).to(state.compressed_kv.dtype)
-            )
+        write_flushed_blocks(state.compressed_kv, compressed, flush_mask, positions, m)
 
-        # ---- full_kv: SWA window ; compressed history to the widest valid prefix ----
-        if n_compressed_max is None:
-            n_compressed_max = int(((positions + 1) // m).max())
-        full_kv = torch.cat([state.swa_kv, state.compressed_kv[:, :n_compressed_max]], dim=1)
+        # ---- full_kv: SWA window ; the whole compressed history buffer ----
+        n_compressed_max = state.compressed_kv.shape[1]
+        full_kv = torch.cat([state.swa_kv, state.compressed_kv], dim=1)
 
         # ---- Per-row gather indices, then one batched MQA-with-sink ----
         topk_idxs = _build_hca_decode_topk_idxs_ragged(

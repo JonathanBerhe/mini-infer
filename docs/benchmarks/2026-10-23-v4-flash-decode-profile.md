@@ -38,6 +38,10 @@ what to optimize first.
 - A CUDA graph of the full decode step is the first thing to do. It removes
   the host time from the step, which takes it from 120 ms to about 33 to
   36 ms (an estimate).
+- Measured on 2026-10-24 ([ADR-042](../decisions/ADR-042-cuda-graph-v4-decode.md)):
+  the step replays from a CUDA graph in 34.2 ms (6 tokens) and 34.7 ms
+  (2,021 tokens), with the same tokens as the eager step. The section "CUDA
+  graph of the decode step" has the details.
 
 ## Per-step time
 
@@ -173,6 +177,109 @@ earlier test. That test ran in this same host-bound eager mode. After the
 graph, attention GPU time is the largest part of the step, so that result
 needs a new measurement.
 
+## CUDA graph of the decode step
+
+Date: 2026-10-24, engine at `6b39ffb` (branch `feat/v4-decode-cuda-graph`).
+[ADR-042](../decisions/ADR-042-cuda-graph-v4-decode.md) makes the ragged
+decode step capturable. The profile mode with `--cuda-graph` captures that
+step in a `DecodeCudaGraph` at batch 1 on both ranks, copies the prefilled
+state into the graph's cache, and replays the same number of steps as the
+eager run. Both modes ran in the same container.
+
+| Measure | 6-token context | 2,021-token context |
+|---|---:|---:|
+| Eager step, no profiler (median of 16) | 67.8 ms | 78.5 ms |
+| CUDA graph step, no profiler (median of 16) | 34.2 ms | 34.7 ms |
+| Speedup | 1.98x | 2.26x |
+| Graph step, min to max | 34.2 to 34.3 ms | 34.6 to 34.7 ms |
+| Graph step, GPU busy (profiled) | 34.4 to 34.7 ms | 34.6 to 34.8 ms |
+| GPU operations per step, eager / graph | 9,026 / 11,881 | 9,087 / 11,882 |
+| Tokens equal to the eager step | 33 of 33 | 33 of 33 |
+
+- The eager step took 67.8 ms here and 120.0 ms in the first run of this
+  report, with the same code. The host time under the profiler halved
+  between the two containers, so the host CPU sets the eager speed. The
+  graph step does not depend on it.
+- The graph step is now bound by the GPU work. Without the profiler it takes
+  34.2 ms, and under the profiler the GPU is busy for 34.4 to 34.7 ms of it.
+- The graph runs the ragged decode step, which does more GPU work than the
+  eager single-request step: about 2,850 more operations and 6 ms more GPU
+  time. The full `torch.cat` of the sliding window and the compressed
+  history in each layer adds about 2.5 ms. Row-indexed writes
+  (`index_elementwise_kernel`, 442 against 89 per step) and the masks add
+  most of the rest.
+- At batch 1 the graph decodes about 29 tokens per second, against 15 for
+  the eager step of the same run.
+
+The two-GPU continuous-batching server with the graph
+(`TensorParallelStateCacheContinuousServer(cuda_graph=True)`), measured with
+`scripts/modal_v4_flash_cb_bench.py --cuda-graph` in one run. Each batch
+size times 63 greedy decode steps after 4 warm-up steps:
+
+| Batch | Eager ms/step | CUDA graph ms/step | Speedup | Tokens per second |
+|---:|---:|---:|---:|---:|
+| 1 | 172.8 | 35.7 | 4.84x | 5.8 to 28.0 |
+| 8 | 170.3 | 48.7 | 3.50x | 47 to 164 |
+| 16 | 169.8 | 57.3 | 2.96x | 94 to 279 |
+
+The graph tokens equal the eager tokens at every batch size. The eager step
+costs about 170 ms at every batch size, so the host sets it. The graph step
+grows by about 1.4 ms per extra request.
+
+## Graph step at batch 16
+
+`scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16` runs
+the ragged decode step of the server at batch 1 and 16, with a cache of 1,024
+tokens. Row `b` prefills its own slice of the passage, of `24 + 8 * b` tokens.
+A graph replay is one launch, so its trace cannot say which part of the model
+a kernel belongs to. The graph replays the kernels of the eager step, though,
+so the eager step runs with every module labelled to split the GPU time.
+
+| Batch | Graph ms/step | Graph GPU busy | GPU operations per step | Tokens equal to eager |
+|---:|---:|---:|---:|---|
+| 1 | 35.4 | 35.5 ms | 11,860 | yes |
+| 16 | 53.8 | 53.7 ms | 11,882 | yes |
+
+GPU ms per step of the eager step, by part of the model:
+
+| Part | Batch 1 | Batch 16 | Growth |
+|---|---:|---:|---:|
+| MoE routed experts | 6.41 | 17.43 | +11.03 |
+| Unlabelled (ragged attention and layer glue) | 15.32 | 18.66 | +3.34 |
+| NCCL collectives | 1.01 | 2.68 | +1.67 |
+| Hyper-connections | 4.40 | 5.92 | +1.52 |
+| Norms | 1.33 | 2.40 | +1.07 |
+| Attention (labelled submodules) | 5.93 | 6.37 | +0.44 |
+| MoE gate | 1.60 | 2.02 | +0.42 |
+| MoE shared expert | 1.69 | 1.34 | -0.35 |
+| Rest | 0.37 | 0.42 | +0.05 |
+| Total | 38.06 | 57.24 | +19.18 |
+
+This profile labelled the batched attention methods (`forward_decode_ragged`
+and `forward_decode_step_ragged`) only partly, so most attention kernels and
+the layer glue count as unlabelled. The script now labels them.
+
+- The routed experts explain 11 ms of the 18 ms growth. The FP4 grouped
+  kernel alone goes from 3.6 to 14.3 ms per step (86 launches). At batch 16
+  the 96 expert picks of a layer touch at most 48 experts per GPU, about
+  600 MB in FP4. At 8 TB/s, 43 layers of that take at most 3.3 ms, so the
+  kernel runs at least 4.4 times slower than its memory-bandwidth limit.
+  The kernel is now the largest single item of a serving step.
+- The NCCL all-reduces grow from 1.0 to 2.7 ms. The MoE output is reduced in
+  fp32, so its message grows with the batch.
+- The softmax of the HCA compressors costs 2.3 ms per step at every batch
+  size: 20 calls of about 116 µs each. The batched step computes the
+  compressed block at every step, while an HCA layer closes a block only once
+  every 128 tokens. The softmax also runs over the slot dimension, which is
+  not the last one, so PyTorch runs it with very few thread blocks.
+
+For serving at batch 8 to 16, these are the largest items in order: the FP4
+kernel at a few rows per expert (up to about 11 ms), the HCA compressor
+softmax (about 2.3 ms), the full-width `torch.cat` of each layer (about
+2.5 ms, see above), and the fp32 MoE all-reduce (about 1 ms to gain at batch
+16). e8m0 scales still do not help, because the kernel is not bound by its
+memory reads.
+
 ## How it is measured
 
 For each context, each rank prefills the context and runs 8 warm-up decode
@@ -218,6 +325,18 @@ the packed FP4 experts.
 
 ```bash
 uv run modal run scripts/modal_v4_flash_generate.py --profile-decode
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_cb_bench.py --cuda-graph --batch-sizes 1,8,16
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).

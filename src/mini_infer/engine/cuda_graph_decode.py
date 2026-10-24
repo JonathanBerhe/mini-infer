@@ -10,7 +10,8 @@ The model opts in with `SUPPORTS_DECODE_CUDA_GRAPH = True` and provides
 `decode_step_static(input_id, positions, state_cache)`. That step must have
 no host sync and no data-dependent shape, and it must update the cache only
 in place: a replay reads and writes the exact tensors the graph saw at
-capture.
+capture. A model whose step meets this only on some devices or settings
+also provides `can_capture_decode(device) -> bool`.
 
 Warmup and capture run the step for real, so they write into every row of
 the cache. Capture before any request is admitted; the scheduler's admission
@@ -33,7 +34,10 @@ _WARMUP_STEPS = 2
 
 def supports_decode_cuda_graph(model: Any, device: torch.device | str) -> bool:
     """Whether `model` can decode through `DecodeCudaGraph` on `device`."""
-    return is_cuda_device(device) and bool(getattr(model, "SUPPORTS_DECODE_CUDA_GRAPH", False))
+    if not (is_cuda_device(device) and getattr(model, "SUPPORTS_DECODE_CUDA_GRAPH", False)):
+        return False
+    can_capture = getattr(model, "can_capture_decode", None)
+    return can_capture is None or bool(can_capture(device))
 
 
 class DecodeCudaGraph:

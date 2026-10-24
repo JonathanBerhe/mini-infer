@@ -67,6 +67,7 @@ from mini_infer.distributed.loader import load_state_dict_with_tp
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks.deepseek_v4_decoder_layer import DeepseekV4DecoderLayer
+from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
 from mini_infer.models.blocks.hyper_connections import HCHeadReduction
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding
@@ -779,6 +780,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     Config: ClassVar[type] = DeepseekV4Config
     # V4 decodes via a per-request StateCache, not the shared PagedKVCache.
     USES_STATE_CACHE: ClassVar[bool] = True
+    # `decode_step_static` is safe to capture in a CUDA graph where
+    # `can_capture_decode` says so.
+    SUPPORTS_DECODE_CUDA_GRAPH: ClassVar[bool] = True
 
     def __init__(self, cfg: DeepseekV4Config) -> None:
         super().__init__()
@@ -1152,16 +1156,43 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         batch_size = input_id.shape[0]
         if positions.shape != (batch_size,):
             raise ValueError(f"positions shape {tuple(positions.shape)} != (B={batch_size},)")
-        positions = positions.to(torch.int64)
+        state_cache.check_capacity(int(positions.max()) + 1)
+        return self.decode_step_static(input_id, positions.to(torch.int64), state_cache)
 
+    def can_capture_decode(self, device: torch.device | str) -> bool:
+        """Whether `decode_step_static` runs on `device` without a host sync.
+
+        The per-expert MoE loop syncs to find the tokens of each expert, so
+        every MoE block must run its experts as grouped matmuls.
+        """
+        dtype = self.model.embed_tokens.weight.dtype
+        return all(
+            block.runs_grouped(device, dtype)
+            for block in self.modules()
+            if isinstance(block, HashRoutedMoEFFN)
+        )
+
+    def decode_step_static(
+        self,
+        input_id: torch.Tensor,
+        positions: torch.Tensor,
+        state_cache: StateCache,
+    ) -> torch.Tensor:
+        """The ragged decode step without the host-side checks.
+
+        `(B, 1)` token ids and `(B,)` int64 positions, both on the model's
+        device. Each layer attends over its whole compressed history buffer
+        with the blocks a row has not reached masked, and writes the blocks of
+        this step with a masked select. So the step has no host sync and no
+        data-dependent shape, and it updates `state_cache` only in place:
+        `DecodeCudaGraph` can capture it where `can_capture_decode` allows.
+        The caller checks shapes and capacity (`StateCache.check_capacity`).
+        """
+        batch_size = input_id.shape[0]
         hidden_state = self.model.embed_tokens(input_id)  # (B, 1, hidden_size)
         window_token_pe, compressed_token_pe = self._token_rope_tables(
             hidden_state, positions.unsqueeze(1)
         )  # each (cos, sin), (B, 1, rope_head_dim)
-
-        # max over rows; (pos + 1) // m is monotonic in pos, so the widest valid
-        # compressed prefix for any layer is (positions_max + 1) // m. One sync.
-        positions_max = int(positions.max())
 
         if self.cfg.use_hyper_connections:
             hidden_state = (
@@ -1170,33 +1201,29 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 .contiguous()
             )
 
+        # Every row gets RoPE for its own block position `(pos // m) * m`, once
+        # per compression ratio; rows that do not flush this step ignore it.
+        block_pe_by_ratio: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for compression_ratio in set(self.cfg.compress_ratios) - {0}:
+            block_position = (positions // compression_ratio) * compression_ratio  # (B,)
+            block_pe_by_ratio[compression_ratio] = self.compress_rotary_emb(
+                torch.zeros(batch_size, 1, device=input_id.device),
+                block_position.unsqueeze(1),
+            )  # each (B, 1, rope_head_dim)
+
         for layer_idx, layer_module in enumerate(self.model.layers):
             layer = cast(DeepseekV4DecoderLayer, layer_module)
             compression_ratio = self.cfg.compress_ratios[layer_idx]
             token_position_embeddings = (
                 compressed_token_pe if compression_ratio != 0 else window_token_pe
             )
-            block_position_embeddings = None
-            n_compressed_max = 0
-            if compression_ratio != 0:
-                # Every row gets RoPE for its own block position `(pos // m) * m`;
-                # rows that do not flush this step ignore it.
-                block_position = (positions // compression_ratio) * compression_ratio  # (B,)
-                cos_for_block, sin_for_block = self.compress_rotary_emb(
-                    torch.zeros(batch_size, 1, device=input_id.device),
-                    block_position.unsqueeze(1),
-                )  # each (B, 1, rope_head_dim)
-                block_position_embeddings = (cos_for_block, sin_for_block)
-                n_compressed_max = (positions_max + 1) // compression_ratio
-
             hidden_state = layer.forward_decode_ragged(
                 hidden_state,
                 positions=positions,
                 state_cache=state_cache,
                 layer_idx=layer_idx,
                 token_position_embeddings=token_position_embeddings,
-                block_position_embeddings=block_position_embeddings,
-                n_compressed_max=n_compressed_max,
+                block_position_embeddings=block_pe_by_ratio.get(compression_ratio),
                 input_ids=input_id if self.cfg.use_moe_ffn else None,
             )
 

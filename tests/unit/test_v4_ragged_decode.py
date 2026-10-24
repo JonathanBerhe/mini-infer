@@ -22,6 +22,7 @@ from mini_infer.cache.state_cache import StateCache, StateLayerSpec
 from mini_infer.models.blocks import HCAAttention
 from mini_infer.models.blocks.rope import RotaryEmbedding
 from mini_infer.models.blocks.swa import SWAAttention
+from mini_infer.models.blocks.v4.lightning_indexer import _topk_lower_index_on_ties
 from mini_infer.models.deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
@@ -423,3 +424,21 @@ def test_model_forward_decode_ragged_matches_per_request_scalar(
             f"request {row} (prompt len {len(prompt)}): "
             f"ragged {ragged_tokens[row]} != scalar {scalar_tokens[row]}"
         )
+
+
+def test_indexer_ties_pick_the_lower_block_at_any_width() -> None:
+    """Equal index scores pick the lower block, however wide the scored buffer.
+
+    The scalar decode step scores the valid prefix and the ragged step the whole
+    buffer with `-inf` past it. Blocks whose ReLU zeroed every head score exactly
+    0, and `torch.topk` picked other tied blocks at the two widths on Linux CI.
+    """
+    prefix = torch.tensor([[[0.0, -0.36, -0.36, 0.0, 0.0, -0.11]]])
+    padded = torch.cat([prefix, torch.full((1, 1, 2), float("-inf"))], dim=-1)
+    negative_zeros = torch.where(prefix == 0, -0.0, prefix)  # ReLU 0 times a negative weight
+    for scores in (prefix, padded, negative_zeros):
+        values, indices = _topk_lower_index_on_ties(scores, 2)
+        assert indices.tolist() == [[[0, 3]]]
+        assert values.tolist() == [[[0.0, 0.0]]]
+    _, indices = _topk_lower_index_on_ties(padded, 8)
+    assert indices.tolist() == [[[0, 3, 4, 5, 1, 2, 6, 7]]]

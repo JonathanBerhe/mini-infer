@@ -303,5 +303,31 @@ class StateCache:
         self.start_pos += n
 
     @property
+    def max_seq_len(self) -> int | None:
+        """The most tokens a request fits: the shortest compressed history, in tokens.
+
+        `None` when no layer compresses, because a sliding window has no limit.
+        """
+        limits = [
+            spec.max_n_compressed * spec.compression_ratio
+            for spec in self.layer_specs
+            if spec.compression_ratio > 0
+        ]
+        return min(limits) if limits else None
+
+    def check_capacity(self, end_pos: int) -> None:
+        """Raise before a decode step that would write past a compressed history.
+
+        The ragged decode writes its blocks without a host check, so the caller
+        checks here with `end_pos` = the largest position of the step + 1.
+        """
+        limit = self.max_seq_len
+        if limit is not None and end_pos > limit:
+            raise ValueError(
+                f"sequence position {end_pos} exceeds the cache's max_seq_len {limit}; "
+                "admit fewer tokens or build the cache with a larger max_seq_len"
+            )
+
+    @property
     def num_layers(self) -> int:
         return len(self._layers)
