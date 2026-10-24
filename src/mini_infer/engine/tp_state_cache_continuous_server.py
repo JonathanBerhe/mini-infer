@@ -27,10 +27,14 @@ With `cuda_graph=True`, every rank captures the decode step in a
 replays it. The constructor runs on every rank in the same order, so the
 all-reduces inside the capture line up. Shutdown drops the graph on every rank,
 because a live graph that holds NCCL work can hang the process group teardown.
+
+With `time_decode=True`, a `DecodeStepTimer` times each decode forward and the
+host gap between forwards; `decode_timings()` returns them.
 """
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 
@@ -41,6 +45,7 @@ from mini_infer.cache.state_cache import StateCache
 from mini_infer.device import is_cuda_device
 from mini_infer.distributed.group import get_rank, get_world_size
 from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode_cuda_graph
+from mini_infer.engine.decode_step_timer import DecodeStepTimer, DecodeStepTiming
 from mini_infer.engine.sampler import SamplingParams, sample
 from mini_infer.engine.tokenizer import Tokenizer
 from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM, build_state_cache_layer_specs
@@ -56,7 +61,8 @@ class TensorParallelStateCacheContinuousServer:
     Construct one on every rank with that rank's sharded model. The leader drives
     `generate_cohort`; followers call `run_follower_loop`. Requires
     `init_distributed` already active. Pass `cuda_graph=True` on every rank to
-    replay the decode step from a CUDA graph (see the module docstring).
+    replay the decode step from a CUDA graph, and `time_decode=True` to time
+    the decode steps (see the module docstring).
     """
 
     def __init__(
@@ -69,6 +75,7 @@ class TensorParallelStateCacheContinuousServer:
         device: str | None = None,
         dtype: torch.dtype | None = None,
         cuda_graph: bool = False,
+        time_decode: bool = False,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
@@ -94,9 +101,16 @@ class TensorParallelStateCacheContinuousServer:
             device=self.device,
             dtype=self.dtype,
         )
+        self._decode_timer = DecodeStepTimer(self.device) if time_decode else None
         # Capture before any prefill: warmup and capture write into every row.
         self._decode_graph = (
-            DecodeCudaGraph(model, self._cache, batch_size=max_batch_size, device=self.device)
+            DecodeCudaGraph(
+                model,
+                self._cache,
+                batch_size=max_batch_size,
+                device=self.device,
+                timer=self._decode_timer,
+            )
             if cuda_graph
             else None
         )
@@ -112,6 +126,8 @@ class TensorParallelStateCacheContinuousServer:
         return self._tokenizer
 
     def _broadcast(self, obj: object) -> object:
+        if self.world_size == 1:
+            return obj  # no followers
         holder = [obj]
         dist.broadcast_object_list(holder, src=_LEADER_RANK)
         return holder[0]
@@ -132,6 +148,8 @@ class TensorParallelStateCacheContinuousServer:
         with torch.inference_mode():
             logits = self._model.forward_prefill_with_cache(input_ids, state_cache=temp)
         self._copy_row(temp, dst=slot_idx)
+        if self._decode_timer is not None:
+            self._decode_timer.skip_gap()
         if self.is_leader:
             return logits[0, -1, :]
         return None
@@ -164,10 +182,24 @@ class TensorParallelStateCacheContinuousServer:
             )
         input_ids = torch.tensor(input_tokens, device=self.device, dtype=torch.long).unsqueeze(1)
         position_tensor = torch.tensor(positions, device=self.device, dtype=torch.long)
-        with torch.inference_mode():
+        with torch.inference_mode(), self._timed_step():
             return self._model.forward_decode_with_cache_ragged(
                 input_ids, positions=position_tensor, state_cache=self._cache
             )
+
+    def _timed_step(self) -> contextlib.AbstractContextManager[None]:
+        if self._decode_timer is None:
+            return contextlib.nullcontext()
+        return self._decode_timer.step()
+
+    def decode_timings(self) -> list[DecodeStepTiming]:
+        """The timing of each decode step since the last call (`time_decode=True`).
+
+        Waits for the last timed step to finish on the device.
+        """
+        if self._decode_timer is None:
+            raise RuntimeError("decode_timings needs a server built with time_decode=True")
+        return self._decode_timer.drain()
 
     # ---- leader-driven operations (broadcast, then run; followers mirror) ----
 
