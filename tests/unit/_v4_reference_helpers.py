@@ -28,6 +28,7 @@ import pytest
 import torch
 from torch.nn.functional import linear
 
+from mini_infer.models.blocks.v4.lightning_indexer import _topk_lower_index_on_ties
 from mini_infer.quant.nvfp4 import dequantize_block_fp8_to_bf16_partial
 
 REFERENCE_DIR = Path(__file__).resolve().parents[2] / "third_party" / "deepseek_v4_reference"
@@ -397,13 +398,42 @@ def install_real_quant_stubs(
         monkeypatch.setattr(reference, "scale_dtype", torch.float8_e8m0fnu)
 
 
+def _decode_ties_to_lower_block(forward: Any) -> Any:
+    """Wrap the reference `Indexer.forward`: a one-token decode breaks top-k ties by index.
+
+    Its `Tensor.topk` leaves the order of equal scores open, and the order
+    changes with the width of the input. Our decode steps give a tie to the
+    lower block (`lightning_indexer._topk_lower_index_on_ties`), so the
+    reference does the same here. Prefill keeps `Tensor.topk` on both sides.
+    """
+
+    def lower_block_topk(
+        scores: torch.Tensor, k: int, dim: int = -1, largest: bool = True, sorted: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert dim in (-1, scores.dim() - 1) and largest
+        return _topk_lower_index_on_ties(scores, k)
+
+    def wrapped(self: Any, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int) -> Any:
+        if start_pos == 0 or x.shape[1] != 1:
+            return forward(self, x, qr, start_pos, offset)
+        original = torch.Tensor.topk
+        torch.Tensor.topk = lower_block_topk  # type: ignore[assignment]
+        try:
+            return forward(self, x, qr, start_pos, offset)
+        finally:
+            torch.Tensor.topk = original  # type: ignore[method-assign]
+
+    return wrapped
+
+
 @pytest.fixture(scope="module")
 def reference_module() -> Any:
     """Import the vendored DeepSeek-V4 reference `model.py` with kernel + Hadamard stubbed.
 
     Forces fp32 default dtype during import so the reference's `nn.Parameter(
     torch.empty(...))` creates fp32 tensors. Also patches the module-level
-    `rotate_activation` to identity (Hadamard is unitary, cancels in `q·k^T`).
+    `rotate_activation` to identity (Hadamard is unitary, cancels in `q·k^T`),
+    and gives the indexer's one-token decode our tie rule for its top-k.
     """
     if not REFERENCE_DIR.exists():
         pytest.skip(
@@ -424,6 +454,7 @@ def reference_module() -> Any:
         # Hadamard rotation: identity for parity. Reference's version asserts
         # bf16 input AND imports `fast_hadamard_transform`; both fail in our setup.
         ref.rotate_activation = lambda x: x
+        ref.Indexer.forward = _decode_ties_to_lower_block(ref.Indexer.forward)
         yield ref
     finally:
         torch.set_default_dtype(prev_dtype)
