@@ -55,8 +55,10 @@ a CUDA graph of the same step is timed and profiled next to it.
 `--compare-fp8-activations` runs the FP4 experts with bf16 inputs and then with
 e4m3 inputs (W4A8, ADR-043) on one load, and reports the passage perplexity,
 the argmax agreement, the greedy tokens and the graph step time per batch
-size of each. `--compare-paths` keeps bf16 inputs on both paths. The other
-modes run the model's default, which is e4m3 inputs on a B200.
+size of each. `--compare-fused-rope` does the same with the partial RoPE of
+PyTorch and then of the Triton kernel, whose outputs are bit-identical.
+`--compare-paths` keeps bf16 inputs on both paths. The other modes run the
+model's default, which is e4m3 inputs on a B200.
 
 Run with:
     HF_TOKEN=<token> uv run modal run scripts/modal_v4_flash_generate.py
@@ -68,6 +70,7 @@ Run with:
     uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
     uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
     uv run modal run scripts/modal_v4_flash_generate.py --compare-fp8-activations
+    uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-rope
 """
 
 import os
@@ -968,25 +971,36 @@ def _profile_batch_one_rank(
     return results
 
 
-def _compare_w4a8_one_rank(
+_COMPARED_MODES = {
+    # `--compare-fp8-activations`: the FP4 experts' inputs (ADR-043).
+    "fp8-activations": ("bf16", "w4a8"),
+    # `--compare-fused-rope`: the PyTorch partial RoPE against the Triton kernel.
+    "fused-rope": ("torch", "fused"),
+}
+
+
+def _compare_modes_one_rank(
     rank: int,
     world_size: int,
     prompt: str,
     passage: str,
     batch_sizes: list[int],
+    feature: str,
     device: str | None = None,
 ) -> dict[str, Any]:
-    """Per-rank work of `--compare-fp8-activations`: bf16 against e4m3 inputs for the FP4 experts.
+    """Per-rank work of `--compare-fp8-activations` and `--compare-fused-rope`.
 
-    One load. For each mode, the MoE blocks' `fp8_activations` is set (ADR-043;
-    the model's own setting comes from `DeepseekV4Config.fp4_fp8_activations`
-    and is restored at the end), then:
+    One load, two modes of `feature` (see `_COMPARED_MODES`). For
+    `fp8-activations` the MoE blocks' `fp8_activations` is set (ADR-043; the
+    model's own setting is restored at the end). For `fused-rope` the partial
+    RoPE kernel's bench hook turns it off, then on. For each mode:
       - the passage prefills once; its next-token NLL gives a perplexity, and
         the argmax at every position is kept to compare the modes;
       - a `DecodeCudaGraph` at batch 1 greedy-decodes the prompt;
       - a `DecodeCudaGraph` per batch size times its decode step, with row `b`
         prefilling its own slice of the passage, as in `--profile-batch`.
-    `device` defaults to this rank's GPU. A CPU dry run passes `"cpu"`.
+    Each graph is captured in its own mode. `device` defaults to this rank's
+    GPU. A CPU dry run passes `"cpu"`.
     """
     import gc
     import statistics
@@ -996,6 +1010,7 @@ def _compare_w4a8_one_rank(
 
     from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph
     from mini_infer.engine.tokenizer import Tokenizer
+    from mini_infer.models.blocks import partial_rope_kernel
     from mini_infer.models.blocks.hash_routed_moe_ffn import HashRoutedMoEFFN
     from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM
 
@@ -1053,10 +1068,17 @@ def _compare_w4a8_one_rank(
         synchronize()
         return tokens, step_ms
 
+    def set_mode(mode: str) -> None:
+        if feature == "fp8-activations":
+            for block in moe_blocks:
+                block.fp8_activations = mode == "w4a8"
+        else:
+            partial_rope_kernel._DISABLED_FOR_BENCH = mode == "torch"
+
+    base_mode, other_mode = _COMPARED_MODES[feature]
     results: dict[str, Any] = {"rank": rank, "moe_layers": len(moe_blocks), "modes": {}}
-    for mode in ("bf16", "w4a8"):
-        for block in moe_blocks:
-            block.fp8_activations = mode == "w4a8"
+    for mode in (base_mode, other_mode):
+        set_mode(mode)
         _checkpoint(rank, f"{mode}: passage perplexity...")
         cache = new_cache(1, len(passage_ids))
         with torch.inference_mode():
@@ -1085,15 +1107,17 @@ def _compare_w4a8_one_rank(
         results["modes"][mode] = entry
     for block, setting in zip(moe_blocks, settings, strict=True):
         block.fp8_activations = setting
-    bf16, w4a8 = results["modes"]["bf16"], results["modes"]["w4a8"]
-    pairs = enumerate(zip(bf16["greedy"][0], w4a8["greedy"][0], strict=True))
+    partial_rope_kernel._DISABLED_FOR_BENCH = False
+    base, other = results["modes"][base_mode], results["modes"][other_mode]
+    pairs = enumerate(zip(base["greedy"][0], other["greedy"][0], strict=True))
     results["first_divergence"] = next((i for i, (a, b) in pairs if a != b), None)
     results["argmax_agreement"] = statistics.mean(
-        a == b for a, b in zip(bf16["argmax"], w4a8["argmax"], strict=True)
+        a == b for a, b in zip(base["argmax"], other["argmax"], strict=True)
     )
     results["last_logits_cosine"] = float(
-        torch.nn.functional.cosine_similarity(bf16["last_logits"], w4a8["last_logits"], dim=0)
+        torch.nn.functional.cosine_similarity(base["last_logits"], other["last_logits"], dim=0)
     )
+    results["last_logits_equal"] = torch.equal(base["last_logits"], other["last_logits"])
     for entry in results["modes"].values():
         del entry["argmax"], entry["last_logits"]
         entry["greedy_text"] = tokenizer.decode(entry["greedy"][0])
@@ -1229,10 +1253,14 @@ def decode_profile(prompt: str, passage: str, keep_trace: bool, cuda_graph: bool
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
-def compare_w4a8(prompt: str, passage: str, batch_sizes: list[int]) -> list[dict]:
-    """bf16 against e4m3 inputs for the FP4 experts; see `_compare_w4a8_one_rank`."""
+def compare_modes(prompt: str, passage: str, batch_sizes: list[int], feature: str) -> list[dict]:
+    """Two modes of `feature` on one load; see `_compare_modes_one_rank`."""
     return _spawn_ranks(
-        _compare_w4a8_one_rank, prompt=prompt, passage=passage, batch_sizes=batch_sizes
+        _compare_modes_one_rank,
+        prompt=prompt,
+        passage=passage,
+        batch_sizes=batch_sizes,
+        feature=feature,
     )
 
 
@@ -1441,26 +1469,31 @@ def _print_batch_profile(per_rank: list[dict], trace_dir: str) -> None:
                 print(f"{mode} trace of batch {size} saved to {path}")
 
 
-def _print_w4a8(per_rank: list[dict]) -> None:
-    """Print the tables of `--compare-fp8-activations`."""
+def _print_mode_comparison(per_rank: list[dict], feature: str) -> None:
+    """Print the tables of `--compare-fp8-activations` or `--compare-fused-rope`."""
     import math
 
+    base_mode, other_mode = _COMPARED_MODES[feature]
     rank0 = per_rank[0]
     modes = rank0["modes"]
     print(f"\nMoE layers: {rank0['moe_layers']}")
     print(f"{'mode':<6} {'passage NLL':>11} {'perplexity':>10} {'top-1':>6}")
     for mode, entry in modes.items():
         print(f"{mode:<6} {entry['nll']:11.4f} {math.exp(entry['nll']):10.3f} {entry['top1']:6.1%}")
-    change = math.exp(modes["w4a8"]["nll"] - modes["bf16"]["nll"]) - 1
-    print(f"perplexity change with W4A8: {change:+.2%}")
+    change = math.exp(modes[other_mode]["nll"] - modes[base_mode]["nll"]) - 1
+    print(f"perplexity change with {other_mode}: {change:+.2%}")
     print(f"argmax agreement over the passage: {rank0['argmax_agreement']:.1%}")
     print(f"last-position logit cosine: {rank0['last_logits_cosine']:.5f}")
+    print(f"last-position logits bit-identical: {rank0['last_logits_equal']}")
     print(f"first differing greedy token (of 33): {rank0['first_divergence']}")
     print("\ngraph decode step, median ms:")
-    for batch_size in modes["bf16"]["step_ms"]:
-        bf16 = modes["bf16"]["step_ms"][batch_size]
-        w4a8 = modes["w4a8"]["step_ms"][batch_size]
-        print(f"  batch {batch_size}: bf16 {bf16:.1f}, W4A8 {w4a8:.1f} ({bf16 / w4a8:.2f}x)")
+    for batch_size in modes[base_mode]["step_ms"]:
+        base = modes[base_mode]["step_ms"][batch_size]
+        other = modes[other_mode]["step_ms"][batch_size]
+        print(
+            f"  batch {batch_size}: {base_mode} {base:.1f}, {other_mode} {other:.1f} "
+            f"({base / other:.2f}x)"
+        )
     for mode, entry in modes.items():
         print(f"{mode} greedy text: {entry['greedy_text']!r}")
 
@@ -1475,11 +1508,14 @@ def main(
     profile_batch: bool = False,
     batch_sizes: str = "1,16",
     compare_fp8_activations: bool = False,
+    compare_fused_rope: bool = False,
     trace_dir: str = "",
 ) -> None:
-    if compare_fp8_activations:
+    if compare_fp8_activations or compare_fused_rope:
         sizes = [int(size) for size in batch_sizes.split(",")]
-        _print_w4a8(compare_w4a8.remote(prompt, _PASSAGE.read_text(), sizes))
+        feature = "fp8-activations" if compare_fp8_activations else "fused-rope"
+        per_rank = compare_modes.remote(prompt, _PASSAGE.read_text(), sizes, feature)
+        _print_mode_comparison(per_rank, feature)
         return
     if profile_batch:
         sizes = [int(size) for size in batch_sizes.split(",")]

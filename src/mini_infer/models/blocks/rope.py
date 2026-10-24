@@ -21,6 +21,12 @@ import math
 import torch
 from torch import nn
 
+from mini_infer.models.blocks.partial_rope_kernel import (
+    broadcast_rope_tables,
+    partial_rope_triton,
+    supports_partial_rope_kernel,
+)
+
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
     """YaRN attention-magnitude correction factor ("mscale", Peng et al. 2023).
@@ -361,6 +367,10 @@ def apply_partial_rope_last_n_dims(
     this as `apply_rotary_emb(x[..., -rd:], freqs_cis)` (in-place mutation
     of a slice). We return a new tensor for safety.
 
+    On CUDA one Triton kernel (`partial_rope_kernel.py`) does the whole call,
+    with the rounding of the PyTorch path, so the output is the same bit for
+    bit. Other devices, and tensors that need a gradient, take the PyTorch path.
+
     Difference vs V2's `apply_interleaved_rotary_pos_emb`: V2 rotates the
     whole input (which is already the rope-only slice); V4 takes the full
     head and selectively rotates the tail. Centralizing the slice-and-rotate
@@ -384,7 +394,17 @@ def apply_partial_rope_last_n_dims(
         )
     if last_n_rotated % 2 != 0:
         raise ValueError(f"last_n_rotated must be even (interleaved RoPE), got {last_n_rotated}")
+    if supports_partial_rope_kernel(x, cos, sin):
+        tables = broadcast_rope_tables(x, cos, sin, last_n_rotated)
+        if tables is not None:
+            return partial_rope_triton(x, *tables, last_n_rotated, inverse=inverse)
+    return _partial_rope_torch(x, cos, sin, last_n_rotated, inverse)
 
+
+def _partial_rope_torch(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, last_n_rotated: int, inverse: bool
+) -> torch.Tensor:
+    """The PyTorch path of `apply_partial_rope_last_n_dims`, one op per step."""
     rope_part = x[..., -last_n_rotated:]
     rest_part = x[..., :-last_n_rotated]
 
