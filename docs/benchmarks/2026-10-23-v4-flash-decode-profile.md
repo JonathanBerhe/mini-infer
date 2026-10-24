@@ -226,6 +226,60 @@ The graph tokens equal the eager tokens at every batch size. The eager step
 costs about 170 ms at every batch size, so the host sets it. The graph step
 grows by about 1.4 ms per extra request.
 
+## Graph step at batch 16
+
+`scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16` runs
+the ragged decode step of the server at batch 1 and 16, with a cache of 1,024
+tokens. Row `b` prefills its own slice of the passage, of `24 + 8 * b` tokens.
+A graph replay is one launch, so its trace cannot say which part of the model
+a kernel belongs to. The graph replays the kernels of the eager step, though,
+so the eager step runs with every module labelled to split the GPU time.
+
+| Batch | Graph ms/step | Graph GPU busy | GPU operations per step | Tokens equal to eager |
+|---:|---:|---:|---:|---|
+| 1 | 35.4 | 35.5 ms | 11,860 | yes |
+| 16 | 53.8 | 53.7 ms | 11,882 | yes |
+
+GPU ms per step of the eager step, by part of the model:
+
+| Part | Batch 1 | Batch 16 | Growth |
+|---|---:|---:|---:|
+| MoE routed experts | 6.41 | 17.43 | +11.03 |
+| Unlabelled (ragged attention and layer glue) | 15.32 | 18.66 | +3.34 |
+| NCCL collectives | 1.01 | 2.68 | +1.67 |
+| Hyper-connections | 4.40 | 5.92 | +1.52 |
+| Norms | 1.33 | 2.40 | +1.07 |
+| Attention (labelled submodules) | 5.93 | 6.37 | +0.44 |
+| MoE gate | 1.60 | 2.02 | +0.42 |
+| MoE shared expert | 1.69 | 1.34 | -0.35 |
+| Rest | 0.37 | 0.42 | +0.05 |
+| Total | 38.06 | 57.24 | +19.18 |
+
+This profile labelled the batched attention methods (`forward_decode_ragged`
+and `forward_decode_step_ragged`) only partly, so most attention kernels and
+the layer glue count as unlabelled. The script now labels them.
+
+- The routed experts explain 11 ms of the 18 ms growth. The FP4 grouped
+  kernel alone goes from 3.6 to 14.3 ms per step (86 launches). At batch 16
+  the 96 expert picks of a layer touch at most 48 experts per GPU, about
+  600 MB in FP4. At 8 TB/s, 43 layers of that take at most 3.3 ms, so the
+  kernel runs at least 4.4 times slower than its memory-bandwidth limit.
+  The kernel is now the largest single item of a serving step.
+- The NCCL all-reduces grow from 1.0 to 2.7 ms. The MoE output is reduced in
+  fp32, so its message grows with the batch.
+- The softmax of the HCA compressors costs 2.3 ms per step at every batch
+  size: 20 calls of about 116 µs each. The batched step computes the
+  compressed block at every step, while an HCA layer closes a block only once
+  every 128 tokens. The softmax also runs over the slot dimension, which is
+  not the last one, so PyTorch runs it with very few thread blocks.
+
+For serving at batch 8 to 16, these are the largest items in order: the FP4
+kernel at a few rows per expert (up to about 11 ms), the HCA compressor
+softmax (about 2.3 ms), the full-width `torch.cat` of each layer (about
+2.5 ms, see above), and the fp32 MoE all-reduce (about 1 ms to gain at batch
+16). e8m0 scales still do not help, because the kernel is not bound by its
+memory reads.
+
 ## How it is measured
 
 For each context, each rank prefills the context and runs 8 warm-up decode
@@ -279,6 +333,10 @@ uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-grap
 
 ```bash
 uv run modal run scripts/modal_v4_flash_cb_bench.py --cuda-graph --batch-sizes 1,8,16
+```
+
+```bash
+uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).

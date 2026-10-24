@@ -96,8 +96,11 @@ _STEP_LABEL = "decode_step"
 # Decode methods that run outside `Module.__call__`, so module hooks miss them.
 _LABELLED_METHODS = (
     "forward_decode_with_cache",
+    "decode_step_static",
     "forward_decode",
+    "forward_decode_ragged",
     "forward_decode_step",
+    "forward_decode_step_ragged",
     "hc_pre",
     "hc_post",
     "_loop_experts",
