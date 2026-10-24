@@ -96,6 +96,8 @@ _GPU_TESTS = [
     "tests/unit/test_rms_norm_kernel.py",
     "tests/unit/test_v4_cuda_graph_decode.py",
     "tests/unit/test_cuda_graph_decode.py",
+    "tests/unit/test_sampler.py",
+    "tests/unit/test_decode_step_timer.py",
 ]
 # A deadlocked kernel never returns. The tests stop after this many seconds.
 _GPU_TESTS_TIMEOUT = 900

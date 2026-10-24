@@ -29,10 +29,10 @@ layers every rank computes identical logits, so a broadcast of the sampled token
 is unnecessary, it rides the next decode op.
 
 With `cuda_graph=True`, every rank captures the decode step in a
-`DecodeCudaGraph` when the server is built, and each `("decode", ...)` op
-replays it. The constructor runs on every rank in the same order, so the
-all-reduces inside the capture line up. Shutdown drops the graph on every rank,
-because a live graph that holds NCCL work can hang the process group teardown.
+`DecodeCudaGraph` when the server is built, and each decode op replays it. The
+constructor runs on every rank in the same order, so the all-reduces inside the
+capture line up. Shutdown drops the graph on every rank, because a live graph
+that holds NCCL work can hang the process group teardown.
 
 With `time_decode=True`, a `DecodeStepTimer` times each decode forward and the
 host gap between forwards; `decode_timings()` returns them.
