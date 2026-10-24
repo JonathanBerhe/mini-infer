@@ -61,6 +61,20 @@ if TYPE_CHECKING:
     from mini_infer.cache.state_cache import _IndexerState
 
 
+def _topk_lower_index_on_ties(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`scores.topk(k)` along the last dim, where equal scores go to the lower index.
+
+    `torch.topk` leaves the order of equal values open, and it changes with the
+    width of the input. The two decode steps score different widths: the scalar
+    step the valid prefix, the ragged step the whole buffer. So exact ties (for
+    example blocks whose ReLU zeroed every head, which score 0) could pick
+    other blocks in each, and a request's tokens would depend on the cache size
+    and the batch. A stable sort breaks the ties by index in both.
+    """
+    values, indices = torch.sort(scores, dim=-1, descending=True, stable=True)
+    return values[..., :k], indices[..., :k]
+
+
 class LightningIndexer(nn.Module):
     """Top-k compressed-entry selector for CSA.
 
@@ -426,7 +440,8 @@ class LightningIndexer(nn.Module):
         # index_score: (B, 1, n_valid_compressed) — replicated.
 
         actual_top_k = min(self.top_k, n_valid_compressed)
-        topk_local_idxs = index_score.topk(actual_top_k, dim=-1)[1]  # (B, 1, actual_top_k)
+        # (B, 1, actual_top_k); the lower block wins a tie, as in the ragged step.
+        topk_local_idxs = _topk_lower_index_on_ties(index_score, actual_top_k)[1]
         topk_absolute: torch.Tensor = (topk_local_idxs + compressed_offset).to(torch.int64)
         return topk_absolute
 
@@ -492,7 +507,7 @@ class LightningIndexer(nn.Module):
         index_score = index_score.masked_fill(~valid.unsqueeze(1), float("-inf"))
 
         actual_top_k = min(self.top_k, n_compressed_max)
-        topk_values, topk_local_idxs = index_score.topk(actual_top_k, dim=-1)
+        topk_values, topk_local_idxs = _topk_lower_index_on_ties(index_score, actual_top_k)
         topk_absolute = (topk_local_idxs + compressed_offset).to(torch.int64)
         # A selected slot with -inf score is padding (row had fewer valid blocks).
         return torch.where(torch.isneginf(topk_values), -1, topk_absolute)
