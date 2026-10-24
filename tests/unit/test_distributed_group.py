@@ -14,8 +14,11 @@ lives in `test_workers_mp.py` (slow / requires_model).
 from __future__ import annotations
 
 import pytest
+import torch
+import torch.distributed as dist
 
 import mini_infer.distributed.group as group
+from tests.unit._distributed_test_utils import is_multi_process_available, run_multi_process
 
 
 def _simulate_pg(monkeypatch: pytest.MonkeyPatch, *, world_size: int, rank: int) -> None:
@@ -74,3 +77,23 @@ def test_no_pg_is_unaffected_by_scope(monkeypatch: pytest.MonkeyPatch) -> None:
         assert group.get_world_size() == 1
         assert group.get_rank() == 0
     assert group.get_world_size() == 1
+
+
+def test_cpu_group_needs_a_process_group() -> None:
+    with pytest.raises(RuntimeError, match="initialized process group"):
+        group.get_cpu_group()
+
+
+def _cpu_group_target(rank: int, world_size: int) -> tuple[bool, str, list[int]]:
+    """Per-rank: build the CPU group twice and broadcast a message on it."""
+    first = group.get_cpu_group()
+    second = group.get_cpu_group()
+    message = torch.tensor([7, 8, 9]) if rank == 0 else torch.zeros(3, dtype=torch.long)
+    dist.broadcast(message, src=0, group=first)
+    return first is second, str(dist.get_backend(first)), message.tolist()
+
+
+@pytest.mark.skipif(not is_multi_process_available(), reason="multi-process / gloo unavailable")
+def test_cpu_group_is_one_gloo_group_per_process() -> None:
+    results = run_multi_process(2, _cpu_group_target, timeout_sec=60.0)
+    assert results == [(True, "gloo", [7, 8, 9])] * 2

@@ -53,6 +53,9 @@ import torch.distributed as dist
 # world_size==1 no-op (MoE). A construction-only scope would miss the latter.
 _FORCE_REPLICA = False
 
+# The gloo group of `get_cpu_group()`, built on first use.
+_CPU_GROUP: dist.ProcessGroup | None = None
+
 
 @contextmanager
 def replica_scope() -> Iterator[None]:
@@ -132,8 +135,29 @@ def destroy_distributed() -> None:
 
     Safe to call from a `finally:` block whether or not init succeeded.
     """
+    global _CPU_GROUP
+    _CPU_GROUP = None
     if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+        dist.destroy_process_group()  # destroys every group, the CPU group too
+
+
+def get_cpu_group() -> dist.ProcessGroup:
+    """A gloo group over every rank, for small control messages between hosts.
+
+    Under NCCL, a message on the default group goes through the GPUs: the
+    tensor must be on the device, and the host waits for the GPU to read it.
+    On this group the message stays in host memory and no GPU stream takes
+    part. The first call creates the group. Like any collective, every rank
+    must make that first call at the same point.
+    """
+    global _CPU_GROUP
+    if not is_initialized():
+        raise RuntimeError("get_cpu_group needs an initialized process group")
+    if _CPU_GROUP is None:
+        group = dist.new_group(backend="gloo")
+        assert isinstance(group, dist.ProcessGroup)
+        _CPU_GROUP = group
+    return _CPU_GROUP
 
 
 def is_initialized() -> bool:
