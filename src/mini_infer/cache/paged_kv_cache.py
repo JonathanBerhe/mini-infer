@@ -55,6 +55,20 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         # write per slot; reset when the slot's active block changes.
         self._nvfp4_shadow: list[torch.Tensor | None] = []
         self._nvfp4_shadow_block_id: list[int | None] = []
+        # Per-step host state that every layer of a step reuses. Reading a
+        # device tensor on the host (`int(t)`, `t.tolist()`) or copying a host
+        # list to the device makes the CPU wait for the GPU. Done once per
+        # layer, that stalls the GPU dozens of times per token on MPS.
+        # `_layout_changed` drops the two indices when slot lengths or block
+        # ids change.
+        self._step_cu_seqlens_q: torch.Tensor | None = None
+        self._step_cu_seqlens_q_list: list[int] = []
+        # (cu_seqlens_q, device, pool block ids, pool slots) of this step's new tokens.
+        self._write_index: tuple[list[int], torch.device, torch.Tensor, torch.Tensor] | None = None
+        # (device, pool block ids, pool slots, cu_seqlens_k) of every cached token.
+        self._gather_index: tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+            None
+        )
 
     @property
     def batch_size(self) -> int:
@@ -74,6 +88,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         token to obtain logits for the next sample; if everything is cached,
         there is nothing to run.
         """
+        self._layout_changed()
         self._num_tokens.append(0)
         self._block_ids.append([])
         self._slot_prompt_tokens.append(list(prompt_token_ids) if prompt_token_ids else [])
@@ -113,6 +128,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         """Free this request's blocks and remove its slot. Shifts later indices down by 1."""
         if not 0 <= batch_idx < self.batch_size:
             raise IndexError(f"batch_idx={batch_idx} out of range for batch_size={self.batch_size}")
+        self._layout_changed()
         for block_id in self._block_ids[batch_idx]:
             self._pool.free(block_id)
         self._block_ids.pop(batch_idx)
@@ -163,6 +179,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 "to avoid corrupting the cache entry's K/V"
             )
 
+        self._layout_changed()
         required_blocks = (new_seq_len + block_size - 1) // block_size
         blocks_to_free = self._block_ids[batch_idx][required_blocks:]
         self._block_ids[batch_idx] = self._block_ids[batch_idx][:required_blocks]
@@ -180,6 +197,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             raise ValueError(f"merge_request expects batch_size=1, got {other.batch_size}")
         if other._pool is not self._pool:
             raise ValueError("cannot merge caches backed by different pools")
+        self._layout_changed()
+        other._layout_changed()
         self._block_ids.append(other._block_ids[0])
         self._num_tokens.append(other._num_tokens[0])
         self._slot_prompt_tokens.append(other._slot_prompt_tokens[0])
@@ -235,6 +254,25 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
     ) -> torch.Tensor:
         """Per-request seq_lens as a `(B,)` tensor on `device`."""
         return torch.tensor(self._num_tokens, device=device, dtype=dtype)
+
+    def cu_seqlens_q_list(self, cu_seqlens_q: torch.Tensor) -> list[int]:
+        """This step's `cu_seqlens_q` as a host list.
+
+        Every layer of a step passes the same tensor object, so only the first
+        call reads it from the device. Layer 0 of `append_kv_packed` always
+        reads it again, so a tensor that a caller updates in place between
+        steps stays correct.
+        """
+        if cu_seqlens_q is not self._step_cu_seqlens_q:
+            return self._read_cu_seqlens_q(cu_seqlens_q)
+        return self._step_cu_seqlens_q_list
+
+    def cu_seqlens_k_list(self) -> list[int]:
+        """Cumulative K lengths `[0, len_0, len_0 + len_1, ...]` as a host list."""
+        cu_seqlens_k = [0]
+        for seq_len in self._num_tokens:
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seq_len)
+        return cu_seqlens_k
 
     def pool_storage_for_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return `(K_pool, V_pool)` slices for one layer, shape
@@ -311,32 +349,21 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             cu_seqlens_k = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
             return empty_kv, empty_kv, cu_seqlens_k, 0
 
-        cu_seqlens_k_list = [0]
-        running = 0
-        for seq_len in seq_lens:
-            running += seq_len
-            cu_seqlens_k_list.append(running)
+        if self._pool.kv_quant is None:
+            # Uncompressed fast path: one gather from pool storage, with an
+            # index that every layer of the step shares.
+            k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
+            block_ids, slots, cu_seqlens_k = self._step_gather_index(device)
+            return k_pool[block_ids, slots], v_pool[block_ids, slots], cu_seqlens_k, max(seq_lens)
+
+        cu_seqlens_k_list = self.cu_seqlens_k_list()
         cu_seqlens_k = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, device=device)
         total_k = cu_seqlens_k_list[-1]
 
         key_packed = torch.empty((total_k, num_kv_heads, head_dim), dtype=dtype, device=device)
         value_packed = torch.empty_like(key_packed)
 
-        if self._pool.kv_quant is None:
-            # Uncompressed fast path: gather directly from pool storage.
-            k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
-            for batch_idx in range(self.batch_size):
-                seq_len = seq_lens[batch_idx]
-                if seq_len == 0:
-                    continue
-                offset = cu_seqlens_k_list[batch_idx]
-                positions = torch.arange(seq_len, device=device)
-                block_ids_lookup = torch.tensor(self._block_ids[batch_idx], device=device)
-                block_ids_per_pos = block_ids_lookup[positions // block_size]
-                slots_per_pos = positions % block_size
-                key_packed[offset : offset + seq_len] = k_pool[block_ids_per_pos, slots_per_pos]
-                value_packed[offset : offset + seq_len] = v_pool[block_ids_per_pos, slots_per_pos]
-        elif self._pool.kv_quant == "fp8":
+        if self._pool.kv_quant == "fp8":
             # FP8 path used by the CPU/MPS reference fallback (the CUDA
             # FlashInfer path skips materialize entirely). Dequant per
             # request: gather fp8 K/V, cast to fp32, multiply by per-head
@@ -510,6 +537,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
           cu_seqlens_q_new   : (batch_size + 1,) int, monotonically non-decreasing
 
         Block allocation only happens on layer 0 (counts advance once per step).
+        Layer 0 also reads `cu_seqlens_q_new` from the device, once for the
+        whole step; later layers reuse that host copy.
         """
         if cu_seqlens_q_new.shape[0] != self.batch_size + 1:
             raise ValueError(
@@ -517,9 +546,13 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
                 f"expected batch_size+1 = {self.batch_size + 1}"
             )
         if layer_idx == 0:
+            # Before any change, so an allocation failure part way through
+            # leaves no stale index behind.
+            self._layout_changed()
+            cu_seqlens = self._read_cu_seqlens_q(cu_seqlens_q_new)
             block_size = self._pool.block_size
             for batch_idx in range(self.batch_size):
-                new_tokens = int(cu_seqlens_q_new[batch_idx + 1] - cu_seqlens_q_new[batch_idx])
+                new_tokens = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
                 if new_tokens == 0:
                     continue
                 new_total = self._num_tokens[batch_idx] + new_tokens
@@ -569,6 +602,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         # first stream of layer 0 is the trigger.
         first_stream_of_layer_0 = self._pool.stream_names(0)[0]
         if layer_idx == 0 and stream_name == first_stream_of_layer_0:
+            self._layout_changed()
             block_size = self._pool.block_size
             for batch_idx in range(self.batch_size):
                 new_tokens = int(cu_seqlens_q_new[batch_idx + 1] - cu_seqlens_q_new[batch_idx])
@@ -695,6 +729,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         return existing + query_length, 0
 
     def free(self) -> None:
+        self._layout_changed()
         for ids in self._block_ids:
             for block_id in ids:
                 self._pool.free(block_id)
@@ -738,6 +773,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             block_id = self._block_ids[batch_idx][block_idx_in_slot]
             canonical_id, was_dup = self._prefix_cache.publish(block_hash, tokens, block_id)
             if was_dup:
+                self._layout_changed()
                 self._pool.free(block_id)
                 self._block_ids[batch_idx][block_idx_in_slot] = canonical_id
             parent_hash = block_hash
@@ -767,23 +803,86 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         packed_v: torch.Tensor,
         cu_seqlens_q_new: torch.Tensor,
     ) -> None:
-        block_size = self._pool.block_size
         k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
-        for batch_idx in range(self.batch_size):
-            packed_start = int(cu_seqlens_q_new[batch_idx])
-            packed_end = int(cu_seqlens_q_new[batch_idx + 1])
-            new_tokens = packed_end - packed_start
-            if new_tokens == 0:
+        cu_seqlens = self.cu_seqlens_q_list(cu_seqlens_q_new)
+        block_ids, slots = self._step_write_index(cu_seqlens, k_pool.device)
+        # Packed rows [cu[0], cu[-1]) hold every slot's new tokens in slot order,
+        # which is the row order of the index.
+        rows = slice(cu_seqlens[0], cu_seqlens[-1])
+        k_pool[block_ids, slots] = packed_k[rows].to(k_pool.dtype)
+        v_pool[block_ids, slots] = packed_v[rows].to(v_pool.dtype)
+
+    def _read_cu_seqlens_q(self, cu_seqlens_q: torch.Tensor) -> list[int]:
+        """Read `cu_seqlens_q` from the device and keep it for the rest of the step."""
+        self._step_cu_seqlens_q = cu_seqlens_q
+        self._step_cu_seqlens_q_list = [int(x) for x in cu_seqlens_q.tolist()]
+        return self._step_cu_seqlens_q_list
+
+    def _layout_changed(self) -> None:
+        """Drop the per-step indices. Call before any change to slot lengths or block ids."""
+        self._write_index = None
+        self._gather_index = None
+
+    def _block_slot_index(
+        self, ranges: list[tuple[int, int]], device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool `(block_ids, slots)` on `device` for positions `[start, end)` of each slot.
+
+        `ranges[batch_idx]` is that slot's position range. Rows follow slot
+        order, then position order, which is the packed layout. The index is
+        built on the host and reaches the device in a single copy.
+        """
+        block_size = self._pool.block_size
+        block_parts: list[torch.Tensor] = []
+        slot_parts: list[torch.Tensor] = []
+        for batch_idx, (start, end) in enumerate(ranges):
+            if end == start:
                 continue
-            # _num_tokens[batch_idx] reflects the post-append count; subtract
-            # new_tokens to find where this step's tokens start in the slot.
-            start_token = self._num_tokens[batch_idx] - new_tokens
-            for token_offset in range(new_tokens):
-                position = start_token + token_offset
-                block_id = self._block_ids[batch_idx][position // block_size]
-                slot_in_block = position % block_size
-                k_pool[block_id, slot_in_block] = packed_k[packed_start + token_offset]
-                v_pool[block_id, slot_in_block] = packed_v[packed_start + token_offset]
+            positions = torch.arange(start, end)
+            table = torch.tensor(self._block_ids[batch_idx])
+            block_parts.append(table[positions // block_size])
+            slot_parts.append(positions % block_size)
+        if not block_parts:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return empty, empty
+        index = torch.stack([torch.cat(block_parts), torch.cat(slot_parts)]).to(device)
+        return index[0], index[1]
+
+    def _step_write_index(
+        self, cu_seqlens: list[int], device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pool `(block_ids, slots)` of this step's new tokens, built once per step.
+
+        Valid after layer 0 advanced the counts: each slot's new tokens are its
+        last `cu[b + 1] - cu[b]` positions.
+        """
+        cached = self._write_index
+        if cached is None or cached[0] != cu_seqlens or cached[1] != device:
+            ranges = []
+            for batch_idx, seq_len in enumerate(self._num_tokens):
+                new_tokens = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
+                ranges.append((seq_len - new_tokens, seq_len))
+            block_ids, slots = self._block_slot_index(ranges, device)
+            cached = (list(cu_seqlens), device, block_ids, slots)
+            self._write_index = cached
+        return cached[2], cached[3]
+
+    def _step_gather_index(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pool `(block_ids, slots)` of every cached token, plus `cu_seqlens_k` on `device`.
+
+        Built once per step and shared by every layer.
+        """
+        cached = self._gather_index
+        if cached is None or cached[0] != device:
+            block_ids, slots = self._block_slot_index(
+                [(0, seq_len) for seq_len in self._num_tokens], device
+            )
+            cu_seqlens_k = torch.tensor(self.cu_seqlens_k_list(), dtype=torch.int32, device=device)
+            cached = (device, block_ids, slots, cu_seqlens_k)
+            self._gather_index = cached
+        return cached[1], cached[2], cached[3]
 
     def _write_packed_kv_fp8(
         self,
