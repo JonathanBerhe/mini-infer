@@ -88,9 +88,15 @@ class DecodeCudaGraph:
         """
         self._input_ids.copy_(input_ids, non_blocking=non_blocking)
         self._positions.copy_(positions, non_blocking=non_blocking)
-        if self._timer is None:
-            self._graph.replay()
-        else:
-            with self._timer.step():
+        # Replay in inference mode, like the capture. torch 2.5 allocates the
+        # graph's RNG seed and offset tensors at capture time, so they become
+        # inference tensors, and each replay fills them in place. Outside
+        # inference mode that fill raises "Inplace update to inference tensor".
+        # Newer torch allocates them outside inference mode.
+        with torch.inference_mode():
+            if self._timer is None:
                 self._graph.replay()
+            else:
+                with self._timer.step():
+                    self._graph.replay()
         return self._logits
