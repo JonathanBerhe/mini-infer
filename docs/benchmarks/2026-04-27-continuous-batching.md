@@ -4,7 +4,7 @@
 **Hardware:** Modal A10 (NVIDIA A10), via Modal default image
 **Model:** `Qwen/Qwen2.5-0.5B-Instruct`, bf16
 **Workload:** identical 40-token prompt × 32 max_tokens × concurrency C ∈ {1, 2, 4, 8}, one warmup run per concurrency before timing.
-**Reproducer:** `uv run modal run scripts/modal_concurrent_bench.py`.
+**Reproducer:** `uv run modal run scripts/bench/modal_concurrent_bench.py`.
 
 ## Numbers
 
@@ -33,7 +33,7 @@ Throughput scaling vs C=1:
 
 ## What this validates
 
-- **Correctness on real hardware**: the Modal smoke (`scripts/modal_concurrent_smoke.py`) confirmed the batched scheduler produces token-for-token identical output to a serial reference at C=4. The benchmark above ran on the same code path.
+- **Correctness on real hardware**: the Modal smoke (`scripts/smoke/modal_concurrent_smoke.py`) confirmed the batched scheduler produces token-for-token identical output to a serial reference at C=4. The benchmark above ran on the same code path.
 - **The batched Triton kernel is exercised end-to-end**: every decode step at C ≥ 2 fires the multi-request kernel grid `(B * num_q_heads,)` with per-request `block_tables` and `seq_lens`.
 - **The scheduler keeps the batch full**: throughput would scale much worse if requests were serializing inside the engine thread.
 

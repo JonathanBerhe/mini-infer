@@ -48,7 +48,7 @@ changes.
 
 The direct transcription of the reference loop crashes the Triton 3.1.0
 compiler with SIGSEGV at JIT time (torch 2.5.1, CUDA 12.4, L40S). A bisect
-(`scripts/modal_hc_kernel_probe.py`) ran each variant in its own subprocess:
+(`scripts/deepseek_v4/modal_hc_kernel_probe.py`) ran each variant in its own subprocess:
 
 | Variant | Reduction operand | Result |
 |---|---|---|
@@ -100,11 +100,11 @@ The parity contract:
 - A non-power-of-2 `hc_mult` takes the slower PyTorch path without a
   warning, as the docstring of `supports_hc_kernel` says.
 - The PyTorch oracle stays canonical on M1, CI and any non-CUDA path.
-  `tests/unit/_v4_reference_helpers.py` still patches
+  `tests/unit/models/deepseek_v4/_v4_reference_helpers.py` still patches
   `kernel.hc_split_sinkhorn = <our public dispatcher>`, so on CPU the V4
   reference parity test reaches the oracle as before.
 
-`scripts/bench_hc_sinkhorn.py` on an L40S, 2026-06-02 (torch 2.5.1+cu124,
+`scripts/deepseek_v4/bench_hc_sinkhorn.py` on an L40S, 2026-06-02 (torch 2.5.1+cu124,
 triton 3.1.0, FP32, `hc_mult=4`, `batch=2`, `sinkhorn_iters=20`), median
 per-call latency over 100 iterations after 10 warm-up iterations:
 
@@ -127,8 +127,8 @@ per-call latency over 100 iterations after 10 warm-up iterations:
 
 ## Pointers
 
-- Kernel and predicate: [src/mini_infer/models/blocks/hc_sinkhorn_kernel.py](../../src/mini_infer/models/blocks/hc_sinkhorn_kernel.py).
-- Dispatcher and oracle: [src/mini_infer/models/blocks/hyper_connections.py](../../src/mini_infer/models/blocks/hyper_connections.py).
-- Bench: [scripts/bench_hc_sinkhorn.py](../../scripts/bench_hc_sinkhorn.py).
-- Parity tests: [tests/unit/test_hc_sinkhorn_kernel.py](../../tests/unit/test_hc_sinkhorn_kernel.py).
+- Kernel and predicate: [src/mini_infer/models/deepseek_v4/hc_sinkhorn_kernel.py](../../src/mini_infer/models/deepseek_v4/hc_sinkhorn_kernel.py).
+- Dispatcher and oracle: [src/mini_infer/models/deepseek_v4/hyper_connections.py](../../src/mini_infer/models/deepseek_v4/hyper_connections.py).
+- Bench: [scripts/deepseek_v4/bench_hc_sinkhorn.py](../../scripts/deepseek_v4/bench_hc_sinkhorn.py).
+- Parity tests: [tests/unit/models/deepseek_v4/test_hc_sinkhorn_kernel.py](../../tests/unit/models/deepseek_v4/test_hc_sinkhorn_kernel.py).
 - Plan: [docs/plans/hc-sinkhorn-triton.md](../plans/hc-sinkhorn-triton.md).

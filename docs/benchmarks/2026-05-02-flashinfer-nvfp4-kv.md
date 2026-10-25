@@ -3,7 +3,7 @@
 Date: 2026-05-02
 Hardware: NVIDIA B200 (Blackwell, SM_100)
 Engine: mini-infer @ this slice (`kv_quant="nvfp4"` mode)
-Script: `MINI_INFER_BENCH_GPU=B200 modal run scripts/modal_packed_bench.py --config flashinfer_nvfp4 --model "Qwen/Qwen2.5-7B-Instruct" --num-blocks 2048`
+Script: `MINI_INFER_BENCH_GPU=B200 modal run scripts/bench/modal_packed_bench.py --config flashinfer_nvfp4 --model "Qwen/Qwen2.5-7B-Instruct" --num-blocks 2048`
 
 The NVFP4 KV cache mode stores K/V as 4-bit values (2 nibbles per byte)
 plus per-16-element FP8 e4m3 block scales, with a single per-(layer,
@@ -97,7 +97,7 @@ is resolved (see "Open issues" below).
 The bf16 path emits coherent English from the prompt's continuation;
 the nvfp4 path collapses to repeated digits and spaces. This is **not
 a code bug** — the integration's structural correctness is validated
-by a separate parity probe (`scripts/modal_nvfp4_parity.py`):
+by a separate parity probe (`scripts/bench/modal_nvfp4_parity.py`):
 
 > Parity probe: write the same random Gaussian K/V into a bf16 pool
 > and an nvfp4 pool, run `flashinfer_attention_forward` on both,
@@ -156,7 +156,7 @@ distributions.
   working paged-FP4 dequant to re-quantize on append. FlashInfer's
   standalone `nvfp4_kv_dequantize` produces incorrect output (the
   layout it reads doesn't match what `nvfp4_quantize_paged_kv_cache`
-  writes — a known asymmetry confirmed by our `scripts/modal_nvfp4_probe2.py`).
+  writes — a known asymmetry confirmed by our `scripts/bench/modal_nvfp4_probe2.py`).
 - **CPU/MPS materialize fallback**. Raises `NotImplementedError` for
   nvfp4 — no bf16 reference path is feasible without a working
   paged-FP4 dequant.
@@ -170,7 +170,7 @@ distributions.
 
 ```
 HF_TOKEN=$(hf auth token) MINI_INFER_BENCH_GPU=B200 \
-    modal run scripts/modal_packed_bench.py \
+    modal run scripts/bench/modal_packed_bench.py \
     --config flashinfer_nvfp4 --model "Qwen/Qwen2.5-7B-Instruct" \
     --num-blocks 2048
 ```
@@ -184,7 +184,7 @@ Single B200 run, ~5-7 min total wall-clock once the image is cached.
   (`kv_quant="nvfp4"` branch in `__init__`)
 - Write path: [src/mini_infer/cache/paged_kv_cache.py](../../src/mini_infer/cache/paged_kv_cache.py)
   (`_write_packed_kv_nvfp4`)
-- Parity probe: [scripts/modal_nvfp4_parity.py](../../scripts/modal_nvfp4_parity.py)
+- Parity probe: [scripts/bench/modal_nvfp4_parity.py](../../scripts/bench/modal_nvfp4_parity.py)
 - Earlier API surveys (informed the implementation):
   [2026-05-02-flashinfer-nvfp4-probe.md](2026-05-02-flashinfer-nvfp4-probe.md)
 - ADR: [ADR-013 / NVFP4 update](../decisions/ADR-013-turboquant-kv.md)

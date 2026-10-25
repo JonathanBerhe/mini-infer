@@ -99,7 +99,7 @@ The practical consequence: today the dependable handoff between a PyTorch/MPS en
 
 ## 4. Kernel-port feasibility for mini-infer specifically
 
-Grounding in the actual repo: every performance kernel mini-infer has is CUDA-only with an explicit non-CUDA fallback, and `src/mini_infer/device.py` centralizes the device check (per the project's own "no scattered `device.type == cuda`" rule). The CUDA kernels are: fused INT8 W8A16 GEMM (`quant/int8_kernel.py`, Triton), TurboQuant V3 KV dequant (`cache/turbo_kernel.py`, Triton), `hc_split_sinkhorn` (`models/blocks/hc_sinkhorn_kernel.py`, Triton), and FlashInfer paged attention (`cache/flashinfer_backend.py`). LightningIndexer and AttentionSink live as model blocks under `models/blocks/v4/`. On Apple there is no FlashInfer and no Triton-on-Metal, so each would need an MLX path or must stay on the composed-op fallback.
+Grounding in the actual repo: every performance kernel mini-infer has is CUDA-only with an explicit non-CUDA fallback, and `src/mini_infer/device.py` centralizes the device check (per the project's own "no scattered `device.type == cuda`" rule). The CUDA kernels are: fused INT8 W8A16 GEMM (`quant/int8_kernel.py`, Triton), TurboQuant V3 KV dequant (`cache/turbo_kernel.py`, Triton), `hc_split_sinkhorn` (`models/deepseek_v4/hc_sinkhorn_kernel.py`, Triton), and FlashInfer paged attention (`cache/flashinfer_backend.py`). LightningIndexer and AttentionSink live as model blocks under `models/deepseek_v4/`. On Apple there is no FlashInfer and no Triton-on-Metal, so each would need an MLX path or must stay on the composed-op fallback.
 
 Ranked by feasibility / worth:
 
@@ -111,14 +111,14 @@ Ranked by feasibility / worth:
 | **RMSNorm / RoPE** | torch / model blocks | Use `mx.fast.rms_norm` / `mx.fast.rope`. | **Do not port.** Already tuned in `mx.fast`. |
 | **INT8 W8A16 dequant GEMM** | `int8_kernel.py` Triton, CUDA-only | Possible, but MLX's built-in `mx.quantized_matmul` already covers the common quantized-GEMM case (affine quant) with a tuned Metal kernel; a bespoke W8A16 kernel would have to beat it, and the `turboquant-mlx` data shows the built-in quant matmul path is the *fast* one. | **Low priority.** Prefer composing on `mx.quantized_matmul`; only write custom if mini-infer's exact W8A16 contract diverges from MLX's affine scheme. |
 | **`hc_split_sinkhorn`** (DeepSeek-V4) | `hc_sinkhorn_kernel.py` Triton, CUDA-only | Mechanically yes (small per-row iterated matrix, identical fusion pattern: keep `(hc,hc)` in registers, no HBM round-trip). No existing MLX implementation found. | **Feasible but niche.** Worth it only if you want V4 to run end-to-end on Metal at speed; for correctness the pure-PyTorch/MPS fallback already exists. |
-| **LightningIndexer** | `models/blocks/v4/lightning_indexer.py` | Mechanically yes; no published MLX port found. | **Defer.** Port only after the V4 model path is proven on MLX. |
-| **AttentionSink** | `models/blocks/v4/sink.py` | Yes; it is a softmax-renormalization tweak, expressible as a custom kernel or composed ops. | **Defer / compose.** Low compute; composed MLX ops likely fine. |
+| **LightningIndexer** | `models/deepseek_v4/lightning_indexer.py` | Mechanically yes; no published MLX port found. | **Defer.** Port only after the V4 model path is proven on MLX. |
+| **AttentionSink** | `models/deepseek_v4/sink.py` | Yes; it is a softmax-renormalization tweak, expressible as a custom kernel or composed ops. | **Defer / compose.** Low compute; composed MLX ops likely fine. |
 
 The pattern: port exactly the things `mx.fast` does NOT give you and where a fused kernel beats composing primitives, which is the quantized-KV family. Everything covered by `mx.fast` (SDPA, RMSNorm, RoPE) should ride the built-ins. The DeepSeek-V4 paper-specific primitives are portable but only worth the effort if Apple Silicon becomes a real V4 target, which is a bigger decision than this report recommends taking now.
 
 **Effort estimate (rough):** an MLX-native TurboQuant KV + quantized-attention island, validated for bit-behaviour against the existing CUDA/CPU reference, is on the order of 1-2 focused weeks given that two reference implementations already exist to learn from. A full DeepSeek-V4-on-MLX path (Sinkhorn + LightningIndexer + Sink + MLA, all in MLX arrays) is materially larger (multiple weeks) and is not recommended at this stage.
 
-**Repo sources:** `src/mini_infer/device.py`; `src/mini_infer/quant/int8_kernel.py`; `src/mini_infer/cache/turbo_kernel.py`; `src/mini_infer/models/blocks/hc_sinkhorn_kernel.py`; `src/mini_infer/cache/flashinfer_backend.py`; `src/mini_infer/models/blocks/v4/lightning_indexer.py`; `src/mini_infer/models/blocks/v4/sink.py`. **External:** `sharpner/turboquant-mlx`; `Thump604/mlx-qsdpa`.
+**Repo sources:** `src/mini_infer/device.py`; `src/mini_infer/quant/int8_kernel.py`; `src/mini_infer/cache/turbo_kernel.py`; `src/mini_infer/models/deepseek_v4/hc_sinkhorn_kernel.py`; `src/mini_infer/cache/flashinfer_backend.py`; `src/mini_infer/models/deepseek_v4/lightning_indexer.py`; `src/mini_infer/models/deepseek_v4/sink.py`. **External:** `sharpner/turboquant-mlx`; `Thump604/mlx-qsdpa`.
 
 ---
 

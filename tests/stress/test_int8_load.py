@@ -1,6 +1,6 @@
 """Stress tests for the INT8 quantized model on a real Qwen2.5-0.5B.
 
-The integration tests in `tests/unit/test_int8_model_integration.py` verify
+The integration tests in `tests/unit/quant/test_int8_model_integration.py` verify
 single-forward correctness; these tests run greedy decode and check that
 quantization noise doesn't immediately flip token decisions.
 

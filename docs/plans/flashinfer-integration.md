@@ -59,11 +59,11 @@ keeps Stage 1's value.
 - **EDIT** `pyproject.toml` — add `flashinfer-python` (and optionally
   `flashinfer-cubin` for pre-compiled kernels) to the `[cuda]` extra,
   alongside `flash-attn`.
-- **NEW** `tests/unit/test_flashinfer_backend.py` — CPU mechanics tests
+- **NEW** `tests/unit/cache/test_flashinfer_backend.py` — CPU mechanics tests
   (predicate returns False, dispatcher falls through) + CUDA parity
   tests (`@pytest.mark.requires_cuda`) comparing FlashInfer output to
   flash-attn output at cosine sim > 0.999.
-- **EDIT** `scripts/modal_packed_bench.py` — add `--config flashinfer`
+- **EDIT** `scripts/bench/modal_packed_bench.py` — add `--config flashinfer`
   for the same workload as `--config turbo` but with the new backend,
   for A/B comparison.
 
@@ -123,7 +123,7 @@ and decode wrappers (separate wrappers share the buffer).
 
 ### Tests
 
-CPU (`tests/unit/test_flashinfer_backend.py`):
+CPU (`tests/unit/cache/test_flashinfer_backend.py`):
 - Predicate `supports_flashinfer_backend(device)` returns False on CPU.
 - BlockPool with `attention_backend="flashinfer"` allocates the
   workspace; with `"flash_attn"` doesn't.
@@ -136,7 +136,7 @@ CUDA (`@pytest.mark.requires_cuda`):
 
 ### Modal validation (~$0.20)
 
-Run `scripts/modal_packed_bench.py --config turbo` first with
+Run `scripts/bench/modal_packed_bench.py --config turbo` first with
 `--attention-backend flash_attn` (current default), then with
 `--attention-backend flashinfer`. Same workload, different backend.
 Acceptance: cosine sim > 0.999 on greedy logits between the two; tok/s
@@ -259,8 +259,8 @@ Mirror the existing `_FUSED_DISABLED_FOR_BENCH` pattern:
   through `from_pretrained`)
 - `src/mini_infer/engine/attention_patches/qwen2.py` (per-step `plan()`
   hook, if not lazy)
-- `tests/unit/test_flashinfer_backend.py` (NEW, both stages)
-- `scripts/modal_packed_bench.py` (new `flashinfer` config, FP8 bench)
+- `tests/unit/cache/test_flashinfer_backend.py` (NEW, both stages)
+- `scripts/bench/modal_packed_bench.py` (new `flashinfer` config, FP8 bench)
 - `pyproject.toml` (`flashinfer-python` dep)
 - `docs/decisions/ADR-014-flashinfer-backend.md` (NEW, captures the
   decision and per-stage status)
@@ -276,11 +276,11 @@ uv run pytest tests/unit/ -v        # Stage 1 + 2 CPU mechanics tests
 uv run pytest tests/golden/ -v      # No regression
 
 # Modal A10 (Stage 1)
-modal run scripts/modal_packed_bench.py --config flashinfer
+modal run scripts/bench/modal_packed_bench.py --config flashinfer
 # Compare logits cosine sim and tok/s vs --config turbo
 
 # Modal H100 (Stage 2)
-MINI_INFER_BENCH_GPU=H100 modal run scripts/modal_packed_bench.py --config flashinfer_fp8
+MINI_INFER_BENCH_GPU=H100 modal run scripts/bench/modal_packed_bench.py --config flashinfer_fp8
 # Compare KV storage, parity, throughput vs bf16 + flash-attn baseline
 ```
 

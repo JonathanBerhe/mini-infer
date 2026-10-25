@@ -68,14 +68,14 @@ for each layer.
 
 Disaggregation must not change the output.
 `test_pd_greedy_matches_continuous_scheduler` (in
-`tests/unit/test_workers.py`) asserts that PD greedy output is
+`tests/unit/workers/test_workers.py`) asserts that PD greedy output is
 token-for-token identical to the greedy output of `ContinuousScheduler`
 for the same prompt and model. Any drift of KV state between the phases
 shows as a different first decoded token. The test passes on Qwen2.5-0.5B
 with the in-process `Orchestrator`. After each PD run, the block pool is
 fully free again, so no slot leaks.
 
-The 6 tests in `tests/unit/test_workers_batch.py` pass on Qwen2.5-0.5B.
+The 6 tests in `tests/unit/workers/test_workers_batch.py` pass on Qwen2.5-0.5B.
 `prefill_batch([r1, r2])` gives byte-identical KV and the same first token
 as `[prefill(r1), prefill(r2)]`. `decode_batch([h1, h2])` gives the same
 token lists as `[list(decode(h1)), list(decode(h2))]`.
@@ -107,7 +107,7 @@ content. It passes in ~4 s.
 test on Qwen2.5-0.5B, is `@pytest.mark.skip` on macOS. Two PyTorch
 processes on one CPU host stall on thread contention under the pytest spawn
 harness. On a CUDA host each rank has its own GPU.
-`scripts/modal_pd_smoke.py` runs `pd_two_process_target` on 2x H100 with
+`scripts/smoke/modal_pd_smoke.py` runs `pd_two_process_target` on 2x H100 with
 Qwen2.5-7B. This ADR does not include a run of that smoke.
 
 ## Consequences

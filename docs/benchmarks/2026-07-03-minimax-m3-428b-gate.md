@@ -2,7 +2,7 @@
 
 Date: 2026-07-03. Hardware: 4x H200 (Modal), bf16 + block-FP8-resident routed
 experts, tensor + expert parallelism (world_size 4). Scripts:
-`scripts/modal_m3_stage_weights.py` (staging) and `scripts/modal_m3_generate.py`
+`scripts/minimax_m3/modal_m3_stage_weights.py` (staging) and `scripts/minimax_m3/modal_m3_generate.py`
 (gate). Checkpoint: `MiniMaxAI/MiniMax-M3` @ `bfd6c97f...`, 854 GB bf16,
 59 shards.
 

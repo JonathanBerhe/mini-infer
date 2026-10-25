@@ -25,7 +25,7 @@ implements `nemotron_h` and is the parity oracle.
 
 1. One mixer per layer, with kinds from `layers_block_type` or
    `hybrid_override_pattern`. Unsupported values fail at load.
-2. Mamba-2 written from scratch in fp32 (`models/blocks/mamba2.py`).
+2. Mamba-2 written from scratch in fp32 (`models/nemotron_h/mamba2.py`).
    Prefill uses a chunked scan and decode a token-by-token recurrence. A
    test pins the two together.
 3. Follow the CUDA kernels, not the CPU fallback: fp32 SSM math and no
@@ -57,10 +57,10 @@ implements `nemotron_h` and is the parity oracle.
 
 ## Consequences
 
-- `tests/unit/test_nemotron_h_real_weights.py` loads Nano 4B and completes
+- `tests/unit/models/nemotron_h/test_nemotron_h_real_weights.py` loads Nano 4B and completes
   "Paris" on an M1 Pro in about 2 minutes (`--run-large-models` only).
 - The real 30B-A3B on one A100-SXM4-80GB passed against transformers
-  (`scripts/modal_nemotron_h_smoke.py`). Prefill logit cosine was 0.9949
+  (`scripts/nemotron_h/modal_nemotron_h_smoke.py`). Prefill logit cosine was 0.9949
   to 0.9989, with the same top-1 on all four prompts. Greedy output matched
   for 31, 7, 2 and 32 of 32 tokens.
 - That agreement is looser than the dense Qwen3.8's (cosine of at least

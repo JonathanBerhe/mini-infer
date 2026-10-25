@@ -151,10 +151,10 @@ masking a bidirectional block across requests is a different problem.
 
 ## Validation (done)
 
-Two layers pass. On CPU, `tests/unit/test_dspark_drafter_parity.py` compares
+Two layers pass. On CPU, `tests/unit/engine/dspark/test_dspark_drafter_parity.py` compares
 per-position base, Markov-corrected and confidence logits with
 re-transcribed reference formulas, on random weights. On GPU,
-`scripts/modal_dspark_parity.py` runs our drafter and the `DeepSpec` one on
+`scripts/dspark/modal_dspark_parity.py` runs our drafter and the `DeepSpec` one on
 real weights (Qwen3-4B + `dspark_qwen3_4b_block7`, one L4), with the same
 injected context.
 

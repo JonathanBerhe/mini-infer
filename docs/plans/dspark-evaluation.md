@@ -156,7 +156,7 @@ Parity contract, in order:
 1. Random-weight micro-config CPU unit tests comparing per-position
    base logits U_1..U_gamma, Markov-biased logits, and confidence
    logits against the DeepSpec reference code (same pattern as
-   `tests/unit/test_minimax_m3_parity.py`).
+   `tests/unit/models/minimax_m3/test_minimax_m3_parity.py`).
 2. Real-checkpoint temperature-0 token-parity fixtures generated with
    the DeepSpec harness (Qwen3-4B target + `dspark_qwen3_4b_block7`) on
    a single short Modal GPU run (L4/A10 class, 24 GB fits both in
@@ -237,8 +237,8 @@ Deliverable: a docs/benchmarks entry. This would be the first
 third-party measurement of any DSpark claim.
 
 The offline batch-1 metrics need no server. Any serving-level run goes
-through the open-loop harness (`scripts/http_openloop_bench.py`, Modal
-entrypoint `scripts/modal_openloop_bench.py`) with the KV pool sized
+through the open-loop harness (`scripts/bench/http_openloop_bench.py`, Modal
+entrypoint `scripts/bench/modal_openloop_bench.py`) with the KV pool sized
 via `MINI_INFER_NUM_BLOCKS` / `MINI_INFER_BLOCK_SIZE`; the 1024 x 16
 dev default holds about 16K token slots and OOMs under load. Direct
 `ModelRunner` construction (fixtures, `SpeculativeRunner` benches)
@@ -268,7 +268,7 @@ or a paper problem; both are findings worth writing up.
   roll back. Re-tune admission headroom and revisit the victim policy
   as part of this work; see
   `docs/decisions/ADR-024-engine-oom-preemption.md` and
-  `tests/unit/test_scheduler_oom.py`.
+  `tests/unit/scheduler/test_scheduler_oom.py`.
 - SPS(B) profiling plus the batch-global Algorithm 1 scheduler. This is
   the "first open implementation" opportunity, but it only demonstrates
   its value under multi-request load, so it cannot precede scheduler

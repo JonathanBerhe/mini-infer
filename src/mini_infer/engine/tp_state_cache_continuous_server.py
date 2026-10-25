@@ -54,7 +54,10 @@ from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode
 from mini_infer.engine.decode_step_timer import DecodeStepTimer, DecodeStepTiming
 from mini_infer.engine.sampler import SamplingParams, sample, sample_batch
 from mini_infer.engine.tokenizer import Tokenizer
-from mini_infer.models.deepseek_v4 import DeepseekV4ForCausalLM, build_state_cache_layer_specs
+from mini_infer.models.deepseek_v4.deepseek_v4 import (
+    DeepseekV4ForCausalLM,
+    build_state_cache_layer_specs,
+)
 
 logger = logging.getLogger(__name__)
 

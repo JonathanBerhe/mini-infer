@@ -59,5 +59,5 @@ reads K/V from the blocks removes it, and HF SDPA has none.
   `" Paris. It is the largest city in"`, token-for-token equal to the
   CPU/fp32 reference. `num_free_blocks` returns to 1024 afterwards.
 - On M1, 48 tests pass and 1 `requires_cuda` test skips. In
-  `tests/unit/test_paged_attention.py`, the reference matches SDPA for
+  `tests/unit/cache/test_paged_attention.py`, the reference matches SDPA for
   block-aligned, partial last block, GQA (14/2) and seq_len=1 cases.

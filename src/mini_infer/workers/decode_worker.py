@@ -302,7 +302,7 @@ class DecodeWorker:
         per handoff (same emitted tokens, same termination behaviour),
         but uses one forward per step instead of B per step. Parity is
         validated against the sequential loop in
-        `tests/unit/test_workers_batch.py`.
+        `tests/unit/workers/test_workers_batch.py`.
 
         Internally: opens a fresh `DecodeSession`, adds all handoffs,
         drives the loop with per-slot alive tracking. The session-based

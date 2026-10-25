@@ -44,11 +44,11 @@ forwards over all in-flight requests.
      request.
 2. **Greedy parity vs `ContinuousScheduler`** on N concurrent requests:
    token-for-token identical output distributions. Covered by
-   `tests/unit/test_pd_scheduler_multi.py`.
+   `tests/unit/workers/test_pd_scheduler_multi.py`.
 3. **HTTP toggle**: `MINI_INFER_USE_PD=1` switches the server to
    `PDScheduler` (`src/mini_infer/api/server.py`); `MINI_INFER_PD_MODE`
    picks `serial` or `parallel` (default `parallel`).
-4. **Bench**: `scripts/bench_pd_scheduler.py` covers the CPU
+4. **Bench**: `scripts/bench/bench_pd_scheduler.py` covers the CPU
    correctness/relative-speedup comparison. The 2x H100 Modal run
    comparing real cross-GPU phase overlap is still deferred until
    budget allows (see `roadmap-2026.md`); that part of this goal is
@@ -128,7 +128,7 @@ refactor, as planned).
 
 **Delivered**: `src/mini_infer/workers/pd_scheduler.py` +
 `DecodeSession` in `decode_worker.py`, plus
-`tests/unit/test_pd_scheduler_multi.py`.
+`tests/unit/workers/test_pd_scheduler_multi.py`.
 
 **Test contract met**: greedy parity vs `ContinuousScheduler` on
 concurrent requests with different `max_tokens` budgets and mid-stream
@@ -169,7 +169,7 @@ ADR-017 (`docs/decisions/ADR-017-pd-scheduler.md`, Accepted) documents
 the design, both modes, the `DecodeSession` decomposition, and the
 test contract.
 
-`scripts/bench_pd_scheduler.py` runs concurrent requests through both
+`scripts/bench/bench_pd_scheduler.py` runs concurrent requests through both
 `ContinuousScheduler` and `PDScheduler` (both modes) and reports
 tok/s + per-request latency on CPU. The CPU bench is in; the 2x H100
 Modal run comparing real cross-GPU phase overlap has not been run yet
@@ -267,12 +267,12 @@ Docs:
 
 Scripts:
 
-- `scripts/bench_pd_scheduler.py` (new): CPU bench, shipped. Modal GPU
+- `scripts/bench/bench_pd_scheduler.py` (new): CPU bench, shipped. Modal GPU
   bench still deferred.
 
 Tests:
 
-- `tests/unit/test_pd_scheduler_multi.py` (new): the scheduler's test
+- `tests/unit/workers/test_pd_scheduler_multi.py` (new): the scheduler's test
   file (named `_multi` rather than the plan's `test_pd_scheduler.py`).
 
 ## Verification (results)
@@ -281,7 +281,7 @@ Tests:
    `mode="serial"` produce greedy output token-for-token identical to
    running each through `ContinuousScheduler` separately. Block-pool
    fully frees after each run. Covered by
-   `tests/unit/test_pd_scheduler_multi.py`.
+   `tests/unit/workers/test_pd_scheduler_multi.py`.
 2. **Slice 2**: same workload, same output, with `mode="parallel"`.
    Cross-thread correctness holds (no dropped handoffs, no double
    emit).

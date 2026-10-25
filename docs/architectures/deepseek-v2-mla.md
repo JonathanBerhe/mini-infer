@@ -48,8 +48,8 @@ model:
 
 | Paper primitive | Reference (HF `modeling_deepseek_v2.py`) | Our code |
 |---|---|---|
-| Backbone | `DeepseekV2Model` + `DeepseekV2ForCausalLM` | `DeepseekV2ForCausalLM` + `_DeepseekV2InnerModel` in `src/mini_infer/models/deepseek_v2.py` (L201, L171) |
-| Decoder layer | `DeepseekV2DecoderLayer` | `_DeepseekV2DecoderLayer` in `src/mini_infer/models/deepseek_v2.py` (L112) |
+| Backbone | `DeepseekV2Model` + `DeepseekV2ForCausalLM` | `DeepseekV2ForCausalLM` + `_DeepseekV2InnerModel` in `src/mini_infer/models/deepseek_v2/deepseek_v2.py` (L201, L171) |
+| Decoder layer | `DeepseekV2DecoderLayer` | `_DeepseekV2DecoderLayer` in `src/mini_infer/models/deepseek_v2/deepseek_v2.py` (L112) |
 | Multi-head Latent Attention | `DeepseekV2Attention` | `MLAAttention` in `src/mini_infer/models/blocks/mla.py` (L68) |
 | Low-rank Q (V2/V3/Kimi-K2 path) | `q_a_proj` + `q_a_layernorm` + `q_b_proj` | same names in `MLAAttention.__init__` |
 | Direct Q (V2-Lite path) | `q_proj` (when `q_lora_rank is None`) | same name in `MLAAttention.__init__` |
@@ -60,7 +60,7 @@ model:
 | MLA attention (Q/K/V different head_dim) | `torch.nn.functional.scaled_dot_product_attention` after manual concat | `mla_packed_attention_forward` in `cache/mla_attention.py` |
 | Heterogeneous FFN dispatch | `if layer_idx < first_k_dense_replace` | `cfg.is_moe_layer(layer_idx)` in `_DeepseekV2DecoderLayer.__init__` (L138) |
 | SwiGLU dense FFN | `DeepseekV2MLP` | `SwiGLU` in `blocks/swiglu.py` |
-| Top-k MoE FFN with shared experts | `DeepseekV2MoE` | `MoEFFN` in `blocks/mixtral_moe.py` (config-extended for shared experts) |
+| Top-k MoE FFN with shared experts | `DeepseekV2MoE` | `MoEFFN` in `blocks/moe/mixtral_moe.py` (config-extended for shared experts) |
 | Per-stream KV cache | manual `past_key_values` tuple (single-request) | `PagedKVCache` with per-layer `StreamSpec` list (`kv_latent`, `k_rope`) in `cache/paged_kv_cache.py` |
 | YaRN long-context RoPE | `precompute_yarn_freqs` (optional) | `RotaryEmbedding` in `blocks/rope.py` (L144), YaRN active past `yarn_original_seq_len` |
 
@@ -209,7 +209,7 @@ of the top-k weights.
 **Reference**: `DeepseekV2MoE` in `modeling_deepseek_v2.py`. Gate +
 routed-expert dispatch + shared-expert path + final scaling.
 
-**Our code**: `MoEFFN` from `blocks/mixtral_moe.py` (with config
+**Our code**: `MoEFFN` from `blocks/moe/mixtral_moe.py` (with config
 extensions for `n_shared_experts`, `shared_intermediate_size`,
 `routed_scaling_factor`, `renormalize_topk`). The shared-experts
 trick is: collapse N shared MLPs into a single MLP whose
@@ -217,7 +217,7 @@ intermediate_size = `n_shared * shared_intermediate`. The aggregated
 shared output is mathematically identical to summing N separate small
 MLPs but uses one matmul instead of N.
 
-This collapse trick is what V4's `HashRoutedMoEFFN` also uses (`blocks/hash_routed_moe_ffn.py`).
+This collapse trick is what V4's `HashRoutedMoEFFN` also uses (`deepseek_v4/hash_routed_moe_ffn.py`).
 
 ## Per-stream KV cache
 
@@ -339,7 +339,7 @@ exercised.
   (and `modular_deepseek_v2.py`). Live in the installed
   transformers package; we don't vendor it.
 - **Paper**: `docs/papers/` (not vendored; the V2 paper is on arXiv).
-- **Our model class**: `src/mini_infer/models/deepseek_v2.py`.
+- **Our model class**: `src/mini_infer/models/deepseek_v2/deepseek_v2.py`.
 - **MLA block**: `src/mini_infer/models/blocks/mla.py`.
 - **MLA attention dispatch**: `src/mini_infer/cache/mla_attention.py`.
 - **Per-stream cache**: `src/mini_infer/cache/paged_kv_cache.py` +

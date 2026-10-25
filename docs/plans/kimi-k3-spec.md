@@ -1,7 +1,7 @@
 # Kimi Linear / Kimi K3 implementable spec
 
 > Status: Stage A (Kimi Linear) verified against the reference; Stage B sections marked TBD until the K3 tech report (2026-07-27)
-> Reference: `moonshotai/Kimi-Linear-48B-A3B-Instruct` `modeling_kimi.py` at revision `e1df551a447157d4658b573f9a695d57658590e9` (vendored by `scripts/clone_kimi_linear_reference.py`), driving FLA (`fla-org/flash-linear-attention`) kernels whose naive reference is `fla/ops/kda/naive.py`.
+> Reference: `moonshotai/Kimi-Linear-48B-A3B-Instruct` `modeling_kimi.py` at revision `e1df551a447157d4658b573f9a695d57658590e9` (vendored by `scripts/kimi_linear/clone_kimi_linear_reference.py`), driving FLA (`fla-org/flash-linear-attention`) kernels whose naive reference is `fla/ops/kda/naive.py`.
 > Rule: **HF code wins** over the paper and over blog descriptions. Everything below is pinned from the reference source, not from prose.
 
 ## Architecture (Kimi Linear 48B-A3B)
@@ -25,7 +25,7 @@ Forward, in reference order:
 
 5. Output: `o_norm(o, g_b(g_a(x)))` = fp32 RMSNorm over head_dim, times the (head-shared) weight, times `sigmoid(gate)`, cast back only at the end; then `o_proj`.
 
-Our split: `blocks/kda.py` holds the pure math (`kda_gate`, `l2norm`, `gated_rmsnorm`, `causal_conv1d_prefill/step`, `kda_recurrent`, `kda_chunkwise`); the layer lives in `models/kimi_linear.py`. Our chunkwise form solves the unit-lower-triangular WY system with `torch.linalg.solve_triangular` instead of FLA's in-place forward substitution (same matrix, different fp op order); `test_kda_block.py` pins chunkwise == recurrent, and the parity suite pins the whole layer against the reference.
+Our split: `blocks/kda.py` holds the pure math (`kda_gate`, `l2norm`, `gated_rmsnorm`, `causal_conv1d_prefill/step`, `kda_recurrent`, `kda_chunkwise`); the layer lives in `models/kimi_linear/kimi_linear.py`. Our chunkwise form solves the unit-lower-triangular WY system with `torch.linalg.solve_triangular` instead of FLA's in-place forward substitution (same matrix, different fp op order); `test_kda_block.py` pins chunkwise == recurrent, and the parity suite pins the whole layer against the reference.
 
 ## MLA layers (NoPE)
 
@@ -47,7 +47,7 @@ Experts are SwiGLU (`experts.N.w1/w2/w3`); the shared expert is one `KimiMLP` of
 
 ## Decode state and serving
 
-Per KDA layer per request: `S` `(H, 128, 128)` fp32 + three conv tails `(C, 4)`. Per MLA layer: the per-token compressed buffer. Ours is `cache/kimi_state_cache.py` (`KimiStateCache`), driven through the same `forward_prefill_with_cache` / `forward_decode_with_cache[_ragged]` contract as DeepSeek-V4 and served by the generalized `StateCacheGenerator` + `StateCacheContinuousScheduler` (models now expose `build_state_cache`, caches expose `copy_row_from`).
+Per KDA layer per request: `S` `(H, 128, 128)` fp32 + three conv tails `(C, 4)`. Per MLA layer: the per-token compressed buffer. Ours is `models/kimi_linear/state_cache.py` (`KimiStateCache`), driven through the same `forward_prefill_with_cache` / `forward_decode_with_cache[_ragged]` contract as DeepSeek-V4 and served by the generalized `StateCacheGenerator` + `StateCacheContinuousScheduler` (models now expose `build_state_cache`, caches expose `copy_row_from`).
 
 Because the family is position-free, `forward_prefill_with_cache` continues from `state_cache.start_pos > 0`: chunked prefill works by carrying `S`, the conv tails, and the MLA buffer offset. Prefix sharing (`StatePrefixCache`) stays V4-only; `snapshot_from_cache` raises a clear TypeError for other cache types.
 
@@ -62,7 +62,7 @@ The module tree mirrors the checkpoint names, so `load_weights` is a direct copy
 3. **`fused_kda_gate` signature drift**: the checkpoint calls the fla-core 0.4.x form `(g, A_log, head_dim, g_bias=...)`; FLA main has `(g, A_log, dt_bias, ...)`. The test stub implements the 0.4.x form the reference actually calls.
 4. **The reference leaves `dt_bias` and `e_score_correction_bias` uninitialized** (`torch.empty`; its `_init_weights` covers only Linear/Embedding). Any fresh-model comparison must overwrite them first or risk inf/NaN flakes; our modules init them to zeros (checkpoints overwrite).
 5. **`KimiLinearModel.__init__` force-overrides `_attn_implementation` to flash_attention_2**, even when eager is requested. Set `model.config._attn_implementation = "eager"` AFTER construction for CPU runs; the layers read the config at call time.
-6. **transformers 5.14 drift** (the reference targets ~4.57, asserts >= 4.56): `OutputRecorder` moved out of `transformers.utils.generic`; `create_causal_mask` renamed `input_embeds -> inputs_embeds` and dropped `cache_position`; the Cache mask protocol now wants `get_query_offset(layer_idx)` and `get_mask_sizes(q_length: int, ...)`. All three are bridged in `tests/unit/_kimi_reference_helpers.py`, and the `create_causal_mask` patch is **restored immediately after the reference imports**: leaving it installed breaks every 5.14-native family in the same pytest process (it broke MiniMax-M3's parity test until scoped).
+6. **transformers 5.14 drift** (the reference targets ~4.57, asserts >= 4.56): `OutputRecorder` moved out of `transformers.utils.generic`; `create_causal_mask` renamed `input_embeds -> inputs_embeds` and dropped `cache_position`; the Cache mask protocol now wants `get_query_offset(layer_idx)` and `get_mask_sizes(q_length: int, ...)`. All three are bridged in `tests/unit/models/kimi_linear/_kimi_reference_helpers.py`, and the `create_causal_mask` patch is **restored immediately after the reference imports**: leaving it installed breaks every 5.14-native family in the same pytest process (it broke MiniMax-M3's parity test until scoped).
 7. **`config.head_dim` (72) is unused** by both attention kinds (MLA uses the nope+rope dims, KDA uses `linear_attn_config.head_dim`); ignore it.
 
 ## Kimi K3 delta (TBD, tech report 2026-07-27)

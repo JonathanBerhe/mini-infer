@@ -32,7 +32,7 @@ row-softmax-with-eps + column-normalize, then `sinkhorn_iters - 1`
 alternating row/column normalizations.
 
 Our current implementation
-(`src/mini_infer/models/blocks/hyper_connections.py:58`,
+(`src/mini_infer/models/deepseek_v4/hyper_connections.py:58`,
 `hc_split_sinkhorn`) is a **pure-PyTorch transcription**. It produces
 bit-identical output on the same inputs by design, but it expresses each
 operation as a separate PyTorch op. For V4-Flash (61 layers, 2 HC
@@ -113,7 +113,7 @@ batch and sequence length.
 ### Slice 1: Triton kernel + parity test
 
 Implement `hc_split_sinkhorn_triton` in a new file
-`src/mini_infer/models/blocks/hc_sinkhorn_kernel.py`. The file holds:
+`src/mini_infer/models/deepseek_v4/hc_sinkhorn_kernel.py`. The file holds:
 
 - `_TRITON_AVAILABLE` import gate.
 - `supports_hc_kernel(device) -> bool`.
@@ -144,7 +144,7 @@ skip; CUDA-equipped local runs and Modal runs execute the parity.
 
 ### Slice 2: Dispatcher wiring
 
-Edit `src/mini_infer/models/blocks/hyper_connections.py`:
+Edit `src/mini_infer/models/deepseek_v4/hyper_connections.py`:
 
 - Top of file imports `supports_hc_kernel` + `hc_split_sinkhorn_triton`
   under a CUDA-safe gate.
@@ -171,13 +171,13 @@ or a separate small commit if Slice 1 grows unexpectedly. Probably
 fold into Slice 1 because the dispatcher is trivial without it.
 
 **Test contract**: existing
-`tests/unit/test_hyper_connections.py` continues to pass on CPU
+`tests/unit/models/deepseek_v4/test_hyper_connections.py` continues to pass on CPU
 (takes the PyTorch path). On CUDA, the kernel path is exercised
 by the Slice 1 parity tests.
 
 ### Slice 3: Bench + ADR (Modal)
 
-Add `scripts/bench_hc_sinkhorn.py`:
+Add `scripts/deepseek_v4/bench_hc_sinkhorn.py`:
 
 - Local CPU mode: prints PyTorch baseline latency. Useful for sanity
   but doesn't show the Triton win (no Triton on CPU).
@@ -280,12 +280,12 @@ cap.
 
 NEW source:
 
-- `src/mini_infer/models/blocks/hc_sinkhorn_kernel.py`: the Triton
+- `src/mini_infer/models/deepseek_v4/hc_sinkhorn_kernel.py`: the Triton
   kernel + `supports_hc_kernel` + the Python entry point.
 
 EDIT source:
 
-- `src/mini_infer/models/blocks/hyper_connections.py`: rename the
+- `src/mini_infer/models/deepseek_v4/hyper_connections.py`: rename the
   existing PyTorch body to `_hc_split_sinkhorn_torch`; add the
   dispatcher to `hc_split_sinkhorn`; import the kernel module under
   the CUDA-safe gate.
@@ -298,14 +298,14 @@ NEW docs:
 
 NEW scripts:
 
-- `scripts/bench_hc_sinkhorn.py`: bench (Modal for the speedup
+- `scripts/deepseek_v4/bench_hc_sinkhorn.py`: bench (Modal for the speedup
   measurement; CPU baseline locally).
 
 NEW tests:
 
-- `tests/unit/test_hc_sinkhorn_kernel.py`: gated on
+- `tests/unit/models/deepseek_v4/test_hc_sinkhorn_kernel.py`: gated on
   `supports_hc_kernel(device)`. Parity vs PyTorch reference.
-- The existing `tests/unit/test_hyper_connections.py` already exercises
+- The existing `tests/unit/models/deepseek_v4/test_hyper_connections.py` already exercises
   `hc_split_sinkhorn` through `HyperConnections.hc_pre`; no edit needed
   beyond confirming it still passes on CPU.
 
@@ -322,20 +322,20 @@ EDIT docs:
 Slice-by-slice:
 
 1. **Slice 1**:
-   - On a CUDA device, `pytest tests/unit/test_hc_sinkhorn_kernel.py`
+   - On a CUDA device, `pytest tests/unit/models/deepseek_v4/test_hc_sinkhorn_kernel.py`
      passes.
    - cosine sim > 0.999 vs `_hc_split_sinkhorn_torch` on multiple
      `(B, T, hc_mult)` configurations.
    - Doubly-stochastic invariant holds within `2 * eps`.
    - On CPU, the new test file skips (gated by predicate).
 2. **Slice 2**:
-   - `pytest tests/unit/test_hyper_connections.py` still passes on
+   - `pytest tests/unit/models/deepseek_v4/test_hyper_connections.py` still passes on
      CPU (PyTorch path).
    - On CUDA, the same suite passes with the dispatch taking the
      Triton path (verifiable via a runtime assert or breakpoint in
      the dispatcher during development).
 3. **Slice 3**:
-   - `scripts/bench_hc_sinkhorn.py` prints PyTorch vs Triton latency
+   - `scripts/deepseek_v4/bench_hc_sinkhorn.py` prints PyTorch vs Triton latency
      at representative shapes; the Triton column is faster at every
      shape we benchmark.
    - ADR-018 records the speedup numbers and the kernel-launch-count

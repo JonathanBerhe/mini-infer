@@ -42,7 +42,7 @@ dispatcher.
    (`pallas_call(..., interpret=True)`). Each kernel must match a NumPy
    reference and a PyTorch golden (cosine > 0.99 and allclose, the ADR-023
    bar). A shuffled-physical-pages test catches a kernel that ignores the
-   block table. `scripts/run_tpu_pallas_kernels.py` runs the kernels on a
+   block table. `scripts/tpu/run_tpu_pallas_kernels.py` runs the kernels on a
    real TPU.
 7. `dispatch_attention` routes to the dense or paged kernel.
    `tpu_backend_available(require_device=...)` gates on JAX and a TPU.
@@ -99,6 +99,6 @@ two launches per step.
   safely, so padding rows are exact zeros.
 
 The decode and prefill kernels stay. They skip the padding waste and are the
-tested baselines in tests/unit/test_tpu_pallas_mixed.py. Interpret-mode
-parity is complete, and scripts/run_tpu_pallas_kernels.py has two mixed
+tested baselines in tests/unit/backends/tpu/test_tpu_pallas_mixed.py. Interpret-mode
+parity is complete, and scripts/tpu/run_tpu_pallas_kernels.py has two mixed
 cases for the next Colab run.

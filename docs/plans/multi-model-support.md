@@ -95,7 +95,7 @@ a registry. The architectural shape is in place for everything below.
   decorator, `from_pretrained` entry point.
 - NEW `src/mini_infer/models/blocks/` — canonical modules:
   - `rmsnorm.py`, `rope.py`, `gqa.py`, `swiglu.py`
-- NEW `src/mini_infer/models/qwen2.py` — Qwen2 model class composing
+- NEW `src/mini_infer/models/qwen/qwen2.py` — Qwen2 model class composing
   blocks; weight-name mapping from HF.
 - EDIT `src/mini_infer/engine/model_runner.py` — accept a model from the
   registry instead of doing its own `AutoModelForCausalLM` call.
@@ -117,9 +117,9 @@ squared-ReLU, the rest are SwiGLU). Each is one small file: a model class
 that composes Phase 1's blocks and declares the weight-name mapping.
 
 **Files (rough):** one per model, ~50–100 lines each.
-- `src/mini_infer/models/llama.py`
-- `src/mini_infer/models/mistral.py`
-- `src/mini_infer/models/qwen3.py`
+- `src/mini_infer/models/llama/llama.py`
+- `src/mini_infer/models/mistral/mistral.py`
+- `src/mini_infer/models/qwen/qwen3.py`
 - `src/mini_infer/models/nemotron.py` (with `squared_relu` block added to
   `models/blocks/`)
 
@@ -138,7 +138,7 @@ have sliding-window branches). Building it in Phase 3 means Phase 5 (V4)
 can reuse it.
 
 **Files:**
-- NEW `src/mini_infer/models/blocks/swa.py` — sliding-window attention.
+- NEW `src/mini_infer/models/deepseek_v4/swa.py` — sliding-window attention.
   Could wrap FlashInfer's SWA path or be a thin mask wrapper around the
   existing GQA path.
 - NEW `src/mini_infer/models/gemma.py` — Gemma 2/3 model class. Adds a
@@ -160,7 +160,7 @@ building block; per-model integration is then trivial.
   expert weights, softmax over selected experts. Start with the simple
   no-fused-grouped-gemm version (one matmul per expert per token); a
   fused implementation is a profile-driven follow-up.
-- NEW `src/mini_infer/models/mixtral.py` — Mixtral 8x7B model class.
+- NEW `src/mini_infer/models/mistral/mixtral.py` — Mixtral 8x7B model class.
 
 **Validation:** golden test against `Mixtral-8x7B-Instruct-v0.1` at small
 batch (the model is large; greedy test on a single-prompt fixture).

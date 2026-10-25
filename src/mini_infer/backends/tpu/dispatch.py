@@ -11,7 +11,7 @@ runner is PyTorch on CUDA/CPU/MPS, so no real request is routed here yet: wiring
 a JAX execution path into the runner is a separate, larger change that must keep
 to ADR-023's backend-isolation rule (backend code stays under `backends/`, never
 in the scheduler, cache, API, or model layers). The dispatcher plus its golden
-parity test (tests/unit/test_tpu_attention_golden.py) exist so the TPU path is
+parity test (tests/unit/backends/tpu/test_tpu_attention_golden.py) exist so the TPU path is
 held to the same numerical bar as the CUDA path: it must match a PyTorch
 reference at temperature 0 (deterministic forward), the same ground truth the
 project's golden tests rest on.

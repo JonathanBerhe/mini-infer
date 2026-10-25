@@ -115,8 +115,8 @@ Configuration changes that matter for shapes:
 
 - The V4 port already has most of the parts:
   - the attention core: MQA over one 512-wide KV head, attention
-    sinks (`models/blocks/v4/sink.py`), the grouped low-rank output
-    projection (`models/blocks/v4/grouped_output.py`) and the sliding
+    sinks (`models/deepseek_v4/sink.py`), the grouped low-rank output
+    projection (`models/deepseek_v4/grouped_output.py`) and the sliding
     window
   - the Sinkhorn split (ADR-018), whose math is unchanged
   - the `sqrtsoftplus` router with `noaux_tc` bias and the SwiGLU clamp
@@ -131,7 +131,7 @@ Configuration changes that matter for shapes:
   (`src/mini_infer/engine/dspark/`, ADR-027, ADR-031). V4.1 is the first
   model that ships its own DSpark weights, so this closes the
   "V4-DSpark" item that the DSpark plan left out of scope.
-- The parity pattern exists: `tests/unit/_v4_reference_helpers.py`
+- The parity pattern exists: `tests/unit/models/deepseek_v4/_v4_reference_helpers.py`
   stubs the reference's TileLang kernels with PyTorch so the reference
   runs on CPU.
 - Differentiation: as of 2026-10-24, transformers (5.20.2) has no
@@ -142,27 +142,27 @@ Configuration changes that matter for shapes:
 
 - **Layer roles.** `DeepseekV4DecoderLayer` picks CSA or HCA from the
   ratio (`CSA_COMPRESSION_RATIO = 4`,
-  `src/mini_infer/models/blocks/deepseek_v4_decoder_layer.py:75`). V4.1
+  `src/mini_infer/models/deepseek_v4/decoder_layer.py:75`). V4.1
   needs a role per layer (sliding-window, Full, Reindex, Reuse) plus a
   source layer for each shared tensor.
 - **Compressor.** `TokenLevelCompressor`
-  (`src/mini_infer/models/blocks/v4/compressor.py`) has overlap mode
+  (`src/mini_infer/models/deepseek_v4/compressor.py`) has overlap mode
   and a position bias. V4.1 needs neither, and needs a ratio-1 path.
 - **Indexer.** `LightningIndexer` owns a second compressor
-  (`src/mini_infer/models/blocks/v4/lightning_indexer.py:140`). V4.1
+  (`src/mini_infer/models/deepseek_v4/lightning_indexer.py:140`). V4.1
   derives K from the main latent and adds the candidate-block mask.
 - **State cache.** `StateLayerSpec`
   (`src/mini_infer/cache/state_cache.py:57`) and
   `build_state_cache_layer_specs`
-  (`src/mini_infer/models/deepseek_v4.py:661`) allocate compressed KV
+  (`src/mini_infer/models/deepseek_v4/deepseek_v4.py:661`) allocate compressed KV
   and indexer state per layer. V4.1 allocates window KV in all 43
   layers but compressed KV and indexer K in only 4. Prefix sharing
   (ADR-020) and the PD transfer layout (ADR-016) follow from this.
 - **Hyper-connections.** `hc_pre` computes and applies its mix in one
-  call (`deepseek_v4_decoder_layer.py:496-505`). V4.1 carries the mix
+  call (`deepseek_v4/decoder_layer.py:496-505`). V4.1 carries the mix
   from one sublayer to the next, and `HCHeadReduction` goes away.
 - **Loader.** The FP8 dequant hardcodes `block_size=(128, 128)`
-  (`src/mini_infer/models/deepseek_v4.py:1393`). The configuration is nested
+  (`src/mini_infer/models/deepseek_v4/deepseek_v4.py:1393`). The configuration is nested
   (`text_config`, `vision_config`), `model_type` is `deepseek_v41`, and
   there are new tensor names: `engram.*`, `gate.bias_vl`, the
   DSpark `mtp.*` blocks, `vision.*`, `aligner.*` and `image_*`.
@@ -293,7 +293,7 @@ rewrite of prefix sharing and PD transfer, stop. Record the decision
 
 Build `DeepseekV41ForCausalLM` from the V4 blocks plus the new parts.
 Put the reference in `third_party/deepseek_v41_reference/` with a CPU
-kernel stub in the style of `tests/unit/_v4_reference_helpers.py`.
+kernel stub in the style of `tests/unit/models/deepseek_v4/_v4_reference_helpers.py`.
 The stub needs `sparse_attn`, the FP8 and FP4 round trips and
 `hc_split_sinkhorn`.
 

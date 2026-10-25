@@ -50,7 +50,7 @@ not a hung stream or a 503. `_reap_done` frees its blocks for the retry.
   client can retry, and no output is wrong.
 - With a correctly sized pool the path never runs. The calibrated sweeps
   ran at `num_blocks=4096` with zero errors.
-- [tests/unit/test_scheduler_oom.py](../../tests/unit/test_scheduler_oom.py)
+- [tests/unit/scheduler/test_scheduler_oom.py](../../tests/unit/scheduler/test_scheduler_oom.py)
   covers victim selection. An end-to-end test forces a mid-step OOM
   through the real engine thread, and the engine recovers and keeps
   serving.

@@ -3,7 +3,7 @@
 Date: 2026-05-02
 Hardware: NVIDIA B200 (Blackwell, SM_100)
 Engine: probe only — does not integrate NVFP4 KV into mini-infer's pool
-Script: `scripts/modal_nvfp4_probe.py`
+Script: `scripts/bench/modal_nvfp4_probe.py`
 
 This was a focused API survey rather than a full integration. The
 research that informed Stage C of the FlashInfer plan flagged NVFP4 KV
@@ -105,14 +105,14 @@ Deferred to a follow-up slice; this one ships the probe + findings.
 ## Reproduce
 
 ```
-MINI_INFER_BENCH_GPU=B200 modal run scripts/modal_nvfp4_probe.py
+MINI_INFER_BENCH_GPU=B200 modal run scripts/bench/modal_nvfp4_probe.py
 ```
 
 Two B200 runs total to collect the data above (~$5 spend).
 
 ## Pointers
 
-- Probe: [scripts/modal_nvfp4_probe.py](../../scripts/modal_nvfp4_probe.py)
+- Probe: [scripts/bench/modal_nvfp4_probe.py](../../scripts/bench/modal_nvfp4_probe.py)
 - Plan: [docs/plans/flashinfer-integration.md](../plans/flashinfer-integration.md)
 - ADR: [ADR-013 / FlashInfer recommendations](../decisions/ADR-013-turboquant-kv.md)
 - Stage A bench: [2026-05-02-flashinfer-bf16.md](2026-05-02-flashinfer-bf16.md)

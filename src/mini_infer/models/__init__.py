@@ -176,21 +176,21 @@ def _register_builtin_models() -> None:
     explicit function (vs a bare bottom-of-file import) so the side-effect
     has a name and a docstring.
     """
-    from mini_infer.models import deepseek_v2 as _deepseek_v2  # noqa: F401
-    from mini_infer.models import deepseek_v4 as _deepseek_v4  # noqa: F401
-    from mini_infer.models import gemma3 as _gemma3  # noqa: F401
-    from mini_infer.models import gemma4 as _gemma4  # noqa: F401
-    from mini_infer.models import glm_moe_dsa as _glm_moe_dsa  # noqa: F401
-    from mini_infer.models import inkling as _inkling  # noqa: F401
-    from mini_infer.models import kimi_linear as _kimi_linear  # noqa: F401
-    from mini_infer.models import llama as _llama  # noqa: F401
-    from mini_infer.models import minimax_m3 as _minimax_m3  # noqa: F401
-    from mini_infer.models import mistral as _mistral  # noqa: F401
-    from mini_infer.models import mixtral as _mixtral  # noqa: F401
-    from mini_infer.models import nemotron_h as _nemotron_h  # noqa: F401
-    from mini_infer.models import qwen2 as _qwen2  # noqa: F401
-    from mini_infer.models import qwen3 as _qwen3  # noqa: F401
-    from mini_infer.models import qwen3_5 as _qwen3_5  # noqa: F401
+    from mini_infer.models.deepseek_v2 import deepseek_v2 as _deepseek_v2  # noqa: F401
+    from mini_infer.models.deepseek_v4 import deepseek_v4 as _deepseek_v4  # noqa: F401
+    from mini_infer.models.gemma import gemma3 as _gemma3  # noqa: F401
+    from mini_infer.models.gemma import gemma4 as _gemma4  # noqa: F401
+    from mini_infer.models.glm import glm_moe_dsa as _glm_moe_dsa  # noqa: F401
+    from mini_infer.models.inkling import inkling as _inkling  # noqa: F401
+    from mini_infer.models.kimi_linear import kimi_linear as _kimi_linear  # noqa: F401
+    from mini_infer.models.llama import llama as _llama  # noqa: F401
+    from mini_infer.models.minimax_m3 import minimax_m3 as _minimax_m3  # noqa: F401
+    from mini_infer.models.mistral import mistral as _mistral  # noqa: F401
+    from mini_infer.models.mistral import mixtral as _mixtral  # noqa: F401
+    from mini_infer.models.nemotron_h import nemotron_h as _nemotron_h  # noqa: F401
+    from mini_infer.models.qwen import qwen2 as _qwen2  # noqa: F401
+    from mini_infer.models.qwen import qwen3 as _qwen3  # noqa: F401
+    from mini_infer.models.qwen import qwen3_5 as _qwen3_5  # noqa: F401
 
 
 _register_builtin_models()

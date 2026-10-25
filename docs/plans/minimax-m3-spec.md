@@ -198,12 +198,12 @@ path (1c), not the kernel. Kernel study informs an optional later Triton port
 | Paged KV cache (full KV) | reuse | `cache/paged_kv_cache.py:14`, `cache/block_pool.py:83` | PagedKVCache, NOT StateCache |
 | Packed varlen attention | extend | `cache/packed_attention.py:190` `_torch` | inject block-sparse mask; mirror `cache/mla_attention.py:86-94` `dsa_topk` |
 | Partial RoPE (64/128, theta 5e6) | reuse | `models/blocks/rope.py` `RotaryEmbedding(rotary_dim)` + `apply_rotary_pos_emb_partial` | NeoX pairing; harness configs must ship the flat partial factor |
-| Per-head qk-norm (q AND k) | reuse | `models/blocks/transformer_block.py:42-43`; `models/qwen3.py:96` | must be Gemma `(1+w)` norm |
+| Per-head qk-norm (q AND k) | reuse | `models/blocks/transformer_block.py:42-43`; `models/qwen/qwen3.py:96` | must be Gemma `(1+w)` norm |
 | Gemma RMSNorm `(1+w)` | reuse | `models/blocks/gemma_rmsnorm.py:12` | for ALL norms incl. 4 per-head qk/index norms |
 | SwiGLU FFN shape | extend | `models/blocks/swiglu.py:23` | shape reusable, activation differs |
 | swigluoai activation | BUILD NEW | none | clamped GLU; dense FFN + all experts |
-| Sigmoid MoE gate+bias+shared+scaling | reuse | `models/blocks/glm_moe_gate.py:37` `GlmNoAuxTcGate` + `:107` `GlmMoeFFN` | GLM is the base, NOT Mixtral. Only change: experts use swigluoai. n_group=topk_group=1, 128 exp, top4, shared1, scale2.0 |
-| Block-level top-k indexer | BUILD NEW (heaviest) | template `v4/lightning_indexer.py:61`; wiring `glm_dsa_indexer.py:160`; mask `mla_attention.py:86-94` | see hardest point |
+| Sigmoid MoE gate+bias+shared+scaling | reuse | `models/blocks/moe/glm_moe_gate.py:37` `GlmNoAuxTcGate` + `:107` `GlmMoeFFN` | GLM is the base, NOT Mixtral. Only change: experts use swigluoai. n_group=topk_group=1, 128 exp, top4, shared1, scale2.0 |
+| Block-level top-k indexer | BUILD NEW (heaviest) | template `v4/lightning_indexer.py:61`; wiring `glm/dsa_indexer.py:160`; mask `mla_attention.py:86-94` | see hardest point |
 | Model registry + `...ForCausalLM` | reuse | `models/__init__.py:63`,:136; `base.py:40` | write `MiniMaxM3ForCausalLM` |
 | StateCache routing | confirm OFF | `models/__init__.py:99`; `base.py:60` | leave `USES_STATE_CACHE=False` (like GLM-MoE-DSA) |
 | ModelRunner | reuse | `engine/model_runner.py:66`,:107 | set `required_attention_backend()="torch"` (additive mask needs materialized SDPA; like GLM-DSA/V2) |

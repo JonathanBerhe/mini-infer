@@ -22,7 +22,7 @@ Neither state fits the one-entry-per-token model of PagedAttention.
 1. KDA math from scratch in `blocks/kda.py`: a one-token recurrence for
    decode and a chunked WY-form for prefill, kept equal by
    `test_kda_block.py`.
-2. A per-request `KimiStateCache` (`cache/kimi_state_cache.py`) holds the
+2. A per-request `KimiStateCache` (`models/kimi_linear/state_cache.py`) holds the
    fp32 KDA state, three conv tails and a dense compressed-KV buffer for
    MLA.
 3. Generalize the state-cache serving seam. Models expose
@@ -53,6 +53,6 @@ Neither state fits the one-entry-per-token model of PagedAttention.
 - Single rank only: `load_weights` raises under TP.
 - `einops` joins the dev group only.
 - `test_kimi_linear_parity.py` compares with a reference vendored at a
-  fixed SHA (`scripts/clone_kimi_linear_reference.py`): prefill cos > 0.999
+  fixed SHA (`scripts/kimi_linear/clone_kimi_linear_reference.py`): prefill cos > 0.999
   and token-exact greedy. The real-checkpoint gate (48B-A3B on Modal) is
   Phase A5.

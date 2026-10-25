@@ -81,12 +81,12 @@ At `world_size=1`, bit-parity holds by construction, and every
 single-device unit test covers it. At `world_size=2`, two CPU processes
 with gloo run each sharded primitive. It must match the unsharded baseline
 within FP32 atol=1e-4 or BF16 atol=1e-2. The tests are
-`tests/unit/test_distributed_linear.py`,
-`tests/unit/test_distributed_embedding.py`,
-`tests/unit/test_attention_tp_parity.py` (GQA, MLA, HCA, CSA, SWA) and
-`tests/unit/test_ffn_tp_parity.py` (SwiGLU and expert-parallel MoE).
+`tests/unit/distributed/test_distributed_linear.py`,
+`tests/unit/distributed/test_distributed_embedding.py`,
+`tests/unit/distributed/test_attention_tp_parity.py` (GQA, MLA, HCA, CSA, SWA) and
+`tests/unit/distributed/test_ffn_tp_parity.py` (SwiGLU and expert-parallel MoE).
 
-On 2× H100 with NCCL, `scripts/modal_llama_tp_smoke.py` loads Qwen2.5-7B
+On 2× H100 with NCCL, `scripts/llama/modal_llama_tp_smoke.py` loads Qwen2.5-7B
 with two-rank TP. The per-rank outputs are finite and have the expected
 `hidden_size / world_size` head sharding. Qwen2.5-7B replaced Llama-3-8B,
 because the Llama-3 weights need an HF gating step. Token-for-token greedy
@@ -95,7 +95,7 @@ parity against single-device Qwen2.5-7B is not tested yet.
 For V4-Flash, a dry run against the real safetensors index matches all
 34,223 model parameters, after dequant pairing consumes 33,389 sibling
 `.scale` companions. The forward pass on 2× B200
-(`scripts/modal_v4_flash_smoke.py`) is the remaining hardware gate. Three
+(`scripts/deepseek_v4/modal_v4_flash_smoke.py`) is the remaining hardware gate. Three
 dtype and meta-init bugs found there are fixed in code, not yet on
 hardware: compressor projection dtype, Hyper-Connections FP32 preservation
 and rotary inv_freq re-materialization.

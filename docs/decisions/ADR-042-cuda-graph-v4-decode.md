@@ -46,7 +46,7 @@ expert.
 ## Consequences
 
 Real V4-Flash on 2x B200, batch 1, greedy
-(`scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph`):
+(`scripts/deepseek_v4/modal_v4_flash_generate.py --profile-decode --cuda-graph`):
 
 | Context | Eager ms/step | CUDA graph ms/step | Speedup |
 |---|---:|---:|---:|
@@ -54,7 +54,7 @@ Real V4-Flash on 2x B200, batch 1, greedy
 | 2,021 tokens | 78.5 | 34.7 | 2.26x |
 
 - Graph and eager tokens are equal for all 33 tokens.
-  `tests/unit/test_v4_cuda_graph_decode.py` pins graph-equals-eager and no
+  `tests/unit/models/deepseek_v4/test_v4_cuda_graph_decode.py` pins graph-equals-eager and no
   host syncs on CUDA.
 - The static step does more GPU work than the eager single-request step
   (about 35 against 29 ms).
@@ -66,7 +66,7 @@ Real V4-Flash on 2x B200, batch 1, greedy
 - Shutdown drops the graph on every rank first, because a live graph that
   holds NCCL work can hang the process group teardown.
 
-The two-GPU server (`scripts/modal_v4_flash_cb_bench.py --cuda-graph`), 63
+The two-GPU server (`scripts/deepseek_v4/modal_v4_flash_cb_bench.py --cuda-graph`), 63
 steps per batch size:
 
 | Batch | Eager ms/step | CUDA graph ms/step | Speedup |
@@ -77,6 +77,6 @@ steps per batch size:
 
 - Graph and eager tokens are equal at every batch size.
 - The graph step grows by about 1.4 ms per extra request.
-- `scripts/modal_v4_flash_cb_serve.py` turns the graph on, and `--eager`
+- `scripts/deepseek_v4/modal_v4_flash_cb_serve.py` turns the graph on, and `--eager`
   turns it off. 6 concurrent HTTP requests of 48 tokens each finished in
   2.75 s, all with HTTP 200.

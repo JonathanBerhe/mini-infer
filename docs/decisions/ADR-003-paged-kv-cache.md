@@ -47,5 +47,5 @@ this copy with a paged attention kernel, which gives the speedup.
 - The pool size is fixed, about 190 MB for the 0.5B model. A request that
   needs more raises `OutOfMemoryError`. Admission control (Slice 2.3) handles
   this, not a pool that grows.
-- The golden tests pass token-for-token. `tests/unit/test_block_pool.py` and
-  `tests/unit/test_paged_kv_cache.py` test the allocator and the cache in CI.
+- The golden tests pass token-for-token. `tests/unit/cache/test_block_pool.py` and
+  `tests/unit/cache/test_paged_kv_cache.py` test the allocator and the cache in CI.
