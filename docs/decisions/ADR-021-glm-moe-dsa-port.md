@@ -3,244 +3,137 @@
 Date: 2026-06-19
 Status: Accepted
 
-> Amendment (2026-07-02): the "non-interleaved RoPE in the main attention"
-> statements below reflected a bug in transformers <= 5.6 that PR
-> huggingface/transformers#46372 fixed. GLM's main MLA uses INTERLEAVED
-> (DeepSeek-style) RoPE; only the indexer is non-interleaved. The port now
-> passes `use_interleaved_rope=True` and is parity-validated against
-> transformers 5.12. HF also stopped instantiating indexer weights on
-> "shared" IndexShare layers; the port mirrors that.
+> Amendment (2026-07-02): the first text of this ADR said that the main
+> attention uses non-interleaved RoPE. That came from a bug in transformers
+> <= 5.6, which PR huggingface/transformers#46372 fixed. GLM's main MLA uses
+> INTERLEAVED (DeepSeek-style) RoPE. The port passes
+> `use_interleaved_rope=True` and matches transformers 5.12. Like HF, it no
+> longer creates indexer weights on "shared" IndexShare layers.
 
 > Amendment (2026-10-20): GLM-5.3 runs on this port with no code change.
 > `zai-org/GLM-5.3` (revision `ba32f8c19c8738e2c57c71798c601d477a7bf844`) is
-> another `GlmMoeDsaForCausalLM`. It ships under the GLM-5.3 License, while
-> GLM-5.2 is MIT. Read the license before you serve the weights. We checked
-> the config, the generation config and the safetensors index. We did not
-> download weights.
+> another `GlmMoeDsaForCausalLM`, under the GLM-5.3 License (GLM-5.2 is
+> MIT). Read the license before you serve the weights.
 >
-> - The config equals the GLM-5.2-FP8 config except `transformers_version`.
->   The generation config and the index are byte-identical to GLM-5.2-FP8.
->   All 141 shards have the same size and none has the same hash, so the
->   weights are new and the layout is the same. The generation config has
->   no `repetition_penalty`, so the reference does not post-process logits.
-> - `from_hf` ignores some fields that look like they change the math. None
->   does. `indexer_types` is explicit, and `index_topk_freq` 4 with
->   `index_skip_topk_offset` 3 gives the same 21 full layers (0, 1, 2, then
->   every fourth from 6). `indexer_rope_interleave`, `rope_interleave`,
->   `scoring_func`, `topk_method` and `moe_router_dtype` hold the values that
->   the port fixes in code. The MTP fields only concern layer 78, which
->   `load_weights` drops.
-> - The reference built on the meta device has 58794 text tensors. The index
->   holds exactly those plus 1569 MTP tensors: 0 missing, 0 extra. Our
->   `load_weights` accepts that key set, FP8 scales included, on meta tensors.
-> - transformers 5.15 changed `modeling_glm_moe_dsa.py` in structure only
->   (buffers, a KV expand helper, a yarn helper, deprecation decorators). On
->   one tiny model with the same weights, 5.14 and 5.15 give bit-identical
->   logits for prefill, cached decode and `generate`. The GLM unit tests also
->   pass with 5.15 as the reference. The pin stays at 5.14.
-> - Correction to the first amendment: since transformers 5.14 the indexer
->   also uses interleaved RoPE, and so does the port. The config says the
->   same with `indexer_rope_interleave: true`.
+> - The configuration equals GLM-5.2-FP8 except `transformers_version`, and
+>   the index is byte-identical. All 141 shards have the same size and a new
+>   hash.
+> - The fields that `from_hf` ignores do not change the math. For example,
+>   `index_topk_freq` 4 with `index_skip_topk_offset` 3 gives the same 21
+>   full layers.
+> - The index holds the 58794 text tensors of the reference plus 1569 MTP
+>   tensors. `load_weights` accepts that key set on meta tensors.
+> - transformers 5.15 changed `modeling_glm_moe_dsa.py` in structure only,
+>   with bit-identical logits. The pin stays at 5.14.
+> - Correction: since transformers 5.14 the indexer also uses interleaved
+>   RoPE, and so does the port.
 >
-> The index lists names only, so real tensor shapes come from the reference.
-> No GLM-5.3 weights have run on a GPU. `tests/unit/test_glm53_config.py`
-> keeps the config, the unread fields and the meta-device load under test.
+> No GLM-5.3 weights ran on a GPU. `tests/unit/test_glm53_config.py` keeps
+> these facts under test.
 
 ## Context
 
-GLM-5.2 (z.ai, released June 2026) ships as `GlmMoeDsaForCausalLM`
-(`model_type: glm_moe_dsa`). Stripped of branding it is **DeepSeek-V3.2's
-architecture plus one GLM-original optimization (IndexShare)**:
+GLM-5.2 (z.ai, June 2026) ships as `GlmMoeDsaForCausalLM`
+(`model_type: glm_moe_dsa`). It is DeepSeek-V3.2 plus one GLM addition:
 
-- **MLA attention** (q_lora 2048, kv_lora 512, qk_nope 192 / qk_rope 64,
-  v_head 256, 64 heads) - identical family to our existing `MLAAttention`.
-- **DeepSeek Sparse Attention (DSA)**: a Lightning Indexer scores the query
-  against past tokens, selects `index_topk` (2048) of them, and the main MLA
-  attends only to those (the rest masked to `-inf`).
-- **MoE** (DeepSeek-V3 style): 256 routed + 1 shared expert, top-8, a sigmoid
-  gate with an aux-loss-free selection bias (`noaux_tc`) and grouped top-k.
-- **IndexShare** (the GLM-original bit): the indexer runs only on `"full"`
-  layers; the next `"shared"` layers reuse that selection (`index_topk_freq`
-  layers share one indexer pass), cutting indexer FLOPs at long context.
-- RoPE non-interleaved (theta 8e6, no YaRN), RMSNorm, SwiGLU dense layers
-  (first 3), MoE after. A single MTP draft layer for speculative decoding.
+- MLA attention (q_lora 2048, kv_lora 512, qk_nope 192 / qk_rope 64,
+  v_head 256, 64 heads), the family of our `MLAAttention`.
+- DeepSeek Sparse Attention (DSA). A Lightning Indexer selects
+  `index_topk` (2048) past tokens for each query, and the main MLA attends
+  only to those.
+- MoE with 256 routed + 1 shared expert, top-8, and a sigmoid `noaux_tc`
+  gate (an aux-loss-free selection bias) with grouped top-k.
+- IndexShare. The indexer runs only on `"full"` layers, and the next
+  `"shared"` layers reuse its selection.
+- RoPE theta 8e6, 3 dense SwiGLU layers, then MoE, and one MTP draft layer.
 
-The project's charter is to be the implementation venue for newly published
-architectures, bit-parity-validated against the upstream reference. The
-decisive enabler here: the pinned `transformers` (5.6.2) already ships
-`modeling_glm_moe_dsa`, so every component can be validated on CPU against the
-official implementation without a checkpoint download.
-
-The one hard constraint: GLM-5.2 ships **only** at ~753B parameters (no Air/Flash
-variant exists, and the small GLM-4.x models are a different architecture). So
-running the trained weights is out of reach for modest hardware. Architecture
-correctness therefore comes from synthetic-config bit-parity, not a checkpoint.
+The pinned `transformers` (5.6.2) ships `modeling_glm_moe_dsa`, so each
+part can be tested on the CPU without a checkpoint. GLM-5.2 exists only at
+~753B parameters. So correctness comes from bit-parity (equal outputs, bit
+for bit) on synthetic configurations.
 
 ## Decision
 
-Port GLM-5.2 end-to-end through the **existing PagedKVCache engine** (the same
-path Qwen2/Llama/DeepSeek-V2 use), bit-parity-validated against the HF
-`glm_moe_dsa` reference at every level: RoPE, indexer selection, MoE routing,
-full-model logits, and multi-step greedy decode. Reuse the DeepSeek-V2
-machinery; add only the three GLM-specific pieces.
+Port GLM-5.2 through the existing PagedKVCache engine and reuse the
+DeepSeek-V2 code (`src/mini_infer/models/deepseek_v2.py`, with
+[ADR-014](ADR-014-deepseek-v4-hybrid-attention.md) as the MLA and
+sparse-attention precedent). Test each level against the HF `glm_moe_dsa`
+reference, from RoPE to multi-step greedy decode.
 
-What shipped:
-
-1. **`MLAAttention` extensions** (`models/blocks/mla.py`), default-off so
-   V2/V3/Kimi stay bit-identical:
-   - `use_interleaved_rope` flag. GLM uses non-interleaved (NeoX/Llama) RoPE
-     for both the main attention and the indexer. (The HF docstring says the
-     main attention is "interleaved", but the actual code applies NeoX
-     `apply_rotary_pos_emb`; we follow the code, which is the parity oracle.)
-   - An optional `indexer` hook + `dsa_topk` argument threaded into the SDPA,
-     and `compute_dsa_topk` for cache-aware selection.
-
-2. **`GlmDsaIndexer`** (`models/blocks/glm_dsa_indexer.py`): the DSA top-k
-   selector over raw tokens. Per-head Q from the shared q_lora latent, a single
-   shared LayerNorm'd key, ReLU'd dot-product scaled and weighted per head,
-   causal-masked top-k. A no-cache `forward` (prefill / block tests) and a
-   cache-aware `forward_cached` that writes per-token keys to a PagedKVCache
-   `index_k` stream and scores against the full history (decode).
-
-3. **DSA sparse mask** (`cache/mla_attention.py`): an optional `dsa_topk` adds a
-   per-query `-inf`-except-selected mask before the causal mask, mirroring HF's
-   `index_mask + causal_mask`. `None` keeps the dense V2/V3 behavior.
-
-4. **`GlmNoAuxTcGate` + `GlmMoeFFN`** (`models/blocks/glm_moe_gate.py`): the
-   sigmoid `noaux_tc` router (selection bias is added for the choice only;
-   expert weighting uses the unbiased sigmoid scores; grouped top-k) plus a thin
-   FFN reusing `MixtralExpert` and the expert-parallel dispatch shape.
-
-5. **`GlmMoeDsaForCausalLM`** (`models/glm_moe_dsa.py`): config + `from_hf`,
-   per-layer dense-vs-MoE dispatch, IndexShare threading through the decoder
-   stack, heterogeneous `per_layer_streams` (full layers carry an `index_k`
-   stream, ordered first so layer 0 triggers block allocation), and
-   `load_weights` that block-FP8-dequantizes the published checkpoint (e4m3 +
-   `weight_scale_inv`, ceil-aware for partial-block shapes like the 576-row
-   `kv_a_proj`), handles both the stacked (HF in-memory) and per-expert
-   (published checkpoint) routed-expert layouts, applies the global->local
-   expert-parallel remap so each rank loads only its expert slice under TP,
-   renames the shared expert, and drops the MTP layer.
-
-6. **FP8-resident experts** (`blocks/fp8_expert.py` + `GlmMoeFFN(expert_dtype=...)`):
-   `Fp8Expert` stores each routed expert's `w1/w2/w3` as e4m3 + a ceil-block scale
-   and dequantizes per matmul, so the FP8 checkpoint fits 8xH200 without the
-   ~1.5 TB BF16 blow-up. `from_hf` sets `expert_dtype="fp8"` from the checkpoint's
-   `quantization_config`; attention / dense / shared / indexer still dequantize to
-   BF16. The ceil-aware block-FP8 dequant lives in `quant/nvfp4.py`, shared by the
-   loader and `Fp8Expert`.
+1. `MLAAttention` extensions (`models/blocks/mla.py`). They are off by
+   default, so V2, V3 and Kimi stay bit-identical. They add the
+   `use_interleaved_rope` flag, an optional `indexer` hook, a `dsa_topk`
+   argument and `compute_dsa_topk`.
+2. `GlmDsaIndexer` (`models/blocks/glm_dsa_indexer.py`) selects the top-k
+   raw tokens. `forward_cached` writes keys to a PagedKVCache `index_k`
+   stream and scores the full history in decode.
+3. A DSA sparse mask (`cache/mla_attention.py`). An optional `dsa_topk`
+   masks all keys except the selected ones to `-inf`, as HF's
+   `index_mask + causal_mask` does. `None` keeps the dense V2/V3 behavior.
+4. `GlmNoAuxTcGate` and `GlmMoeFFN` (`models/blocks/glm_moe_gate.py`). The
+   sigmoid `noaux_tc` router uses the selection bias only to choose the
+   experts, and weights them by the unbiased scores. The FFN reuses
+   `MixtralExpert`.
+5. `GlmMoeDsaForCausalLM` (`models/glm_moe_dsa.py`). Full layers carry an
+   `index_k` stream in `per_layer_streams`, ordered first so that layer 0
+   allocates the blocks. `load_weights` dequantizes the block-FP8
+   checkpoint (e4m3 + `weight_scale_inv`, with ceil for partial blocks such
+   as the 576-row `kv_a_proj`). It maps global to local experts, so each
+   rank loads only its experts under TP. It drops the MTP layer.
+6. FP8-resident experts (`blocks/fp8_expert.py`). `Fp8Expert` keeps each
+   routed expert in e4m3 with a ceil-block scale and dequantizes per
+   matmul. So the FP8 checkpoint fits 8xH200 without the ~1.5 TB BF16 copy.
+   `from_hf` sets `expert_dtype="fp8"` from the checkpoint's
+   `quantization_config`.
 
 ## Alternatives Considered
 
-**StateCache (V4-style) instead of PagedKVCache.** V4's `StateCache` is built
-around compressed history + SWA windows, which DSA does not have (it keeps full
-K/V and just masks). Reject: it would fight the abstraction, and the HF
-reference itself keeps full K/V and applies an additive mask. PagedKVCache is
-the natural fit and gives GLM the existing scheduler/golden plumbing for free.
-
-**Reuse the V4 `LightningIndexer`.** V4's indexer is compressor-coupled (it
-scores compressed blocks via a `TokenLevelCompressor` with partial RoPE). GLM's
-DSA scores raw tokens with full non-interleaved RoPE. Reject: different enough
-that a dedicated, simpler block is clearer than overloading V4's.
-
-**Overload `MoEFFN` for the gate.** `MoEFFN` is softmax-routed; GLM needs
-sigmoid + `noaux_tc` + grouped top-k. Reject: a small dedicated gate keeps the
-widely-shared Mixtral block clean. The expert dispatch loop is still reused.
-
-**Cache indexer keys in a separate per-request buffer (like HF's `_cached_keys`).**
-A standalone buffer does not fit continuous batching (multiple ragged requests).
-Reject: a PagedKVCache `index_k` stream pages per request idiomatically and
-reuses the existing append/materialize machinery. Ordering it first on full
-layers makes layer 0 the allocation trigger, before any slot is written.
-
-**Model the MTP draft layer.** It is a speculative-decoding accelerator, not
-required for greedy correctness, and the HF model's own forward never runs it.
-Reject: drop its checkpoint keys at load; add it only if/when spec-decode for
-GLM is in scope.
+- `StateCache` (V4-style) instead of PagedKVCache. Rejected, because DSA
+  keeps full K/V and only masks it, as the HF reference does.
+- Reuse the V4 `LightningIndexer`. Rejected, because it scores compressed
+  blocks through a `TokenLevelCompressor`, and GLM scores raw tokens.
+- Extend `MoEFFN` for the gate. Rejected, because it routes with softmax.
+- Keep indexer keys in a separate buffer per request, like HF's
+  `_cached_keys`. Rejected, because it does not work with continuous
+  batching.
+- Build the MTP draft layer. Rejected, because greedy correctness does not
+  need it, and the HF forward never runs it.
 
 ## Consequences
 
-**Positive:**
+mini-infer loads GLM-5.2, matches the HF reference and generates correct
+text on the CPU with no checkpoint download. Later DeepSeek-V3.2-family
+models can reuse the DSA hook in `MLAAttention`.
 
-- mini-infer now loads, parity-validates, and **generates correct text** for
-  GLM-5.2, all on CPU with no checkpoint download. The synthetic-config
-  bit-parity exercises 100% of the architecture (MLA, DSA, IndexShare, noaux_tc
-  MoE), which is the actual correctness gate.
-- `MLAAttention` now carries an optional DSA hook (indexer + sparse mask + a
-  cache-aware `index_k` stream) that any future DeepSeek-V3.2-family model can
-  reuse. V2/V3/Kimi are untouched by default arguments.
-- The port reused the entire DeepSeek-V2 path (config shape, decoder skeleton,
-  MLA cache contract, weight-load structure), so the GLM-specific surface is
-  one model file plus two block files.
+On L4 GPUs, the MoE expert dispatch has a GPU-vs-CPU fp32 gap. So TP
+results must be compared with a reference on the same device.
 
-**Negative:**
+The published checkpoint is per-expert block-FP8 (~755 GB, read from the
+index by `scripts/inspect_glm_safetensors.py`). The routed experts are ~96%
+of the weights, and the FP8-resident model takes ~785 GB on 8xH200. `scripts/modal_glm_stage_weights.py` stages the weights
+on a CPU-only function. The 753B checkpoint itself did not run, because it
+needs a multi-GPU node.
 
-- Running the trained 753B weights end-to-end is out of scope for modest
-  hardware (FP8 weights alone are ~753 GB, needing a multi-GPU node). The port
-  is validated against the HF reference on synthetic configs; a real-checkpoint
-  smoke is deferred and gated separately.
-- Single-GPU CUDA (exact fp32 parity + bf16 generation) and 2-GPU NCCL tensor
-  parallelism, including expert-parallel MoE (logits identical across ranks,
-  exact vs the world_size=1 GPU reference), are validated on L4s. The only
-  remaining unrun item is the 753B checkpoint itself (needs a multi-GPU node,
-  beyond budget). Caveat surfaced in testing: the MoE expert dispatch has a
-  GPU-vs-CPU fp32 gap (index_add_ / scaled matmuls), so TP correctness must be
-  judged against a same-device reference, not CPU.
-- The published checkpoint is **per-expert block-FP8** (~755 GB; confirmed via
-  the index with `scripts/inspect_glm_safetensors.py`) and `load_weights`
-  ingests it (ceil-aware dequant + per-expert + EP remap). To fit a single node,
-  `expert_dtype="fp8"` keeps the routed experts (~96% of the weights)
-  e4m3-resident via `Fp8Expert` (dequant per-matmul, like V4's `FP4Expert`) while
-  attention / dense / shared / indexer dequantize to BF16, landing ~785 GB on
-  8xH200; `from_hf` selects this automatically from the checkpoint's
-  `quantization_config`. `scripts/modal_glm_stage_weights.py` stages the weights
-  on a CPU-only function. The only thing left between here and generated text is
-  the funded multi-GPU run itself (~$36/hr on 8xH200, beyond the current budget).
+Limits:
 
-**Trade-offs:**
+- On "full" indexer layers the q_lora latent is computed twice per step,
+  in `compute_dsa_topk` and in the attention forward.
+- The `index_k` stream stores RoPE'd keys in bf16, like the main k_rope
+  stream. The CPU tests run in fp32 and are exact.
 
-- On "full" indexer layers the q_lora latent is computed twice per step (once in
-  `compute_dsa_topk`, once in the attention forward). Correctness-first; a
-  shared-latent pass is a perf follow-up.
-- The `index_k` stream stores RoPE'd keys at bf16 in production (same as the
-  main k_rope stream), so decode introduces the same cache-precision delta the
-  main attention already has. The CPU parity tests run fp32, so they are exact.
+The tests compare with the HF reference on tiny synthetic configurations,
+on the CPU in fp32 unless the row names a GPU:
 
-## Validation
-
-All tests gate on the in-venv HF `glm_moe_dsa` reference via
-`pytest.importorskip`. Synthetic tiny configs, CPU, fp32.
-
-| Level | Test | Result |
-|---|---|---|
-| Main-attention RoPE | `test_glm_mla_rope_parity` | cosine > 0.999, allclose 1e-4 (+ V2 regression) |
-| DSA indexer top-k | `test_glm_dsa_indexer_parity` | selected key set matches HF (selective + all-pass) |
-| MLA + DSA attention | `test_glm_mla_dsa_attention_parity` | cosine > 0.999, allclose 1e-4 |
-| noaux_tc gate + MoE | `test_glm_moe_gate_parity` | routing + FFN match (n_group 1 and 2) |
-| Model assembly + IndexShare | `test_models_glm_moe_dsa` | structure, indexer reuse `[1,0,0,0]` / `[1,0,1,0]` |
-| Full-model logits | `test_full_model_parity_vs_hf` | logits allclose 1e-3, greedy argmax identical |
-| Greedy decode | `test_greedy_decode_parity_vs_hf` | tokens identical to HF over 6 steps |
-| Batched decode | `test_batched_decode_matches_hf` | two ragged prompts, tokens match HF per request |
-| TP indexer selection | `test_glm_dsa_indexer_tp_parity` | world_size=2 top-k identical across ranks + matches ws=1 |
-| Prefix cache (index_k) | `test_glm_dsa_prefix_cache` | index_k publishes/reuses; prefix-hit logits match full prefill |
-| Real GPU (NVIDIA L4) | `scripts/modal_glm_smoke.py` | fp32 parity exact (cos 1.0, max abs diff 0); fp32 decode tokens match HF; bf16 generation finite |
-| TP model (CPU gloo, ws=2) | `test_glm_moe_tp_parity` | full MoE model: ranks identical, matches ws=1 (expert-parallel load) |
-| Real GPU TP (2x L4, NCCL) | `scripts/modal_glm_tp_smoke.py` | MoE config: ranks identical (diff 0); exact vs ws=1 GPU ref (cos 1.0) |
-| Block-FP8 + per-expert load | `test_glm_fp8_load` | ceil-aware dequant on partial blocks; per-expert BF16 load exact; FP8 round-trip recovers (cos > 0.97) |
-| FP8-resident experts | `test_glm_fp8_load` | Fp8Expert == dequantized MixtralExpert; fp8-resident model logits == bf16-dequant (experts stay e4m3) |
-
-## References
-
-- HF reference: `transformers.models.glm_moe_dsa.modeling_glm_moe_dsa`
-  (transformers 5.6.2, the pinned project version).
-- Model card / config: `huggingface.co/zai-org/GLM-5.2`
-  (`GlmMoeDsaForCausalLM`, 78 layers, 256 routed + 1 shared experts, 1M context).
-- DeepSeek-V2 template this port reused: `src/mini_infer/models/deepseek_v2.py`
-  and [ADR-014](ADR-014-deepseek-v4-hybrid-attention.md) (MLA + sparse-attention
-  precedent).
-- Real-GPU smokes: `scripts/modal_glm_smoke.py` (single L4) and
-  `scripts/modal_glm_tp_smoke.py` (2x L4 NCCL TP), both validated PASS.
-- Real-checkpoint readiness: `scripts/inspect_glm_safetensors.py` (confirmed the
-  per-expert block-FP8 format from the index, $0) and
-  `scripts/modal_glm_stage_weights.py` (CPU-only Volume staging for a funded run).
-- Implementation on branch `glm-moe-dsa`.
+| Test | Result |
+|---|---|
+| `test_glm_mla_rope_parity`, `test_glm_mla_dsa_attention_parity` | cosine > 0.999, allclose 1e-4 |
+| `test_glm_dsa_indexer_parity` | selected key set matches HF |
+| `test_glm_moe_gate_parity` | routing + FFN match |
+| `test_full_model_parity_vs_hf` | logits allclose 1e-3, greedy argmax identical |
+| `test_greedy_decode_parity_vs_hf` | tokens identical to HF over 6 steps |
+| `test_batched_decode_matches_hf` | two ragged prompts match HF |
+| `test_glm_dsa_prefix_cache` | prefix-hit logits match full prefill |
+| `test_glm_moe_tp_parity` | CPU gloo, ws=2: ranks identical, matches ws=1 |
+| `scripts/modal_glm_smoke.py` | NVIDIA L4: fp32 parity exact (cos 1.0) |
+| `scripts/modal_glm_tp_smoke.py` | 2x L4, NCCL: ranks identical (diff 0) |
+| `test_glm_fp8_load` | fp8-resident logits == bf16-dequant |
