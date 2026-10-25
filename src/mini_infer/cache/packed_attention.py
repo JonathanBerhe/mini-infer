@@ -122,13 +122,13 @@ def packed_attention_forward(
     # materialized-SDPA tax for the whole model. See ADR / model file
     # `Gemma4ForCausalLM.required_attention_backend`.
     if cache._pool.attention_backend == "torch":
-        keys_packed, values_packed, cu_seqlens_k, _ = cache.materialize_packed_kv(layer_idx)
+        keys_packed, values_packed, _, _ = cache.materialize_packed_kv(layer_idx)
         return packed_attention_torch(
             q,
             keys_packed,
             values_packed,
-            cu_seqlens_q,
-            cu_seqlens_k,
+            cache.cu_seqlens_q_list(cu_seqlens_q),
+            cache.cu_seqlens_k_list(),
             softmax_scale,
             window=window,
             block_mask=block_mask,
@@ -193,19 +193,32 @@ def packed_attention_forward(
             q, cache, layer_idx, cu_seqlens_q, softmax_scale, window=window
         )
     # PyTorch reference path: gather K/V from blocks into a packed buffer, then
-    # use the per-request SDPA reference. Slower but device-agnostic.
-    keys_packed, values_packed, cu_seqlens_k, _ = cache.materialize_packed_kv(layer_idx)
+    # use the per-request SDPA reference. Slower but device-agnostic. The
+    # boundaries come from the cache's host copies, so no layer waits on the GPU.
+    keys_packed, values_packed, _, _ = cache.materialize_packed_kv(layer_idx)
     return packed_attention_torch(
-        q, keys_packed, values_packed, cu_seqlens_q, cu_seqlens_k, softmax_scale, window=window
+        q,
+        keys_packed,
+        values_packed,
+        cache.cu_seqlens_q_list(cu_seqlens_q),
+        cache.cu_seqlens_k_list(),
+        softmax_scale,
+        window=window,
     )
+
+
+def _host_list(cu_seqlens: torch.Tensor | list[int]) -> list[int]:
+    if isinstance(cu_seqlens, torch.Tensor):
+        return [int(x) for x in cu_seqlens.tolist()]
+    return cu_seqlens
 
 
 def packed_attention_torch(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor | list[int],
+    cu_seqlens_k: torch.Tensor | list[int],
     softmax_scale: float,
     window: int | None = None,
     block_mask: list[torch.Tensor] | None = None,
@@ -216,6 +229,10 @@ def packed_attention_torch(
     tensors, computes causal SDPA with GQA broadcasting, and writes back to the
     output's per-request slice. Slow (Python loop) but trivially correct;
     serves as the oracle for the flash backend.
+
+    The boundaries can be tensors or host lists. A device tensor costs one
+    GPU sync each, because the loop needs the values on the host. A host
+    list costs nothing.
 
     Causal-mask convention for chunked prefill: a request's `q_len` tokens
     occupy positions `[k_len - q_len, k_len)` within its full K/V history (the
@@ -232,11 +249,12 @@ def packed_attention_torch(
         raise ValueError(f"num_q_heads={num_q_heads} not a multiple of num_kv_heads={num_kv_heads}")
     group_size = num_q_heads // num_kv_heads
 
-    batch_size = cu_seqlens_q.shape[0] - 1
-    if cu_seqlens_k.shape[0] - 1 != batch_size:
+    cu_q = _host_list(cu_seqlens_q)
+    cu_k = _host_list(cu_seqlens_k)
+    batch_size = len(cu_q) - 1
+    if len(cu_k) - 1 != batch_size:
         raise ValueError(
-            f"cu_seqlens_q has {batch_size + 1} entries but cu_seqlens_k has "
-            f"{cu_seqlens_k.shape[0]} entries"
+            f"cu_seqlens_q has {batch_size + 1} entries but cu_seqlens_k has {len(cu_k)} entries"
         )
     if block_mask is not None and len(block_mask) != batch_size:
         raise ValueError(
@@ -249,10 +267,8 @@ def packed_attention_torch(
         raise ValueError("block_mask and window are mutually exclusive")
 
     for batch_idx in range(batch_size):
-        q_start = int(cu_seqlens_q[batch_idx])
-        q_end = int(cu_seqlens_q[batch_idx + 1])
-        k_start = int(cu_seqlens_k[batch_idx])
-        k_end = int(cu_seqlens_k[batch_idx + 1])
+        q_start, q_end = cu_q[batch_idx], cu_q[batch_idx + 1]
+        k_start, k_end = cu_k[batch_idx], cu_k[batch_idx + 1]
         q_len = q_end - q_start
         k_len = k_end - k_start
         if q_len == 0:
