@@ -51,9 +51,9 @@ the whole tree to find the code of one model.
 - Keep the family names in `models/blocks/__init__.py`, so that the old
   imports still work. Then `blocks` depends on every family. No code outside
   this repository imports these paths.
-- Move the ADRs, plans and benchmark reports into model folders. They
-  record decisions in time order, and many of them cover more than one
-  model.
+- Move the ADRs and benchmark reports into model folders. They record
+  decisions and results in time order, and many of them cover more than
+  one model.
 
 ## Consequences
 

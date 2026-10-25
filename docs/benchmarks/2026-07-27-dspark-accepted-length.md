@@ -257,7 +257,6 @@ Raw data: `docs/benchmarks/data/dspark-stage-c.json`.
 ## Pointers
 
 - ADR: [ADR-027](../decisions/ADR-027-dspark-drafter-port.md)
-- Plan: [dspark-evaluation.md](../plans/dspark-evaluation.md) Stage C
 - Implementation: `src/mini_infer/engine/dspark/speculative.py`,
   `src/mini_infer/engine/dspark/proposal.py`,
   `src/mini_infer/engine/dspark/sampling.py`

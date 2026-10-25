@@ -8,9 +8,7 @@ Status: Accepted
 Kimi K3 (announced 2026-07-16) uses Kimi Delta Attention (KDA) from Kimi
 Linear (arXiv:2510.26692), which has a runnable reference
 (`moonshotai/Kimi-Linear-48B-A3B-Instruct`). A `kimi_linear` port first
-tests about 90% of the inference novelty of K3 against a real oracle. See
-[docs/plans/kimi-k3.md](../plans/kimi-k3.md) and the
-[spec](../plans/kimi-k3-spec.md).
+tests about 90% of the inference novelty of K3 against a real oracle.
 
 KDA is the first linear-attention family here. Its decode state is a
 fixed-size fp32 matrix per layer (a delta rule with per-channel decay) plus

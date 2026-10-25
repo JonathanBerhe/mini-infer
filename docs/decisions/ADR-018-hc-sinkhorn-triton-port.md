@@ -131,4 +131,3 @@ per-call latency over 100 iterations after 10 warm-up iterations:
 - Dispatcher and oracle: [src/mini_infer/models/deepseek_v4/hyper_connections.py](../../src/mini_infer/models/deepseek_v4/hyper_connections.py).
 - Bench: [scripts/deepseek_v4/bench_hc_sinkhorn.py](../../scripts/deepseek_v4/bench_hc_sinkhorn.py).
 - Parity tests: [tests/unit/models/deepseek_v4/test_hc_sinkhorn_kernel.py](../../tests/unit/models/deepseek_v4/test_hc_sinkhorn_kernel.py).
-- Plan: [docs/plans/hc-sinkhorn-triton.md](../plans/hc-sinkhorn-triton.md).

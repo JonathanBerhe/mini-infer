@@ -108,9 +108,7 @@ Each block has its own `tests/unit/test_v4_*_parity.py` test:
 
 With the narrower unit tests and the model-level tests, all 53 V4 tests
 pass. The paper is at `docs/papers/deepseek-v4.pdf` (gitignored). The
-reference is vendored read-only at `third_party/deepseek_v4_reference/`. The
-original 4-stage plan is
-[docs/plans/deepseek-v4-attention.md](../plans/deepseek-v4-attention.md).
+reference is vendored read-only at `third_party/deepseek_v4_reference/`.
 
 ## Update: full primitive integration (2026-05-10)
 

@@ -113,7 +113,6 @@ Two B200 runs total to collect the data above (~$5 spend).
 ## Pointers
 
 - Probe: [scripts/bench/modal_nvfp4_probe.py](../../scripts/bench/modal_nvfp4_probe.py)
-- Plan: [docs/plans/flashinfer-integration.md](../plans/flashinfer-integration.md)
 - ADR: [ADR-013 / FlashInfer recommendations](../decisions/ADR-013-turboquant-kv.md)
 - Stage A bench: [2026-05-02-flashinfer-bf16.md](2026-05-02-flashinfer-bf16.md)
 - Stage B bench: [2026-05-02-flashinfer-fp8-kv.md](2026-05-02-flashinfer-fp8-kv.md)

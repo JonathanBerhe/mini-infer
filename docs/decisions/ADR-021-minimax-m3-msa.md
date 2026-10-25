@@ -1,9 +1,7 @@
 # ADR-021: MiniMax-M3 (MSA) text-only port
 
 Date: 2026-06-26
-Status: Accepted (Phase 0). Design fixed; implementation phased (see
-[docs/plans/minimax-m3.md](../plans/minimax-m3.md)). Full implementable detail in
-[docs/plans/minimax-m3-spec.md](../plans/minimax-m3-spec.md).
+Status: Accepted (Phase 0). Design fixed; implementation phased.
 
 ## Context
 

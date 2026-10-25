@@ -129,5 +129,3 @@ MINI_INFER_BENCH_GPU=H100 modal run scripts/bench/modal_packed_bench.py --config
   `prefill_wrapper.run()`).
 - Tests:
   [tests/unit/cache/test_fp8_kv.py](../../tests/unit/cache/test_fp8_kv.py).
-- Plan:
-  [docs/plans/flashinfer-integration.md](../plans/flashinfer-integration.md).

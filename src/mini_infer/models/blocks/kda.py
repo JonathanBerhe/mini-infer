@@ -13,7 +13,7 @@ KDA refines it to one per key channel):
 The reference semantics are Moonshot's `modeling_kimi.py` driving the FLA
 (`fla-org/flash-linear-attention`) `chunk_kda` / `fused_recurrent_kda` kernels;
 the naive reference for those kernels is `fla/ops/kda/naive.py`. Numerical
-conventions pinned from that stack (see docs/plans/kimi-k3-spec.md):
+conventions pinned from that stack:
 
   - everything runs in fp32 inside the recurrence; outputs cast back,
   - q and k are L2-normalized per head (eps 1e-6) and q is scaled by

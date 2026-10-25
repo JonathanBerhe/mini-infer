@@ -9,7 +9,7 @@ in [ADR-031](ADR-031-multi-request-dspark.md))
 
 DeepSeek released DSpark ("Confidence-Scheduled Speculative Decoding with
 Semi-Autoregressive Generation", 2026-06-27) with the MIT-licensed `DeepSpec`
-training and eval code. `docs/plans/dspark-evaluation.md` stages the work.
+training and eval code. The work runs in stages.
 This ADR is the Stage A output: it resolves the parity-critical unknowns
 before the Stage B code.
 

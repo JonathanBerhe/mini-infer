@@ -3,8 +3,7 @@
 Per-architecture line-by-line correspondence between research paper,
 upstream reference implementation, and our from-scratch port.
 
-The direct realization of mini-infer's research-paper-engine niche
-(see [roadmap-2026.md](../plans/roadmap-2026.md)).
+The direct realization of mini-infer's research-paper-engine niche.
 
 ## Where the code is
 

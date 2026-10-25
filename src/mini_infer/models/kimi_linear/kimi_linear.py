@@ -4,7 +4,7 @@ From-scratch port of Moonshot's hybrid linear-attention architecture
 (arXiv:2510.26692), the attention foundation of Kimi K3. The parity
 reference is the checkpoint's `modeling_kimi.py` (trust_remote_code, vendored
 by `scripts/kimi_linear/clone_kimi_linear_reference.py`) driving the FLA `kda` kernels;
-see docs/plans/kimi-k3-spec.md for the pinned semantics.
+`mini_infer.models.blocks.kda` lists the pinned semantics.
 
 Architecturally, a 27-layer decoder that interleaves two attention kinds at
 ~3:1 (per the config's 1-indexed `kda_layers` / `full_attn_layers` lists):

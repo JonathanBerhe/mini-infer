@@ -100,5 +100,3 @@ uv run modal run scripts/bench/modal_packed_bench.py --config flashinfer
   [packed_attention.py:packed_attention_forward](../../src/mini_infer/cache/packed_attention.py).
 - Tests:
   [tests/unit/cache/test_flashinfer_backend.py](../../tests/unit/cache/test_flashinfer_backend.py).
-- Plan:
-  [docs/plans/flashinfer-integration.md](../plans/flashinfer-integration.md).

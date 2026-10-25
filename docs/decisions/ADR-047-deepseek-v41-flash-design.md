@@ -1,9 +1,8 @@
 # ADR-047: DeepSeek-V4.1-Flash port design
 
 Date: 2026-10-25
-Status: Accepted (design only). Stage A of
-[the V4.1-Flash plan](../plans/deepseek-v41-flash.md) is done, and its gate
-did not trigger. Stage B builds the port.
+Status: Accepted (design only). Stage A of the V4.1-Flash plan is done, and
+its gate did not trigger. Stage B builds the port.
 
 ## Context
 
