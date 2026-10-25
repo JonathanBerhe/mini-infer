@@ -5,95 +5,52 @@ Status: Accepted
 
 ## Context
 
-MiniMax-M3's serving path is pinned to the `torch` attention backend: the MSA
-block mask needs a materialized SDPA. At decode that path pays O(context) per
-layer per step: materialize the full K/V history, build a dense additive mask,
-run attention over every cached token, then throw away everything the selection
-masked out. MSA's whole premise is that each query attends to at most
-`topk_blocks + local` 128-token blocks, so the memory traffic the torch path
-pays is mostly wasted at long context.
+The MiniMax-M3 serving path uses the `torch` attention backend, because the
+MSA block mask needs a materialized SDPA. At decode it attends over every
+cached token, at O(context) cost per layer per step. But each MSA query
+attends to at most `topk_blocks + local` 128-token blocks.
 
-The reference `MiniMax-AI/MSA` repo does not help directly: its sparse decode
-entry point is a stub (`NotImplementedError`), so the only authority is our own
-dense-mask oracle. ADR-020 (the V4 decode-kernel rejection) sets the bar: a
-kernel ships default-on only if the END-TO-END A/B on the real model shows a
-win AND the greedy tokens match; per-primitive speedups do not count.
+The `MiniMax-AI/MSA` reference has no sparse decode (`NotImplementedError`),
+so our dense-mask oracle (ADR-021) is the only authority. ADR-020 sets the
+bar: a kernel is on by default only if the real-model end-to-end A/B shows a
+gain and the greedy tokens match.
 
 ## Decision
 
 Ship `msa_paged_decode` (`cache/msa_paged_attention.py`), a Triton decode
-kernel that reads ONLY the indexer-selected blocks straight from the paged
-pool, **opt-in and off by default** (`MiniMaxM3ForCausalLM.set_decode_kernel`).
+kernel that reads only the selected blocks from the paged pool. It is off by
+default (`MiniMaxM3ForCausalLM.set_decode_kernel`).
 
-Design:
+- One program per `(request, KV head)` reads each selected block once for the
+  whole GQA group.
+- `MiniMaxM3Indexer.select_cached` picks the blocks and also builds the
+  oracle mask, so the two paths differ only in float rounding.
+- The math is fp32, with one bf16 cast at the store. Parity with the oracle
+  is cosine 1.000 at max_abs ~1e-4, not bit-exact.
+- Prefill, mixed batches, TP and CPU keep the oracle.
 
-- One program per `(request, KV head)`: a `(16, 128)` output tile covers the
-  whole GQA group, so each selected block is read once per group (not once per
-  q head) and QK / PV are real `tl.dot` MMAs. The selection is one set per
-  request shared across all heads (the HF-verified property), which removes
-  the per-head selection plumbing the reference carries.
-- Selection comes from `MiniMaxM3Indexer.select_cached`, the SAME routine that
-  builds the oracle's dense mask; the kernel and oracle cannot disagree about
-  which blocks are attended, only about float rounding.
-- Host-side, selected index blocks expand to (pool block id, base position)
-  pairs via the block table (`index_block_size` must be a multiple of the pool
-  block size), ascending-sorted for deterministic accumulation order; `-1`
-  selection padding becomes dead entries the kernel skips outside the softmax
-  update (running them through would produce `exp(-inf - -inf) = nan`).
-- fp32 scores, fp32 online softmax, fp32 accumulator, ieee-precision PV, one
-  bf16 cast at the store, mirroring the oracle's dtype discipline. bf16
-  matmul reduction order still differs, so bit-exactness vs the oracle is not
-  claimed (the ADR-020 trap); parity is cosine 1.000 at max_abs ~1e-4 bf16.
-- Dense layers (0-2) reuse the existing `paged_attention_decode_batched`
-  kernel on the same opt-in flag.
-- Pure decode steps only (every request contributes one token), single rank;
-  prefill, mixed batches, TP, and CPU always take the materialized oracle.
-
-A pure-torch reference (`msa_paged_decode_torch`) is CPU-validated against the
-dense-mask oracle; the Triton kernel is GPU-validated against that reference,
-plus a sparsity probe: perturbing K/V outside the selected blocks leaves the
-kernel output bit-identical.
+A pure-torch reference (`msa_paged_decode_torch`) matches the oracle on CPU,
+and the kernel matches that reference on GPU. Changes to K/V outside the
+selected blocks leave the output bit-identical.
 
 ## Alternatives Considered
 
-- **Port the reference kernel's machinery** (split-KV with up to 256 splits,
-  LSE combine pass, schedule kernel, exp2-space softmax). Rejected: all of it
-  serves dense 1M-token decode; MSA decode reads at most ~2.2K tokens, one
-  program covers that in <= 17 block iterations, and a combine pass would add
-  an HBM round-trip for nothing.
-- **One program per (request, q head)** (the shape of our existing dense paged
-  kernel). Rejected after review: it re-reads every K/V block 16x (once per
-  head in the group); the group-tile design reads each block once.
-- **Keeping selection inside the kernel** (score + top-k on device, the
-  reference's fused ambition). Out of scope: the indexer's O(context) scoring
-  is shared with the oracle path and stays in torch; the kernel replaces only
-  the main-attention traffic.
+- Port the split-KV machinery of the reference (up to 256 splits and a
+  combine pass). Rejected: MSA decode reads at most ~2.2K tokens, so the
+  combine pass only adds an HBM round trip.
+- One program per (request, q head). Rejected: it reads every K/V block 16x.
+- Selection inside the kernel. Out of scope: the oracle shares the indexer
+  scoring, which stays in torch.
 
 ## Consequences
 
-- Attention-op decode cost becomes O(topk * 128) instead of O(context): 2.3x
-  at 1K context to 105.9x at 64K (A10, M3 head geometry; see
-  docs/benchmarks/2026-07-03-msa-decode-kernel.md).
-- End-to-end on a 114M-param synthetic M3-shaped model at 32K context the
-  kernel arm is 0.95x (a slight LOSS): per-step host overhead and the
-  indexer's O(context) re-scoring dominate at toy scale.
-- **The real-model A/B (the ship gate) ran on the 428B checkpoint, 4x H200,
-  16K context: 0.98x with token identity PASS** (see
+- The attention op at decode is 2.3x faster at 1K context and 105.9x at 64K
+  (A10, see docs/benchmarks/2026-07-03-msa-decode-kernel.md).
+- The ship gate on the real 428B checkpoint (4x H200, 16K context) gave 0.98x
+  with token identity PASS (see
   docs/benchmarks/2026-07-03-minimax-m3-428b-gate.md). MoE weight traffic
-  (~13 GB/step) dwarfs the K/V materialization the kernel eliminates
-  (~2 GB/step at 16K), so the kernel cannot move the end-to-end number at
-  practical contexts. **Decision: stays off by default**, same verdict shape
-  as ADR-020; unlike V4's kernel the arms are token-identical, so the flag
-  remains a safe opt-in for long-context experiments.
-- The remaining O(context) decode term is the index branch (re-scores the full
-  cached index-K history every step); a future incremental-scoring or fused
-  selection kernel is the next lever if the real-model A/B shows the indexer
-  dominating.
-
-## References
-
-- ADR-020 (V4 decode-kernel rejection; the end-to-end-or-nothing rule).
-- ADR-021 (MiniMax-M3 port; the dense-mask oracle this kernel is validated
-  against).
-- `MiniMax-AI/MSA` (reference repo; sparse decode stubbed, contract only).
-- Benchmark: docs/benchmarks/2026-07-03-msa-decode-kernel.md.
+  (~13 GB/step) is much larger than the K/V traffic that the kernel removes
+  (~2 GB/step). So the kernel stays off by default, as in ADR-020. The arms
+  are token-identical, so the flag is a safe opt-in.
+- The next lever is the indexer, which still re-scores the full index-K
+  history every step.
