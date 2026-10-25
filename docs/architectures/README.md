@@ -33,8 +33,10 @@ for its scripts. A file that two or more families use is in
 |---|---|---|---|
 | Nemotron-H (Nemotron 3.5 Lightning, Nemotron 3 Nano; Mamba-2 hybrid, text-only) | Mamba-2 / SSD paper (arXiv 2405.21060) | HF transformers `modeling_nemotron_h.py` | [nemotron-h.md](nemotron-h.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated DeltaNet hybrid, text-only) | Gated DeltaNet paper (arXiv 2412.06464) | HF transformers `modeling_qwen3_5.py` (text path) | [qwen3-5.md](qwen3-5.md) |
+| Kimi Linear 48B-A3B (KDA + NoPE-MLA hybrid) | Kimi Linear paper (arXiv 2510.26692) | Checkpoint `modeling_kimi.py` (trust_remote_code, vendored) | [kimi-linear.md](kimi-linear.md) |
 | Inkling / Inkling-Small | [Release post](https://thinkingmachines.ai/news/introducing-inkling/) | HF transformers `modeling_inkling.py` (text path) | [inkling.md](inkling.md) |
 | MiniMax-M3 (MSA) | MSA report (arXiv 2606.13392) | HF transformers `modeling_minimax_m3_vl.py` (text path) | [minimax-m3.md](minimax-m3.md) |
+| GLM-5.2 / GLM-5.3 (GlmMoeDsa: MLA + DSA + IndexShare) | No GLM paper. DSA from DeepSeek-V3.2, IndexShare from arXiv 2603.12201 | HF transformers `modeling_glm_moe_dsa.py` | [glm-moe-dsa.md](glm-moe-dsa.md) |
 | DeepSeek-V4 | DeepSeek-V4 technical report | [DeepSeek-V4-Pro/inference](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main/inference) | [deepseek-v4.md](deepseek-v4.md) |
 | DeepSeek-V2 / V3 / Kimi-K2 (MLA) | DeepSeek-V2 technical report | HF transformers `modeling_deepseek_v2.py` | [deepseek-v2-mla.md](deepseek-v2-mla.md) |
 | Gemma 4 (text-only) | Gemma 4 release notes | HF transformers `modeling_gemma3.py` (text path) | [gemma-4.md](gemma-4.md) |
@@ -47,10 +49,7 @@ for its scripts. A file that two or more families use is in
 
 ## Pending walkthroughs
 
-- **GLM-5.2 (GlmMoeDsa)**: ported and merged (ADR-021, the GLM one);
-  walkthrough not yet written. Until then the ADR plus the DeepSeek-V2
-  MLA walkthrough cover most of it (GLM = V3.2-shape MLA + DSA indexer
-  + IndexShare).
+None. Every ported family has a walkthrough.
 
 Future additions trigger when a new paper architecture is implemented
 per the [roadmap-2026 §Paper-watch-list](../plans/roadmap-2026.md).
