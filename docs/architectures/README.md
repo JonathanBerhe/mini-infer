@@ -51,8 +51,7 @@ for its scripts. A file that two or more families use is in
 
 None. Every ported family has a walkthrough.
 
-Future additions trigger when a new paper architecture is implemented
-per the [roadmap-2026 §Paper-watch-list](../plans/roadmap-2026.md).
+Future additions follow when a new paper architecture is implemented.
 
 Reading order suggestion if you're new to the codebase:
 

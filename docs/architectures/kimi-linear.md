@@ -19,8 +19,8 @@ disagree, the code wins.
 > to code. Read the [DeepSeek-V2 walkthrough](deepseek-v2-mla.md) first for
 > MLA. Pair this page with
 > [ADR-026](../decisions/ADR-026-kimi-linear-kda-port.md) for the port
-> decisions and [the Kimi spec](../plans/kimi-k3-spec.md) for the pinned
-> semantics.
+> decisions. The `blocks/kda.py` docstring lists the pinned numerical
+> conventions.
 
 ## TL;DR
 
@@ -423,8 +423,6 @@ git worktree, symlink it from the main checkout, or run the clone script.
   The folder is not in git.
 - Paper: Kimi Linear, arXiv 2510.26692.
 - ADR: [ADR-026](../decisions/ADR-026-kimi-linear-kda-port.md).
-- Spec and plan: [kimi-k3-spec.md](../plans/kimi-k3-spec.md),
-  [kimi-k3.md](../plans/kimi-k3.md).
 - Model class and configuration:
   [`kimi_linear/kimi_linear.py`](../../src/mini_infer/models/kimi_linear/kimi_linear.py).
 - KDA math: [`blocks/kda.py`](../../src/mini_infer/models/blocks/kda.py).
@@ -435,8 +433,8 @@ git worktree, symlink it from the main checkout, or run the clone script.
 
 ## What is still open
 
-- The real 48B-A3B checkpoint never ran. The gate (step A5 of the
-  [Kimi plan](../plans/kimi-k3.md)) is pending.
+- The real 48B-A3B checkpoint never ran. That gate is still open
+  ([ADR-026](../decisions/ADR-026-kimi-linear-kda-port.md)).
 - Single rank only. Tensor parallelism needs the KDA conv channels and the
   per-head state split across ranks.
 - No prefix sharing across requests. That needs a snapshot of the KDA state.
@@ -446,5 +444,4 @@ git worktree, symlink it from the main checkout, or run the clone script.
   step does not run under a CUDA graph.
 - The MoE runs its experts one at a time in a loop, with no grouped-matmul
   path.
-- The Kimi K3 port (stage B of the plan) builds on this one and does not
-  exist yet.
+- The Kimi K3 port builds on this one and does not exist yet.
