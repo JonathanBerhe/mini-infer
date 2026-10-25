@@ -5,180 +5,100 @@ Status: Accepted
 
 ## Context
 
-ADR-023 opened the cross-accelerator scope and made the TPU (JAX/Pallas) a
-first-class backend. Attention is the first non-trivial thing the backend needs,
-and it raised a cluster of design questions that recur for every TPU kernel we
-will write:
+ADR-023 made the TPU (JAX/Pallas) a first-class backend. Attention raises
+questions that apply to every TPU kernel:
 
-- The signature TPU-hard operation is paged attention's KV gather: the physical
-  page for a token is `block_table[seq, logical_page]`, known only at run time.
-  Plain XLA wants statically shaped, contiguous access, so this is the exact
-  pattern it cannot express (the motivation in the Ragged Paged Attention paper,
-  arXiv 2604.15464).
-- FlashAttention keeps running softmax state (max, denominator, accumulator)
-  across the KV loop. On a TPU the grid runs sequentially, unlike CUDA where the
-  KV loop is inside a concurrent thread block. Where does the state live and how
-  is the loop expressed?
-- Real models use grouped-query attention (num_kv_heads < num_heads) and ragged
-  batches (per-sequence context lengths).
-- We have no TPU on the development box. How do we develop and hold the kernels
-  to the same parity bar as the CUDA path?
+- Paged attention reads the page of a token from
+  `block_table[seq, logical_page]` at run time, a gather that plain XLA
+  cannot express. This motivates the Ragged Paged Attention (RPA) paper,
+  arXiv 2604.15464.
+- FlashAttention carries softmax state across the KV loop, but a TPU runs
+  its grid in sequence, not as concurrent thread blocks.
+- Models use grouped-query attention (GQA) and ragged batches (one context
+  length per sequence).
 
-The kernels built under this ADR: M0 row-wise softmax (scaffold), M1 dense
-flash-attention, M2 paged + ragged decode attention, a paged prefill /
-multi-query kernel, plus grouped-query support and a backend dispatcher.
+This ADR covers M0 row-wise softmax (scaffold), M1 dense flash-attention, M2
+paged + ragged decode attention, a paged prefill / multi-query kernel, and a
+dispatcher.
 
 ## Decision
 
-1. **Paging via scalar prefetch.** The block table and per-sequence lengths are
-   prefetched into SMEM with `pltpu.PrefetchScalarGridSpec`, and each KV
-   `BlockSpec.index_map` reads the block table to return the physical page for
-   the current grid step (`block_table[seq, page]`). This is the one place the
-   TPU toolchain accepts a runtime-computed page index; it is the readable
-   expression of RPA's "dynamic slicing over ragged memory."
-
-2. **Online softmax carried in VMEM across the sequential grid.** The KV/page
-   axis is the innermost grid axis, so successive lexicographic grid steps are
-   successive FlashAttention iterations. Running max/denominator/accumulator live
-   in `pltpu.VMEM` scratch that Pallas threads across steps; we reset on the
-   first step (`pl.when(step == 0)`) and finalize (`acc / l`) on the last. The
-   grid IS the loop.
-
-3. **Grouped-query attention by index_map mapping.** Query head `h` reads kv
-   head `h // (num_heads // num_kv_heads)`; no kv replication, so no wasted
-   memory or compute.
-
-4. **Ragged masking by absolute position.** A key at absolute position `j` is
-   valid for a sequence only if `j < length[seq]`; invalid scores get a large
-   finite negative sentinel (not `-inf`, to keep interpret-mode intermediates
-   finite). This covers partial final pages and page slots past a sequence's
-   real pages (which gather an in-bounds dummy page and are fully masked).
-
-5. **Vendor-first, per ADR-023.** We hand-write only where XLA cannot express
-   the memory pattern (the paged gather). The dense M1 kernel could ride XLA,
-   but we wrote it in Pallas deliberately to build the online-softmax foundation
-   that M2's paged kernel extends; it is the stepping stone, not a claim that
-   dense attention needs a custom kernel.
-
-6. **Develop and validate in interpret mode; confirm on hardware separately.**
-   Plain `jax` runs Pallas kernels in interpret mode on CPU
-   (`pallas_call(..., interpret=True)`). Every kernel is parity-tested there
-   against a NumPy reference and a PyTorch golden (cosine > 0.99 and allclose,
-   the ADR-023 bar), including a shuffled-physical-pages test that fails for any
-   kernel that ignores the block table. A standalone script
-   (`scripts/run_tpu_pallas_kernels.py`) runs the same kernels on a real TPU for
-   the on-hardware confirmation.
-
-7. **A backend dispatcher as the engine seam.** `dispatch_attention` routes to
-   the dense or paged kernel; `tpu_backend_available(require_device=...)` gates
-   on JAX and optionally a physical TPU. Nothing in the PyTorch runner routes to
-   it yet; that integration is deferred (see Consequences) and, per ADR-023,
-   must keep backend code isolated under `backends/`.
+1. Paging via scalar prefetch. `pltpu.PrefetchScalarGridSpec` loads the
+   block table and lengths into SMEM. Each KV `BlockSpec.index_map` reads it
+   and returns the physical page. Only here does the TPU toolchain accept a
+   runtime page index.
+2. Online softmax in VMEM across the sequential grid. The page axis is the
+   innermost grid axis, so each grid step is one FlashAttention iteration.
+   The running state lives in `pltpu.VMEM` scratch, reset at
+   `pl.when(step == 0)` and finalized as `acc / l`. The grid is the loop.
+3. GQA by index_map. Query head `h` reads kv head
+   `h // (num_heads // num_kv_heads)`, with no copy.
+4. Ragged masking by absolute position. A key at `j` is valid only if
+   `j < length[seq]`. Invalid scores get a large finite sentinel, not
+   `-inf`, so all values stay finite.
+5. Vendor-first, per ADR-023. We hand-write only the paged gather. M1 exists
+   as the online-softmax base for M2.
+6. Develop in interpret mode, a CPU emulation of Pallas
+   (`pallas_call(..., interpret=True)`). Each kernel must match a NumPy
+   reference and a PyTorch golden (cosine > 0.99 and allclose, the ADR-023
+   bar). A shuffled-physical-pages test catches a kernel that ignores the
+   block table. `scripts/run_tpu_pallas_kernels.py` runs the kernels on a
+   real TPU.
+7. `dispatch_attention` routes to the dense or paged kernel.
+   `tpu_backend_available(require_device=...)` gates on JAX and a TPU.
 
 ## Alternatives Considered
 
-1. **Manual double-buffered DMA** (as JAX's production `paged_attention` kernel
-   does, with `pltpu.make_async_copy` and semaphores). Rejected for this kernel
-   family: far more code and complexity for a readable reference. The index_map
-   indirection is clear, correct, and sufficient; DMA/prefetch tuning is a later
-   performance concern, not a correctness one.
-2. **Materialize each sequence's KV in XLA, then run dense attention.** Rejected:
-   that is not paging. It defeats the memory-efficiency point and does not
-   demonstrate the gather that motivates the whole exercise.
-3. **Implement GQA by replicating kv heads up to num_heads.** Rejected: wastes
-   HBM and bandwidth; the index_map head mapping is free.
-4. **Wait for real TPU access to develop.** Rejected: interpret mode lets us
-   develop and parity-test with zero hardware and zero cost; the on-TPU run is a
-   separate confirmation, not a prerequisite for correctness work.
+1. Manual double-buffered DMA (`pltpu.make_async_copy`), as the JAX
+   `paged_attention` kernel does. Rejected: far more code.
+2. Materialize the KV of each sequence in XLA. Rejected: that is not paging.
+3. Copy KV heads up to num_heads for GQA. Rejected: it wastes HBM.
+4. Wait for TPU access. Rejected: interpret mode needs no hardware.
 
 ## Consequences
 
-Positive:
-
-- The RPA-style dynamic KV gather is expressed and validated, on the JAX/XLA
-  through-line that also covers Trainium.
-- Readable reference kernels a paper reader can follow, held to the same parity
-  bar as the CUDA kernels.
-- Zero-cost, zero-hardware development and CI via interpret mode; grouped-query
-  and ragged batches supported.
-
-Costs and risks:
-
-- Interpret mode does NOT exercise real Mosaic lowering, tiling, or padding, so
-  on-TPU execution is a real, still-open confirmation step (run the script).
-- These are correctness-first reference kernels, not performance-tuned; block
-  sizes are conservative and there is no DMA pipelining.
-- Mixed prefill/decode batches (variable query length in one batch, RPA's
-  distribution-aware case) are a planned extension; decode and single-batch
-  paged prefill / multi-query are shipped.
-- Nothing is wired into the PyTorch runner yet. A JAX execution path in the
-  runner is a larger cross-framework effort, intentionally out of scope here to
-  respect ADR-023's backend-isolation rule; the dispatcher is the seam it will
-  plug into.
+- The RPA-style gather works on the JAX/XLA path, which also covers
+  Trainium.
+- The kernels are not tuned: conservative block sizes, no DMA pipelining.
+- The PyTorch runner does not use the kernels yet. That work is out of scope
+  under the ADR-023 backend-isolation rule.
 
 ## Amendment (2026-07-09): first real-TPU run
 
-The interpret-mode risk called out above materialized exactly as predicted, and
-the first run on real hardware (Colab TPU v5e) taught two things:
+On a Colab TPU v5e, the dense kernels passed: `dense causal=False` at cosine
+0.9999949 and `causal=True` at 0.9999963 against fp32 NumPy. The paged
+kernels broke the Mosaic block-shape rule, which interpret mode does not
+test. The last two dims of a block must be divisible by (8, 128) or equal
+the array dims, and `(1, page_size, 1, head_dim)` is neither.
 
-1. **Dense kernels PASS on hardware.** `dense causal=False` cosine 0.9999949,
-   `causal=True` cosine 0.9999963 vs the fp32 NumPy reference (the ~1e-3 max
-   abs error is the TPU's default matmul precision, not a logic difference).
-   This is the first on-hardware validation of the backend.
-2. **The paged kernels hit the Mosaic block-shape rule** that interpret mode
-   does not check: a block's last two dims must be divisible by (8, 128) or
-   equal the array dims. Blocks like `(1, page_size, 1, head_dim)` put a 1 in
-   the sublane slot over a >1 heads axis and are rejected at lowering.
+The fix is heads-first page pools,
+`(num_kv_heads, num_pages, page_size, head_dim)`, so every KV block ends in
+`(page_size, head_dim)`. Decode queries get a singleton axis, and prefill
+queries are transposed to `(num_seqs, num_heads, q_len, head_dim)`. Colab's
+preinstalled libtpu can also reject valid Mosaic ("expected <= 7 but got
+8"), so the notebook installs a matched `jax[tpu]` and restarts once.
 
-Resolution: the page pools are now **heads-first**,
-`(num_kv_heads, num_pages, page_size, head_dim)`, so every KV block's last two
-dims are exactly `(page_size, head_dim)`, equal to the array dims and legal for
-any page size. Decode queries gain an internal singleton axis and prefill
-queries are carried transposed as `(num_seqs, num_heads, q_len, head_dim)` for
-the same reason. JAX's production `paged_attention` kernel uses the same
-heads-first layout; the hardware constraint independently forced the same
-design. Also fixed en route: Colab's preinstalled libtpu can lag jaxlib and
-reject valid Mosaic ("expected <= 7 but got 8"); the Colab notebook installs a
-matched `jax[tpu]` and restarts once.
-
-**Closure (same day):** with the heads-first layout, the full suite passed on
-the TPU v5e: dense (causal and non-causal), paged decode (MHA and GQA), and
-paged prefill (MHA and GQA), all cosine >= 0.999995 vs the NumPy reference,
-exit 0 (commit 83321f8). The small (1, 1) and (q_len, 1) VMEM scratch shapes
-lowered without issue. The on-TPU confirmation step called out in Consequences
-is complete; results in docs/benchmarks/2026-07-09-tpu-v5e-pallas-kernels.md.
+With this layout, the full suite passed the same day (commit 83321f8).
+Dense, paged decode and paged prefill (MHA and GQA) all reached cosine >=
+0.999995 against NumPy. Results:
+docs/benchmarks/2026-07-09-tpu-v5e-pallas-kernels.md.
 
 ## Amendment (2026-07-09): mixed prefill/decode batches in one launch
 
-The "planned extension" in Consequences is now implemented:
-`pallas_paged_mixed_attention` serves a batch where some sequences are decoding
-(one new token) and some are prefilling (a chunk of new tokens) in a single
-kernel launch, the distribution-aware case the RPA design targets. Without it,
-an engine running continuous batching must split every scheduler step into a
-decode launch plus a prefill launch.
+`pallas_paged_mixed_attention` runs decoding and prefilling sequences in one
+kernel launch, the case RPA targets. Without it, continuous batching needs
+two launches per step.
 
-Design, relative to the uniform prefill kernel:
+- Queries are padded to `max_q_len`, and `q_lens` is a third
+  scalar-prefetch input. Row `t` of sequence `s` is real only if
+  `t < q_lens[s]`. The causal mask is `k_pos <= lengths[s] - q_lens[s] + t`,
+  and `q_lens[s] == 0` marks an inactive slot.
+- A fully masked padding row keeps its running max at the sentinel. Then
+  `exp(score - max)` is `exp(0) == 1`, and the row returns an average of
+  unrelated values. The kernel zeroes masked probabilities and divides
+  safely, so padding rows are exact zeros.
 
-- Queries are padded to the batch-wide `max_q_len`, and a per-sequence `q_lens`
-  array rides in SMEM as a THIRD scalar-prefetch input next to the block table
-  and lengths. Row `t` of sequence `s` is real only if `t < q_lens[s]`; the
-  causal mask becomes `k_pos <= lengths[s] - q_lens[s] + t`, with `q_lens[s]` a
-  runtime scalar where the prefill kernel had a compile-time constant.
-  `q_lens[s] == 0` marks an inactive batch slot, which continuous batching
-  produces naturally.
-- Padding rows exposed a real online-softmax trap: a row with EVERY score
-  masked keeps its running max at the sentinel, so `exp(score - max)` is
-  `exp(0) == 1` at all masked positions and the row would silently return a
-  plausible-looking average of unrelated values. The kernel zeroes masked
-  probabilities explicitly and safe-divides at finalize, so padding rows are
-  exact zeros (a tested contract, not an accident).
-- Layouts are unchanged from the prefill kernel (q transposed, pools
-  heads-first), so no new Mosaic tiling surface is introduced.
-
-The specialized decode and prefill kernels stay: they skip the padding waste
-(decode pays `max_q_len` times its query bandwidth through the mixed kernel)
-and they are the hardware-validated baselines the mixed kernel is tested
-against, per sequence, in tests/unit/test_tpu_pallas_mixed.py. Interpret-mode
-parity is complete (NumPy and PyTorch references, GQA included); on-TPU
-validation rides scripts/run_tpu_pallas_kernels.py, which now includes two
-mixed cases with shuffled physical pages, in the next Colab run.
+The decode and prefill kernels stay. They skip the padding waste and are the
+tested baselines in tests/unit/test_tpu_pallas_mixed.py. Interpret-mode
+parity is complete, and scripts/run_tpu_pallas_kernels.py has two mixed
+cases for the next Colab run.
