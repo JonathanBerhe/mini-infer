@@ -80,7 +80,7 @@ _TEST_GPU = os.environ.get("MINI_INFER_TEST_GPU", "H100")
 # A cost cap, not an expected duration. A hung container bills the whole cap.
 _TEST_TIMEOUT = int(os.environ.get("MINI_INFER_TEST_TIMEOUT", "1200"))
 
-_REPO = Path(__file__).resolve().parents[2]
+_REPO = Path(__file__).resolve().parent.parent.parent
 _LOCAL_FIXTURES = _REPO / "tests" / "fixtures"
 _LOCAL_PASSAGE = _REPO / "scripts" / "data" / "technical_passage.md"
 _REMOTE_FIXTURES = Path("/root/tests/fixtures")

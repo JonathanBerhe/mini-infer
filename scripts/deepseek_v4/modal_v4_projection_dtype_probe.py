@@ -68,7 +68,7 @@ _PROMPT_FILES = (
     "docs/architectures/gemma-4.md",
 )
 _REMOTE_PROMPT_DIR = "/root/data/prompt"
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 app = modal.App("mini-infer-v4-projection-dtype-probe")
 
