@@ -12,7 +12,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mini_infer.engine.cuda_graph_decode import supports_decode_cuda_graph
+from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph, supports_decode_cuda_graph
+from mini_infer.engine.decode_step_timer import DecodeStepTimer
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
 from mini_infer.models.qwen3_5 import Qwen35Config, Qwen35ForConditionalGeneration
@@ -95,6 +96,36 @@ def test_support_needs_cuda_and_the_model_opt_in() -> None:
     assert not supports_decode_cuda_graph(model, "cpu")
     assert not supports_decode_cuda_graph(model, "mps")
     assert not supports_decode_cuda_graph(object(), "cuda")
+
+
+@pytest.mark.parametrize("timed", [False, True])
+def test_replay_fills_inference_tensors_without_raising(timed: bool) -> None:
+    """torch 2.5 makes the graph's RNG state inference tensors and fills them on replay.
+
+    The capture runs in inference mode, so torch 2.5 allocates the seed and
+    offset tensors as inference tensors. Every replay fills them in place.
+    The scheduler replays outside inference mode, so `replay` must enter it.
+    """
+    with torch.inference_mode():
+        rng_seed = torch.zeros(1, dtype=torch.long)
+
+    class _Torch25Graph:
+        def replay(self) -> None:
+            rng_seed.fill_(7)
+
+    # The real constructor captures on a CUDA device; build the replay side only.
+    graph = DecodeCudaGraph.__new__(DecodeCudaGraph)
+    graph._timer = DecodeStepTimer("cpu") if timed else None
+    graph._input_ids = torch.zeros(2, 1, dtype=torch.long)
+    graph._positions = torch.zeros(2, dtype=torch.long)
+    graph._logits = torch.zeros(2, VOCAB)
+    graph._graph = _Torch25Graph()  # type: ignore[assignment]
+
+    assert not torch.is_inference_mode_enabled()
+    graph.replay(torch.tensor([[3], [5]]), torch.tensor([9, 4]))
+    assert rng_seed.item() == 7
+    assert graph._input_ids.flatten().tolist() == [3, 5]
+    assert graph._positions.tolist() == [9, 4]
 
 
 def test_scheduler_rejects_cuda_graph_where_unsupported() -> None:
