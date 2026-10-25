@@ -1,7 +1,10 @@
 # DeepSeek-V4.1-Flash port plan
 
 Date: 2026-10-24
-Status: Proposed. Nothing is built yet. Stage A (design study) is next.
+Updated: 2026-10-25, Stage A done.
+Status: Stage A (design study) done in
+[ADR-047](../decisions/ADR-047-deepseek-v41-flash-design.md). Stage B
+(text-only port) is next.
 
 Model: `deepseek-ai/DeepSeek-V4.1-Flash` (released 2026-09-10) and its
 weight refresh `deepseek-ai/DeepSeek-V4.1-Flash-1017` (released
@@ -222,7 +225,29 @@ cache is about 3.2 KB per token. 16 requests at 128K tokens need about
 
 ## Stages and gates
 
-### Stage A: design study (CPU only, no code shipped)
+### Stage A: design study (CPU only, no code shipped), done
+
+Done (2026-10-25): see
+[ADR-047](../decisions/ADR-047-deepseek-v41-flash-design.md). All eight
+unknowns have answers from the reference code, a CPU run of the reference
+with PyTorch kernel stand-ins, and a rebuild of the Engram layout. Three
+results change the later stages:
+
+- The reference's own prefill and decode disagree when indexer scores tie,
+  because `torch.topk` breaks ties by row width. With a lower-index tie rule
+  they agree within 2.4e-6. The port and the parity harness use that rule.
+- With the FP8 and FP4 round trips on, float noise crosses rounding
+  boundaries, so even the reference does not match itself exactly. The
+  parity contract separates quantization-off equality from quantization-on
+  agreement.
+- The Engram layout rebuilt from the configuration and the tokenizer
+  matches the checkpoint's table sizes and compressed vocabulary exactly.
+
+**Gate** (did not trigger): shared compressed KV needs only a new field in
+`StateLayerSpec`. Prefix sharing works unchanged, and the prefill/decode
+split path does not serve `StateCache` models.
+
+Original plan text follows.
 
 Resolve the parity-critical unknowns against the reference code, not
 the report's prose, and record them in a new ADR:
