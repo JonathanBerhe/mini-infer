@@ -69,6 +69,9 @@ the whole tree to find the code of one model.
   path in the Triton cache key changes, so the first GPU run compiles each
   kernel again. One kernel docstring names a moved script. That kernel
   compiles to the same PTX and SASS for sm90 and sm100.
+- The GPU unit tests pass on an A10 (46 tests), an H100 (312 tests) and a
+  B200 (283 tests). A later move must also update the imports inside code
+  strings, for example the script that a test runs in a subprocess.
 - Every open branch that touches a moved file needs a rebase. Git detects
   the renames, so most conflicts resolve automatically.
 - A new port adds one package, one test folder and one script folder. It
