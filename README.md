@@ -61,10 +61,10 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 | `MixtralForCausalLM` | Mixtral 8x7B, 8x22B | [doc](docs/architectures/mixtral.md) |
 | `DeepseekV2ForCausalLM` | DeepSeek-V2, V3, Kimi-K2 | [doc](docs/architectures/deepseek-v2-mla.md) |
 | `DeepseekV4ForCausalLM` | DeepSeek-V4-Pro, V4-Flash | [doc](docs/architectures/deepseek-v4.md) |
-| `GlmMoeDsaForCausalLM` | GLM-5.2, GLM-5.3 | [ADR-021](docs/decisions/ADR-021-glm-moe-dsa-port.md) |
+| `GlmMoeDsaForCausalLM` | GLM-5.2, GLM-5.3 | [doc](docs/architectures/glm-moe-dsa.md) |
 | `MiniMaxM3SparseForConditionalGeneration` | MiniMax-M3 (text only) | [doc](docs/architectures/minimax-m3.md) |
 | `InklingForConditionalGeneration` | Inkling (text only) | [doc](docs/architectures/inkling.md) |
-| `KimiLinearForCausalLM` | Kimi Linear 48B | [ADR-026](docs/decisions/ADR-026-kimi-linear-kda-port.md) |
+| `KimiLinearForCausalLM` | Kimi Linear 48B | [doc](docs/architectures/kimi-linear.md) |
 | `NemotronHForCausalLM` | Nemotron 3.5 Lightning 30B-A3B, Nemotron 3 Nano 4B (text only) | [doc](docs/architectures/nemotron-h.md) |
 
 To add a model family, add a folder in `src/mini_infer/models/`. Build the model from the shared blocks in `src/mini_infer/models/blocks/` (RMSNorm, RoPE, attention, MoE). Decorate the class with `@register_model`, and import its module in `_register_builtin_models()` in [`models/__init__.py`](src/mini_infer/models/__init__.py). [mistral.py](src/mini_infer/models/mistral/mistral.py) is the shortest example.
