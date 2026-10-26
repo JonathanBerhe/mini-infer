@@ -36,19 +36,19 @@ against the reference at FP32 with cosine-sim 1.0000 and max abs diff
 
 | Paper primitive | Reference (`third_party/deepseek_v4_reference/model.py`) | Our code |
 |---|---|---|
-| Backbone | `class Transformer` (L769) | `DeepseekV4ForCausalLM` in `src/mini_infer/models/deepseek_v4.py` (L586) |
-| Decoder layer | `class Block` (L647) | `Block` in `src/mini_infer/models/blocks/deepseek_v4_decoder_layer.py` |
-| Token-level compressor | `class Compressor` (L279) | `TokenLevelCompressor` in `blocks/v4/compressor.py` (L43) |
-| Lightning Indexer | `class Indexer` (L380) | `LightningIndexer` in `blocks/v4/lightning_indexer.py` (L61) |
-| Attention Sink | inside `Attention` (L436) | `AttentionSink` in `blocks/v4/sink.py` |
-| Grouped output projection | `Attention.wo_a` / `wo_b` (L520-540) | `GroupedOutputProjection` in `blocks/v4/grouped_output.py` |
-| HCA (full long-range attention) | `Attention.forward` with `m'` (L436) | `HCAAttention` in `blocks/hca.py` (L204) |
-| CSA (chunked SWA + Indexer) | `Attention.forward` with overlap (L436) | `CSAAttention` in `blocks/csa.py` |
-| SWA (ratio=0 fallback) | implicit in `Attention` | `SWAAttention` in `blocks/swa.py` |
-| Hash-routed gate | `class Gate` (L546) | `HashRoutedGate` in `blocks/hash_routed_gate.py` |
-| Hash-routed MoE FFN | `class MoE` (L609) | `HashRoutedMoEFFN` in `blocks/hash_routed_moe_ffn.py` |
-| Hyper-Connections | `Block.forward` mixing (L676-700) | `HyperConnections` in `blocks/hyper_connections.py` (L137); core kernel `hc_split_sinkhorn` (L56) |
-| HC head reduction | `Transformer.forward` final mix (L800-820) | `HCHeadReduction` in `blocks/hyper_connections.py` (L265) |
+| Backbone | `class Transformer` (L769) | `DeepseekV4ForCausalLM` in `src/mini_infer/models/deepseek_v4/deepseek_v4.py` (L586) |
+| Decoder layer | `class Block` (L647) | `Block` in `src/mini_infer/models/deepseek_v4/decoder_layer.py` |
+| Token-level compressor | `class Compressor` (L279) | `TokenLevelCompressor` in `deepseek_v4/compressor.py` (L43) |
+| Lightning Indexer | `class Indexer` (L380) | `LightningIndexer` in `deepseek_v4/lightning_indexer.py` (L61) |
+| Attention Sink | inside `Attention` (L436) | `AttentionSink` in `deepseek_v4/sink.py` |
+| Grouped output projection | `Attention.wo_a` / `wo_b` (L520-540) | `GroupedOutputProjection` in `deepseek_v4/grouped_output.py` |
+| HCA (full long-range attention) | `Attention.forward` with `m'` (L436) | `HCAAttention` in `deepseek_v4/hca.py` (L204) |
+| CSA (chunked SWA + Indexer) | `Attention.forward` with overlap (L436) | `CSAAttention` in `deepseek_v4/csa.py` |
+| SWA (ratio=0 fallback) | implicit in `Attention` | `SWAAttention` in `deepseek_v4/swa.py` |
+| Hash-routed gate | `class Gate` (L546) | `HashRoutedGate` in `deepseek_v4/hash_routed_gate.py` |
+| Hash-routed MoE FFN | `class MoE` (L609) | `HashRoutedMoEFFN` in `deepseek_v4/hash_routed_moe_ffn.py` |
+| Hyper-Connections | `Block.forward` mixing (L676-700) | `HyperConnections` in `deepseek_v4/hyper_connections.py` (L137); core kernel `hc_split_sinkhorn` (L56) |
+| HC head reduction | `Transformer.forward` final mix (L800-820) | `HCHeadReduction` in `deepseek_v4/hyper_connections.py` (L265) |
 | YaRN long-context RoPE | `precompute_freqs_cis` (L200) | `RotaryEmbedding` in `blocks/rope.py`, two tables per model (see §3.1) |
 | Per-request state | `Attention` mutable buffers (single-request) | `StateCache` in `cache/state_cache.py` + `build_state_cache_layer_specs` |
 
@@ -70,7 +70,7 @@ class Transformer(nn.Module):
         # embedding + N x Block + RMSNorm + ParallelHead
 ```
 
-**Our code (`src/mini_infer/models/deepseek_v4.py:586`)**:
+**Our code (`src/mini_infer/models/deepseek_v4/deepseek_v4.py:586`)**:
 ```python
 class DeepseekV4ForCausalLM(BaseCausalLM):
     # embed_tokens + _DeepseekV4InnerModel + lm_head
@@ -99,14 +99,14 @@ branched on `args.compress_ratios[layer_idx]`. The forward pass picks
 between `local_attention` (SWA-style) and a compressed-history path.
 
 **Our code**: three separate classes for the three modes.
-- `SWAAttention` (`blocks/swa.py:14`)
-- `CSAAttention` (`blocks/csa.py:25`)
-- `HCAAttention` (`blocks/hca.py:204`)
+- `SWAAttention` (`deepseek_v4/swa.py:14`)
+- `CSAAttention` (`deepseek_v4/csa.py:25`)
+- `HCAAttention` (`deepseek_v4/hca.py:201`)
 
 Three files because the per-mode forward + per-mode KV-cache layout
 differ enough that a single class would obscure the math. The shared
 primitives (Q-LoRA, partial RoPE, AttentionSink, GroupedOutputProjection)
-are factored out into `blocks/v4/`.
+are factored out into `deepseek_v4/`.
 
 ### Token-level compressor (paper §2.2)
 
@@ -123,7 +123,7 @@ def forward(self, hidden_states, start_pos, ratio):
     # Sum-pool weighted by scores
 ```
 
-**Our code (`blocks/v4/compressor.py:43`, `class TokenLevelCompressor`)**:
+**Our code (`deepseek_v4/compressor.py:43`, `class TokenLevelCompressor`)**:
 - `forward` (L113): the textbook prefill compressor.
 - `forward_prefill_with_cache` (L165): cache-aware prefill (incremental
   prompt processing for chunked-prefill scheduling).
@@ -156,7 +156,7 @@ def forward(self, hidden_states, prev_kv, start_pos):
     # Returns (topk_indices, scores)
 ```
 
-**Our code (`blocks/v4/lightning_indexer.py:61`, `class LightningIndexer`)**:
+**Our code (`deepseek_v4/lightning_indexer.py:61`, `class LightningIndexer`)**:
 - `forward` (L134): standalone prefill (full-attention indexer for
   small contexts).
 - `forward_prefill_with_cache` (L216): cache-aware prefill where the
@@ -173,7 +173,7 @@ when no key matches the query well — critical for long-context stability.
 `attn_sink: shape (n_heads,)`. Added to the softmax denominator via
 `exp(sink) + sum(exp(scores))`.
 
-**Our code (`blocks/v4/sink.py`, `class AttentionSink`)**: same math,
+**Our code (`deepseek_v4/sink.py`, `class AttentionSink`)**: same math,
 small class so it's reusable across HCA / CSA / SWA. Per-head learnable
 logit, added to softmax denom.
 
@@ -186,7 +186,7 @@ before the output projection. The output projection has two parts:
 **Reference (`model.py:520-540`)**: `Attention` has `wo_a` and `wo_b`
 projections.
 
-**Our code (`blocks/v4/grouped_output.py`, `class GroupedOutputProjection`)**:
+**Our code (`deepseek_v4/grouped_output.py`, `class GroupedOutputProjection`)**:
 same two-stage projection; exposed as a reusable block.
 
 ## §2.3 — HCA: full long-range attention
@@ -200,7 +200,7 @@ compressed sequence is already short.
 attention uses the compressor's output as the K cache. Q stays at full
 resolution.
 
-**Our code (`blocks/hca.py:204`, `class HCAAttention`)**:
+**Our code (`deepseek_v4/hca.py:201`, `class HCAAttention`)**:
 - `forward` (L284): single-shot prefill.
 - `forward_prefill_with_cache` (L365): cache-aware prefill.
 - `forward_decode_step` (later in file): per-token decode.
@@ -221,7 +221,7 @@ selected compressed history. Two attention paths fused.
 **Reference**: same `class Attention`, but with `ratio=4` and the
 indexer active.
 
-**Our code (`blocks/csa.py:25`, `class CSAAttention`)**: same shape as
+**Our code (`deepseek_v4/csa.py:25`, `class CSAAttention`)**: same shape as
 HCA, plus the indexer wiring + the overlap-mode compressor for the
 in-flight chunk.
 
@@ -234,7 +234,7 @@ with no compressor and no indexer.
 **Reference**: implicit — `ratio=0` is handled inside `class Attention`
 by skipping the compressed path.
 
-**Our code (`blocks/swa.py:14`, `class SWAAttention`)**: separate file
+**Our code (`deepseek_v4/swa.py:14`, `class SWAAttention`)**: separate file
 to keep the V4-Flash head clean. The "no compressor, no indexer" path
 is much simpler than HCA / CSA and benefits from its own implementation
 rather than a branch inside a shared class.
@@ -254,7 +254,7 @@ V4's MoE has two routing modes:
 **Reference (`model.py:546`, `class Gate`)**: handles both routing modes
 in one class via a `routing_mode` flag.
 
-**Our code (`blocks/hash_routed_gate.py`, `class HashRoutedGate`)**:
+**Our code (`deepseek_v4/hash_routed_gate.py`, `class HashRoutedGate`)**:
 same two-mode design. The `score_func` parameter picks between the three
 score functions (paper §2.2 specifies different ones for different
 layers).
@@ -264,9 +264,9 @@ layers).
 **Reference (`model.py:609`, `class MoE`)**: routed experts + shared
 experts. Shared experts are collapsed into a single MLP (V2/V3 trick).
 
-**Our code (`blocks/hash_routed_moe_ffn.py`, `class HashRoutedMoEFFN`)**:
+**Our code (`deepseek_v4/hash_routed_moe_ffn.py`, `class HashRoutedMoEFFN`)**:
 same shape. Routed experts use the standard Mixtral-shape expert MLP
-(`blocks/mixtral_moe.py::MixtralExpert`); the shared experts are
+(`blocks/moe/mixtral_moe.py::MixtralExpert`); the shared experts are
 collapsed into one MLP whose intermediate_size is `n_shared * shared_intermediate`.
 
 Every expert, routed and shared, clamps its two projections before the
@@ -290,7 +290,7 @@ repo's kernel.py / model.py mixing math). Performs `n` Sinkhorn
 iterations on a learnable mixing matrix to produce a doubly-stochastic
 matrix.
 
-**Our code (`blocks/hyper_connections.py`, `hc_split_sinkhorn`)**:
+**Our code (`deepseek_v4/hyper_connections.py`, `hc_split_sinkhorn`)**:
 two implementations behind one dispatcher.
 
 - `_hc_split_sinkhorn_torch`: line-by-line transcription of the
@@ -298,7 +298,7 @@ two implementations behind one dispatcher.
   accumulator, same iteration count (`hc_sinkhorn_iters = 20`), same
   `eps = 1e-6`. The numerical oracle and the CPU / MPS path. See
   ADR-014 for the original transcription decision.
-- `hc_split_sinkhorn_triton` (`blocks/hc_sinkhorn_kernel.py`): fused
+- `hc_split_sinkhorn_triton` (`deepseek_v4/hc_sinkhorn_kernel.py`): fused
   Triton kernel, CUDA fast path. One launch replaces ~50 PyTorch op
   dispatches per call; measured ~14x per-call latency reduction on
   L40S at V4's `hc=4, iters=20`. Restored to kernel form because the
@@ -313,7 +313,7 @@ two implementations behind one dispatcher.
 `hc_pre` → attention → `hc_post` → FFN → `hc_post` (the "pre/post"
 mixing happens before and after each sub-block).
 
-**Our code (`blocks/hyper_connections.py:137`, `class HyperConnections`)**:
+**Our code (`deepseek_v4/hyper_connections.py:137`, `class HyperConnections`)**:
 - `hc_pre` (L185): mixes the `hc_mult` copies before a sub-block.
   Returns `(branch_input, residual, mix_matrix)` so the sub-block runs
   on the mixed input, and `hc_post` can combine its output with the
@@ -327,7 +327,7 @@ mixing happens before and after each sub-block).
 stack, the `hc_mult` copies are collapsed back to one hidden state
 before the LM head.
 
-**Our code (`blocks/hyper_connections.py:265`, `class HCHeadReduction`)**:
+**Our code (`deepseek_v4/hyper_connections.py:265`, `class HCHeadReduction`)**:
 the collapse step. `(B, T, hc_mult, dim) → (B, T, dim)`. Same math as
 the reference; explicit class because the reduction is shared between
 the LM-head path and any future probe of the per-copy state.
@@ -359,7 +359,7 @@ Lightning Indexer of a compressed layer use that layer's table. An
 earlier version used one `rope_theta` table with YaRN for every layer.
 On an 8,192-token prompt that version scored a perplexity of 247
 instead of 4.4 (`docs/benchmarks/2026-10-19-v4-projection-dtype.md`).
-`tests/unit/test_v4_rope_tables.py` compares each layer's table with
+`tests/unit/models/deepseek_v4/test_v4_rope_tables.py` compares each layer's table with
 the reference's `precompute_freqs_cis`.
 
 ## Decoder-layer assembly
@@ -376,7 +376,7 @@ def forward(self, h, start_pos, freqs_cis):
     return h
 ```
 
-**Our code (`blocks/deepseek_v4_decoder_layer.py`, `class Block`)**:
+**Our code (`deepseek_v4/decoder_layer.py`, `class Block`)**:
 same shape. Wraps the per-layer attention type (SWA/CSA/HCA) +
 HashRoutedMoEFFN (or SwiGLU for the dense layers) + HyperConnections.
 
@@ -401,7 +401,7 @@ request).
 **Our code**: `StateCache` in `src/mini_infer/cache/state_cache.py`
 generalizes this to a multi-request engine. Each request has a `StateCacheRequest`
 holding the per-layer state spec. `build_state_cache_layer_specs(config, ...)`
-in `models/deepseek_v4.py:500` constructs the spec list from a V4 config.
+in `models/deepseek_v4/deepseek_v4.py:500` constructs the spec list from a V4 config.
 
 ## Validation
 
@@ -483,7 +483,7 @@ Two config flags select one of three modes:
   same numbers as the kernels. The second flag needs the first, because
   the reference never quantizes GEMM inputs without the QAT round trips.
 
-The code is in `blocks/v4/act_quant.py`. It transcribes the tilelang
+The code is in `deepseek_v4/act_quant.py`. It transcribes the tilelang
 kernels and the Hadamard transform into PyTorch. Like the kernels, it
 computes in FP32 and casts back to the input dtype. Each attention
 block, the indexer and the MoE FFN take `act_quant: SimulatedActQuant
@@ -550,7 +550,7 @@ Pulled out into [ADR-014](../decisions/ADR-014-deepseek-v4-hybrid-attention.md):
 1. **Three attention classes instead of one**. Reference has one
    `class Attention` that switches on `ratio`. We split into
    `SWAAttention` / `CSAAttention` / `HCAAttention`. Cleaner per-mode
-   forward; the shared primitives are in `blocks/v4/`.
+   forward; the shared primitives are in `deepseek_v4/`.
 2. **Tilelang → PyTorch transcription for `hc_split_sinkhorn`**. The
    reference uses a tilelang kernel; we transcribed it into plain
    PyTorch. We're FP32 / 20-iteration / `eps=1e-6` identical to the
@@ -571,8 +571,8 @@ Pulled out into [ADR-014](../decisions/ADR-014-deepseek-v4-hybrid-attention.md):
   Original at the V4-Pro HF repo's `inference/` directory.
 - **Paper**: `docs/papers/deepseek-v4.pdf`.
 - **ADR-014**: design decisions made along the way.
-- **Our model class**: `src/mini_infer/models/deepseek_v4.py`.
-- **Per-primitive blocks**: `src/mini_infer/models/blocks/v4/` for the
+- **Our model class**: `src/mini_infer/models/deepseek_v4/deepseek_v4.py`.
+- **Per-primitive blocks**: `src/mini_infer/models/deepseek_v4/` for the
   V4-specific primitives, `blocks/{hca,csa,swa,hyper_connections,
   hash_routed_gate,hash_routed_moe_ffn}.py` for the larger pieces.
 - **Loader**: `DeepseekV4ForCausalLM.load_weights` handles the

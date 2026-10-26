@@ -72,7 +72,7 @@ likely causes, most likely first:
 - Two FA paths need upkeep, but both are short (about 80 lines to revert).
 - On M1 (CPU, fp32), 75 unit and 3 golden tests pass. On Modal A10, the smoke
   test passes on both paths, with bf16 tail drift on the longest prompt only.
-  `tests/unit/test_packed_attention.py::test_paged_flash_matches_torch_reference`
+  `tests/unit/cache/test_packed_attention.py::test_paged_flash_matches_torch_reference`
   (`requires_cuda`) covers paged FA.
 - Full numbers: `docs/benchmarks/2026-04-27-packed-forward.md` ("Paged vs
   materialized FA" section).

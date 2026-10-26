@@ -1,8 +1,8 @@
 """The technique registry: the single source of truth for what gets benched.
 
 Kept separate from `harness.py` (the model-agnostic core) and shared by both
-the local entry point (`scripts/bench_all.py`) and the Modal GPU wrapper
-(`scripts/modal_bench_all.py`), so CPU and GPU runs bench the exact same set of
+the local entry point (`scripts/bench/bench_all.py`) and the Modal GPU wrapper
+(`scripts/bench/modal_bench_all.py`), so CPU and GPU runs bench the exact same set of
 techniques against the exact same workload.
 
 The heavy imports (`ModelRunner` and the schedulers) live inside

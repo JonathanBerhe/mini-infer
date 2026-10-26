@@ -109,7 +109,7 @@ class PrefillWorker:
         forward call instead of B, which is the throughput win
         production engines deliver on the prefill side. Parity is
         validated against the per-request loop in
-        `tests/unit/test_workers_batch.py`.
+        `tests/unit/workers/test_workers_batch.py`.
 
         Limitations today:
           - All requests share the cache's block pool. If the combined

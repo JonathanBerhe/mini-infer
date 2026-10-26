@@ -72,7 +72,7 @@ same K/V bits as a new prefill of the same prompt.
 - On M1 (CPU, fp32), 21 + 12 = 33 prefix-cache tests pass, and the 75
   existing tests stay green. On Qwen2.5-0.5B, the cached output equals the
   uncached output token for token
-  (`tests/unit/test_scheduler.py::test_prefix_cache_matches_no_cache`,
+  (`tests/unit/scheduler/test_scheduler.py::test_prefix_cache_matches_no_cache`,
   `tests/stress/test_prefix_cache_load.py::test_shared_system_prompt_parity`).
   20 unique long prompts on a 64-block pool complete without OOM
   (`tests/stress/test_prefix_cache_load.py::test_eviction_under_unique_prompts`).

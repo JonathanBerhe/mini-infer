@@ -23,7 +23,7 @@ warps do different jobs).
 ## Decision
 
 1. A Gluon kernel for sm90 (H100) in
-   `models/blocks/fp8_grouped_gluon.py`. It keeps the numerics of ADR-037:
+   `models/blocks/moe/fp8_grouped_gluon.py`. It keeps the numerics of ADR-037:
    each e4m3 weight times its fp32 block scale, rounded to bf16, then a bf16
    multiply into an fp32 accumulator.
 2. A work item is one expert, one tile of its token rows and one tile of

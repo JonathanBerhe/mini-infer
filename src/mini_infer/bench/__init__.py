@@ -1,7 +1,7 @@
 """Uniform benchmarking: run one workload through many techniques, one table.
 
 See `harness.py` for the design. The concrete technique registry (which knows
-about `ModelRunner` and the schedulers) lives in `scripts/bench_all.py`, the
+about `ModelRunner` and the schedulers) lives in `scripts/bench/bench_all.py`, the
 single CLI entry point.
 """
 

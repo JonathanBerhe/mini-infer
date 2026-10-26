@@ -15,7 +15,7 @@ import torch
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.engine.dspark import Qwen3DSparkConfig, Qwen3DSparkDrafter
-from mini_infer.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
+from mini_infer.models.qwen.qwen3 import Qwen3Config, Qwen3ForCausalLM
 
 VOCAB = 64
 HIDDEN = 32

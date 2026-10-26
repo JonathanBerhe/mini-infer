@@ -13,7 +13,7 @@ output always shows the full technique surface and what was and wasn't measured.
 
 The harness core is deliberately model-agnostic and import-light (torch is
 touched only in `BenchEnv.detect`); the concrete technique registry that knows
-about `ModelRunner` / schedulers lives in `scripts/bench_all.py`.
+about `ModelRunner` / schedulers lives in `scripts/bench/bench_all.py`.
 """
 
 from __future__ import annotations

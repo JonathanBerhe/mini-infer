@@ -74,5 +74,5 @@ supported only batch 1.
   batch-aware cache. `test_batched_decode_matches_serial` runs 3 concurrent
   requests and matches a serial reference token-for-token.
   `test_short_request_finishing_first_does_not_corrupt_others` covers the
-  drift. On a Modal A10, `scripts/modal_concurrent_smoke.py` runs 4
+  drift. On a Modal A10, `scripts/smoke/modal_concurrent_smoke.py` runs 4
   concurrent requests that match a serial run.

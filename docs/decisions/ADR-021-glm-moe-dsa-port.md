@@ -28,7 +28,7 @@ Status: Accepted
 > - Correction: since transformers 5.14 the indexer also uses interleaved
 >   RoPE, and so does the port.
 >
-> No GLM-5.3 weights ran on a GPU. `tests/unit/test_glm53_config.py` keeps
+> No GLM-5.3 weights ran on a GPU. `tests/unit/models/glm/test_glm53_config.py` keeps
 > these facts under test.
 
 ## Context
@@ -55,7 +55,7 @@ for bit) on synthetic configurations.
 ## Decision
 
 Port GLM-5.2 through the existing PagedKVCache engine and reuse the
-DeepSeek-V2 code (`src/mini_infer/models/deepseek_v2.py`, with
+DeepSeek-V2 code (`src/mini_infer/models/deepseek_v2/deepseek_v2.py`, with
 [ADR-014](ADR-014-deepseek-v4-hybrid-attention.md) as the MLA and
 sparse-attention precedent). Test each level against the HF `glm_moe_dsa`
 reference, from RoPE to multi-step greedy decode.
@@ -64,23 +64,23 @@ reference, from RoPE to multi-step greedy decode.
    default, so V2, V3 and Kimi stay bit-identical. They add the
    `use_interleaved_rope` flag, an optional `indexer` hook, a `dsa_topk`
    argument and `compute_dsa_topk`.
-2. `GlmDsaIndexer` (`models/blocks/glm_dsa_indexer.py`) selects the top-k
+2. `GlmDsaIndexer` (`models/glm/dsa_indexer.py`) selects the top-k
    raw tokens. `forward_cached` writes keys to a PagedKVCache `index_k`
    stream and scores the full history in decode.
 3. A DSA sparse mask (`cache/mla_attention.py`). An optional `dsa_topk`
    masks all keys except the selected ones to `-inf`, as HF's
    `index_mask + causal_mask` does. `None` keeps the dense V2/V3 behavior.
-4. `GlmNoAuxTcGate` and `GlmMoeFFN` (`models/blocks/glm_moe_gate.py`). The
+4. `GlmNoAuxTcGate` and `GlmMoeFFN` (`models/blocks/moe/glm_moe_gate.py`). The
    sigmoid `noaux_tc` router uses the selection bias only to choose the
    experts, and weights them by the unbiased scores. The FFN reuses
    `MixtralExpert`.
-5. `GlmMoeDsaForCausalLM` (`models/glm_moe_dsa.py`). Full layers carry an
+5. `GlmMoeDsaForCausalLM` (`models/glm/glm_moe_dsa.py`). Full layers carry an
    `index_k` stream in `per_layer_streams`, ordered first so that layer 0
    allocates the blocks. `load_weights` dequantizes the block-FP8
    checkpoint (e4m3 + `weight_scale_inv`, with ceil for partial blocks such
    as the 576-row `kv_a_proj`). It maps global to local experts, so each
    rank loads only its experts under TP. It drops the MTP layer.
-6. FP8-resident experts (`blocks/fp8_expert.py`). `Fp8Expert` keeps each
+6. FP8-resident experts (`blocks/moe/fp8_expert.py`). `Fp8Expert` keeps each
    routed expert in e4m3 with a ceil-block scale and dequantizes per
    matmul. So the FP8 checkpoint fits 8xH200 without the ~1.5 TB BF16 copy.
    `from_hf` sets `expert_dtype="fp8"` from the checkpoint's
@@ -109,8 +109,8 @@ On L4 GPUs, the MoE expert dispatch has a GPU-vs-CPU fp32 gap. So TP
 results must be compared with a reference on the same device.
 
 The published checkpoint is per-expert block-FP8 (~755 GB, read from the
-index by `scripts/inspect_glm_safetensors.py`). The routed experts are ~96%
-of the weights, and the FP8-resident model takes ~785 GB on 8xH200. `scripts/modal_glm_stage_weights.py` stages the weights
+index by `scripts/glm/inspect_glm_safetensors.py`). The routed experts are ~96%
+of the weights, and the FP8-resident model takes ~785 GB on 8xH200. `scripts/glm/modal_glm_stage_weights.py` stages the weights
 on a CPU-only function. The 753B checkpoint itself did not run, because it
 needs a multi-GPU node.
 
@@ -134,6 +134,6 @@ on the CPU in fp32 unless the row names a GPU:
 | `test_batched_decode_matches_hf` | two ragged prompts match HF |
 | `test_glm_dsa_prefix_cache` | prefix-hit logits match full prefill |
 | `test_glm_moe_tp_parity` | CPU gloo, ws=2: ranks identical, matches ws=1 |
-| `scripts/modal_glm_smoke.py` | NVIDIA L4: fp32 parity exact (cos 1.0) |
-| `scripts/modal_glm_tp_smoke.py` | 2x L4, NCCL: ranks identical (diff 0) |
+| `scripts/glm/modal_glm_smoke.py` | NVIDIA L4: fp32 parity exact (cos 1.0) |
+| `scripts/glm/modal_glm_tp_smoke.py` | 2x L4, NCCL: ranks identical (diff 0) |
 | `test_glm_fp8_load` | fp8-resident logits == bf16-dequant |

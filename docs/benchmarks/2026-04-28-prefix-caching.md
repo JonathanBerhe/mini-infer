@@ -6,7 +6,7 @@ Model: Qwen2.5-0.5B-Instruct
 Engine: mini-infer @ commit `9646cd2` (prefix caching slice)
 Kernel path: materialized FlashAttention varlen (`block_size=16`)
 Pool: 12,272 blocks (auto-bumped from default 1024 to fit cache-OFF C=8)
-Script: `scripts/modal_packed_bench.py --config prefix`
+Script: `scripts/bench/modal_packed_bench.py --config prefix`
 
 ## Workload
 
@@ -76,7 +76,7 @@ The C=8 result is the realistic chat-server upper bound at this prompt size:
   forward consumes exactly the same way it would for freshly-prefilled
   blocks. (Token-for-token parity vs the no-cache reference was already
   verified on M1 in
-  [tests/unit/test_scheduler.py::test_prefix_cache_matches_no_cache](../../tests/unit/test_scheduler.py).)
+  [tests/unit/scheduler/test_scheduler.py::test_prefix_cache_matches_no_cache](../../tests/unit/scheduler/test_scheduler.py).)
 - The auto-bumped pool (12,272 blocks ≈ 2.4 GB of K/V on A10) handled both
   legs without OOM. Cache OFF holds 8 × 16k tokens = ~127k tokens of K/V at
   peak; cache ON holds 1 × 16k shared + 8 × tail ≈ 16k tokens — the cache
@@ -100,7 +100,7 @@ The C=8 result is the realistic chat-server upper bound at this prompt size:
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config prefix
+uv run modal run scripts/bench/modal_packed_bench.py --config prefix
 ```
 
 Defaults: A10, target_prompt_tokens=12000 (tokenizes to ~15.9k), max_tokens=32,
@@ -112,5 +112,5 @@ concurrencies=1,4,8. Set `MINI_INFER_BENCH_GPU=H100` for an H100 sweep.
 - Implementation: `src/mini_infer/cache/prefix_cache.py`,
   `src/mini_infer/cache/paged_kv_cache.py`,
   `src/mini_infer/cache/block_pool.py`.
-- M1 parity test: `tests/unit/test_scheduler.py::test_prefix_cache_matches_no_cache`.
+- M1 parity test: `tests/unit/scheduler/test_scheduler.py::test_prefix_cache_matches_no_cache`.
 - Stress: `tests/stress/test_prefix_cache_load.py`.

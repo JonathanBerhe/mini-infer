@@ -8,7 +8,7 @@ Workload: 50 prompts per dataset from DeepSpec's bundled `eval_datasets/`,
 128 new tokens each, greedy, chat template with `enable_thinking=False`
 (threshold sweep: mt-bench, same settings)
 Engine: mini-infer @ ADR-027 (Stage C)
-Script: `scripts/modal_dspark_bench.py`
+Script: `scripts/dspark/modal_dspark_bench.py`
 
 As far as I can tell this is the first third-party measurement of any DSpark
 claim; the paper shipped with no independent replication.
@@ -212,7 +212,7 @@ chasing, and it is not a bug in the loop.
 1. **Divergence does not scale with speculation.** In the threshold sweep,
    offered tokens per round fell 6x while the divergence count stayed flat.
 2. **fp32 is exact on a real model.**
-   `tests/unit/test_dspark_speculative_real_model.py` runs Qwen3-0.6B on CPU
+   `tests/unit/engine/dspark/test_dspark_speculative_real_model.py` runs Qwen3-0.6B on CPU
    across the all-rejected, partial-accept (2 of 7) and full-accept (7 of 7)
    paths, at prompt lengths chosen to land the cache truncation at different
    offsets inside a block. Every case matches target-alone token-for-token.
@@ -233,7 +233,7 @@ a sanity check, as vLLM and SGLang also treat it.
 ## Reproduce
 
 ```bash
-DSPARK_SAMPLES=50 DSPARK_TEMPS=0.0 DSPARK_ARMS=templated uv run modal run --detach scripts/modal_dspark_bench.py
+DSPARK_SAMPLES=50 DSPARK_TEMPS=0.0 DSPARK_ARMS=templated uv run modal run --detach scripts/dspark/modal_dspark_bench.py
 ```
 
 Raw data: `docs/benchmarks/data/dspark-stage-c.json`.
@@ -257,7 +257,6 @@ Raw data: `docs/benchmarks/data/dspark-stage-c.json`.
 ## Pointers
 
 - ADR: [ADR-027](../decisions/ADR-027-dspark-drafter-port.md)
-- Plan: [dspark-evaluation.md](../plans/dspark-evaluation.md) Stage C
 - Implementation: `src/mini_infer/engine/dspark/speculative.py`,
   `src/mini_infer/engine/dspark/proposal.py`,
   `src/mini_infer/engine/dspark/sampling.py`

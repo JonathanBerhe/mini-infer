@@ -55,5 +55,5 @@ sparse-gather path stays.
 - No fused attention kernel ships. Only the end-to-end measurement caught
   the problem, so a per-primitive speedup is not enough. Do not repeat this
   experiment without a new reason.
-- Tests: [test_state_prefix_cache.py](../../tests/unit/test_state_prefix_cache.py),
-  [test_state_cache_continuous_scheduler.py](../../tests/unit/test_state_cache_continuous_scheduler.py).
+- Tests: [test_state_prefix_cache.py](../../tests/unit/cache/test_state_prefix_cache.py),
+  [test_state_cache_continuous_scheduler.py](../../tests/unit/scheduler/test_state_cache_continuous_scheduler.py).

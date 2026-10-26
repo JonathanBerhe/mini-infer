@@ -10,7 +10,7 @@ Engine: mini-infer at `ecd31c6`, with the reference's FP8 and FP4 round trips
 on (`--simulate-act-quant --simulate-fp8-gemm-inputs`) and the expert clamp
 at `swiglu_limit`
 Upstream code compared: vLLM `main` at `b965ee5`, `vllm/models/deepseek_v4/attention.py`
-Script: `scripts/modal_v4_projection_dtype_probe.py`
+Script: `scripts/deepseek_v4/modal_v4_projection_dtype_probe.py`
 Data: `docs/benchmarks/data/v4-projection-dtype-probe-fixed-rope.json`
 (main run), plus two earlier runs (see "Earlier runs")
 

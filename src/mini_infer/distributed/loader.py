@@ -31,7 +31,7 @@ from torch import nn
 from mini_infer.distributed.embedding import VocabParallelEmbedding
 from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
 
-# `mini_infer.models.blocks.v4` cannot be imported at module-load time
+# `mini_infer.models.deepseek_v4` cannot be imported at module-load time
 # without inducing a circular import — `deepseek_v4.py` imports this
 # loader, and the `models` package eagerly registers it at first import.
 # Resolve V4 sink / grouped-output lazily inside the function.
@@ -72,9 +72,10 @@ def load_state_dict_with_tp(
         return: names present in the model but absent from `full_state_dict`,
         and names in `full_state_dict` that the model didn't consume.
     """
-    # Lazy import: `models.blocks.v4` triggers registry of `deepseek_v4`
+    # Lazy import: `models.deepseek_v4` triggers registry of `deepseek_v4`
     # which imports this loader, so module-level import would deadlock.
-    from mini_infer.models.blocks.v4 import AttentionSink, GroupedOutputProjection
+    from mini_infer.models.deepseek_v4.grouped_output import GroupedOutputProjection
+    from mini_infer.models.deepseek_v4.sink import AttentionSink
 
     # If the caller passed a target device, we move each loaded tensor
     # there before constructing the replacement Parameter. Used by the

@@ -18,7 +18,7 @@ some multiply.
 
 ## Decision
 
-1. Gluon kernels for FP4 (`models/blocks/fp4_grouped_gluon.py`) for sm90
+1. Gluon kernels for FP4 (`models/blocks/moe/fp4_grouped_gluon.py`) for sm90
    and sm100, built on parts of `fp8_grouped_gluon.py`.
    `block_fp4_grouped_mm` calls them (decision 6).
 2. TMA copies the packed bytes (two e2m1 values each). Each fp32 scale
@@ -31,7 +31,7 @@ some multiply.
    other.
 6. The kernels run above 256 rows. On sm90 they run only above 32 mean
    rows per expert, over the experts of all ranks.
-7. `tests/unit/test_fp4_grouped_gluon.py` compiles the default tiles
+7. `tests/unit/models/blocks/moe/test_fp4_grouped_gluon.py` compiles the default tiles
    without spills, with no GPU. On a GPU, it compares the kernel with fp32
    math and the Triton kernel, also in a CUDA graph and under Triton's
    concurrency sanitizer.

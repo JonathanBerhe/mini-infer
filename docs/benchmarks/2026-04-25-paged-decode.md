@@ -4,7 +4,7 @@
 **Hardware:** Modal A10 24GB, NVIDIA driver via Modal default image
 **Model:** `Qwen/Qwen2.5-0.5B-Instruct`, bf16, single batch
 **Workload:** 4 prompt lengths × 2 paths (kernel, materialization) × 50 measured iters + 5 warmup iters per config. Prompts generated synthetically to hit each target seq_len.
-**Reproducer:** `uv run modal run scripts/modal_bench_paged.py`.
+**Reproducer:** `uv run modal run scripts/bench/modal_bench_paged.py`.
 
 ## Numbers
 

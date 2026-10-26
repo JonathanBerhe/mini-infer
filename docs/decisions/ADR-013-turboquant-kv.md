@@ -115,9 +115,9 @@ Python-side bit unpacking in `read_compressed_block` on every materialize.
 - On M1, 16 unit tests cover the TurboQuant primitives, and 3 real-model
   integration tests pass. The existing 143-test unit suite stays green. The
   fp32 reference gives attention-logit cosine > 0.99 and first-token greedy
-  parity. Tests: `tests/unit/test_turbo_quant.py`,
-  `tests/unit/test_turbo_quant_integration.py`. Bench:
-  `scripts/modal_packed_bench.py --config turbo`.
+  parity. Tests: `tests/unit/cache/test_turbo_quant.py`,
+  `tests/unit/cache/test_turbo_quant_integration.py`. Bench:
+  `scripts/bench/modal_packed_bench.py --config turbo`.
 - Code: `src/mini_infer/cache/turbo_quant.py`,
   `src/mini_infer/cache/block_pool.py`,
   `src/mini_infer/cache/paged_kv_cache.py`.
@@ -163,7 +163,7 @@ Qwen2.5-0.5B on an A10, real ~2000-token prompt
   6.10 / 6.31 t/s against 0.86 / 0.90 / 0.92 t/s for turbo4.
 - 0.31-0.41x of bf16, against 0.04-0.18x in the V3 baseline.
 - Storage savings stay at 73.3% on 0.5B, because the layout does not change.
-- The tests in [test_turbo_kernel.py](../../tests/unit/test_turbo_kernel.py)
+- The tests in [test_turbo_kernel.py](../../tests/unit/cache/test_turbo_kernel.py)
   compare the kernel with the Python loop, not with bf16.
 
 Launch overhead, not arithmetic, was the bottleneck in V3. One kernel per

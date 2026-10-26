@@ -3,7 +3,7 @@
 Date: 2026-05-02
 Hardware: NVIDIA A10 (Ampere, SM_86), bf16 model
 Engine: mini-infer @ this slice (V2b fused dequant + online softmax kernel)
-Script: `scripts/modal_packed_bench.py --config turbo_v2b`
+Script: `scripts/bench/modal_packed_bench.py --config turbo_v2b`
 
 V2b extends the V2a fused dequant kernel into a fully-fused
 attention path: a single Triton program walks compressed K/V blocks
@@ -17,7 +17,7 @@ The bench tests that motivation directly. **It doesn't pan out.**
 
 ## Workload
 
-- Real long prompt (`scripts/modal_packed_bench.py:_TECHNICAL_PASSAGE`):
+- Real long prompt (`scripts/bench/modal_packed_bench.py:_TECHNICAL_PASSAGE`):
   ~2000 tokens of varied technical prose.
 - `max_tokens=128`, single request (`C=1`). Decode-heavy regime where
   V2b's per-step savings (no transient materialized buffer) would be
@@ -146,8 +146,8 @@ prompt (2026-05-02 turbo bench), 8.18 t/s on Qwen2.5-7B (this run).
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config turbo_v2b
-uv run modal run scripts/modal_packed_bench.py --config turbo_v2b \
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo_v2b
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo_v2b \
     --model "Qwen/Qwen2.5-7B-Instruct"
 ```
 
@@ -157,7 +157,7 @@ uv run modal run scripts/modal_packed_bench.py --config turbo_v2b \
 - V2a baseline: [2026-05-02-turboquant-v2a.md](2026-05-02-turboquant-v2a.md).
 - V2b kernel: [turbo_kernel.py](../../src/mini_infer/cache/turbo_kernel.py)
   (`_turbo_fused_attn_decode_kernel` and `fused_turbo_attention_decode`).
-- V2b parity tests: [test_turbo_kernel.py](../../tests/unit/test_turbo_kernel.py)
+- V2b parity tests: [test_turbo_kernel.py](../../tests/unit/cache/test_turbo_kernel.py)
   (`test_fused_attn_decode_matches_materialized_*`).
 - Production-grade alternatives for KV-quantized fused attention:
   see ADR-013 V2b update.

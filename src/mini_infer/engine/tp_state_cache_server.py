@@ -37,7 +37,7 @@ from mini_infer.cache.state_cache import StateCache
 from mini_infer.distributed.group import get_rank, get_world_size
 from mini_infer.engine.sampler import SamplingParams, sample
 from mini_infer.engine.tokenizer import Tokenizer
-from mini_infer.models.deepseek_v4 import (
+from mini_infer.models.deepseek_v4.deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
     build_state_cache_layer_specs,

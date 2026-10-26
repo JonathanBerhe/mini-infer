@@ -3,12 +3,12 @@
 **Reference:** HF transformers 5.14 `modeling_inkling.py` (text path;
 `InklingForCausalLM`). Release announcement:
 [thinkingmachines.ai/news/introducing-inkling](https://thinkingmachines.ai/news/introducing-inkling/).
-**Our port:** [`src/mini_infer/models/inkling.py`](../../src/mini_infer/models/inkling.py)
+**Our port:** [`src/mini_infer/models/inkling/inkling.py`](../../src/mini_infer/models/inkling/inkling.py)
 plus three blocks:
-[`inkling_rel_bias.py`](../../src/mini_infer/models/blocks/inkling_rel_bias.py),
-[`inkling_sconv.py`](../../src/mini_infer/models/blocks/inkling_sconv.py),
-[`inkling_moe.py`](../../src/mini_infer/models/blocks/inkling_moe.py).
-**Parity suite:** [`tests/unit/test_inkling_parity.py`](../../tests/unit/test_inkling_parity.py).
+[`inkling/rel_bias.py`](../../src/mini_infer/models/inkling/rel_bias.py),
+[`inkling/sconv.py`](../../src/mini_infer/models/inkling/sconv.py),
+[`inkling/moe.py`](../../src/mini_infer/models/inkling/moe.py).
+**Parity suite:** [`tests/unit/models/inkling/test_inkling_parity.py`](../../tests/unit/models/inkling/test_inkling_parity.py).
 
 Inkling is a 975B-total / 41B-active decoder-only MoE (66 layers, hidden
 6144, vocab 201024 padded / 200058 real, 1M-token context). Inkling-Small
@@ -23,7 +23,7 @@ gate and up projections are fused into one `w13` tensor whose rows alternate
 gate, up, gate, up. transformers renames and de-interleaves these at load
 (its `conversion_mapping.py`, entry `inkling_mm_model`). Our loader applies
 the same renames in `_RELEASED_RENAMES` and `_released_to_hf`
-(`models/inkling.py`). Thus it reads the released files and HF's in-memory
+(`models/inkling/inkling.py`). Thus it reads the released files and HF's in-memory
 names (`model.language_model.*`) alike.
 
 ## The decoder layer
@@ -115,7 +115,7 @@ experts score high, the shared gammas shrink. Each shared expert multiplies
 its gamma into the activated intermediate (before down-proj) and the
 cross-expert sum runs in fp32. This differs enough from `GlmNoAuxTcGate`
 (weights from unbiased sigmoid scores, grouped top-k, shared expert outside
-the normalization) that it gets its own gate in `inkling_moe.py`.
+the normalization) that it gets its own gate in `inkling/moe.py`.
 
 ## 4. Unembedding
 

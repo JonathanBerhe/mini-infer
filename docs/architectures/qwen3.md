@@ -32,7 +32,7 @@ That's it. The entire family implementation file is ~160 lines.
 
 | Primitive | Reference (HF `modeling_qwen3.py`) | Our code |
 |---|---|---|
-| Backbone | `Qwen3Model` + `Qwen3ForCausalLM` | `Qwen3ForCausalLM` + `_Qwen3InnerModel` in `src/mini_infer/models/qwen3.py` (L104, L78) |
+| Backbone | `Qwen3Model` + `Qwen3ForCausalLM` | `Qwen3ForCausalLM` + `_Qwen3InnerModel` in `src/mini_infer/models/qwen/qwen3.py` (L104, L78) |
 | Decoder layer | `Qwen3DecoderLayer` | shared `TransformerBlock` from `blocks/transformer_block.py` |
 | GQA attention | `Qwen3Attention` | `GQAAttention` in `blocks/gqa.py` (shared) |
 | **Per-head Q norm** | `Qwen3Attention.q_norm` (RMSNorm, per head) | per-head `q_norm` flag in `GQAAttention.__init__` |
@@ -171,7 +171,7 @@ Tests under `tests/unit/`; layout intentionally not enumerated.
 
 ## Why Qwen3's implementation is so short
 
-The whole `src/mini_infer/models/qwen3.py` is ~160 lines because:
+The whole `src/mini_infer/models/qwen/qwen3.py` is ~160 lines because:
 
 1. **Decoder layer is shared**. `TransformerBlock` from
    `blocks/transformer_block.py` is the standard pre-norm shape that
@@ -210,7 +210,7 @@ Llama-shape architecture with one or two family quirks.
 
 - **Reference**: HF transformers
   `transformers/models/qwen3/modeling_qwen3.py`.
-- **Our model class**: `src/mini_infer/models/qwen3.py`.
+- **Our model class**: `src/mini_infer/models/qwen/qwen3.py`.
 - **GQA block** (shared with Llama / Qwen2 / Mistral / SmolLM2):
   `src/mini_infer/models/blocks/gqa.py`.
 - **TransformerBlock** (shared decoder shape):

@@ -67,7 +67,7 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 | `KimiLinearForCausalLM` | Kimi Linear 48B | [ADR-026](docs/decisions/ADR-026-kimi-linear-kda-port.md) |
 | `NemotronHForCausalLM` | Nemotron 3.5 Lightning 30B-A3B, Nemotron 3 Nano 4B (text only) | [doc](docs/architectures/nemotron-h.md) |
 
-To add a model family, add one file in `src/mini_infer/models/`. Build the model from the shared blocks (RMSNorm, RoPE, attention, MoE) and decorate the class with `@register_model`. [mistral.py](src/mini_infer/models/mistral.py) is the shortest example.
+To add a model family, add a folder in `src/mini_infer/models/`. Build the model from the shared blocks in `src/mini_infer/models/blocks/` (RMSNorm, RoPE, attention, MoE). Decorate the class with `@register_model`, and import its module in `_register_builtin_models()` in [`models/__init__.py`](src/mini_infer/models/__init__.py). [mistral.py](src/mini_infer/models/mistral/mistral.py) is the shortest example.
 
 Tests compare each port with the Hugging Face reference. Small models load a real checkpoint. Models too large for a laptop run on Modal GPUs, or each block runs against the reference block on synthetic input.
 
@@ -126,12 +126,16 @@ For quantization or a different attention backend, build the runner in Python an
 
 ## Project layout
 
-* `src/mini_infer/models/`: the model families and the shared blocks.
+* `src/mini_infer/models/`: one folder for each model family, for example `deepseek_v4/` and `qwen/`. A file that only one family uses is in the folder of that family. The `blocks/` folder holds the parts that two or more families use.
 * `src/mini_infer/engine/`: model loading, prefill, decode, sampling, and speculative decoding.
 * `src/mini_infer/scheduler/`: the engine thread, request admission, and the running batch.
 * `src/mini_infer/cache/`: the block pool, the paged KV cache, and the paged attention kernels.
 * `src/mini_infer/api/`: the FastAPI server.
 * `src/mini_infer/backends/`: the TPU kernels.
+* `tests/unit/`: the same folders as `src/mini_infer/`. A test named after one model is in the folder of that model.
+* `scripts/`: one folder for each model family, with its GPU smoke tests and tools. The `bench/`, `smoke/`, `dspark/`, and `tpu/` folders hold the other scripts.
+
+[docs/architectures/](docs/architectures/README.md#where-the-code-is) lists the code, test, and script folders of each model family.
 
 ## Tests
 

@@ -27,7 +27,7 @@ determinism floor) and the same fp32 math with a different rounding order
 (`FP32_OUT` vs `FP32_OUT_UPCAST_GEMM`, the sensitivity floor).
 
 Device-agnostic; batch size 1 (one request's state cache). The Modal driver
-runs it on the real checkpoint, `scripts/v4_projection_dtype_probe_synthetic.py`
+runs it on the real checkpoint, `scripts/deepseek_v4/v4_projection_dtype_probe_synthetic.py`
 on CPU with random weights.
 """
 
@@ -45,16 +45,16 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mini_infer.engine.sampler import SamplingParams, sample
-from mini_infer.models.blocks.csa import CSAAttention
-from mini_infer.models.blocks.hca import HCAAttention
-from mini_infer.models.blocks.v4 import compressor as compressor_module
-from mini_infer.models.blocks.v4.compressor import (
+from mini_infer.models.deepseek_v4 import compressor as compressor_module
+from mini_infer.models.deepseek_v4.compressor import (
     ProjectionOutDtype,
     TokenLevelCompressor,
     configure_projection_out_dtype,
 )
-from mini_infer.models.blocks.v4.lightning_indexer import LightningIndexer
-from mini_infer.models.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
+from mini_infer.models.deepseek_v4.csa import CSAAttention
+from mini_infer.models.deepseek_v4.deepseek_v4 import DeepseekV4Config, DeepseekV4ForCausalLM
+from mini_infer.models.deepseek_v4.hca import HCAAttention
+from mini_infer.models.deepseek_v4.lightning_indexer import LightningIndexer
 
 if TYPE_CHECKING:
     from mini_infer.cache.state_cache import StateCache, _IndexerState

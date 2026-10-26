@@ -41,13 +41,13 @@ Kernel launches, not memory bandwidth, bound the step.
 
 ## Consequences
 
-With `scripts/modal_qwen38_smoke.py --cuda-graph` on one A100-SXM4-80GB, a
+With `scripts/qwen/modal_qwen38_smoke.py --cuda-graph` on one A100-SXM4-80GB, a
 batch-1 step went from 107.3 to 46.2 ms (2.32x). Batch 4 went from 109.4 to
 51.8 ms (2.11x), about 77 tokens per second.
 
 - End to end, batch 1 went from 7.4 to 13.4 tokens per second.
 - Tokens equal the eager step and still match transformers.
-  `tests/unit/test_cuda_graph_decode.py` pins graph-equals-eager in fp32 and
+  `tests/unit/engine/test_cuda_graph_decode.py` pins graph-equals-eager in fp32 and
   bf16 on CUDA.
 - The graph reaches about 57 percent of the bandwidth bound. Fusing the
   Gated DeltaNet step and the norms is the next lever.

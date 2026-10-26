@@ -27,7 +27,7 @@ Implement the V4 attention at block level, plus a runnable hybrid backbone.
 Each step has a bit-parity test against the published reference. The work
 is five commits, `b632256` … `4dabeb1`:
 
-1. Six primitives in `src/mini_infer/models/blocks/v4/`:
+1. Six primitives in `src/mini_infer/models/deepseek_v4/`:
    - `TokenLevelCompressor` (§2.3.2) pools every `m` tokens into one KV
      entry with softmax weights. HCA uses `overlap_mode=False`, `m'=128`.
      CSA uses `overlap_mode=True`, `m=4`, and also pools the previous
@@ -39,7 +39,7 @@ is five commits, `b632256` … `4dabeb1`:
      `g` groups. This cuts compute when `n_h` is large (V4-Pro: 128 heads).
    - `apply_partial_rope_last_n_dims` rotates only the last
      `rope_head_dim` dimensions.
-   - `hca_mqa_with_sink` (`cache/hca_attention.py`) is the PyTorch core
+   - `hca_mqa_with_sink` (`models/deepseek_v4/hca_attention.py`) is the PyTorch core
      attention: many Q heads, one KV head, sink logits.
 2. Two attention blocks. `HCAAttention` (`hca.py`) is SWA, heavy
    compression, sink and grouped output, and attends to all causally valid
@@ -53,7 +53,7 @@ is five commits, `b632256` … `4dabeb1`:
    `HCAAttention.forward_decode` / `CSAAttention.forward_decode`, which
    decode one token from a `StateCache`. A compressed entry comes out at
    each block boundary.
-5. `DeepseekV4ForCausalLM` (`models/deepseek_v4.py`), registered under the
+5. `DeepseekV4ForCausalLM` (`models/deepseek_v4/deepseek_v4.py`), registered under the
    HF architecture string. `compress_ratios` drives the attention class of
    each layer: ratio 4 gives `CSAAttention`, any other ratio gives
    `HCAAttention`. This per-layer dispatch selects the type from the
@@ -81,7 +81,7 @@ is five commits, `b632256` … `4dabeb1`:
   no workload needs it yet.
 - Ship the blocks without a model class. Rejected: the class is about 200
   lines. It tests the hybrid layer dispatch and the per-layer StateCache
-  wiring, and it runs the demo (`scripts/demo_deepseek_v4_hybrid.py`).
+  wiring, and it runs the demo (`scripts/deepseek_v4/demo_deepseek_v4_hybrid.py`).
 
 ## Consequences
 
@@ -108,9 +108,7 @@ Each block has its own `tests/unit/test_v4_*_parity.py` test:
 
 With the narrower unit tests and the model-level tests, all 53 V4 tests
 pass. The paper is at `docs/papers/deepseek-v4.pdf` (gitignored). The
-reference is vendored read-only at `third_party/deepseek_v4_reference/`. The
-original 4-stage plan is
-[docs/plans/deepseek-v4-attention.md](../plans/deepseek-v4-attention.md).
+reference is vendored read-only at `third_party/deepseek_v4_reference/`.
 
 ## Update: full primitive integration (2026-05-10)
 

@@ -40,8 +40,8 @@ Five primitives that distinguish Gemma 3 from a Llama baseline:
 
 | Primitive | Reference (HF `modeling_gemma3.py`) | Our code |
 |---|---|---|
-| Backbone | `Gemma3Model` + `Gemma3ForCausalLM` | `Gemma3ForCausalLM` + `_Gemma3InnerModel` in `src/mini_infer/models/gemma3.py` (L116, L88) |
-| Decoder layer | `Gemma3DecoderLayer` | `GemmaDecoderLayer` in `blocks/gemma_decoder_layer.py` |
+| Backbone | `Gemma3Model` + `Gemma3ForCausalLM` | `Gemma3ForCausalLM` + `_Gemma3InnerModel` in `src/mini_infer/models/gemma/gemma3.py` (L116, L88) |
+| Decoder layer | `Gemma3DecoderLayer` | `GemmaDecoderLayer` in `gemma/gemma_decoder_layer.py` |
 | GQA attention | `Gemma3Attention` | `GQAAttention` in `blocks/gqa.py` (shared) with `q_norm` / `k_norm` / `query_scale=1.0` flags |
 | Sliding-window vs global per-layer | `Gemma3Attention.is_sliding` flag | per-layer `LayerAttentionSpec` from `Gemma3Config.per_layer_attention()` |
 | Dual RoPE (same head_dim, different theta) | two `Gemma3RotaryEmbedding` instances | two `RotaryEmbedding` instances in `_Gemma3InnerModel` |
@@ -159,7 +159,7 @@ residual stream's magnitude through the block.
 `post_attention_layernorm`, `pre_feedforward_layernorm`, and
 `post_feedforward_layernorm`.
 
-**Our code**: `GemmaDecoderLayer` in `blocks/gemma_decoder_layer.py`
+**Our code**: `GemmaDecoderLayer` in `gemma/gemma_decoder_layer.py`
 carries the same four-norm shape. The four norms are all
 `GemmaRMSNorm` (offset variant).
 
@@ -238,8 +238,8 @@ Tests under `tests/unit/`; layout intentionally not enumerated.
 
 - **Reference**: HF transformers
   `transformers/models/gemma3/modeling_gemma3.py` (text path).
-- **Our model class**: `src/mini_infer/models/gemma3.py`.
-- **Decoder layer**: `src/mini_infer/models/blocks/gemma_decoder_layer.py`.
+- **Our model class**: `src/mini_infer/models/gemma/gemma3.py`.
+- **Decoder layer**: `src/mini_infer/models/gemma/gemma_decoder_layer.py`.
 - **GemmaRMSNorm (offset)**: `src/mini_infer/models/blocks/gemma_rmsnorm.py`.
 - **GQA block (shared)**: `src/mini_infer/models/blocks/gqa.py`.
 

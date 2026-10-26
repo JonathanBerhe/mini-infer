@@ -3,7 +3,7 @@
 Date: 2026-04-30
 Hardware: NVIDIA A10 (Ampere, SM_86), bf16 model
 Engine: mini-infer @ this slice (ADR-013 V3 update)
-Script: `scripts/modal_packed_bench.py --config turbo`
+Script: `scripts/bench/modal_packed_bench.py --config turbo`
 
 V3 ships the full TurboQuant algorithm: rotation + polar transform +
 Lloyd-Max codebook + QJL residual sign + asymmetric K (3-bit Lloyd-Max +
@@ -154,8 +154,8 @@ codec work (Lloyd-Max table lookup + QJL bit fiddle) in shared memory.
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config turbo
-uv run modal run scripts/modal_packed_bench.py --config turbo \
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo \
     --model "Qwen/Qwen2.5-7B-Instruct"
 ```
 
@@ -166,6 +166,6 @@ uv run modal run scripts/modal_packed_bench.py --config turbo \
 - Implementation: `src/mini_infer/cache/turbo_quant.py` (Lloyd-Max
   codebooks + polar primitives), `src/mini_infer/cache/block_pool.py`
   (turbo3 storage layout dispatch).
-- Unit tests: `tests/unit/test_turbo_quant.py` (V3 primitives),
-  `tests/unit/test_turbo_quant_integration.py` (real-model parity).
+- Unit tests: `tests/unit/cache/test_turbo_quant.py` (V3 primitives),
+  `tests/unit/cache/test_turbo_quant_integration.py` (real-model parity).
 - Paper: https://arxiv.org/abs/2504.19874

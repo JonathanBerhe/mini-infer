@@ -4,7 +4,7 @@
 **Hardware:** Modal A10 (NVIDIA A10), via the cu124 Modal image with FlashAttention 2.7.4 prebuilt wheel.
 **Model:** `Qwen/Qwen2.5-0.5B-Instruct`, bf16.
 **Workload:** mixed-length, 50/50 split of short (~5 token prompt) and long (~80 token prompt) at concurrency C ∈ {1, 4, 8}, `max_tokens=32` per request, greedy sampling, one warmup run before the timed run at each setting.
-**Reproducer:** `uv run modal run scripts/modal_packed_bench.py`.
+**Reproducer:** `uv run modal run scripts/bench/modal_packed_bench.py`.
 
 ## Numbers
 
@@ -49,7 +49,7 @@ Throughput scaling (chunked, vs C=1): C=4 → 2.4×, C=8 → 3.3×.
 
 ## Long-context sweep
 
-Re-ran with realistic long prompts to surface the long-context behavior. Workload: 3938-token prompts (RAG / long-chat scale), `max_tokens=64`, sweep at C ∈ {1, 2, 4}, same chunked-vs-unchunked split. Reproducer: `scripts/modal_packed_bench.py --config throughput --workload long`.
+Re-ran with realistic long prompts to surface the long-context behavior. Workload: 3938-token prompts (RAG / long-chat scale), `max_tokens=64`, sweep at C ∈ {1, 2, 4}, same chunked-vs-unchunked split. Reproducer: `scripts/bench/modal_packed_bench.py --config throughput --workload long`.
 
 | Config | C | Elapsed (s) | Output tokens | Throughput (tok/s) |
 |---|---:|---:|---:|---:|
@@ -70,7 +70,7 @@ This last point is worth dwelling on: **on this synthetic-batch workload the chu
 
 ## Head-of-line blocking microbench
 
-To check whether chunked prefill actually delivers its claimed benefit (decoders keep flowing while a long prompt is being prefilled), I ran a focused microbench. Setup: start a short decoder, let it emit 4 tokens at steady-state ITL (~55-58ms). Then submit a 3065-token long prompt. Measure: the time from long-submit to the short decoder's next token. Reproducer: `scripts/modal_packed_bench.py --config holb`.
+To check whether chunked prefill actually delivers its claimed benefit (decoders keep flowing while a long prompt is being prefilled), I ran a focused microbench. Setup: start a short decoder, let it emit 4 tokens at steady-state ITL (~55-58ms). Then submit a 3065-token long prompt. Measure: the time from long-submit to the short decoder's next token. Reproducer: `scripts/bench/modal_packed_bench.py --config holb`.
 
 | Config | Baseline ITL (ms) | First short token after long-submit (ms) | Long total (ms) |
 |---|---:|---:|---:|

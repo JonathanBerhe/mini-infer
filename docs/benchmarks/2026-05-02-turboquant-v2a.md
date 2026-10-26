@@ -3,7 +3,7 @@
 Date: 2026-05-02
 Hardware: NVIDIA A10 (Ampere, SM_86), bf16 model
 Engine: mini-infer @ this slice (V2a fused dequant Triton kernel)
-Script: `scripts/modal_packed_bench.py --config turbo`
+Script: `scripts/bench/modal_packed_bench.py --config turbo`
 
 V2a replaces the per-block Python loop inside
 `PagedKVCache.materialize_packed_kv` (the compressed branch at
@@ -21,7 +21,7 @@ storage layout, same codec, just collapses the launches.
 
 ## Workload
 
-- **Real long prompt** (`scripts/modal_packed_bench.py:_TECHNICAL_PASSAGE`):
+- **Real long prompt** (`scripts/bench/modal_packed_bench.py:_TECHNICAL_PASSAGE`):
   ~2000 tokens of varied technical prose covering memory bandwidth, KV
   cache mechanics, paged attention, TurboQuant, batching, speculative
   decoding, and several related topics. Distinct paragraphs, no repetition.
@@ -197,7 +197,7 @@ first).
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config turbo
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo
 ```
 
 (0.5B by default; pass `--model "Qwen/Qwen2.5-7B-Instruct"` for the
@@ -211,6 +211,6 @@ larger run when ready.)
 - Implementation: [turbo_kernel.py](../../src/mini_infer/cache/turbo_kernel.py),
   dispatcher edit at
   [paged_kv_cache.py:301](../../src/mini_infer/cache/paged_kv_cache.py).
-- Tests: [test_turbo_kernel.py](../../tests/unit/test_turbo_kernel.py).
+- Tests: [test_turbo_kernel.py](../../tests/unit/cache/test_turbo_kernel.py).
 - Centralized device helper introduced this slice:
   [device.py](../../src/mini_infer/device.py).

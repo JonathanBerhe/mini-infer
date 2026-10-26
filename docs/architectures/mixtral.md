@@ -33,11 +33,11 @@ This is the FFN primitive every later MoE family in the registry
 
 | Primitive | Reference (HF `modeling_mixtral.py`) | Our code |
 |---|---|---|
-| Backbone | `MixtralModel` + `MixtralForCausalLM` | `MixtralForCausalLM` + `_MixtralInnerModel` in `src/mini_infer/models/mixtral.py` (L100, L74) |
+| Backbone | `MixtralModel` + `MixtralForCausalLM` | `MixtralForCausalLM` + `_MixtralInnerModel` in `src/mini_infer/models/mistral/mixtral.py` (L100, L74) |
 | Decoder layer | `MixtralDecoderLayer` | shared `LlamaDecoderLayer` shape; MoE FFN swaps in for SwiGLU |
 | GQA attention | `MixtralAttention` | `GQAAttention` in `blocks/gqa.py` (shared with Llama) |
-| Top-k sparse MoE FFN | `MixtralSparseMoeBlock` | `MoEFFN` in `blocks/mixtral_moe.py` (L65) |
-| Single expert MLP | `MixtralBLockSparseTop2MLP` | `MixtralExpert` in `blocks/mixtral_moe.py` (L46) |
+| Top-k sparse MoE FFN | `MixtralSparseMoeBlock` | `MoEFFN` in `blocks/moe/mixtral_moe.py` (L65) |
+| Single expert MLP | `MixtralBLockSparseTop2MLP` | `MixtralExpert` in `blocks/moe/mixtral_moe.py` (L46) |
 | Router (gate) linear | `block_sparse_moe.gate` (no bias) | `MoEFFN.gate` (`nn.Linear`, no bias) |
 
 Bit-parity is exercised against HF transformers' `MixtralSparseMoeBlock`
@@ -73,7 +73,7 @@ combination.
 
 **Reference**: `MixtralBLockSparseTop2MLP` is a SwiGLU-shaped FFN.
 
-**Our code**: `MixtralExpert` in `blocks/mixtral_moe.py:55`.
+**Our code**: `MixtralExpert` in `blocks/moe/mixtral_moe.py:58`.
 
 ```python
 class MixtralExpert(nn.Module):
@@ -106,7 +106,7 @@ distribution.
 **Reference**: `routing_weights = routing_weights /
 routing_weights.sum(dim=-1, keepdim=True)` after `topk`.
 
-**Our code**: same step in `MoEFFN.forward` (`blocks/mixtral_moe.py:269`).
+**Our code**: same step in `MoEFFN.forward` (`blocks/moe/mixtral_moe.py:272`).
 
 ### Dispatch implementation
 
@@ -221,9 +221,9 @@ Tests under `tests/unit/`; layout intentionally not enumerated.
 
 - **Reference**: HF transformers
   `transformers/models/mixtral/modeling_mixtral.py`.
-- **Our model class**: `src/mini_infer/models/mixtral.py`.
-- **MoE block**: `src/mini_infer/models/blocks/mixtral_moe.py`.
-- **Expert MLP**: `blocks/mixtral_moe.py::MixtralExpert`.
+- **Our model class**: `src/mini_infer/models/mistral/mixtral.py`.
+- **MoE block**: `src/mini_infer/models/blocks/moe/mixtral_moe.py`.
+- **Expert MLP**: `blocks/moe/mixtral_moe.py::MixtralExpert`.
 
 ## What's still open
 

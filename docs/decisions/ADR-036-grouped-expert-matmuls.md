@@ -19,7 +19,7 @@ grouped GEMM: one launch computes a different matmul for each group of rows.
 
 ## Decision
 
-1. `grouped_expert_mlp` (`models/blocks/grouped_experts.py`) sorts the
+1. `grouped_expert_mlp` (`models/blocks/moe/grouped_experts.py`) sorts the
    (token, expert) pairs by expert on the GPU. The gate-up and the down
    projections each run as one `functional.grouped_mm`. Nothing reads back
    to the host, so the forward runs in a CUDA graph.
@@ -57,7 +57,7 @@ grouped GEMM: one launch computes a different matmul for each group of rows.
   Mixtral at 16384 tokens on the B200 (0.88x).
 - The paths differ only in bf16 rounding: a prefill logit cosine of 0.9994
   to 0.9995 on the real model.
-- `tests/unit/test_grouped_experts.py` runs the path on the CPU against a
+- `tests/unit/models/blocks/moe/test_grouped_experts.py` runs the path on the CPU against a
   token-by-token reference.
 - Block-FP8 and FP4 experts got Triton grouped kernels
   ([ADR-037](ADR-037-block-fp8-grouped-kernel.md),

@@ -59,7 +59,7 @@ does not get worse, and the greedy tokens do not change.
 ## Consequences
 
 Measured on 2x B200, real V4-Flash, both modes on one load
-(`scripts/modal_v4_flash_generate.py --compare-fp8-activations`), on the
+(`scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fp8-activations`), on the
 first 2,048 tokens of `scripts/data/technical_passage.md`:
 
 | Measure | bf16 inputs | e4m3 inputs (W4A8) |
@@ -76,7 +76,7 @@ first 2,048 tokens of `scripts/data/technical_passage.md`:
   batch 1 it is 0.8 ms faster (1.02x).
 - Every V4 run on a B200 with the released checkpoint now takes e4m3 expert
   inputs.
-- `tests/unit/test_fp4_grouped_kernel.py` tests the quantizer scales, the
+- `tests/unit/models/blocks/moe/test_fp4_grouped_kernel.py` tests the quantizer scales, the
   W4A8 kernel against fp32 math, and a full MoE layer against the bf16
   loop. The Triton interpreter casts fp32 to e4m3 wrongly, so bit-exact
   e4m3 tests run only on CUDA.

@@ -8,9 +8,7 @@ Status: Accepted
 Kimi K3 (announced 2026-07-16) uses Kimi Delta Attention (KDA) from Kimi
 Linear (arXiv:2510.26692), which has a runnable reference
 (`moonshotai/Kimi-Linear-48B-A3B-Instruct`). A `kimi_linear` port first
-tests about 90% of the inference novelty of K3 against a real oracle. See
-[docs/plans/kimi-k3.md](../plans/kimi-k3.md) and the
-[spec](../plans/kimi-k3-spec.md).
+tests about 90% of the inference novelty of K3 against a real oracle.
 
 KDA is the first linear-attention family here. Its decode state is a
 fixed-size fp32 matrix per layer (a delta rule with per-channel decay) plus
@@ -22,7 +20,7 @@ Neither state fits the one-entry-per-token model of PagedAttention.
 1. KDA math from scratch in `blocks/kda.py`: a one-token recurrence for
    decode and a chunked WY-form for prefill, kept equal by
    `test_kda_block.py`.
-2. A per-request `KimiStateCache` (`cache/kimi_state_cache.py`) holds the
+2. A per-request `KimiStateCache` (`models/kimi_linear/state_cache.py`) holds the
    fp32 KDA state, three conv tails and a dense compressed-KV buffer for
    MLA.
 3. Generalize the state-cache serving seam. Models expose
@@ -53,6 +51,6 @@ Neither state fits the one-entry-per-token model of PagedAttention.
 - Single rank only: `load_weights` raises under TP.
 - `einops` joins the dev group only.
 - `test_kimi_linear_parity.py` compares with a reference vendored at a
-  fixed SHA (`scripts/clone_kimi_linear_reference.py`): prefill cos > 0.999
+  fixed SHA (`scripts/kimi_linear/clone_kimi_linear_reference.py`): prefill cos > 0.999
   and token-exact greedy. The real-checkpoint gate (48B-A3B on Modal) is
   Phase A5.

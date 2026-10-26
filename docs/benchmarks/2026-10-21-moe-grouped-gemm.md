@@ -16,7 +16,7 @@ Gluon on the H100) and
 in Gluon on the B200),
 [ADR-040](../decisions/ADR-040-fp4-grouped-kernel.md) (FP4) and
 [ADR-041](../decisions/ADR-041-gluon-fp4-grouped.md) (FP4 in Gluon)
-Script: `scripts/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
+Script: `scripts/bench/modal_moe_grouped_bench.py` (`--fp8-only`, `--fp8-kernel`,
 `--fp8-tiles`, `--fp8-gluon` and `--fp8-expert-tiles` for the FP8 runs,
 `--fp4` and `--fp4-gluon` for the FP4 runs)
 
@@ -194,7 +194,7 @@ Prefill of the real passage, milliseconds:
 | 2048 | 624.4 | 127.7 | 4.89x | 566.3 | 84.5 | 6.70x |
 
 Decode, milliseconds per step. Each row of the batch has a 64-token random
-prompt, as in `scripts/modal_nemotron_h_smoke.py`.
+prompt, as in `scripts/nemotron_h/modal_nemotron_h_smoke.py`.
 
 | GPU | batch | before eager | before graph | after eager | after graph |
 |---|---:|---:|---:|---:|---:|
@@ -894,7 +894,7 @@ B200.
 
 On 2026-10-23 we loaded the real `deepseek-ai/DeepSeek-V4-Flash` on two
 B200 GPUs with tensor parallelism, 128 experts per GPU
-(`scripts/modal_v4_flash_generate.py --compare-paths`). That image had
+(`scripts/deepseek_v4/modal_v4_flash_generate.py --compare-paths`). That image had
 PyTorch 2.10.0 and Triton 3.6.0. The script loads the model once and runs
 both MoE paths on it. All 43 MoE layers ran on the FP4 kernel, and the two
 GPUs generated the same tokens.

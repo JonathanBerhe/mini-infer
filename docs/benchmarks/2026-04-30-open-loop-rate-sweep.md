@@ -3,19 +3,19 @@
 Date: 2026-04-30
 Hardware: NVIDIA A10G (Ampere, 24 GB) and NVIDIA H100 80GB HBM3 (Hopper)
 Engine: mini-infer @ this slice (continuous batching, paged KV, HTTP `/v1/completions` with SSE streaming)
-Driver: [scripts/http_openloop_bench.py](../../scripts/http_openloop_bench.py)
-Modal entrypoint: [scripts/modal_openloop_bench.py](../../scripts/modal_openloop_bench.py)
+Driver: [scripts/bench/http_openloop_bench.py](../../scripts/bench/http_openloop_bench.py)
+Modal entrypoint: [scripts/bench/modal_openloop_bench.py](../../scripts/bench/modal_openloop_bench.py)
 Reproducer:
 
 ```
 # A10 + Qwen-0.5B
-MINI_INFER_BENCH_GPU=A10 uv run modal run scripts/modal_openloop_bench.py \
+MINI_INFER_BENCH_GPU=A10 uv run modal run scripts/bench/modal_openloop_bench.py \
     --model Qwen/Qwen2.5-0.5B-Instruct \
     --rates 0.1,0.2,0.4,0.6,1.0 --duration 30 --warmup 1 \
     --max-tokens 128 --num-blocks 4096
 
 # H100 + Qwen-7B
-MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/modal_openloop_bench.py \
+MINI_INFER_BENCH_GPU=H100 uv run modal run scripts/bench/modal_openloop_bench.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --rates 0.5,1,2,4 --duration 30 --warmup 1 \
     --max-tokens 128 --num-blocks 4096
@@ -159,7 +159,7 @@ than a 503 across the board.
 
 All 10 existing scheduler unit tests still pass, plus a dedicated test for
 the preemption path itself
-([tests/unit/test_scheduler_oom.py](../../tests/unit/test_scheduler_oom.py)):
+([tests/unit/scheduler/test_scheduler_oom.py](../../tests/unit/scheduler/test_scheduler_oom.py)):
 it forces a mid-step `OutOfMemoryError` and asserts the engine thread
 survives, cancels the youngest prefiller, and the retried step succeeds.
 The path did not trigger during the calibrated sweeps above (errs=0)
@@ -174,7 +174,7 @@ because `num_blocks=4096` keeps the pool comfortably ahead of offered load.
   open-loop overload: the queue grows, latency rises, no requests are
   dropped or corrupted.
 - The OOM-preemption refactor of the engine loop does not regress
-  existing scheduler behaviour (`tests/unit/test_scheduler.py`, 10/10).
+  existing scheduler behaviour (`tests/unit/scheduler/test_scheduler.py`, 10/10).
 - Cross-hardware comparisons can use the same driver against the same
   prompt corpus, producing comparable curves.
 
@@ -192,5 +192,5 @@ because `num_blocks=4096` keeps the pool comfortably ahead of offered load.
   optimization path. These are orthogonal axes that should each get
   their own calibrated sweep.
 - The OOM-preemption path under live overload. The mechanism is
-  unit-tested (`tests/unit/test_scheduler_oom.py`), but a deliberately
+  unit-tested (`tests/unit/scheduler/test_scheduler_oom.py`), but a deliberately
   oversubscribed Modal run would exercise it end-to-end on real GPU memory.

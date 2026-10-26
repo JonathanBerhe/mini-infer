@@ -4,7 +4,7 @@ Date: 2026-04-28
 Hardware: NVIDIA A10 (Ampere, SM_86)
 Model: Qwen/Qwen2.5-0.5B-Instruct
 Engine: mini-infer @ this slice (ADR-010)
-Script: `scripts/modal_packed_bench.py --config quant`
+Script: `scripts/bench/modal_packed_bench.py --config quant`
 
 ## Workload
 
@@ -77,7 +77,7 @@ speedup. Out of scope for this slice; flagged as follow-up in ADR-010.
   consistent with dequant overhead on small batches.
 - **Numerical correctness: preserved.** Verified independently on M1:
   cosine similarity > 0.99 on logits
-  (`tests/unit/test_int8_model_integration.py::test_quantized_logits_close_to_fp_reference`),
+  (`tests/unit/quant/test_int8_model_integration.py::test_quantized_logits_close_to_fp_reference`),
   first-token greedy parity across multiple prompts
   (`tests/stress/test_int8_load.py::test_int8_first_tokens_match_fp_reference`).
 - **Weight tying gotcha surfaced.** `quant_lm_head=True` is not free on
@@ -104,7 +104,7 @@ speedup. Out of scope for this slice; flagged as follow-up in ADR-010.
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config quant
+uv run modal run scripts/bench/modal_packed_bench.py --config quant
 ```
 
 Defaults: A10, Qwen2.5-0.5B-Instruct, prompt ~80 tokens, max_tokens=32,
@@ -116,6 +116,6 @@ concurrencies=1,4,8. Set `MINI_INFER_BENCH_GPU=H100` for the H100 sweep.
 - Implementation: `src/mini_infer/quant/int8.py`.
 - Integration: `src/mini_infer/engine/model_runner.py::from_pretrained`
   (the `quant=` and `quant_lm_head=` flags).
-- Unit tests: `tests/unit/test_int8_quant.py`.
-- Real-model tests: `tests/unit/test_int8_model_integration.py`.
+- Unit tests: `tests/unit/quant/test_int8_quant.py`.
+- Real-model tests: `tests/unit/quant/test_int8_model_integration.py`.
 - Stress: `tests/stress/test_int8_load.py`.

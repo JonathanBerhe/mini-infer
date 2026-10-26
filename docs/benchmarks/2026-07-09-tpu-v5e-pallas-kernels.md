@@ -3,7 +3,7 @@
 Date: 2026-07-09
 Hardware: Google Colab TPU v5e (single chip), jax 0.7.2 with matched libtpu
 Code: branch `tpu-pallas-backend`, commit `83321f8`
-Runner: `scripts/run_tpu_pallas_kernels.py` via `scripts/colab/run_tpu.ipynb`, `interpret=False`
+Runner: `scripts/tpu/run_tpu_pallas_kernels.py` via `scripts/tpu/colab/run_tpu.ipynb`, `interpret=False`
 
 ## What this is
 
@@ -56,6 +56,6 @@ kernel-math bugs; full detail in ADR-024's amendment:
 
 ## Reproduce
 
-Open `scripts/colab/run_tpu.ipynb` in Colab (Runtime -> TPU -> Run all; run the
+Open `scripts/tpu/colab/run_tpu.ipynb` in Colab (Runtime -> TPU -> Run all; run the
 cell twice if the one-time libtpu alignment restart triggers). The log must
 print the running commit and end with ALL PASS.

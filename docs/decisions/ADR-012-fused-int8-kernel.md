@@ -74,12 +74,12 @@ max_tokens=32 (from `docs/benchmarks/2026-04-29-fused-int8-kernel.md`):
 - `supports_fused_kernel` and `_FUSED_DISABLED_FOR_BENCH` gate the fused
   path, so a revert is a one-line change.
 - On M1, the 143 existing unit tests stay green.
-  `tests/unit/test_int8_kernel.py` has 8 CUDA-only tests that compare fused
+  `tests/unit/quant/test_int8_kernel.py` has 8 CUDA-only tests that compare fused
   with naive at decode and prefill shapes.
-  `tests/unit/test_int8_quant.py::test_int8_linear_cpu_does_not_attempt_fused_kernel`
+  `tests/unit/quant/test_int8_quant.py::test_int8_linear_cpu_does_not_attempt_fused_kernel`
   asserts that the CPU path does not call the fused kernel.
 - This closes the "Modal-side correctness not verified" gap.
-  `scripts/modal_packed_bench.py --config quant_kernel` decodes one prompt
+  `scripts/bench/modal_packed_bench.py --config quant_kernel` decodes one prompt
   greedily with naive and fused dispatch before the throughput sweeps. The
   token IDs are equal on Qwen2.5-0.5B and Qwen2.5-7B.
 

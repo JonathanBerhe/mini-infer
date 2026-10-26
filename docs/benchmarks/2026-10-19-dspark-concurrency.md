@@ -9,7 +9,7 @@ Workload: the first 32 prompts of gsm8k and of mt-bench from DeepSpec's
 template with `enable_thinking=False`
 Engine: mini-infer at `0cb4cb1`, `ContinuousScheduler` with DSpark
 ([ADR-031](../decisions/ADR-031-multi-request-dspark.md))
-Script: `scripts/modal_dspark_concurrency_bench.py`
+Script: `scripts/dspark/modal_dspark_concurrency_bench.py`
 
 ## Result
 
@@ -207,7 +207,7 @@ effect in detail.
 ## Reproduce
 
 ```bash
-uv run modal run --detach scripts/modal_dspark_concurrency_bench.py --run-tag main
+uv run modal run --detach scripts/dspark/modal_dspark_concurrency_bench.py --run-tag main
 ```
 
 The script writes the full results to

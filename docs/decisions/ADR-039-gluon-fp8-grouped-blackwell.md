@@ -20,7 +20,7 @@ which sm100 does not have.
 
 ## Decision
 
-1. A Gluon kernel for sm100 (`models/blocks/fp8_grouped_gluon.py`) keeps the
+1. A Gluon kernel for sm100 (`models/blocks/moe/fp8_grouped_gluon.py`) keeps the
    numerics of ADR-038. Each e4m3 weight times its fp32 block scale is
    rounded to bf16, and the multiply runs in bf16 into an fp32 accumulator.
 2. It keeps the persistent schedule of ADR-038: one program per SM walks

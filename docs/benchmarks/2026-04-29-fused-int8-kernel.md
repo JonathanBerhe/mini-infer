@@ -5,7 +5,7 @@ Hardware: NVIDIA A10 (Ampere, SM_86), bf16
 Model: Qwen/Qwen2.5-0.5B-Instruct
 Engine: mini-infer @ this slice (ADR-012)
 Triton: 3.x (Modal image default)
-Script: `scripts/modal_packed_bench.py --config quant_kernel`
+Script: `scripts/bench/modal_packed_bench.py --config quant_kernel`
 
 ## Workload
 
@@ -153,7 +153,7 @@ caveat.
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config quant_kernel
+uv run modal run scripts/bench/modal_packed_bench.py --config quant_kernel
 ```
 
 Defaults: A10, Qwen2.5-0.5B-Instruct, prompt ~80 tokens, max_tokens=32,
@@ -164,5 +164,5 @@ C ∈ {1, 4, 8}.
 - ADR: [ADR-012](../decisions/ADR-012-fused-int8-kernel.md).
 - Implementation: `src/mini_infer/quant/int8_kernel.py`.
 - Dispatch: `src/mini_infer/quant/int8.py::Int8Linear.forward`.
-- Unit tests (CUDA-only parity): `tests/unit/test_int8_kernel.py`.
+- Unit tests (CUDA-only parity): `tests/unit/quant/test_int8_kernel.py`.
 - ADR-010 baseline: `docs/decisions/ADR-010-int8-weight-quant.md`.

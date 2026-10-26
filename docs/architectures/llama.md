@@ -43,13 +43,13 @@ that don't change the architecture).
 
 | Primitive | Reference (HF `modeling_llama.py`) | Our code |
 |---|---|---|
-| Backbone | `LlamaModel` + `LlamaForCausalLM` | `LlamaForCausalLM` + `_LlamaInnerModel` in [src/mini_infer/models/llama.py:113](../../src/mini_infer/models/llama.py#L113), [:87](../../src/mini_infer/models/llama.py#L87) |
+| Backbone | `LlamaModel` + `LlamaForCausalLM` | `LlamaForCausalLM` + `_LlamaInnerModel` in [src/mini_infer/models/llama/llama.py:113](../../src/mini_infer/models/llama/llama.py#L113), [:87](../../src/mini_infer/models/llama/llama.py#L87) |
 | Decoder layer | `LlamaDecoderLayer` | shared `TransformerBlock` in [blocks/transformer_block.py](../../src/mini_infer/models/blocks/transformer_block.py) |
 | GQA attention | `LlamaAttention` | shared `GroupedQueryAttention` in [blocks/gqa.py](../../src/mini_infer/models/blocks/gqa.py) |
 | Standard RoPE | `LlamaRotaryEmbedding` | shared `RotaryEmbedding` in [blocks/rope.py:144](../../src/mini_infer/models/blocks/rope.py#L144) |
 | RMSNorm | `LlamaRMSNorm` | shared `RMSNorm` in [blocks/rmsnorm.py](../../src/mini_infer/models/blocks/rmsnorm.py) |
 | SwiGLU FFN | `LlamaMLP` | shared `SwiGLU` in [blocks/swiglu.py](../../src/mini_infer/models/blocks/swiglu.py) |
-| Tied embeddings | `tie_word_embeddings=True` in config | `LlamaForCausalLM.__init__` aliases `lm_head.weight = embed_tokens.weight` ([llama.py:127](../../src/mini_infer/models/llama.py#L127)) |
+| Tied embeddings | `tie_word_embeddings=True` in config | `LlamaForCausalLM.__init__` aliases `lm_head.weight = embed_tokens.weight` ([llama.py:127](../../src/mini_infer/models/llama/llama.py#L127)) |
 | Vocab-parallel embedding | `nn.Embedding` | `VocabParallelEmbedding` (ws=1 identity to `nn.Embedding`) |
 | Column-parallel LM head | `nn.Linear` | `ColumnParallelLinear(..., gather_output=True)` |
 
@@ -193,13 +193,13 @@ where the embedding matrix dominates the parameter count.
 | Llama-3.2-1B / 3B | True | Same rationale |
 | Llama-2-7B / Llama-3-8B / Llama-3-70B | False | Embedding is <5% of total params |
 
-**Our code**: [llama.py:127](../../src/mini_infer/models/llama.py#L127)
+**Our code**: [llama.py:127](../../src/mini_infer/models/llama/llama.py#L127)
 aliases `lm_head.weight = self.model.embed_tokens.weight` when the
 config says to. Both tensors are stored as `(vocab_per_rank, hidden_size)`
 so aliasing still works under tensor parallelism; at world_size=1
 it's exactly the unsharded tying.
 
-[llama.py:156](../../src/mini_infer/models/llama.py#L156) whitelists
+[llama.py:156](../../src/mini_infer/models/llama/llama.py#L156) whitelists
 `lm_head.weight` from the load-mismatch check when tying is on, because
 HF checkpoints with `tie_word_embeddings=True` only ship `embed_tokens.weight`.
 
@@ -268,7 +268,7 @@ Tests under `tests/unit/`; layout intentionally not enumerated.
 
 ## Why Llama is the template
 
-The entire `src/mini_infer/models/llama.py` is ~180 lines because every
+The entire `src/mini_infer/models/llama/llama.py` is ~180 lines because every
 non-config piece is shared:
 
 1. **Decoder layer is shared.** `TransformerBlock` is the standard
@@ -315,7 +315,7 @@ on this file:
 ## Pointers
 
 - **Reference**: HF transformers `transformers/models/llama/modeling_llama.py`.
-- **Our model class**: [src/mini_infer/models/llama.py](../../src/mini_infer/models/llama.py).
+- **Our model class**: [src/mini_infer/models/llama/llama.py](../../src/mini_infer/models/llama/llama.py).
 - **GQA block** (shared with Qwen2 / Qwen3 / Mistral / SmolLM2): [blocks/gqa.py](../../src/mini_infer/models/blocks/gqa.py).
 - **TransformerBlock** (shared decoder shape): [blocks/transformer_block.py](../../src/mini_infer/models/blocks/transformer_block.py).
 - **RoPE** (shared with every Llama-shape family): [blocks/rope.py](../../src/mini_infer/models/blocks/rope.py).

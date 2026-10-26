@@ -25,13 +25,13 @@ Three details matter most:
 
 | Primitive | Reference (`transformers/models/nemotron_h/modeling_nemotron_h.py`) | Our code |
 | --- | --- | --- |
-| Layer | `NemotronHBlock` | [nemotron_h.py](../../src/mini_infer/models/nemotron_h.py) `_NemotronBlock` |
+| Layer | `NemotronHBlock` | [nemotron_h.py](../../src/mini_infer/models/nemotron_h/nemotron_h.py) `_NemotronBlock` |
 | Mamba-2 mixer | `NemotronHMamba2Mixer.torch_forward` | `_NemotronMamba2Mixer` |
-| Short conv | `conv1d` + SiLU | [mamba2.py](../../src/mini_infer/models/blocks/mamba2.py) `mamba_conv_prefill`, `mamba_conv_step` |
+| Short conv | `conv1d` + SiLU | [mamba2.py](../../src/mini_infer/models/nemotron_h/mamba2.py) `mamba_conv_prefill`, `mamba_conv_step` |
 | SSD scan, prefill | chunked naive SSD | `ssd_chunked` |
 | SSM step, decode | single-token update | `ssd_recurrent` |
 | Gated norm | `Zamba2RMSNormGated` (gate before norm, groups) | `gated_group_rmsnorm` |
-| Router | `NemotronHTopkRouter` | [glm_moe_gate.py](../../src/mini_infer/models/blocks/glm_moe_gate.py) `GlmNoAuxTcGate` |
+| Router | `NemotronHTopkRouter` | [glm_moe_gate.py](../../src/mini_infer/models/blocks/moe/glm_moe_gate.py) `GlmNoAuxTcGate` |
 | Experts | `NemotronHExperts` (3D tensors) | `_NemotronMoE.experts_up`, `experts_down` |
 | Shared expert, dense MLP | `NemotronHMLP` | `_ReluSquaredMLP` |
 | Attention | `NemotronHAttention` (no RoPE) | `_NemotronAttention` |
@@ -57,7 +57,7 @@ fp32, and the state is cached in fp32.
 `ssd_chunked` evaluates the same recurrence in chunks of 128 tokens: inside
 a chunk the output is a masked product of C against B, and only one state per
 chunk is carried forward. `ssd_recurrent` steps one token at a time and is
-the decode path. `tests/unit/test_mamba2_block.py` pins them to each other,
+the decode path. `tests/unit/models/nemotron_h/test_mamba2_block.py` pins them to each other,
 including carried states and partial last chunks.
 
 ## MoE
@@ -102,9 +102,9 @@ drops the `mtp.` layer.
   token at a time (see the TL;DR).
 - Real weights on a laptop: Nemotron 3 Nano 4B completes "Paris" on an M1
   Pro (MPS, fp16). Run it with
-  `pytest tests/unit/test_nemotron_h_real_weights.py --run-large-models`.
+  `pytest tests/unit/models/nemotron_h/test_nemotron_h_real_weights.py --run-large-models`.
 - Real 30B-A3B on one A100 80 GB GPU, bf16, against transformers on the
-  same weights: `scripts/modal_nemotron_h_smoke.py` passed. Prefill logit
+  same weights: `scripts/nemotron_h/modal_nemotron_h_smoke.py` passed. Prefill logit
   cosine was 0.9949 to 0.9989 with the same last-token top-1 on all four
   prompts, and greedy output matched for 31, 7, 2 and 32 of 32 tokens. The
   first prompt completes as " Paris.". ADR-035 discusses why the agreement

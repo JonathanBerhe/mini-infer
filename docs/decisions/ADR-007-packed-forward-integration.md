@@ -77,5 +77,5 @@ The decision is unchanged, but two points changed.
   every position. `forward_step` still serves every other caller, such as the
   prefill worker and the draft model in `engine/speculative.py`.
 
-`tests/unit/test_scheduler_variable_tokens.py` covers the packing and
+`tests/unit/scheduler/test_scheduler_variable_tokens.py` covers the packing and
 slicing without a model.

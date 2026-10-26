@@ -3,7 +3,7 @@
 Date: 2026-04-29
 Hardware: NVIDIA A10 (Ampere, SM_86), bf16 model
 Engine: mini-infer @ this slice (ADR-013)
-Script: `scripts/modal_packed_bench.py --config turbo`
+Script: `scripts/bench/modal_packed_bench.py --config turbo`
 
 ## Workload
 
@@ -132,8 +132,8 @@ shared memory tile-by-tile. That's the single highest-value follow-up.
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config turbo
-uv run modal run scripts/modal_packed_bench.py --config turbo --model "Qwen/Qwen2.5-7B-Instruct"
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo
+uv run modal run scripts/bench/modal_packed_bench.py --config turbo --model "Qwen/Qwen2.5-7B-Instruct"
 ```
 
 Defaults: A10, prompt ~80 tokens, max_tokens=32, C ∈ {1, 4, 8}.
@@ -144,6 +144,6 @@ Defaults: A10, prompt ~80 tokens, max_tokens=32, C ∈ {1, 4, 8}.
 - Implementation: `src/mini_infer/cache/turbo_quant.py`.
 - Cache integration: `src/mini_infer/cache/block_pool.py`,
   `src/mini_infer/cache/paged_kv_cache.py`.
-- Unit tests: `tests/unit/test_turbo_quant.py`,
-  `tests/unit/test_turbo_quant_integration.py`.
+- Unit tests: `tests/unit/cache/test_turbo_quant.py`,
+  `tests/unit/cache/test_turbo_quant_integration.py`.
 - Paper: https://arxiv.org/abs/2504.19874

@@ -66,10 +66,10 @@ Every `modal run` bills the account. There is no free tier. See the project's lo
 
 ### Smoke test
 
-`scripts/modal_smoke.py` spins up an A10 24GB container, installs the project's runtime deps, mounts the `mini_infer` package, loads `Qwen/Qwen2.5-0.5B-Instruct`, runs greedy generation, asserts the output contains "Paris", and exits. Run with:
+`scripts/smoke/modal_smoke.py` spins up an A10 24GB container, installs the project's runtime deps, mounts the `mini_infer` package, loads `Qwen/Qwen2.5-0.5B-Instruct`, runs greedy generation, asserts the output contains "Paris", and exits. Run with:
 
 ```bash
-uv run modal run scripts/modal_smoke.py
+uv run modal run scripts/smoke/modal_smoke.py
 ```
 
 Expected cost: roughly $0.02 once the image is cached. First run includes ~2 minutes of image build (also billed but cheaper); the built image is reused on subsequent runs.

@@ -54,11 +54,11 @@ dev = [
     # (single) resolved transformers for the whole repo to 5.14.x; the golden
     # suite is re-run to confirm the existing families still match under the bump.
     "transformers>=5.14,<5.15",
-    # async HTTP client for the open-loop bench (scripts/http_openloop_bench.py).
+    # async HTTP client for the open-loop bench (scripts/bench/http_openloop_bench.py).
     # Streaming + per-token timing via SSE; not used by the server itself.
     "httpx>=0.27",
     # imported by the vendored Kimi Linear reference the parity tests run
-    # (third_party/kimi_linear_reference; see tests/unit/_kimi_reference_helpers.py).
+    # (third_party/kimi_linear_reference; see tests/unit/models/kimi_linear/_kimi_reference_helpers.py).
     "einops>=0.8.2",
 ]
 
@@ -73,20 +73,20 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 # Triton kernels conventionally use uppercase pointer args (Q_ptr) and constexpr
 # constants (HEAD_DIM, BLOCK_SIZE). Allow it in the kernel modules.
 "src/mini_infer/cache/paged_attention.py" = ["N803"]
-"src/mini_infer/cache/msa_paged_attention.py" = ["N803"]
+"src/mini_infer/models/minimax_m3/msa_paged_attention.py" = ["N803"]
 "src/mini_infer/cache/turbo_kernel.py" = ["N803"]
 "src/mini_infer/quant/int8_kernel.py" = ["N803"]
-"src/mini_infer/models/blocks/hc_sinkhorn_kernel.py" = ["N803"]
-"src/mini_infer/models/blocks/gdn_decode_kernel.py" = ["N803"]
-"src/mini_infer/models/blocks/fp8_grouped_kernel.py" = ["N803"]
-"src/mini_infer/models/blocks/fp4_grouped_kernel.py" = ["N803"]
+"src/mini_infer/models/deepseek_v4/hc_sinkhorn_kernel.py" = ["N803"]
+"src/mini_infer/models/qwen/gdn_decode_kernel.py" = ["N803"]
+"src/mini_infer/models/blocks/moe/fp8_grouped_kernel.py" = ["N803"]
+"src/mini_infer/models/blocks/moe/fp4_grouped_kernel.py" = ["N803"]
 "src/mini_infer/models/blocks/partial_rope_kernel.py" = ["N803"]
 "src/mini_infer/models/blocks/rms_norm_kernel.py" = ["N803"]
 # Gluon kernels also name their constexpr locals in uppercase and build
 # buffer shapes by list concatenation, which the Gluon frontend parses. A
 # Gluon aggregate's constructor is a method without `self`.
-"src/mini_infer/models/blocks/fp8_grouped_gluon.py" = ["N803", "N805", "N806", "RUF005"]
-"src/mini_infer/models/blocks/fp4_grouped_gluon.py" = ["N803", "N806", "RUF005"]
+"src/mini_infer/models/blocks/moe/fp8_grouped_gluon.py" = ["N803", "N805", "N806", "RUF005"]
+"src/mini_infer/models/blocks/moe/fp4_grouped_gluon.py" = ["N803", "N806", "RUF005"]
 # `Depends(...)` in default args is the canonical FastAPI dependency-injection
 # idiom; B008 flags it as a "function call in default", which is the point.
 "src/mini_infer/api/server.py" = ["B008"]

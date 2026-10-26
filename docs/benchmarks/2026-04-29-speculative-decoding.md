@@ -7,7 +7,7 @@ Draft: Qwen/Qwen2.5-0.5B-Instruct
 K (draft length): 4
 max_tokens: 32 (greedy)
 Engine: mini-infer @ this slice (ADR-011)
-Script: `scripts/modal_packed_bench.py --config spec` (set `MINI_INFER_BENCH_GPU=H100` for H100)
+Script: `scripts/bench/modal_packed_bench.py --config spec` (set `MINI_INFER_BENCH_GPU=H100` for H100)
 
 ## Workload
 
@@ -152,7 +152,7 @@ H100 produced `match=yes` on all three prompts. Two plausible reasons:
 2. Hopper's higher numerical headroom in TF32 / FP8 paths reduces the
    bf16-cast frequency at intermediate steps.
 
-Either way, the M1 fp32 reference parity (in `tests/unit/test_speculative.py`
+Either way, the M1 fp32 reference parity (in `tests/unit/engine/test_speculative.py`
 and `tests/stress/test_speculative_load.py`) is the strict correctness
 oracle; the GPU bf16 paths are subject to floating-point drift at the
 same level any production engine ships at bf16. vLLM and SGLang treat
@@ -198,7 +198,7 @@ same.
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config spec
+uv run modal run scripts/bench/modal_packed_bench.py --config spec
 ```
 
 Defaults: A10, target=Qwen/Qwen2.5-7B-Instruct, draft=Qwen/Qwen2.5-0.5B-Instruct,
@@ -211,5 +211,5 @@ K=4, max_tokens=32, 3 prompts. Override the model pair via
 - Implementation: `src/mini_infer/engine/speculative.py`,
   `src/mini_infer/cache/paged_kv_cache.py::truncate_to`.
 - M1 parity tests:
-  `tests/unit/test_speculative.py`,
+  `tests/unit/engine/test_speculative.py`,
   `tests/stress/test_speculative_load.py`.

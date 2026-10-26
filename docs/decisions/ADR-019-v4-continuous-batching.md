@@ -47,7 +47,7 @@ at per-request seqlens) needs a kernel:
 - (a) FlashMLA-sparse / DeepGEMM indexer kernels, as vLLM and SGLang use.
   They are fast, but tied to the Hopper/Blackwell stack and hard to read.
 - (b) A readable torch/Triton ragged variant of `hca_mqa_with_sink`
-  ([hca_attention.py](../../src/mini_infer/cache/hca_attention.py)) that
+  ([hca_attention.py](../../src/mini_infer/models/deepseek_v4/hca_attention.py)) that
   takes per-request seqlens and top-k indices.
 
 The decision: (b) as the reference, with (a) as an optional fast backend
@@ -92,7 +92,7 @@ throughput numbers.
 
 ## Benchmark (2026-06-24, real V4-Flash, 2x B200, TP)
 
-`scripts/modal_v4_flash_cb_bench.py`, 16 requests x 64 tokens, identical
+`scripts/deepseek_v4/modal_v4_flash_cb_bench.py`, 16 requests x 64 tokens, identical
 output:
 
 | path | wall | throughput |
@@ -111,7 +111,7 @@ GPU. A model too big for one GPU uses
 `TensorParallelStateCacheContinuousServer`. `StateCacheScheduler` and
 `StateCacheCohortScheduler` are gone. The GPU gate served real V4-Flash on
 2x B200 with 6 concurrent requests: all HTTP 200, coherent output, clean
-follower teardown (`scripts/modal_v4_flash_cb_serve.py`).
+follower teardown (`scripts/deepseek_v4/modal_v4_flash_cb_serve.py`).
 
 Correction (2026-10-18): that HTTP gate served its 6 requests one at a time.
 The endpoint ran the blocking `scheduler.run()` inside the async handler,
@@ -119,7 +119,7 @@ which held the event loop for each whole request (see
 [ADR-028](ADR-028-engine-liveness.md)). So the gate did not exercise
 multi-slot admission on the real checkpoint. Ragged batched decode did run
 on the real checkpoint through `generate_cohort` in the benchmark. A rerun
-of `scripts/modal_v4_flash_cb_serve.py` is the pending gate for that path.
+of `scripts/deepseek_v4/modal_v4_flash_cb_serve.py` is the pending gate for that path.
 
 ## Alternatives Considered
 
