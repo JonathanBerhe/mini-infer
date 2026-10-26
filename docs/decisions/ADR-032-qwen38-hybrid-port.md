@@ -67,7 +67,7 @@ transformers 5.14 hardcodes the behavior of `attn_output_gate: true` and
   in dimensions and the GDN head ratio.
 - The 27B does not fit the local Apple Silicon machine. Synthetic parity
   tests cover its 3x GDN ratio. A one-GPU gate on the real weights
-  (`scripts/modal_qwen38_smoke.py`, A100 80 GB, bf16) gives a prefill logit
+  (`scripts/qwen/modal_qwen38_smoke.py`, A100 80 GB, bf16) gives a prefill logit
   cosine of at least 0.99985 against transformers. Greedy output equals the
   reference token for token on all four prompts (see ADR-034 for the fused
   decode step).

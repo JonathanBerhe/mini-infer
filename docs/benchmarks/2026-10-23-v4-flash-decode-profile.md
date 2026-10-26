@@ -10,7 +10,7 @@ Workload: batch 1, greedy decode, eager (no CUDA graph). Two contexts: the
 6-token prompt "The capital of France is", and the first 2,021 tokens of
 `scripts/data/technical_passage.md`
 Engine: mini-infer at `d9587f0`
-Script: `scripts/modal_v4_flash_generate.py --profile-decode`
+Script: `scripts/deepseek_v4/modal_v4_flash_generate.py --profile-decode`
 
 ## Question
 
@@ -121,9 +121,9 @@ CUDA sync debug mode found these sources, per step:
 | Source | Syncs per step | What it does |
 |---|---:|---|
 | the decode loop (as in `StateCacheGenerator`) | 1 | copies the new token id to the GPU |
-| `models/deepseek_v4.py:1070` | 1 | copies the token position to the GPU |
+| `models/deepseek_v4/deepseek_v4.py:1070` | 1 | copies the token position to the GPU |
 | `engine/sampler.py:26` | 1 | `.item()` of the greedy argmax |
-| `models/deepseek_v4.py:1096` | 5.25 (short), 10.25 (long) | copies the position of a flushed block to the GPU, once per flushing layer |
+| `models/deepseek_v4/deepseek_v4.py:1096` | 5.25 (short), 10.25 (long) | copies the position of a flushed block to the GPU, once per flushing layer |
 
 The copies to the GPU sync because they read from pageable host memory. The
 syncs cost almost nothing today (0.0 to 0.3 ms per step), because the GPU is
@@ -214,7 +214,7 @@ eager run. Both modes ran in the same container.
 
 The two-GPU continuous-batching server with the graph
 (`TensorParallelStateCacheContinuousServer(cuda_graph=True)`), measured with
-`scripts/modal_v4_flash_cb_bench.py --cuda-graph` in one run. Each batch
+`scripts/deepseek_v4/modal_v4_flash_cb_bench.py --cuda-graph` in one run. Each batch
 size times 63 greedy decode steps after 4 warm-up steps:
 
 | Batch | Eager ms/step | CUDA graph ms/step | Speedup | Tokens per second |
@@ -229,7 +229,7 @@ grows by about 1.4 ms per extra request.
 
 ## Graph step at batch 16
 
-`scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16` runs
+`scripts/deepseek_v4/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16` runs
 the ragged decode step of the server at batch 1 and 16, with a cache of 1,024
 tokens. Row `b` prefills its own slice of the passage, of `24 + 8 * b` tokens.
 A graph replay is one launch, so its trace cannot say which part of the model
@@ -286,7 +286,7 @@ memory reads.
 [ADR-043](../decisions/ADR-043-w4a8-fp4-experts.md) adds a mode that
 quantizes the expert inputs to e4m3 and runs the FP4 matmuls on the
 Blackwell tensor cores without the software decode.
-`scripts/modal_v4_flash_generate.py --compare-fp8-activations` runs both
+`scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fp8-activations` runs both
 modes on one load:
 
 | Measure | bf16 inputs | e4m3 inputs |
@@ -314,7 +314,7 @@ compressed history, by contrast, takes about 0.14 ms at batch 16 with the
 
 [ADR-044](../decisions/ADR-044-fused-partial-rope.md) does each call in
 one Triton kernel with the same rounding.
-`scripts/modal_v4_flash_generate.py --compare-fused-rope` runs both on one
+`scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fused-rope` runs both on one
 load, with the FP4 experts on W4A8:
 
 | Measure | PyTorch partial RoPE | Fused kernel |
@@ -335,7 +335,7 @@ batch 16) and 43 per-head q-norms of 7 kernels each (about 0.7 ms).
 
 [ADR-045](../decisions/ADR-045-fused-rms-norm.md) runs each norm as one
 Triton kernel. Its sum runs in another order than PyTorch's, so it is not
-bit-identical. `scripts/modal_v4_flash_generate.py --compare-fused-norm`
+bit-identical. `scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fused-norm`
 runs both on one load, with W4A8 and the fused RoPE:
 
 | Measure | PyTorch norms | Fused kernel |
@@ -392,31 +392,31 @@ the packed FP4 experts.
 ## Reproduce
 
 ```bash
-uv run modal run scripts/modal_v4_flash_generate.py --profile-decode
+uv run modal run scripts/deepseek_v4/modal_v4_flash_generate.py --profile-decode
 ```
 
 ```bash
-uv run modal run scripts/modal_v4_flash_generate.py --profile-decode --cuda-graph
+uv run modal run scripts/deepseek_v4/modal_v4_flash_generate.py --profile-decode --cuda-graph
 ```
 
 ```bash
-uv run modal run scripts/modal_v4_flash_cb_bench.py --cuda-graph --batch-sizes 1,8,16
+uv run modal run scripts/deepseek_v4/modal_v4_flash_cb_bench.py --cuda-graph --batch-sizes 1,8,16
 ```
 
 ```bash
-uv run modal run scripts/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
+uv run modal run scripts/deepseek_v4/modal_v4_flash_generate.py --profile-batch --batch-sizes 1,16
 ```
 
 ```bash
-uv run modal run scripts/modal_v4_flash_generate.py --compare-fp8-activations
+uv run modal run scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fp8-activations
 ```
 
 ```bash
-uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-rope
+uv run modal run scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fused-rope
 ```
 
 ```bash
-uv run modal run scripts/modal_v4_flash_generate.py --compare-fused-norm
+uv run modal run scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fused-norm
 ```
 
 `--trace-dir <dir>` also saves the raw Chrome traces (about 80 MB each).

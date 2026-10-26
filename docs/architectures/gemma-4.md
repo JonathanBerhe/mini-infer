@@ -49,8 +49,8 @@ fallback because that's what the project's non-goal list says.
 
 | Primitive | Reference (HF `modeling_gemma3.py` / `modeling_gemma4_text.py`) | Our code |
 |---|---|---|
-| Backbone (text decoder) | `Gemma3TextModel` + `Gemma4ForConditionalGeneration` text head | `Gemma4ForCausalLM` + `_Gemma4InnerModel` in `src/mini_infer/models/gemma4.py` (L181, L151) |
-| Decoder layer | `Gemma3DecoderLayer` | `Gemma4DecoderLayer` in `src/mini_infer/models/blocks/gemma4_decoder_layer.py` (L39) |
+| Backbone (text decoder) | `Gemma3TextModel` + `Gemma4ForConditionalGeneration` text head | `Gemma4ForCausalLM` + `_Gemma4InnerModel` in `src/mini_infer/models/gemma/gemma4.py` (L181, L151) |
+| Decoder layer | `Gemma3DecoderLayer` | `Gemma4DecoderLayer` in `src/mini_infer/models/gemma/gemma4_decoder_layer.py` (L39) |
 | GQA with heterogeneous head shapes | `Gemma3Attention` | `GQAAttention` in `blocks/gqa.py` (shared with Llama/Qwen/Mistral; Gemma 4 declares per-layer shape via `per_layer_kv_shape()`) |
 | Sliding-window / global alternation | `Gemma3Attention` `sliding_window` field | per-layer `LayerAttentionSpec` from `Gemma4Config.per_layer_attention()` |
 | Dual RoPE (sliding theta=10000, global theta=1000000 partial 0.25) | `Gemma3RotaryEmbedding` (two instances) | two `RotaryEmbedding` instances in `_Gemma4InnerModel` (one per type) |
@@ -60,7 +60,7 @@ fallback because that's what the project's non-goal list says.
 | Standard RMSNorm (not Gemma 3's `(1+w)*x`) | `Gemma3RMSNorm` (with the `(1+w)*x` transform on Gemma 3 only) | `RMSNorm` in `blocks/rmsnorm.py` (standard form for Gemma 4; the offset variant is `GemmaRMSNorm` in `blocks/gemma_rmsnorm.py` and is Gemma 3-only) |
 | Final logit softcap | `tanh(logits / 30) * 30` inside `Gemma4ForConditionalGeneration` | applied in `Gemma4ForCausalLM.forward` after `lm_head` |
 | Softmax scale 1.0 | hard-coded scale in `Gemma3Attention.forward` | `query_scale=1.0` passed into `GQAAttention` |
-| Multimodal weight filter | not applicable (HF holds vision tower separately) | `_MULTIMODAL_PREFIX_RE` in `gemma4.py:65`; filters at load time |
+| Multimodal weight filter | not applicable (HF holds vision tower separately) | `_MULTIMODAL_PREFIX_RE` in `gemma4.py:66`; filters at load time |
 | Attention backend override | not applicable (HF runs reference SDPA / Triton unified) | `Gemma4ForCausalLM.required_attention_backend()` returns `"torch"` (line near L181) |
 
 Bit-parity is exercised against HF transformers' `Gemma3Attention`
@@ -251,7 +251,7 @@ The published `google/gemma-4-31B-it` checkpoint contains:
 - `vision_tower`, `audio_tower`, `multi_modal_projector`,
   `embed_vision`, `embed_audio` (we filter these out)
 
-**Our code**: `_MULTIMODAL_PREFIX_RE` (`gemma4.py:65`) is a regex
+**Our code**: `_MULTIMODAL_PREFIX_RE` (`gemma4.py:66`) is a regex
 applied during `load_state_dict`. Keys matching the multimodal
 prefixes are dropped; only the text decoder loads.
 
@@ -322,8 +322,8 @@ that proved out the heterogeneous-KV BlockPool path on real weights.
   `transformers/models/gemma3/modeling_gemma3.py` (the text path
   Gemma 4 uses in the published HF version; some later transformers
   versions split this into `models/gemma4_text/`).
-- **Our model class**: `src/mini_infer/models/gemma4.py`.
-- **Decoder layer**: `src/mini_infer/models/blocks/gemma4_decoder_layer.py`.
+- **Our model class**: `src/mini_infer/models/gemma/gemma4.py`.
+- **Decoder layer**: `src/mini_infer/models/gemma/gemma4_decoder_layer.py`.
 - **GQA block (shared)**: `src/mini_infer/models/blocks/gqa.py`.
 - **Heterogeneous-KV pool**: `src/mini_infer/cache/block_pool.py::LayerAttentionSpec`.
 - **Standard RMSNorm**: `src/mini_infer/models/blocks/rmsnorm.py`.
@@ -333,7 +333,7 @@ that proved out the heterogeneous-KV BlockPool path on real weights.
 
 - **Gemma 4 MoE variants (26B-A4B)**. Not yet implemented; would
   reuse most of the text decoder path plus the MoE block from
-  `blocks/mixtral_moe.py`. Listed in the Gemma 4 docstring as out of
+  `blocks/moe/mixtral_moe.py`. Listed in the Gemma 4 docstring as out of
   scope for the current text-only port.
 - **Gemma 4 PLE variants (E2B / E4B)**. Per-Layer Embeddings + shared
   KV across layers. Separate code path, different from the current

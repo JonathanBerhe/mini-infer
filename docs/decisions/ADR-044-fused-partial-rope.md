@@ -47,7 +47,7 @@ GPU time per step at batch 1 and 5.2 ms at batch 16.
 ## Consequences
 
 Measured on 2x B200 with real V4-Flash
-(`scripts/modal_v4_flash_generate.py --compare-fused-rope`), with W4A8 FP4
+(`scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fused-rope`), with W4A8 FP4
 experts ([ADR-043](ADR-043-w4a8-fp4-experts.md)):
 
 | Measure | PyTorch partial RoPE | Fused kernel |
@@ -59,7 +59,7 @@ experts ([ADR-043](ADR-043-w4a8-fp4-experts.md)):
 - The real-model outputs are bit-identical, down to the 33 greedy tokens.
 - The step is 1.10x faster at both batch sizes. So the 212 fused launches
   cost about 0.6 to 1.0 ms per step.
-- `tests/unit/test_partial_rope_kernel.py` compares the kernel with the
+- `tests/unit/models/blocks/test_partial_rope_kernel.py` compares the kernel with the
   PyTorch path. On an H100 and a B200 the outputs are equal bit for bit.
 - All V4 callers on CUDA take the kernel: the CSA, HCA and SWA attention,
   the compressor and the Lightning Indexer.

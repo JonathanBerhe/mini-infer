@@ -19,7 +19,7 @@ in a CUDA graph.
 
 ## Decision
 
-1. A W4A16 grouped kernel in Triton (`models/blocks/fp4_grouped_kernel.py`),
+1. A W4A16 grouped kernel in Triton (`models/blocks/moe/fp4_grouped_kernel.py`),
    shaped like the FP8 kernel of ADR-037. Activations stay bf16, the weights
    are the left operand of the dot (`out.T = W @ rows.T`), and the
    accumulator is fp32. Up to 256 (token, expert) rows, a program takes
@@ -36,7 +36,7 @@ in a CUDA graph.
 5. FP4 experts use the kernel on Hopper or newer when the activations are
    bf16 or fp16. The loop stays the reference.
 6. Three tile tiers by row count, tuned on an H100 and a B200.
-7. `tests/unit/test_fp4_grouped_kernel.py` runs on CUDA or under the Triton
+7. `tests/unit/models/blocks/moe/test_fp4_grouped_kernel.py` runs on CUDA or under the Triton
    interpreter, against `dequantize_nvfp4_to_bf16`.
 
 ## Alternatives Considered

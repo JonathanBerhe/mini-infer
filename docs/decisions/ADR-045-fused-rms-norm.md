@@ -38,7 +38,7 @@ a few microseconds to start and end.
 ## Consequences
 
 Measured on 2x B200, real V4-Flash, both modes on one load
-(`scripts/modal_v4_flash_generate.py --compare-fused-norm`), with W4A8 FP4
+(`scripts/deepseek_v4/modal_v4_flash_generate.py --compare-fused-norm`), with W4A8 FP4
 experts ([ADR-043](ADR-043-w4a8-fp4-experts.md)) and the fused RoPE. A
 step time is the median of 16 CUDA-graph decode steps.
 
@@ -54,7 +54,7 @@ step time is the median of 16 CUDA-graph decode steps.
 - The modes pick the same next token at 95.0% of positions. A likely
   cause, not measured, is MoE routing: a last-bit change can move a token
   to another expert.
-- `tests/unit/test_rms_norm_kernel.py` bounds the difference. On CUDA,
+- `tests/unit/models/blocks/test_rms_norm_kernel.py` bounds the difference. On CUDA,
   fewer than 2% of the bf16 outputs differ. It passes on H100 and B200.
 - The hyper-connection norm (87 per step) and about 716 other casts per
   step stay as they are.

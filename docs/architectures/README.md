@@ -3,8 +3,29 @@
 Per-architecture line-by-line correspondence between research paper,
 upstream reference implementation, and our from-scratch port.
 
-The direct realization of mini-infer's research-paper-engine niche
-(see [roadmap-2026.md](../plans/roadmap-2026.md)).
+The direct realization of mini-infer's research-paper-engine niche.
+
+## Where the code is
+
+Each model family has one folder for its code, one for its tests, and one
+for its scripts. A file that two or more families use is in
+`src/mini_infer/models/blocks/`, and its tests are in
+`tests/unit/models/blocks/`.
+
+| Family | Code | Tests | Scripts |
+|---|---|---|---|
+| Llama | [`models/llama/`](../../src/mini_infer/models/llama/) | [`models/llama/`](../../tests/unit/models/llama/) | [`llama/`](../../scripts/llama/) |
+| Mistral, Mixtral | [`models/mistral/`](../../src/mini_infer/models/mistral/) | [`models/mistral/`](../../tests/unit/models/mistral/) | none |
+| Qwen2, Qwen3, Qwen3.5 | [`models/qwen/`](../../src/mini_infer/models/qwen/) | [`models/qwen/`](../../tests/unit/models/qwen/) | [`qwen/`](../../scripts/qwen/) |
+| Gemma 3, Gemma 4 | [`models/gemma/`](../../src/mini_infer/models/gemma/) | [`models/gemma/`](../../tests/unit/models/gemma/) | [`gemma/`](../../scripts/gemma/) |
+| DeepSeek-V2, V3 | [`models/deepseek_v2/`](../../src/mini_infer/models/deepseek_v2/) | [`models/deepseek_v2/`](../../tests/unit/models/deepseek_v2/) | [`deepseek_v2/`](../../scripts/deepseek_v2/) |
+| DeepSeek-V4 | [`models/deepseek_v4/`](../../src/mini_infer/models/deepseek_v4/) | [`models/deepseek_v4/`](../../tests/unit/models/deepseek_v4/) | [`deepseek_v4/`](../../scripts/deepseek_v4/) |
+| GLM-5.2, GLM-5.3 | [`models/glm/`](../../src/mini_infer/models/glm/) | [`models/glm/`](../../tests/unit/models/glm/) | [`glm/`](../../scripts/glm/) |
+| MiniMax-M3 | [`models/minimax_m3/`](../../src/mini_infer/models/minimax_m3/) | [`models/minimax_m3/`](../../tests/unit/models/minimax_m3/) | [`minimax_m3/`](../../scripts/minimax_m3/) |
+| Inkling | [`models/inkling/`](../../src/mini_infer/models/inkling/) | [`models/inkling/`](../../tests/unit/models/inkling/) | [`inkling/`](../../scripts/inkling/) |
+| Kimi Linear | [`models/kimi_linear/`](../../src/mini_infer/models/kimi_linear/) | [`models/kimi_linear/`](../../tests/unit/models/kimi_linear/) | [`kimi_linear/`](../../scripts/kimi_linear/) |
+| Nemotron-H | [`models/nemotron_h/`](../../src/mini_infer/models/nemotron_h/) | [`models/nemotron_h/`](../../tests/unit/models/nemotron_h/) | [`nemotron_h/`](../../scripts/nemotron_h/) |
+| Shared blocks | [`models/blocks/`](../../src/mini_infer/models/blocks/) | [`models/blocks/`](../../tests/unit/models/blocks/) | none |
 
 ## Available walkthroughs
 

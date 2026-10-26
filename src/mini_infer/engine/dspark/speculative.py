@@ -61,7 +61,7 @@ class DSparkSpeculativeRunner:
     tokens are a draw from the target's own distribution, so per-run outputs
     differ from any particular target-alone run while the distribution matches
     (see `sampling.py` for why, and the statistical test in
-    `tests/unit/test_dspark_rejection_sampling.py`).
+    `tests/unit/engine/dspark/test_dspark_rejection_sampling.py`).
     """
 
     def __init__(

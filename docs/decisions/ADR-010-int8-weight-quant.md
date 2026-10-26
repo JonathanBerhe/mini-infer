@@ -58,9 +58,9 @@ Per-channel INT8 usually keeps cosine similarity above 0.999 between
 quantized and fp logits on Qwen-class models. The tests require a cosine
 above 0.99 on Qwen2.5-0.5B-Instruct:
 
-- `tests/unit/test_int8_model_integration.py::test_quantized_logits_close_to_fp_reference`
+- `tests/unit/quant/test_int8_model_integration.py::test_quantized_logits_close_to_fp_reference`
   compares the last-position logits.
-- `tests/unit/test_int8_model_integration.py::test_quantized_model_decodes_paris`
+- `tests/unit/quant/test_int8_model_integration.py::test_quantized_model_decodes_paris`
   makes sure that the quantized model answers "Paris".
 - `tests/stress/test_int8_load.py::test_int8_first_tokens_match_fp_reference`
   compares the first greedy token over several prompts.
@@ -77,7 +77,7 @@ skip keeps the 136M-param `lm_head` in fp16:
 | int8 (skip lm_head)   | ~630 MB             | ~36%            |
 | int8 (incl. lm_head)  | ~494 MB             | ~50%            |
 
-`tests/unit/test_int8_model_integration.py::test_quantized_weight_storage_smaller_than_fp`
+`tests/unit/quant/test_int8_model_integration.py::test_quantized_weight_storage_smaller_than_fp`
 asserts ≥30% savings with the default skip. On an M1 CPU, 15 unit tests,
 5 real-model tests and 1 stress test pass.
 

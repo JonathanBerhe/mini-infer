@@ -42,7 +42,7 @@ Scope: this module holds the paged kernel family: single-token decode, uniform
 prefill / multi-query, and mixed prefill/decode batches. All support
 grouped-query attention (num_kv_heads divides num_heads; query head h reads kv
 head h // (num_heads // num_kv_heads)) and run in interpret mode on CPU.
-On-TPU validation goes through scripts/run_tpu_pallas_kernels.py (results in
+On-TPU validation goes through scripts/tpu/run_tpu_pallas_kernels.py (results in
 docs/benchmarks/, design in ADR-024).
 
 JAX is optional and import-guarded exactly as in pallas_softmax.py /

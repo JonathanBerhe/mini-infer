@@ -3,7 +3,7 @@
 Date: 2026-05-02
 Hardware: NVIDIA H100 80 GB HBM3 (Hopper, SM_90)
 Engine: mini-infer @ this slice (`kv_quant="fp8"` mode)
-Script: `MINI_INFER_BENCH_GPU=H100 modal run scripts/modal_packed_bench.py --config flashinfer_fp8`
+Script: `MINI_INFER_BENCH_GPU=H100 modal run scripts/bench/modal_packed_bench.py --config flashinfer_fp8`
 
 The FP8 KV cache mode stores K/V in `torch.float8_e4m3fn` (instead of
 bf16) and routes attention through FlashInfer, which fuses fp8 dequant
@@ -113,7 +113,7 @@ parity vs bf16 is the wrong bar (no production FP8 KV hits that).
 ## Reproduce
 
 ```
-MINI_INFER_BENCH_GPU=H100 modal run scripts/modal_packed_bench.py --config flashinfer_fp8
+MINI_INFER_BENCH_GPU=H100 modal run scripts/bench/modal_packed_bench.py --config flashinfer_fp8
 ```
 
 ## Pointers
@@ -128,6 +128,4 @@ MINI_INFER_BENCH_GPU=H100 modal run scripts/modal_packed_bench.py --config flash
   (the `kv_quant=="fp8"` branch passes `k_scale`/`v_scale` to
   `prefill_wrapper.run()`).
 - Tests:
-  [tests/unit/test_fp8_kv.py](../../tests/unit/test_fp8_kv.py).
-- Plan:
-  [docs/plans/flashinfer-integration.md](../plans/flashinfer-integration.md).
+  [tests/unit/cache/test_fp8_kv.py](../../tests/unit/cache/test_fp8_kv.py).

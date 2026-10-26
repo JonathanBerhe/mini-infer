@@ -4,7 +4,7 @@ Date: 2026-05-02
 Hardware: NVIDIA A10G (Ampere, SM_86), bf16 model
 Engine: mini-infer @ this slice (FlashInfer backend opt-in via
 `attention_backend="flashinfer"`)
-Script: `scripts/modal_packed_bench.py --config flashinfer`
+Script: `scripts/bench/modal_packed_bench.py --config flashinfer`
 
 The integration adds [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 as an alternative paged-attention backend alongside the existing
@@ -89,7 +89,7 @@ re-using the dispatcher gate this slice added.
 ## Reproduce
 
 ```
-uv run modal run scripts/modal_packed_bench.py --config flashinfer
+uv run modal run scripts/bench/modal_packed_bench.py --config flashinfer
 ```
 
 ## Pointers
@@ -99,6 +99,4 @@ uv run modal run scripts/modal_packed_bench.py --config flashinfer
 - Dispatcher gate:
   [packed_attention.py:packed_attention_forward](../../src/mini_infer/cache/packed_attention.py).
 - Tests:
-  [tests/unit/test_flashinfer_backend.py](../../tests/unit/test_flashinfer_backend.py).
-- Plan:
-  [docs/plans/flashinfer-integration.md](../plans/flashinfer-integration.md).
+  [tests/unit/cache/test_flashinfer_backend.py](../../tests/unit/cache/test_flashinfer_backend.py).

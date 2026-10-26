@@ -25,8 +25,8 @@ on:
       - "src/mini_infer/api/**"
       - "src/mini_infer/scheduler/**"
       - "tests/_pinned_models.toml"
-      - "tests/unit/test_models_*.py"
-      - "tests/unit/test_api*.py"
+      - "tests/unit/models/**"
+      - "tests/unit/api/**"
       - ".github/workflows/bitparity.yml"
   workflow_dispatch:
 
@@ -73,11 +73,11 @@ jobs:
         # exits and frees memory/threads first) keeps both green. Models are
         # already prefetched + cached above.
         run: >
-          uv run pytest tests/unit/test_api.py tests/unit/test_api_families.py
+          uv run pytest tests/unit/api/test_api.py tests/unit/api/test_api_families.py
           -m "requires_model and not requires_cuda and not gpu" -v
       - name: Bit-parity tests
         # `-m requires_model` runs every test that loads an HF model. The API
         # serving smokes are excluded here; they run in their own step above.
         run: >
           uv run pytest -m "requires_model and not requires_cuda and not gpu"
-          --ignore=tests/unit/test_api.py --ignore=tests/unit/test_api_families.py -v
+          --ignore=tests/unit/api/test_api.py --ignore=tests/unit/api/test_api_families.py -v

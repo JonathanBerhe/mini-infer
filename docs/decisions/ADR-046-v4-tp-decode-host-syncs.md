@@ -45,7 +45,7 @@ control traffic off NCCL. This ADR ports the cheap parts.
 ## Consequences
 
 Measured on 2x B200, real V4-Flash, in one container
-(`scripts/modal_v4_flash_cb_bench.py --host-gap`): first commit e18778b,
+(`scripts/deepseek_v4/modal_v4_flash_cb_bench.py --host-gap`): first commit e18778b,
 then this change. Each batch size serves greedy requests of 64 tokens. The
 worst gap is the largest of the 63 decode steps, and the host gap is their
 median.
@@ -66,7 +66,7 @@ median.
 - Greedy tokens do not change. The two-rank gloo tests compare the server
   with the single-process generator.
 - A sampled row uses another random stream than `sample()`, so a seed gives
-  other tokens. `tests/unit/test_sampler.py` tests the filters and the
+  other tokens. `tests/unit/engine/test_sampler.py` tests the filters and the
   draw distribution.
 - The follower now waits under the gloo timeout (30 minutes by default),
   not the NCCL timeout (10 minutes). In both cases, a server that is idle

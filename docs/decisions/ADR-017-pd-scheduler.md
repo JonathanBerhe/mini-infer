@@ -110,7 +110,7 @@ cost ~60 LoC of duplicated loop logic (`_engine_loop` against
 - Reverting is clean. The default API server still uses
   `ContinuousScheduler`, and `MINI_INFER_USE_PD` is opt-in.
 
-The test contract is in `tests/unit/test_pd_scheduler_multi.py`. Both modes
+The test contract is in `tests/unit/workers/test_pd_scheduler_multi.py`. Both modes
 give the same tokens as `ContinuousScheduler` under greedy decoding, for
 N=1 and N=3 concurrent requests, and give identical tokens to each other.
 After each run, the block pool is fully free. Requests with `max_tokens` of
@@ -120,6 +120,6 @@ emits a terminal step, and the two other requests complete. `start()` and
 
 The `test_api.py` suite passes unchanged. A manual smoke with
 `MINI_INFER_USE_PD=1 MINI_INFER_PD_MODE=...` serves `/v1/completions`
-through both modes. `scripts/bench_pd_scheduler.py` compares the
+through both modes. `scripts/bench/bench_pd_scheduler.py` compares the
 schedulers on CPU. The 2× H100 throughput run of parallel against serial
 mode did not run yet.

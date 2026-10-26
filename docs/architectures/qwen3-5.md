@@ -23,22 +23,22 @@ the 4B and 9B, so the ratio has to come from the config.
 The expensive math was already in the repo. Gated DeltaNet's recurrence is
 the Kimi Delta Attention recurrence with a coarser decay, so
 [blocks/kda.py](../../src/mini_infer/models/blocks/kda.py) is reused
-unchanged and [blocks/gdn.py](../../src/mini_infer/models/blocks/gdn.py)
+unchanged and [qwen/gdn.py](../../src/mini_infer/models/qwen/gdn.py)
 holds only the parts that genuinely differ.
 
 ## The map
 
 | Primitive | Reference (`transformers/models/qwen3_5/modeling_qwen3_5.py`) | Our code |
 | --- | --- | --- |
-| Gated DeltaNet layer | `Qwen3_5GatedDeltaNet` | [qwen3_5.py](../../src/mini_infer/models/qwen3_5.py) `_QwenGatedDeltaNet` |
+| Gated DeltaNet layer | `Qwen3_5GatedDeltaNet` | [qwen3_5.py](../../src/mini_infer/models/qwen/qwen3_5.py) `_QwenGatedDeltaNet` |
 | Delta-rule recurrence | `torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule` | [kda.py](../../src/mini_infer/models/blocks/kda.py) `kda_chunkwise`, `kda_recurrent` |
-| Decay gate | inline `-A_log.exp() * softplus(a + dt_bias)` | [gdn.py](../../src/mini_infer/models/blocks/gdn.py) `gdn_gate` |
-| Gated output norm | `Qwen3_5RMSNormGated` | [gdn.py](../../src/mini_infer/models/blocks/gdn.py) `gated_rmsnorm_silu` |
+| Decay gate | inline `-A_log.exp() * softplus(a + dt_bias)` | [gdn.py](../../src/mini_infer/models/qwen/gdn.py) `gdn_gate` |
+| Gated output norm | `Qwen3_5RMSNormGated` | [gdn.py](../../src/mini_infer/models/qwen/gdn.py) `gated_rmsnorm_silu` |
 | Fused causal conv | `causal_conv1d_fn` / `F.silu(conv1d(...))` fallback | [kda.py](../../src/mini_infer/models/blocks/kda.py) `causal_conv1d_prefill`, `causal_conv1d_step` |
-| Gated attention | `Qwen3_5Attention` | [qwen3_5.py](../../src/mini_infer/models/qwen3_5.py) `_QwenGatedAttention` |
+| Gated attention | `Qwen3_5Attention` | [qwen3_5.py](../../src/mini_infer/models/qwen/qwen3_5.py) `_QwenGatedAttention` |
 | Decoder norm | `Qwen3_5RMSNorm` (the `1 + w` form) | [gemma_rmsnorm.py](../../src/mini_infer/models/blocks/gemma_rmsnorm.py) `GemmaRMSNorm` |
 | Partial rotary | `Qwen3_5TextRotaryEmbedding` + `apply_rotary_pos_emb` | [rope.py](../../src/mini_infer/models/blocks/rope.py) `RotaryEmbedding`, `apply_rotary_pos_emb_partial` |
-| Decode state | `Qwen3_5DynamicCache` | [qwen3_5_state_cache.py](../../src/mini_infer/cache/qwen3_5_state_cache.py) `Qwen35StateCache` |
+| Decode state | `Qwen3_5DynamicCache` | [qwen3_5_state_cache.py](../../src/mini_infer/models/qwen/qwen3_5_state_cache.py) `Qwen35StateCache` |
 
 ## Gated DeltaNet
 
@@ -174,7 +174,7 @@ Covered: one-shot prefill, greedy decode across the chunk boundary, chunked
 prefill split mid-conv-kernel, ragged batched decode after `copy_row_from`,
 the mrope collapse, and the weight-drop path. See `tests/unit/`.
 
-Real weights: `tests/unit/test_qwen3_5_real_weights.py` loads
+Real weights: `tests/unit/models/qwen/test_qwen3_5_real_weights.py` loads
 `Qwen/Qwen3.5-4B` at a pinned revision, the smallest checkpoint with this
 architecture. It goes through `StateCacheGenerator.from_pretrained` and the
 state-cache scheduler, and checks the layout and a greedy "Paris" completion.
@@ -183,7 +183,7 @@ loading. The download is 9.3 GB, so the test carries the `large_model`
 marker and skips unless you pass `--run-large-models`.
 
 The 27B is 55.6 GB and does not fit the local development box.
-[scripts/modal_qwen38_smoke.py](../../scripts/modal_qwen38_smoke.py) runs it
+[scripts/qwen/modal_qwen38_smoke.py](../../scripts/qwen/modal_qwen38_smoke.py) runs it
 on one A100 80 GB GPU in bf16 against transformers on the same weights, with
 four prompts from 4 to 83 tokens. Result on `Qwen/Qwen3.8-27B` at revision
 `1d4bf0f`:
@@ -214,9 +214,9 @@ rope on purpose, and staying single-rank for this port.
 ## Pointers
 
 - Reference: `transformers/models/qwen3_5/modeling_qwen3_5.py` (pinned 5.14)
-- Model: [src/mini_infer/models/qwen3_5.py](../../src/mini_infer/models/qwen3_5.py)
-- Blocks: [gdn.py](../../src/mini_infer/models/blocks/gdn.py), [kda.py](../../src/mini_infer/models/blocks/kda.py), [gdn_decode_kernel.py](../../src/mini_infer/models/blocks/gdn_decode_kernel.py)
-- Cache: [qwen3_5_state_cache.py](../../src/mini_infer/cache/qwen3_5_state_cache.py)
+- Model: [src/mini_infer/models/qwen/qwen3_5.py](../../src/mini_infer/models/qwen/qwen3_5.py)
+- Blocks: [gdn.py](../../src/mini_infer/models/qwen/gdn.py), [kda.py](../../src/mini_infer/models/blocks/kda.py), [gdn_decode_kernel.py](../../src/mini_infer/models/qwen/gdn_decode_kernel.py)
+- Cache: [qwen3_5_state_cache.py](../../src/mini_infer/models/qwen/qwen3_5_state_cache.py)
 - ADRs: [ADR-032](../decisions/ADR-032-qwen38-hybrid-port.md) (port),
   [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode),
   [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md) (fused Gated DeltaNet step)

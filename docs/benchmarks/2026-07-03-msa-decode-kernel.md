@@ -1,13 +1,13 @@
 # MSA block-sparse decode kernel: parity + microbench + end-to-end A/B
 
 Date: 2026-07-03. GPU: NVIDIA A10G (Modal), torch 2.6.0 cu124, bf16 pool.
-Script: `scripts/modal_msa_kernel_bench.py`. Kernel:
-`mini_infer/cache/msa_paged_attention.py` (`msa_paged_decode_triton`).
+Script: `scripts/minimax_m3/modal_msa_kernel_bench.py`. Kernel:
+`mini_infer/models/minimax_m3/msa_paged_attention.py` (`msa_paged_decode_triton`).
 
 ## Parity (kernel vs pure-torch reference, bf16 paged data)
 
 The torch reference is itself CPU-validated against the dense-mask oracle
-(`tests/unit/test_msa_paged_attention.py`). Sweeps cover ragged batches,
+(`tests/unit/models/minimax_m3/test_msa_paged_attention.py`). Sweeps cover ragged batches,
 partial last blocks, and short contexts where the selection carries `-1`
 padding.
 

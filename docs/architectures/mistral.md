@@ -45,7 +45,7 @@ boilerplate.
 
 | Primitive | Reference (HF `modeling_mistral.py`) | Our code |
 |---|---|---|
-| Backbone | `MistralModel` + `MistralForCausalLM` | `MistralForCausalLM` extends `LlamaForCausalLM` in [src/mini_infer/models/mistral.py:28](../../src/mini_infer/models/mistral.py#L28) |
+| Backbone | `MistralModel` + `MistralForCausalLM` | `MistralForCausalLM` extends `LlamaForCausalLM` in [src/mini_infer/models/mistral/mistral.py:28](../../src/mini_infer/models/mistral/mistral.py#L28) |
 | Decoder layer | `MistralDecoderLayer` | shared `TransformerBlock` (via `_LlamaInnerModel`) |
 | GQA attention | `MistralAttention` | shared `GroupedQueryAttention` in [blocks/gqa.py](../../src/mini_infer/models/blocks/gqa.py) |
 | Standard RoPE | `MistralRotaryEmbedding` | shared `RotaryEmbedding` in [blocks/rope.py](../../src/mini_infer/models/blocks/rope.py) |
@@ -125,7 +125,7 @@ The reference attention mask masks out positions further than
    tweaks.
 
 Reference to where SWA lives in our codebase for V4:
-[`blocks/swa.py`](../../src/mini_infer/models/blocks/swa.py).
+[`deepseek_v4/swa.py`](../../src/mini_infer/models/deepseek_v4/swa.py).
 That file's purpose is V4's pure-SWA attention layers (no compressor,
 no indexer), so it carries V4's low-rank Q machinery and isn't a
 drop-in for Mistral's plain GQA + window combination.
@@ -210,10 +210,10 @@ The honest read of mini-infer's Mistral support is:
 ## Pointers
 
 - **Reference**: HF transformers `transformers/models/mistral/modeling_mistral.py`.
-- **Our model class**: [src/mini_infer/models/mistral.py](../../src/mini_infer/models/mistral.py).
-- **Inherited from**: [src/mini_infer/models/llama.py](../../src/mini_infer/models/llama.py). See [llama.md](llama.md) for the substance.
+- **Our model class**: [src/mini_infer/models/mistral/mistral.py](../../src/mini_infer/models/mistral/mistral.py).
+- **Inherited from**: [src/mini_infer/models/llama/llama.py](../../src/mini_infer/models/llama/llama.py). See [llama.md](llama.md) for the substance.
 - **GQA block** (shared): [blocks/gqa.py](../../src/mini_infer/models/blocks/gqa.py).
-- **V4's pure-SWA block** (not Mistral's; here for cross-reference): [blocks/swa.py](../../src/mini_infer/models/blocks/swa.py).
+- **V4's pure-SWA block** (not Mistral's; here for cross-reference): [deepseek_v4/swa.py](../../src/mini_infer/models/deepseek_v4/swa.py).
 
 ## What's still open
 

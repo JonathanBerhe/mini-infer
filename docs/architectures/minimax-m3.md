@@ -55,18 +55,18 @@ token-identical through the paged cache.
 
 | Primitive | Reference (`modeling_minimax_m3_vl.py`) | Our code |
 |---|---|---|
-| Backbone | `MiniMaxM3VLForCausalLM` (text path) | `MiniMaxM3ForCausalLM` in `src/mini_infer/models/minimax_m3.py` |
+| Backbone | `MiniMaxM3VLForCausalLM` (text path) | `MiniMaxM3ForCausalLM` in `src/mini_infer/models/minimax_m3/minimax_m3.py` |
 | Decoder layer | `MiniMaxM3VLDecoderLayer` | `_MiniMaxM3DecoderLayer` (same file) |
 | Main attention | `MiniMaxM3VLAttention` | `_MiniMaxM3Attention` (same file) |
-| MSA indexer | `MiniMaxM3VLIndexer` | `MiniMaxM3Indexer` in `blocks/minimax_m3_indexer.py` |
+| MSA indexer | `MiniMaxM3VLIndexer` | `MiniMaxM3Indexer` in `minimax_m3/indexer.py` |
 | Selection -> mask | eager/sdpa mask construction | `MiniMaxM3Indexer.build_block_mask` |
 | Gemma RMSNorm | `MiniMaxM3VLRMSNorm` (`(1+w)`, fp32) | `GemmaRMSNorm` in `blocks/gemma_rmsnorm.py` |
 | swigluoai | `ACT2FN["swigluoai"]` composition | `swigluoai` in `blocks/activations.py` |
-| MoE router | `MiniMaxM3VLTopKRouter` | `GlmNoAuxTcGate` in `blocks/glm_moe_gate.py` (reused) |
+| MoE router | `MiniMaxM3VLTopKRouter` | `GlmNoAuxTcGate` in `blocks/moe/glm_moe_gate.py` (reused) |
 | MoE block | `MiniMaxM3VLSparseMoeBlock` | `GlmMoeFFN` (reused, `activation=swigluoai`) |
 | RoPE | `MiniMaxM3VLRotaryEmbedding` + `apply_rotary_pos_emb` | `RotaryEmbedding` + `apply_rotary_pos_emb` in `blocks/rope.py` |
 | KV cache | HF cache + separate indexer key cache | `PagedKVCache` streams `k`/`v`/`index_k` |
-| Block-sparse decode kernel (opt-in) | none upstream (repo kernel's sparse decode is a stub) | `msa_paged_decode` in `cache/msa_paged_attention.py` |
+| Block-sparse decode kernel (opt-in) | none upstream (repo kernel's sparse decode is a stub) | `msa_paged_decode` in `models/minimax_m3/msa_paged_attention.py` |
 
 Layer routing: layers 0-2 are dense full attention + dense SwiGLU; layers
 3-59 are MSA + MoE (`mlp_layer_types` / `layer_types` in the config,
@@ -173,7 +173,7 @@ all cached blocks; there is no incremental block-score state. The savings are
 in the main branch (at most 17 blocks attended); the index branch stays
 O(context) per step.
 
-Serving gates, all CPU-validated in `tests/unit/test_minimax_m3_parity.py`
+Serving gates, all CPU-validated in `tests/unit/models/minimax_m3/test_minimax_m3_parity.py`
 and `test_minimax_m3_tp_parity.py`: greedy decode and batched ragged decode
 token-equal with HF's incremental decode; world_size=2 tensor+expert parallel
 logits identical across ranks and matching the single-rank reference; a
@@ -186,7 +186,7 @@ bias) loads to the same model as HF's in-memory state_dict.
 
 The torch path pays O(context) per layer per decode step (materialize +
 dense mask + full attention). `msa_paged_decode`
-(`cache/msa_paged_attention.py`) reads ONLY the selected blocks from the
+(`models/minimax_m3/msa_paged_attention.py`) reads ONLY the selected blocks from the
 paged pool: one Triton program per `(request, KV head)` computes the whole
 16-head GQA group tile with online softmax in fp32. Selection comes from the
 same `select_cached` routine that builds the oracle's mask, so the two paths

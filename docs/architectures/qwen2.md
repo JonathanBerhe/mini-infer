@@ -39,13 +39,13 @@ family because of its per-head Q/K norm; see [qwen3.md](qwen3.md).
 
 | Primitive | Reference (HF `modeling_qwen2.py`) | Our code |
 |---|---|---|
-| Backbone | `Qwen2Model` + `Qwen2ForCausalLM` | `Qwen2ForCausalLM` + `_Qwen2InnerModel` in [src/mini_infer/models/qwen2.py:94](../../src/mini_infer/models/qwen2.py#L94), [:69](../../src/mini_infer/models/qwen2.py#L69) |
+| Backbone | `Qwen2Model` + `Qwen2ForCausalLM` | `Qwen2ForCausalLM` + `_Qwen2InnerModel` in [src/mini_infer/models/qwen/qwen2.py:94](../../src/mini_infer/models/qwen/qwen2.py#L94), [:69](../../src/mini_infer/models/qwen/qwen2.py#L69) |
 | Decoder layer | `Qwen2DecoderLayer` | shared `TransformerBlock` in [blocks/transformer_block.py](../../src/mini_infer/models/blocks/transformer_block.py) |
 | GQA attention with QKV biases | `Qwen2Attention` (`attention_bias=True`) | shared `GroupedQueryAttention` with `qkv_bias=True` in [blocks/gqa.py](../../src/mini_infer/models/blocks/gqa.py) |
 | Standard RoPE | `Qwen2RotaryEmbedding` | shared `RotaryEmbedding` in [blocks/rope.py](../../src/mini_infer/models/blocks/rope.py) |
 | RMSNorm | `Qwen2RMSNorm` | shared `RMSNorm` in [blocks/rmsnorm.py](../../src/mini_infer/models/blocks/rmsnorm.py) |
 | SwiGLU FFN | `Qwen2MLP` | shared `SwiGLU` in [blocks/swiglu.py](../../src/mini_infer/models/blocks/swiglu.py) |
-| Tied embeddings | `tie_word_embeddings=True` in config | `Qwen2ForCausalLM.__init__` aliases `lm_head.weight = embed_tokens.weight` ([qwen2.py:112](../../src/mini_infer/models/qwen2.py#L112)) |
+| Tied embeddings | `tie_word_embeddings=True` in config | `Qwen2ForCausalLM.__init__` aliases `lm_head.weight = embed_tokens.weight` ([qwen2.py:112](../../src/mini_infer/models/qwen/qwen2.py#L112)) |
 
 Bit-parity is exercised against HF transformers' `Qwen2Attention` on
 synthetic configs at FP32 with cosine-sim > 0.999, via the shared
@@ -91,7 +91,7 @@ self.v_proj = ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=qk
 When `qkv_bias=True`, each linear constructs its bias parameter; when
 False, no bias. The o_proj is hardcoded to `bias=False` either way.
 
-`_Qwen2InnerModel.__init__` passes `qkv_bias=True` ([qwen2.py:84](../../src/mini_infer/models/qwen2.py#L84));
+`_Qwen2InnerModel.__init__` passes `qkv_bias=True` ([qwen2.py:84](../../src/mini_infer/models/qwen/qwen2.py#L84));
 `_LlamaInnerModel.__init__` passes `qkv_bias=False`. That single line
 flip is the architectural difference between the two families.
 
@@ -110,7 +110,7 @@ Three reasons:
    a `Linear` (then optionally aliased to `embed_tokens.weight`),
    because downstream int8-quant walkers expect a consistent module
    shape. That construction note lives in `Qwen2ForCausalLM.__init__`
-   ([qwen2.py:103](../../src/mini_infer/models/qwen2.py#L103)) and
+   ([qwen2.py:103](../../src/mini_infer/models/qwen/qwen2.py#L103)) and
    would be a footgun to inherit silently.
 3. **Independent evolution headroom.** Qwen2 → Qwen2.5 didn't change
    the architecture, but Qwen3 did (per-head Q/K norm). Having Qwen2
@@ -195,14 +195,14 @@ project isn't its novelty (it has very little); it's that it's the
    `attention_k_eq_v`, etc. Family quirks compose better as flags on
    the shared block than as forked attention classes.
 2. **lm_head always constructed as `Linear`, then optionally aliased.**
-   Comment at [qwen2.py:103](../../src/mini_infer/models/qwen2.py#L103)
+   Comment at [qwen2.py:103](../../src/mini_infer/models/qwen/qwen2.py#L103)
    explains why: the int8-quant walker expects to see a consistent
    module type for the LM head regardless of tying.
 
 ## Pointers
 
 - **Reference**: HF transformers `transformers/models/qwen2/modeling_qwen2.py`.
-- **Our model class**: [src/mini_infer/models/qwen2.py](../../src/mini_infer/models/qwen2.py).
+- **Our model class**: [src/mini_infer/models/qwen/qwen2.py](../../src/mini_infer/models/qwen/qwen2.py).
 - **GQA block** (shared with Llama / Qwen3 / Mistral / SmolLM2):
   [blocks/gqa.py](../../src/mini_infer/models/blocks/gqa.py).
 - **TransformerBlock** (shared decoder shape):

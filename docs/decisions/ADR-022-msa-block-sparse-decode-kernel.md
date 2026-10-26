@@ -17,7 +17,7 @@ gain and the greedy tokens match.
 
 ## Decision
 
-Ship `msa_paged_decode` (`cache/msa_paged_attention.py`), a Triton decode
+Ship `msa_paged_decode` (`models/minimax_m3/msa_paged_attention.py`), a Triton decode
 kernel that reads only the selected blocks from the paged pool. It is off by
 default (`MiniMaxM3ForCausalLM.set_decode_kernel`).
 

@@ -16,7 +16,7 @@ blocks.
 
 ## Decision
 
-1. A W8A16 grouped kernel in Triton (`models/blocks/fp8_grouped_kernel.py`).
+1. A W8A16 grouped kernel in Triton (`models/blocks/moe/fp8_grouped_kernel.py`).
    It multiplies each e4m3 weight by its block scale in fp32 and rounds it
    to bf16, as `Fp8Expert.forward` does. The bf16 tensor cores then
    multiply into fp32. With no host sync, it runs in a CUDA graph.
@@ -32,7 +32,7 @@ blocks.
    fp16 activations. Otherwise it keeps the loop, which stays the reference.
 7. Tiles for each GPU family. Three tiers by row count (up to 256, up to
    8192, above), with one table for Hopper and one for Blackwell.
-8. `tests/unit/test_fp8_grouped_kernel.py` runs on CUDA or under Triton's
+8. `tests/unit/models/blocks/moe/test_fp8_grouped_kernel.py` runs on CUDA or under Triton's
    interpreter (the `mini-infer-triton-interp` Docker image). There the
    kernel multiplies in fp32, because the interpreter gets a bf16 `tl.dot`
    wrong.

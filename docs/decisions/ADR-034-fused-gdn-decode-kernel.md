@@ -17,15 +17,15 @@ show an end-to-end gain, with greedy output compared against transformers.
 
 ## Decision
 
-1. Two Triton launches per layer (`models/blocks/gdn_decode_kernel.py`).
+1. Two Triton launches per layer (`models/qwen/gdn_decode_kernel.py`).
    `_conv_step_kernel` updates the conv cache in place, with one owner per
    channel. `_recurrent_step_kernel` does the rest, with the `(128, 128)`
    fp32 state in registers.
-2. The kernels round to the model dtype where `blocks/gdn.py` does, so the
+2. The kernels round to the model dtype where `qwen/gdn.py` does, so the
    two paths differ only in fp32 summation order.
 3. On by default on CUDA (`supports_gdn_decode_kernel(device)`), inside the
    CUDA graph. Other devices keep the eager path as the reference.
-4. `tests/unit/test_gdn_decode_kernel.py` runs on CUDA or under
+4. `tests/unit/models/qwen/test_gdn_decode_kernel.py` runs on CUDA or under
    `TRITON_INTERPRET=1`. Against the eager layer, fp32 is within 1e-5 and
    bf16 cosine is above 0.999.
 
@@ -40,7 +40,7 @@ show an end-to-end gain, with greedy output compared against transformers.
 
 ## Consequences
 
-One A100-SXM4-80GB, bf16 (`scripts/modal_qwen38_smoke.py --cuda-graph`),
+One A100-SXM4-80GB, bf16 (`scripts/qwen/modal_qwen38_smoke.py --cuda-graph`),
 milliseconds per decode step:
 
 | Batch | Eager, PyTorch | Graph, PyTorch | Graph, fused |

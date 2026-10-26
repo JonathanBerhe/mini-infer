@@ -73,7 +73,7 @@ only measured.
   target size, where decode stays HBM-bound and the draft costs less.
 - On A10, one of three prompts differed from the exact target-alone baseline
   by bf16 drift (at most 1 flipped token in 32). H100 matched all three.
-- `tests/unit/test_speculative.py` and
+- `tests/unit/engine/test_speculative.py` and
   `tests/stress/test_speculative_load.py` cover parity. With target == draft
   (Qwen2.5-0.5B), acceptance is 100%. A synthetic divergent draft gives 0%
   acceptance. Both match target-alone greedy, and no blocks leak.
@@ -81,4 +81,4 @@ only measured.
   one request at a time, and greedy only.
 - `SpeculativeRunner` is a separate path, so `ContinuousScheduler` does not
   change. `truncate_to`, `forward_step_packed` and `Tokenizer.vocab_size`
-  are additive. The bench is `scripts/modal_packed_bench.py --config spec`.
+  are additive. The bench is `scripts/bench/modal_packed_bench.py --config spec`.

@@ -8,7 +8,7 @@ by the V4 parity tests; harmless for other tests.
 with the FLA kernel package replaced by its naive-reference semantics.
 """
 
-from tests.unit._kimi_reference_helpers import kimi_reference
-from tests.unit._v4_reference_helpers import reference_module
+from tests.unit.models.deepseek_v4._v4_reference_helpers import reference_module
+from tests.unit.models.kimi_linear._kimi_reference_helpers import kimi_reference
 
 __all__ = ["kimi_reference", "reference_module"]
