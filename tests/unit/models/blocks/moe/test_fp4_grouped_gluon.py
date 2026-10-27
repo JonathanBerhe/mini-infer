@@ -471,7 +471,7 @@ def test_kernel_runs_in_a_cuda_graph(monkeypatch: pytest.MonkeyPatch, case: Case
 _SANITIZER_SCRIPT = textwrap.dedent(
     """
     import torch
-    from mini_infer.models.blocks import fp4_grouped_gluon
+    from mini_infer.models.blocks.moe import fp4_grouped_gluon
 
     torch.manual_seed(0)
     fp4_grouped_gluon._PROGRAMS_FOR_TESTS = 2
