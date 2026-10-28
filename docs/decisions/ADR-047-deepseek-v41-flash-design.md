@@ -4,6 +4,9 @@ Date: 2026-10-25
 Status: Accepted (design only). Stage A of the V4.1-Flash plan is done, and
 its gate did not trigger. Stage B builds the port.
 
+> Amendment (2026-10-28): section 8 now makes exact decoder replay the
+> Stage E default. The short replay of the tech report becomes an opt-in flag.
+
 ## Context
 
 DeepSeek-V4.1-Flash keeps the V4 attention core but changes how layers share
@@ -26,7 +29,7 @@ The findings come from three methods:
 
 DeepInfer
 (`deepseek-ai/DeepInfer`, the engine that serves V4.1) was the second source
-for bounded replay.
+for decoder replay.
 
 ## Decision
 
@@ -125,15 +128,26 @@ The router uses `sqrtsoftplus` of FP32 logits. The bias picks the experts,
 but the routing weights are the raw scores of the picks. Image tokens use
 `bias_vl` in place of `bias`. There are no hash-routed layers.
 
-### 8. Encoder-decoder boundary and bounded replay
+### 8. Encoder-decoder boundary and decoder replay
 
-The port derives the boundary as `num_hidden_layers // 2` (20). DeepInfer's
-bounded replay narrows the window of each decoder query to the last
-`KEEP_TOKENS` prompt positions.
+The port derives the boundary as `num_hidden_layers // 2` (20). Layer 20
+computes the decoder's compressed KV and index K from its own input, one
+token at a time. Each layer computes its window KV the same way. So decoder
+replay can run the decoder layers on the end of the prompt only.
 
-Decision: the port runs the full prefill, as the reference `model.py` does.
-Bounded replay is a Stage E option that is off by default, because it
-changes outputs by design.
+The tech report (arXiv 2609.19969) and DeepInfer (`KEEP_TOKENS`) replay
+about the last 128 prompt tokens. This changes outputs by design, because
+the decoder windows miss older tokens. Each decoder layer needs exact
+inputs for 127 more tokens than the layer above it. So an exact replay
+covers the last 128 + 19 × 127 = 2,541 tokens, DSpark taps included.
+
+Decision: Stage B runs the full prefill, as the reference `model.py` does.
+Stage E makes exact decoder replay the default. Layer 20 still projects its
+compressed KV and index K for every token. Layers 20 to 39 run attention
+and MoE on the last 2,541 tokens only, and the result must match the full
+prefill under section 10. A short replay (default 128 tokens) is an opt-in
+flag for agreement with DeepInfer and SGLang. On a 128K prompt, the decoder
+then runs on under 2% of the tokens (an estimate, not measured).
 
 ### 9. DSpark drafter
 
@@ -175,6 +189,8 @@ Parity contract for Stage B:
   dequantize-on-load path in the decode kernel, and BF16 fits at our scale.
 - Keep the raw `torch.topk` tie order. Rejected. The reference's own prefill
   and decode disagree under ties.
+- Make the short replay the default, as DeepInfer does. Rejected. It
+  changes outputs, so the parity contract of section 10 cannot hold.
 - Engram on the GPUs on 2x B200. Not possible. The other weights take
   307 GB and the tables 203 GB, against 384 GB of HBM.
 
@@ -191,4 +207,4 @@ Parity contract for Stage B:
   5.20.2 has no V4.1 class).
 - Follow-ups: Stage D makes sure that a Modal B200 container can get about
   210 GB of host RAM for the Engram tables. Stage E adds FP4 cache storage,
-  bounded replay and the batched DSpark drafter.
+  exact decoder replay and the batched DSpark drafter.
