@@ -87,7 +87,7 @@ from mini_infer.models.blocks.kda import (
 from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.swiglu import SwiGLU
-from mini_infer.models.kimi_linear.attn_res import attn_res_mix
+from mini_infer.models.kimi_linear.attn_res import AttnResQueryNorm, attn_res_mix
 from mini_infer.models.kimi_linear.state_cache import (
     KimiKdaLayerState,
     KimiKdaStateSpec,
@@ -96,6 +96,7 @@ from mini_infer.models.kimi_linear.state_cache import (
     KimiStateCache,
     KimiStateLayerSpec,
 )
+from mini_infer.quant.mxfp4 import dequantize_mxfp4_to_bf16
 
 # The reference builds `q_a_layernorm` / `kv_a_layernorm` as `KimiRMSNorm(rank)`
 # with the class default eps, NOT `config.rms_norm_eps` (1e-5 on both checkpoints).
@@ -182,13 +183,26 @@ class KimiLinearConfig:
         if hidden_act not in ("silu", "situ"):
             raise ValueError(f"unsupported hidden_act {hidden_act!r} (expected silu or situ)")
         num_experts = getattr(hf_config, "num_experts", None)
-        q_lora_rank = getattr(hf_config, "q_lora_rank", None)
         situ_linear_beta = getattr(hf_config, "activation_situ_linear_beta", None)
+        # Check the K3 knobs here, not in the first forward: a bad value
+        # must fail before the checkpoint loads.
+        q_lora_rank = getattr(hf_config, "q_lora_rank", None)
+        if q_lora_rank is not None and int(q_lora_rank) <= 0:
+            raise ValueError(f"q_lora_rank must be positive or None, got {q_lora_rank}")
         gate_lower_bound = linear_attn.get("gate_lower_bound", None)
+        if gate_lower_bound is not None and float(gate_lower_bound) >= 0:
+            raise ValueError(
+                f"linear_attn_config.gate_lower_bound must be negative, got {gate_lower_bound}"
+            )
         attn_res_block_size = getattr(hf_config, "attn_res_block_size", None)
         if attn_res_block_size is not None and int(attn_res_block_size) <= 0:
             raise ValueError(f"attn_res_block_size must be positive, got {attn_res_block_size}")
         routed_expert_hidden_size = getattr(hf_config, "routed_expert_hidden_size", None)
+        if routed_expert_hidden_size is not None and int(routed_expert_hidden_size) <= 0:
+            raise ValueError(
+                f"routed_expert_hidden_size must be positive or None, "
+                f"got {routed_expert_hidden_size}"
+            )
         return cls(
             vocab_size=int(hf_config.vocab_size),
             hidden_size=int(hf_config.hidden_size),
@@ -685,9 +699,9 @@ class _KimiDecoderLayer(nn.Module):
             )
         self.attn_res_block_size = cfg.attn_res_block_size
         if self.attn_res_block_size is not None:
-            self.self_attention_res_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            self.self_attention_res_norm = AttnResQueryNorm(cfg.hidden_size)
             self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False)
-            self.mlp_res_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            self.mlp_res_norm = AttnResQueryNorm(cfg.hidden_size)
             self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False)
 
     def _attention(
@@ -766,7 +780,7 @@ class _KimiInnerModel(nn.Module):
         )
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         if cfg.attn_res_block_size is not None:
-            self.output_attn_res_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            self.output_attn_res_norm = AttnResQueryNorm(cfg.hidden_size)
             self.output_attn_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False)
 
 
@@ -774,6 +788,9 @@ class _KimiInnerModel(nn.Module):
 _KDA_CONV_RE = re.compile(r"^(.*\.(?:q|k|v)_conv1d)\.weight$")
 # FusedRMSNormGated's weight -> our flat parameter name.
 _O_NORM_RE = re.compile(r"^(.*)\.o_norm\.weight$")
+# compressed-tensors `mxfp4-pack-quantized` pair (K3's routed experts).
+_PACKED_SUFFIX = ".weight_packed"
+_SCALE_SUFFIX = ".weight_scale"
 
 
 @register_model
@@ -967,13 +984,24 @@ def _remap_kimi_state(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch
     """HF tensors -> our module keys.
 
     The module tree deliberately mirrors the reference names, so almost
-    everything copies straight through. Three exceptions: the KDA conv
+    everything copies straight through. Four exceptions: the KDA conv
     weights lose HF's Conv1d singleton dim, `o_norm.weight` maps to our flat
-    `o_norm_weight` parameter, and `A_log` is flattened to `(H,)` (Kimi
-    Linear ships `(1, 1, H, 1)`, K3 ships `(H,)`).
+    `o_norm_weight` parameter, `A_log` is flattened to `(H,)` (Kimi Linear
+    ships `(1, 1, H, 1)`, K3 ships `(H,)`), and every MXFP4
+    `weight_packed` / `weight_scale` pair (K3's routed experts) becomes its
+    dequantized BF16 `weight`. A packed tensor without its scale, or the
+    reverse, is a corrupt shard and fails loudly.
     """
     remapped: dict[str, torch.Tensor] = {}
+    packed: dict[str, torch.Tensor] = {}
+    scales: dict[str, torch.Tensor] = {}
     for key, tensor in hf_state_dict.items():
+        if key.endswith(_PACKED_SUFFIX):
+            packed[key[: -len(_PACKED_SUFFIX)]] = tensor
+            continue
+        if key.endswith(_SCALE_SUFFIX):
+            scales[key[: -len(_SCALE_SUFFIX)]] = tensor
+            continue
         conv = _KDA_CONV_RE.match(key)
         if conv is not None:  # (C, 1, W) -> (C, W)
             remapped[f"{conv.group(1)}.weight"] = tensor.squeeze(1)
@@ -986,4 +1014,11 @@ def _remap_kimi_state(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch
             remapped[key] = tensor.reshape(-1)
             continue
         remapped[key] = tensor
+    if set(packed) != set(scales):
+        orphans = sorted(set(packed) ^ set(scales))
+        raise ValueError(f"MXFP4 weight_packed / weight_scale pairs do not match: {orphans[:5]}")
+    for module_name, packed_weight in packed.items():
+        remapped[f"{module_name}.weight"] = dequantize_mxfp4_to_bf16(
+            packed_weight, scales[module_name]
+        )
     return remapped

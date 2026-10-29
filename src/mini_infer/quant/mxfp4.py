@@ -29,13 +29,23 @@ def mx_scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
 
     Accepts the `uint8` storage compressed-tensors writes (biased exponent)
     or a native `float8_e8m0fnu` tensor (PyTorch casts it directly).
+
+    Byte 255 is E8M0's NaN encoding. It decodes to inf (uint8 path) or NaN
+    (native path), and either would turn a whole 32-value block into
+    non-finite weights, so a corrupt scale fails here at load time.
     """
     if scale.dtype == torch.uint8:
-        return torch.exp2(scale.to(torch.float32) - _E8M0_BIAS)
-    e8m0 = getattr(torch, "float8_e8m0fnu", None)
-    if e8m0 is not None and scale.dtype == e8m0:
-        return scale.float()
-    raise ValueError(f"MXFP4 scale must be uint8 (E8M0 bits) or float8_e8m0fnu, got {scale.dtype}")
+        out = torch.exp2(scale.to(torch.float32) - _E8M0_BIAS)
+    else:
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0 is None or scale.dtype != e8m0:
+            raise ValueError(
+                f"MXFP4 scale must be uint8 (E8M0 bits) or float8_e8m0fnu, got {scale.dtype}"
+            )
+        out = scale.float()
+    if not bool(torch.isfinite(out).all()):
+        raise ValueError("MXFP4 scale holds the E8M0 NaN encoding (byte 255); the shard is corrupt")
+    return out
 
 
 def dequantize_mxfp4_to_bf16(

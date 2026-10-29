@@ -31,6 +31,30 @@ def test_mx_scale_rejects_float_input() -> None:
         mx_scale_to_fp32(torch.ones(1, 1))
 
 
+def test_mx_scale_rejects_e8m0_nan_byte() -> None:
+    """Byte 255 is E8M0's NaN; it must fail at load, not become inf weights."""
+    scale = torch.tensor([[127, 255]], dtype=torch.uint8)
+    with pytest.raises(ValueError, match="NaN"):
+        mx_scale_to_fp32(scale)
+    with pytest.raises(ValueError, match="NaN"):
+        dequantize_mxfp4_to_bf16(torch.zeros(1, 32, dtype=torch.uint8), scale)
+
+
+def test_mx_scale_rejects_native_e8m0_nan() -> None:
+    e8m0 = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0 is None:
+        pytest.skip("this torch build has no float8_e8m0fnu")
+    scale = torch.tensor([[127, 255]], dtype=torch.uint8).view(e8m0)
+    with pytest.raises(ValueError, match="NaN"):
+        mx_scale_to_fp32(scale)
+
+
+def test_mx_scale_largest_finite_byte_is_accepted() -> None:
+    """Byte 254 (2**127) is the largest finite E8M0 value and stays finite."""
+    scale = torch.tensor([[254]], dtype=torch.uint8)
+    assert torch.isfinite(mx_scale_to_fp32(scale)).all()
+
+
 def test_dequant_applies_power_of_two_block_scales() -> None:
     """Two blocks of 32 with scales 2^1 and 2^-1: every nibble value appears,
     scaled by its block's exponent."""
