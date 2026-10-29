@@ -1008,7 +1008,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 "shard the KDA conv channels and the per-head matrix state. "
                 "A follow-up, like Inkling."
             )
-        remapped = _remap_kimi_state(hf_state_dict, mxfp4_weights=model.cfg.mxfp4_weights)
+        remapped = _remap_kimi_state(
+            hf_state_dict,
+            mxfp4_weights=model.cfg.mxfp4_weights,
+            kda_num_heads=model.cfg.kda_num_heads,
+        )
         missing, unexpected = model.load_state_dict(remapped, strict=False)
         missing_set = set(missing) - model.expected_missing_state_keys()
         if missing_set or unexpected:
@@ -1019,15 +1023,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
 
 def _remap_kimi_state(
-    hf_state_dict: dict[str, torch.Tensor], *, mxfp4_weights: bool
+    hf_state_dict: dict[str, torch.Tensor], *, mxfp4_weights: bool, kda_num_heads: int
 ) -> dict[str, torch.Tensor]:
     """HF tensors -> our module keys.
 
     The module tree deliberately mirrors the reference names, so almost
     everything copies straight through. Four exceptions: the KDA conv
     weights lose HF's Conv1d singleton dim, `o_norm.weight` maps to our flat
-    `o_norm_weight` parameter, `A_log` is flattened to `(H,)` (Kimi Linear
-    ships `(1, 1, H, 1)`, K3 ships `(H,)`), and, when the config declares
+    `o_norm_weight` parameter, `A_log` becomes `(H,)` (see `_flat_a_log`),
+    and, when the config declares
     `mxfp4-pack-quantized` (`mxfp4_weights`), every `weight_packed` /
     `weight_scale` pair (K3's routed experts) becomes its dequantized BF16
     `weight`. A packed tensor without its scale, or the reverse, is a
@@ -1053,7 +1057,7 @@ def _remap_kimi_state(
             remapped[f"{o_norm.group(1)}.o_norm_weight"] = tensor
             continue
         if key.endswith(".A_log"):
-            remapped[key] = tensor.reshape(-1)
+            remapped[key] = _flat_a_log(key, tensor, kda_num_heads)
             continue
         remapped[key] = tensor
     no_scale = sorted(set(packed) - set(scales))
@@ -1069,3 +1073,25 @@ def _remap_kimi_state(
             packed_weight, scales[module_name]
         )
     return remapped
+
+
+def _flat_a_log(key: str, tensor: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """A checkpoint `A_log` -> our `(H,)` parameter.
+
+    Kimi Linear ships `(1, 1, H, 1)`. The released K3 checkpoint ships a
+    flat vector padded with zeros from its 96 heads to 128 entries, while the
+    reference parameter has `num_heads` entries, so the padding carries no
+    meaning: drop it, and fail if it is not all zero. A meta tensor (the
+    shape-only checkpoint check) has no values to test. A vector shorter
+    than `num_heads` passes through and fails the load's shape check.
+    """
+    flat = tensor.reshape(-1)
+    if flat.numel() <= num_heads:
+        return flat
+    padding = flat[num_heads:]
+    if not padding.is_meta and bool(padding.any()):
+        raise ValueError(
+            f"{key} has {flat.numel()} entries for {num_heads} heads and the "
+            f"extra entries are not zero padding"
+        )
+    return flat[:num_heads]

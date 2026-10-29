@@ -33,7 +33,8 @@ def mx_scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
 
     Byte 255 is E8M0's NaN encoding. It would turn a whole 32-value block
     into non-finite weights, so a corrupt scale fails here at load time.
-    The check reads the raw bytes, before the fp32 decode.
+    The check reads the raw bytes, before the fp32 decode. A meta tensor
+    (the shape-only checkpoint check) has no bytes to test.
     """
     e8m0 = getattr(torch, "float8_e8m0fnu", None)
     if scale.dtype == torch.uint8:
@@ -44,7 +45,7 @@ def mx_scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"MXFP4 scale must be uint8 (E8M0 bits) or float8_e8m0fnu, got {scale.dtype}"
         )
-    if bool((raw == _E8M0_NAN_BYTE).any()):
+    if not raw.is_meta and bool((raw == _E8M0_NAN_BYTE).any()):
         raise ValueError("MXFP4 scale holds the E8M0 NaN encoding (byte 255); the shard is corrupt")
     return torch.exp2(raw.to(torch.float32) - _E8M0_BIAS)
 
