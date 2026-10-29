@@ -23,7 +23,7 @@ for its scripts. A file that two or more families use is in
 | GLM-5.2, GLM-5.3 | [`models/glm/`](../../src/mini_infer/models/glm/) | [`models/glm/`](../../tests/unit/models/glm/) | [`glm/`](../../scripts/glm/) |
 | MiniMax-M3 | [`models/minimax_m3/`](../../src/mini_infer/models/minimax_m3/) | [`models/minimax_m3/`](../../tests/unit/models/minimax_m3/) | [`minimax_m3/`](../../scripts/minimax_m3/) |
 | Inkling | [`models/inkling/`](../../src/mini_infer/models/inkling/) | [`models/inkling/`](../../tests/unit/models/inkling/) | [`inkling/`](../../scripts/inkling/) |
-| Kimi Linear | [`models/kimi_linear/`](../../src/mini_infer/models/kimi_linear/) | [`models/kimi_linear/`](../../tests/unit/models/kimi_linear/) | [`kimi_linear/`](../../scripts/kimi_linear/) |
+| Kimi Linear, Kimi K3 | [`models/kimi_linear/`](../../src/mini_infer/models/kimi_linear/) | [`models/kimi_linear/`](../../tests/unit/models/kimi_linear/) | [`kimi_linear/`](../../scripts/kimi_linear/) |
 | Nemotron-H | [`models/nemotron_h/`](../../src/mini_infer/models/nemotron_h/) | [`models/nemotron_h/`](../../tests/unit/models/nemotron_h/) | [`nemotron_h/`](../../scripts/nemotron_h/) |
 | Shared blocks | [`models/blocks/`](../../src/mini_infer/models/blocks/) | [`models/blocks/`](../../tests/unit/models/blocks/) | none |
 
@@ -34,6 +34,7 @@ for its scripts. A file that two or more families use is in
 | Nemotron-H (Nemotron 3.5 Lightning, Nemotron 3 Nano; Mamba-2 hybrid, text-only) | Mamba-2 / SSD paper (arXiv 2405.21060) | HF transformers `modeling_nemotron_h.py` | [nemotron-h.md](nemotron-h.md) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated DeltaNet hybrid, text-only) | Gated DeltaNet paper (arXiv 2412.06464) | HF transformers `modeling_qwen3_5.py` (text path) | [qwen3-5.md](qwen3-5.md) |
 | Kimi Linear 48B-A3B (KDA + NoPE-MLA hybrid) | Kimi Linear paper (arXiv 2510.26692) | Checkpoint `modeling_kimi.py` (trust_remote_code, vendored) | [kimi-linear.md](kimi-linear.md) |
+| Kimi K3 / K3.1 Pro (SiTU, gated MLA, AttnRes, latent MoE, MXFP4; text-only) | Kimi K3 tech report | Checkpoint `modeling_kimi_linear.py` (trust_remote_code, vendored) | [kimi-k3.md](kimi-k3.md) |
 | Inkling / Inkling-Small | [Release post](https://thinkingmachines.ai/news/introducing-inkling/) | HF transformers `modeling_inkling.py` (text path) | [inkling.md](inkling.md) |
 | MiniMax-M3 (MSA) | MSA report (arXiv 2606.13392) | HF transformers `modeling_minimax_m3_vl.py` (text path) | [minimax-m3.md](minimax-m3.md) |
 | GLM-5.2 / GLM-5.3 (GlmMoeDsa: MLA + DSA + IndexShare) | No GLM paper. DSA from DeepSeek-V3.2, IndexShare from arXiv 2603.12201 | HF transformers `modeling_glm_moe_dsa.py` | [glm-moe-dsa.md](glm-moe-dsa.md) |

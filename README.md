@@ -6,7 +6,7 @@ mini-infer is an LLM inference engine, written from scratch. It ports new model 
 
 mini-infer has these features:
 
-* Thirteen model families, from Qwen2 and Gemma to DeepSeek-V4, GLM-5.2, MiniMax-M3, Inkling, and Kimi Linear. See [Supported models](#supported-models).
+* Thirteen model families, from Qwen2 and Gemma to DeepSeek-V4, GLM-5.2, MiniMax-M3, Inkling, Kimi Linear, and Kimi K3. See [Supported models](#supported-models).
 * A continuous-batching scheduler. New requests join the running batch at each step.
 * A paged KV cache (the attention memory, stored in fixed-size blocks), with prefix caching and chunked prefill.
 * An HTTP server that is compatible with the OpenAI Completions API, with SSE streaming.
@@ -65,6 +65,7 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 | `MiniMaxM3SparseForConditionalGeneration` | MiniMax-M3 (text only) | [doc](docs/architectures/minimax-m3.md) |
 | `InklingForConditionalGeneration` | Inkling (text only) | [doc](docs/architectures/inkling.md) |
 | `KimiLinearForCausalLM` | Kimi Linear 48B | [doc](docs/architectures/kimi-linear.md) |
+| `KimiK3ForConditionalGeneration` | Kimi K3, Kimi K3.1 Pro (text only) | [doc](docs/architectures/kimi-k3.md) |
 | `NemotronHForCausalLM` | Nemotron 3.5 Lightning 30B-A3B, Nemotron 3 Nano 4B (text only) | [doc](docs/architectures/nemotron-h.md) |
 
 To add a model family, add a folder in `src/mini_infer/models/`. Build the model from the shared blocks in `src/mini_infer/models/blocks/` (RMSNorm, RoPE, attention, MoE). Decorate the class with `@register_model`, and import its module in `_register_builtin_models()` in [`models/__init__.py`](src/mini_infer/models/__init__.py). [mistral.py](src/mini_infer/models/mistral/mistral.py) is the shortest example.
