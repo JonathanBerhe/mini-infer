@@ -318,6 +318,44 @@ def _checkpoint_state(
     return state, expected_experts
 
 
+_A_LOG_KEY = "language_model.model.layers.0.self_attn.A_log"
+
+
+def test_load_weights_drops_zero_a_log_padding() -> None:
+    """The released K3 checkpoint pads `A_log` with zeros from 96 heads to
+    128 entries. The loader keeps the first `num_heads` entries."""
+    model = _tiny_model()
+    state, _ = _checkpoint_state(model, "language_model.")
+    heads = state[_A_LOG_KEY]
+    state[_A_LOG_KEY] = torch.cat([heads, torch.zeros(2)])
+
+    KimiK3ForConditionalGeneration.load_weights(model, state)
+    assert torch.equal(model.state_dict()["model.layers.0.self_attn.A_log"], heads)
+
+
+def test_load_weights_rejects_non_zero_a_log_padding() -> None:
+    """Non-zero extra entries are not padding; dropping them would lose data."""
+    model = _tiny_model()
+    state, _ = _checkpoint_state(model, "language_model.")
+    state[_A_LOG_KEY] = torch.cat([state[_A_LOG_KEY], torch.ones(2)])
+    with pytest.raises(ValueError, match="not zero padding"):
+        KimiK3ForConditionalGeneration.load_weights(model, state)
+
+
+def test_load_weights_accepts_a_meta_checkpoint() -> None:
+    """The shape-only check (`scripts/kimi_linear/check_kimi_k3_checkpoint.py`)
+    runs the loader on meta tensors into a meta model: the translation, the
+    MXFP4 dequant and the `A_log` padding must all work without values."""
+    state, _ = _checkpoint_state(_tiny_model(), "language_model.")
+    state[_A_LOG_KEY] = torch.cat([state[_A_LOG_KEY], torch.zeros(2)])
+    meta_state = {key: tensor.to("meta") for key, tensor in state.items()}
+    with torch.device("meta"):
+        meta_model = KimiK3ForConditionalGeneration(KimiK3Config.from_hf(_tiny_hf_namespace()))
+
+    KimiK3ForConditionalGeneration.load_weights(meta_model, meta_state)
+    assert meta_model.state_dict()["model.layers.0.self_attn.A_log"].shape == (2,)
+
+
 def test_load_weights_translates_the_checkpoint_layout() -> None:
     """A state_dict in the released CHECKPOINT's layout loads: `language_model.`
     prefix, vision tower + projector present (dropped), and MXFP4 experts

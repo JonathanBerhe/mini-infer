@@ -55,6 +55,17 @@ def test_mx_scale_largest_finite_byte_is_accepted() -> None:
     assert torch.isfinite(mx_scale_to_fp32(scale)).all()
 
 
+def test_dequant_runs_on_meta_tensors() -> None:
+    """The shape-only checkpoint check dequantizes meta tensors: no bytes to
+    test for NaN, but the output shape and dtype must be right."""
+    packed = torch.empty(3, 16, dtype=torch.uint8, device="meta")
+    scale = torch.empty(3, 1, dtype=torch.uint8, device="meta")
+    out = dequantize_mxfp4_to_bf16(packed, scale)
+    assert out.is_meta
+    assert out.shape == (3, 32)
+    assert out.dtype == torch.bfloat16
+
+
 def test_dequant_applies_power_of_two_block_scales() -> None:
     """Two blocks of 32 with scales 2^1 and 2^-1: every nibble value appears,
     scaled by its block's exponent."""
