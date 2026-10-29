@@ -444,4 +444,5 @@ git worktree, symlink it from the main checkout, or run the clone script.
   step does not run under a CUDA graph.
 - The MoE runs its experts one at a time in a loop, with no grouped-matmul
   path.
-- The Kimi K3 port builds on this one and does not exist yet.
+- The Kimi K3 delta (SiTU, gated MLA, AttnRes, latent MoE, MXFP4 experts)
+  is in [kimi-k3.md](kimi-k3.md) and ADR-049.

@@ -108,9 +108,26 @@ def test_from_hf_rejects_roped_mla() -> None:
         KimiLinearConfig.from_hf(_tiny_hf_namespace(mla_use_nope=False))
 
 
-def test_from_hf_rejects_q_lora() -> None:
-    with pytest.raises(ValueError, match="q_lora_rank"):
-        KimiLinearConfig.from_hf(_tiny_hf_namespace(q_lora_rank=64))
+def test_from_hf_accepts_low_rank_q() -> None:
+    """`q_lora_rank` (K3) builds the `q_a_proj -> norm -> q_b_proj` path on
+    the MLA layers; Kimi Linear's `None` keeps the plain `q_proj`."""
+    cfg = KimiLinearConfig.from_hf(_tiny_hf_namespace(q_lora_rank=12))
+    model = KimiLinearForCausalLM(cfg)
+    mla = model.model.layers[3].self_attn
+    assert mla.q_a_proj.weight.shape == (12, 32)
+    assert mla.q_b_proj.weight.shape == (2 * (8 + 4), 12)
+    assert not hasattr(mla, "q_proj")
+    plain = KimiLinearForCausalLM(KimiLinearConfig.from_hf(_tiny_hf_namespace()))
+    assert hasattr(plain.model.layers[3].self_attn, "q_proj")
+
+
+def test_from_hf_keeps_kimi_linear_router_convention() -> None:
+    """A config without any K3-only field is the Kimi Linear modeling file,
+    whose expert weights are the BIASED scores."""
+    cfg = KimiLinearConfig.from_hf(_tiny_hf_namespace())
+    assert cfg.moe_weights_from_biased_scores is True
+    assert cfg.hidden_act == "silu"
+    assert cfg.attn_res_block_size is None
 
 
 def test_layer_kind_indexing_is_one_indexed() -> None:
