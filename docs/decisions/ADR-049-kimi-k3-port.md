@@ -26,7 +26,9 @@ supports that delta, so that K3.1 Pro loads on the day its weights land.
    wrapper over the text stack. Its config reads `text_config`. Its loader
    drops `vision_tower.` and `mm_projector.` and strips `language_model.`,
    as the Inkling port does. The text stack's own loader dequantizes the
-   MXFP4 experts, so a text-only re-export loads the same way.
+   MXFP4 experts, so a text-only re-export loads the same way. It does so
+   only when `quantization_config` declares `mxfp4-pack-quantized`; any
+   other declared format fails at config time.
 3. The math is pinned from the K3 reference code, not from the blog or the
    report. SiTU-GLU: `beta * tanh(g / beta) * sigmoid(g)` times
    `lb * tanh(u / lb)`, with `beta = 4` and `lb = 25`, in fp32. MLA: low-rank

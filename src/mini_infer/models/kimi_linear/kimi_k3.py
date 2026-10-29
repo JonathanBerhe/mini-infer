@@ -18,7 +18,8 @@ own loader (`_remap_kimi_state`), so a text-only extraction that names
 `KimiLinearForCausalLM` loads the same way. That includes the MXFP4 routed
 experts (`experts.N.w{1,2,3}.weight_packed` + `.weight_scale`,
 compressed-tensors `mxfp4-pack-quantized`, group 32), which the loader
-dequantizes to BF16 `.weight` with `quant/mxfp4.py`. Attention, shared
+dequantizes to BF16 `.weight` with `quant/mxfp4.py` when
+`quantization_config` declares that format. Attention, shared
 experts, the dense MLP, the latent projections, the AttnRes queries and
 `lm_head` ship unquantized.
 """
@@ -57,6 +58,11 @@ class KimiK3Config:
         if isinstance(text_config, dict):
             # `_raw_config_namespace` keeps nested dicts as dicts.
             text_config = SimpleNamespace(**text_config)
+        # K3 nests `quantization_config` in `text_config`. A wrapper-level one
+        # applies to the text model too.
+        quant = getattr(hf_config, "quantization_config", None)
+        if quant and not getattr(text_config, "quantization_config", None):
+            text_config = SimpleNamespace(**{**vars(text_config), "quantization_config": quant})
         return cls(text=KimiLinearConfig.from_hf(text_config))
 
 

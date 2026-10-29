@@ -9,6 +9,7 @@ transcriptions of the reference formulas.
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +27,8 @@ from mini_infer.models.kimi_linear.kimi_k3 import (
 from mini_infer.models.kimi_linear.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM
 
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+# The two fields of K3's `text_config.quantization_config` the loader reads.
+_MXFP4_QUANT = {"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized"}
 
 
 def _tiny_text_config(**overrides: Any) -> dict[str, Any]:
@@ -75,6 +78,7 @@ def _tiny_text_config(**overrides: Any) -> dict[str, Any]:
         num_nextn_predict_layers=0,
         rms_norm_eps=1e-5,
         tie_word_embeddings=False,
+        quantization_config=dict(_MXFP4_QUANT),
     )
     fields.update(overrides)
     return fields
@@ -173,11 +177,50 @@ def test_from_hf_rejects_non_positive_widths(override: dict[str, Any], match: st
         KimiK3Config.from_hf(_tiny_hf_namespace(**override))
 
 
-@pytest.mark.parametrize("lower_bound", [0.0, 2.5])
-def test_from_hf_rejects_non_negative_gate_lower_bound(lower_bound: float) -> None:
+@pytest.mark.parametrize("lower_bound", [0.0, 2.5, math.nan, -math.inf])
+def test_from_hf_rejects_bad_gate_lower_bound(lower_bound: float) -> None:
+    """Zero, positive, NaN and infinite bounds all fail; NaN passes a plain
+    `>= 0` test, so the check must reject it explicitly."""
     linear_attn = dict(_tiny_text_config()["linear_attn_config"], gate_lower_bound=lower_bound)
     with pytest.raises(ValueError, match="gate_lower_bound"):
         KimiK3Config.from_hf(_tiny_hf_namespace(linear_attn_config=linear_attn))
+
+
+@pytest.mark.parametrize("linear_beta", [0.0, -25.0, math.nan])
+def test_from_hf_rejects_bad_situ_linear_beta(linear_beta: float) -> None:
+    """`lb * tanh(u / lb)` divides by `lb`, so zero gives NaN outputs and a
+    negative value flips the up branch."""
+    with pytest.raises(ValueError, match="activation_situ_linear_beta"):
+        KimiK3Config.from_hf(_tiny_hf_namespace(activation_situ_linear_beta=linear_beta))
+
+
+def test_from_hf_reads_the_mxfp4_declaration() -> None:
+    assert KimiK3Config.from_hf(_tiny_hf_namespace()).text.mxfp4_weights is True
+    bf16 = KimiK3Config.from_hf(_tiny_hf_namespace(quantization_config=None))
+    assert bf16.text.mxfp4_weights is False
+
+
+def test_from_hf_reads_a_wrapper_level_quantization_config() -> None:
+    """A checkpoint that puts `quantization_config` on the wrapper, not in
+    `text_config`, still loads its MXFP4 experts."""
+    hf = _tiny_hf_namespace(quantization_config=None)
+    hf.quantization_config = dict(_MXFP4_QUANT)
+    assert KimiK3Config.from_hf(hf).text.mxfp4_weights is True
+
+
+@pytest.mark.parametrize(
+    "quant",
+    [
+        {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized"},
+        {"quant_method": "compressed-tensors", "format": "float-quantized"},
+        {"quant_method": "fp8"},
+    ],
+)
+def test_from_hf_rejects_other_quantization_formats(quant: dict[str, Any]) -> None:
+    """The loader only dequantizes MXFP4, so another format fails at config
+    time instead of as a confusing load error."""
+    with pytest.raises(ValueError, match="unsupported quantization_config"):
+        KimiK3Config.from_hf(_tiny_hf_namespace(quantization_config=quant))
 
 
 def test_attn_res_query_norm_is_weight_only() -> None:
@@ -322,8 +365,19 @@ def test_load_weights_rejects_orphan_packed_weight() -> None:
     state[key.replace(".weight", ".weight_packed")] = torch.zeros(
         tensor.shape[0], tensor.shape[1] // 2, dtype=torch.uint8
     )
-    with pytest.raises(ValueError, match="weight_packed / weight_scale"):
+    with pytest.raises(ValueError, match="1 weight_packed without a weight_scale"):
         KimiK3ForConditionalGeneration.load_weights(model, state)
+
+
+def test_unquantized_config_does_not_dequantize_pair_keys() -> None:
+    """Without the MXFP4 declaration, `weight_packed` / `weight_scale` keys
+    are not guessed at: they fail the load as unexpected keys."""
+    torch.manual_seed(0)
+    text = _tiny_text_config(quantization_config=None)
+    model = KimiLinearForCausalLM(KimiLinearConfig.from_hf(SimpleNamespace(**text))).float()
+    state, _ = _checkpoint_state(model, "")
+    with pytest.raises(ValueError, match=r"unexpected=.*weight_packed"):
+        KimiLinearForCausalLM.load_weights(model, state)
 
 
 def test_load_weights_rejects_unknown_keys() -> None:
