@@ -1,4 +1,4 @@
-"""Kimi Delta Attention (KDA) core math — Kimi Linear (arXiv:2510.26692), Kimi K3.
+"""Kimi Delta Attention (KDA) core math: Kimi Linear (arXiv:2510.26692), Kimi K3.
 
 KDA is a linear-attention layer: instead of a per-token KV cache it carries a
 fixed-size matrix state `S` of shape `(num_heads, head_dim_k, head_dim_v)` per
@@ -108,7 +108,7 @@ def gated_rmsnorm(
 
     Per-head output norm of the KDA layer: RMS-normalize the last dim in
     fp32, apply the (head_dim-wide, head-shared) affine weight, THEN the
-    sigmoid gate, and only then cast back — the kernel keeps everything in
+    sigmoid gate, and only then cast back. The kernel keeps everything in
     fp32 through the gate multiply.
     """
     x32 = x.float()

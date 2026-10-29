@@ -21,6 +21,22 @@ is `num_blocks` extra hidden vectors during the forward.
 from __future__ import annotations
 
 import torch
+from torch import nn
+
+
+class AttnResQueryNorm(nn.Module):
+    """The RMSNorm affine weight of one AttnRes query, kept under the checkpoint name.
+
+    The reference stores it as a `KimiRMSNorm` (`*_res_norm.weight`), but
+    never calls that norm: `_apply_attn_res` only multiplies its `weight`
+    into the scoring query, and the eps it uses is `config.rms_norm_eps`.
+    So this module holds the weight and has no forward, which keeps anyone
+    from normalizing the candidates twice by calling it.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
 
 
 def attn_res_mix(
