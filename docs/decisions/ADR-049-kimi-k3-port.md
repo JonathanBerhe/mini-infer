@@ -59,10 +59,15 @@ supports that delta, so that K3.1 Pro loads on the day its weights land.
 
 - K3.1 Pro will load through this path if its config and tensor names match
   K3. Check both on the day the weights land before any GPU run.
-- The port found three corrections. The reference builds `q_a_layernorm`
+  `scripts/kimi_linear/check_kimi_k3_checkpoint.py` does this from the
+  shard headers alone: it diffs the config against K3 and runs the loader on
+  meta tensors. It passes on K3 and on Kimi Linear 48B.
+- The port found four corrections. The reference builds `q_a_layernorm`
   and `kv_a_layernorm` with eps 1e-6, not `rms_norm_eps`; Stage A used 1e-5
-  and is fixed. `A_log` is `(H,)` in K3 and `(1, 1, H, 1)` in Kimi Linear;
-  the loader flattens both. The K3 reference no longer calls
+  and is fixed. `A_log` is `(1, 1, H, 1)` in Kimi Linear, and the released
+  K3 checkpoint pads it with zeros from 96 heads to 128 entries, which the
+  header check found; the loader flattens it, drops the padding, and fails
+  if the padding is not zero. The K3 reference no longer calls
   `fused_kda_gate`; the gate moved into the recurrence kernels.
 - No real-weight run exists, the bar GLM-753B shipped with. The first real
   run needs a streaming loader and a multi-GPU script.

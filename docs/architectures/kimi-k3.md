@@ -71,7 +71,9 @@ used 1e-5 for `kv_a_layernorm`; the parity tolerance hid it. Both now use
 ## KDA: full-rank output gate and the bounded decay
 
 `use_full_rank_gate` replaces the low-rank `g_a_proj / g_b_proj` output
-gate with one `g_proj` (7168 to 96 x 128). `A_log` is stored flat `(H,)`.
+gate with one `g_proj` (7168 to 96 x 128). The reference `A_log` is flat
+`(H,)`, but the released checkpoint stores 128 entries: the 96 head values,
+then 32 zeros. The loader drops the zeros and fails if they are not zero.
 
 `gate_lower_bound = -5.0` changes the decay gate. Kimi Linear computes
 `-exp(A_log) * softplus(raw + dt_bias)`, unbounded below. K3 passes the raw
@@ -152,6 +154,17 @@ greedy decode, batched ragged decode through one state cache, chunked
 prefill across a conv-kernel boundary, and the gate. The structural tests
 pin the config contract, the loader translation with MXFP4 experts, and the
 block formulas against direct transcriptions.
+
+`scripts/kimi_linear/check_kimi_k3_checkpoint.py` checks a real checkpoint
+without downloading its weights. It reads every tensor's name, dtype and
+shape from the safetensors headers, diffs the config against the pinned K3
+release, builds the model on the meta device, and runs the loader on meta
+tensors. It takes about four minutes on a laptop CPU. Run it on K3.1 Pro
+before any GPU run:
+
+```bash
+uv run python scripts/kimi_linear/check_kimi_k3_checkpoint.py moonshotai/Kimi-K3.1-Pro
+```
 
 ## What is still open
 
