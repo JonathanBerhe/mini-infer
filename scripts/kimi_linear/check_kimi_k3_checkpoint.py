@@ -33,6 +33,13 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from huggingface_hub.errors import (
+    GatedRepoError,
+    HfHubHTTPError,
+    RemoteEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 
 # The release `clone_kimi_k3_reference.py` vendors (the parity oracle).
 BASELINE_REPO = "moonshotai/Kimi-K3"
@@ -62,6 +69,29 @@ def _config_json(repo: str, revision: str | None) -> dict[str, Any]:
     with Path(path).open() as config_file:
         config: dict[str, Any] = json.load(config_file)
     return config
+
+
+def _hub_error_message(error: HfHubHTTPError, repo: str, revision: str | None) -> str:
+    """One readable line (plus repo hints) for a failed `config.json` fetch."""
+    if isinstance(error, GatedRepoError):
+        return f"{repo} is gated; accept its terms on huggingface.co, then run `hf auth login`"
+    if isinstance(error, RevisionNotFoundError):
+        return f"{repo} has no revision {revision!r}"
+    if isinstance(error, RemoteEntryNotFoundError):
+        return f"{repo} has no config.json at {revision or 'main'}"
+    if not isinstance(error, RepositoryNotFoundError):
+        return f"could not read {repo}/config.json: {error}"
+    owner = repo.split("/")[0]
+    message = f"{repo} does not exist on Hugging Face (or is private)"
+    try:
+        from huggingface_hub import HfApi
+
+        newest = [m.id for m in HfApi().list_models(author=owner, sort="last_modified", limit=5)]
+    except HfHubHTTPError:
+        newest = []
+    if newest:
+        message += f". Newest {owner} repos: " + ", ".join(newest)
+    return message
 
 
 def _diff(old: Any, new: Any, path: str = "") -> list[str]:
@@ -120,7 +150,11 @@ def main() -> int:
     failures = 0
 
     print(f"== 1. config: {args.repo_id} @ {args.revision or 'main'}")
-    raw = _config_json(args.repo_id, args.revision)
+    try:
+        raw = _config_json(args.repo_id, args.revision)
+    except HfHubHTTPError as error:
+        print(f"FAIL: {_hub_error_message(error, args.repo_id, args.revision)}")
+        return 1
     architecture = (raw.get("architectures") or ["?"])[0]
     model_cls = REGISTRY.lookup(architecture)
     if not issubclass(model_cls, KimiLinearForCausalLM):
