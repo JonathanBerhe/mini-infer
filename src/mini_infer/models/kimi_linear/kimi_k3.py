@@ -12,20 +12,16 @@ wrapper (`modeling_kimi_k3.py`) around three parts:
     decay, latent MoE, AttnRes).
 
 So this module is a thin wrapper: the config reads `text_config`, the model
-IS the text stack, and `load_weights` translates the checkpoint layout:
-
-  1. drop the vision keys;
-  2. strip the `language_model.` prefix;
-  3. dequantize the MXFP4 routed experts (`experts.N.w{1,2,3}.weight_packed`
-     + `.weight_scale`, compressed-tensors `mxfp4-pack-quantized`, group 32)
-     to `.weight` with `quant/mxfp4.py`. Attention, shared experts, the
-     dense MLP, the latent projections, the AttnRes queries and `lm_head`
-     ship unquantized.
-
-Resident MXFP4 experts (dequant inside the grouped GEMM, as the DeepSeek-V4
-FP4 path does) are the optimization step after parity; this loader
-materializes BF16 experts, which is what the parity and structural tests
-exercise.
+IS the text stack, and `load_weights` drops the vision keys and strips the
+`language_model.` prefix. The rest of the translation is the text stack's
+own loader (`_remap_kimi_state`), so a text-only extraction that names
+`KimiLinearForCausalLM` loads the same way. That includes the MXFP4 routed
+experts (`experts.N.w{1,2,3}.weight_packed` + `.weight_scale`,
+compressed-tensors `mxfp4-pack-quantized`, group 32), which the loader
+dequantizes to BF16 `.weight` with `quant/mxfp4.py` when
+`quantization_config` declares that format. Attention, shared
+experts, the dense MLP, the latent projections, the AttnRes queries and
+`lm_head` ship unquantized.
 """
 
 from __future__ import annotations
@@ -40,12 +36,9 @@ import torch
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM
 from mini_infer.models.kimi_linear.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM
-from mini_infer.quant.mxfp4 import dequantize_mxfp4_to_bf16
 
 _DROP_RE = re.compile(r"^(vision_tower|mm_projector)\.")
 _LANGUAGE_PREFIX = "language_model."
-_PACKED_SUFFIX = ".weight_packed"
-_SCALE_SUFFIX = ".weight_scale"
 
 
 @dataclass
@@ -65,6 +58,11 @@ class KimiK3Config:
         if isinstance(text_config, dict):
             # `_raw_config_namespace` keeps nested dicts as dicts.
             text_config = SimpleNamespace(**text_config)
+        # K3 nests `quantization_config` in `text_config`. A wrapper-level one
+        # applies to the text model too.
+        quant = getattr(hf_config, "quantization_config", None)
+        if quant and not getattr(text_config, "quantization_config", None):
+            text_config = SimpleNamespace(**{**vars(text_config), "quantization_config": quant})
         return cls(text=KimiLinearConfig.from_hf(text_config))
 
 
@@ -89,30 +87,17 @@ class KimiK3ForConditionalGeneration(KimiLinearForCausalLM):
 
 
 def text_state_dict_from_k3(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Checkpoint tensors -> the `KimiLinearForCausalLM` layout.
+    """Checkpoint tensors -> the text model's checkpoint names.
 
-    Drops the vision tower and projector, strips `language_model.` (keys
-    without it pass through, so an already text-only extraction loads too),
-    and replaces every MXFP4 `weight_packed` / `weight_scale` pair by its
-    dequantized BF16 `weight`. A packed tensor without its scale (or the
-    reverse) is a corrupt shard, so it fails loudly.
+    Drops the vision tower and projector and strips `language_model.`. Keys
+    without the prefix pass through, so an already text-only extraction
+    loads too. The MXFP4 pairs stay packed here; `_remap_kimi_state`
+    dequantizes them inside `KimiLinearForCausalLM.load_weights`.
     """
     text: dict[str, torch.Tensor] = {}
-    packed: dict[str, torch.Tensor] = {}
-    scales: dict[str, torch.Tensor] = {}
     for key, tensor in hf_state_dict.items():
         if _DROP_RE.match(key):
             continue
         name = key[len(_LANGUAGE_PREFIX) :] if key.startswith(_LANGUAGE_PREFIX) else key
-        if name.endswith(_PACKED_SUFFIX):
-            packed[name[: -len(_PACKED_SUFFIX)]] = tensor
-        elif name.endswith(_SCALE_SUFFIX):
-            scales[name[: -len(_SCALE_SUFFIX)]] = tensor
-        else:
-            text[name] = tensor
-    if set(packed) != set(scales):
-        orphans = sorted(set(packed) ^ set(scales))
-        raise ValueError(f"MXFP4 weight_packed / weight_scale pairs do not match: {orphans[:5]}")
-    for module_name, packed_weight in packed.items():
-        text[f"{module_name}.weight"] = dequantize_mxfp4_to_bf16(packed_weight, scales[module_name])
+        text[name] = tensor
     return text

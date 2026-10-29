@@ -138,6 +138,9 @@ nibble first) and `.weight_scale` (uint8, one E8M0 exponent per 32 values,
 `scale = 2 ** (byte - 127)`). Attention, the shared experts, the dense MLP,
 the latent projections, the AttnRes queries and `lm_head` are BF16.
 `quant/mxfp4.py` dequantizes a pair to BF16 through the NVFP4 nibble path.
+The loader does this only when `quantization_config` declares
+`mxfp4-pack-quantized`. Any other declared format fails when the config
+loads.
 
 ## Validation contract
 

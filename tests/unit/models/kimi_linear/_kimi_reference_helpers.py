@@ -9,7 +9,7 @@ imports, replacing each kernel with the pure-PyTorch semantics FLA itself
 documents (the recurrence is a transcription of `fla/ops/kda/naive.py`, the
 gate forms of `fla/ops/kda/gate.py`; MIT, (c) 2023-2026 Songlin Yang, Yu
 Zhang, Zhiyuan Li). The stubs deliberately do NOT import
-`mini_infer.models.blocks.kda` — the parity tests compare our
+`mini_infer.models.blocks.kda`. The parity tests compare our
 implementation against these independently-written semantics, so sharing
 code would test a stub against itself.
 
@@ -354,25 +354,22 @@ def install_fla_stub() -> None:
         sys.modules[name] = module
 
 
-@pytest.fixture(scope="module")
-def kimi_reference() -> Any:
-    """Import the vendored Kimi Linear reference with the `fla` stub installed.
-
-    Skips when the reference isn't vendored (run
-    `uv run python scripts/kimi_linear/clone_kimi_linear_reference.py`).
-    """
-    if not (REFERENCE_DIR / "modeling_kimi.py").exists():
+def _import_vendored_reference(
+    reference_dir: Path, module_file: str, clone_script: str, label: str
+) -> Any:
+    """Import `<reference_dir.name>.<module_file>` with the `fla` stub and the
+    transformers shims installed, or skip when it is not vendored."""
+    if not (reference_dir / f"{module_file}.py").exists():
         pytest.skip(
-            f"Kimi Linear reference not vendored at {REFERENCE_DIR}; "
-            "run `uv run python scripts/kimi_linear/clone_kimi_linear_reference.py`"
+            f"{label} reference not vendored at {reference_dir}; run `uv run python {clone_script}`"
         )
     restore = shim_transformers_for_reference()
     install_fla_stub()
-    parent = str(REFERENCE_DIR.parent)
+    parent = str(reference_dir.parent)
     if parent not in sys.path:
         sys.path.insert(0, parent)
     try:
-        reference = importlib.import_module("kimi_linear_reference.modeling_kimi")
+        reference = importlib.import_module(f"{reference_dir.name}.{module_file}")
     finally:
         # The reference bound the compat wrapper at import; every other
         # family must keep seeing the 5.14-native function.
@@ -382,29 +379,25 @@ def kimi_reference() -> Any:
 
 
 @pytest.fixture(scope="module")
-def kimi_k3_reference() -> Any:
-    """Import the vendored Kimi K3 text model (`modeling_kimi_linear.py`)
-    with the `fla` stub installed.
+def kimi_reference() -> Any:
+    """The vendored Kimi Linear reference (`modeling_kimi.py`)."""
+    return _import_vendored_reference(
+        REFERENCE_DIR,
+        "modeling_kimi",
+        "scripts/kimi_linear/clone_kimi_linear_reference.py",
+        "Kimi Linear",
+    )
 
-    Skips when the reference isn't vendored (run
-    `uv run python scripts/kimi_linear/clone_kimi_k3_reference.py`).
-    """
-    if not (K3_REFERENCE_DIR / "modeling_kimi_linear.py").exists():
-        pytest.skip(
-            f"Kimi K3 reference not vendored at {K3_REFERENCE_DIR}; "
-            "run `uv run python scripts/kimi_linear/clone_kimi_k3_reference.py`"
-        )
-    restore = shim_transformers_for_reference()
-    install_fla_stub()
-    parent = str(K3_REFERENCE_DIR.parent)
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    try:
-        reference = importlib.import_module("kimi_k3_reference.modeling_kimi_linear")
-    finally:
-        restore()
-    _patch_reference_cache_protocol(reference)
-    return reference
+
+@pytest.fixture(scope="module")
+def kimi_k3_reference() -> Any:
+    """The vendored Kimi K3 text model (`modeling_kimi_linear.py`)."""
+    return _import_vendored_reference(
+        K3_REFERENCE_DIR,
+        "modeling_kimi_linear",
+        "scripts/kimi_linear/clone_kimi_k3_reference.py",
+        "Kimi K3",
+    )
 
 
 def _patch_reference_cache_protocol(reference: Any) -> None:
