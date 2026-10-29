@@ -1,15 +1,23 @@
-"""Shared fixture + `fla` stub for the Kimi Linear parity tests.
+"""Shared fixtures + `fla` stub for the Kimi Linear and Kimi K3 parity tests.
 
-The vendored reference at `third_party/kimi_linear_reference/modeling_kimi.py`
-imports the FLA library's Triton kernels (`chunk_kda`, `fused_recurrent_kda`,
+The vendored references (`third_party/kimi_linear_reference/modeling_kimi.py`
+and `third_party/kimi_k3_reference/modeling_kimi_linear.py`) import the FLA
+library's Triton kernels (`chunk_kda`, `fused_recurrent_kda`,
 `fused_kda_gate`, `ShortConvolution`, `FusedRMSNormGated`), which need a GPU.
 We register a stub `fla` package in `sys.modules` BEFORE the reference
 imports, replacing each kernel with the pure-PyTorch semantics FLA itself
-documents (the recurrence is a transcription of `fla/ops/kda/naive.py`, MIT,
-(c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li). The stubs deliberately do
-NOT import `mini_infer.models.blocks.kda` — the parity tests compare our
+documents (the recurrence is a transcription of `fla/ops/kda/naive.py`, the
+gate forms of `fla/ops/kda/gate.py`; MIT, (c) 2023-2026 Songlin Yang, Yu
+Zhang, Zhiyuan Li). The stubs deliberately do NOT import
+`mini_infer.models.blocks.kda` — the parity tests compare our
 implementation against these independently-written semantics, so sharing
 code would test a stub against itself.
+
+The two references call the kernels differently: Kimi Linear computes the
+decay gate and `sigmoid(beta)` itself and passes them in; K3 passes the raw
+features with `use_gate_in_kernel` / `use_beta_sigmoid_in_kernel`, `A_log`,
+`dt_bias`, a `lower_bound` (the bounded sigmoid gate) and
+`transpose_state_layout` (the state kept as `[V, K]`). One stub serves both.
 
 Only the paths the parity tests exercise are implemented; everything else
 (varlen `cu_seqlens`, padding masks) raises loudly.
@@ -29,7 +37,9 @@ import torch
 from torch import nn
 from torch.nn import functional
 
-REFERENCE_DIR = Path(__file__).resolve().parents[4] / "third_party" / "kimi_linear_reference"
+_THIRD_PARTY = Path(__file__).resolve().parents[4] / "third_party"
+REFERENCE_DIR = _THIRD_PARTY / "kimi_linear_reference"
+K3_REFERENCE_DIR = _THIRD_PARTY / "kimi_k3_reference"
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -69,27 +79,68 @@ def _naive_recurrent_kda(
     return out.to(dtype), (state if output_final_state else None)
 
 
+def _in_kernel_gate(
+    g: torch.Tensor,
+    a_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """`fla/ops/kda/gate.py` semantics for `use_gate_in_kernel=True`:
+    `-exp(A_log) * softplus(g + dt_bias)`, or with `lower_bound`
+    `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` (`g` is `[..., H, K]`)."""
+    num_heads = g.shape[-2]
+    gate = g.float()
+    if dt_bias is not None:
+        gate = gate + dt_bias.float().view(num_heads, -1)
+    if lower_bound is None:
+        assert a_log is not None
+        return -a_log.float().view(num_heads, 1).exp() * functional.softplus(gate)
+    if a_log is not None:
+        gate = a_log.float().view(num_heads, 1).exp() * gate
+    return lower_bound * torch.sigmoid(gate)
+
+
 def _kda_op(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
+    A_log: torch.Tensor | None = None,  # noqa: N803 (FLA's keyword)
+    dt_bias: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    lower_bound: float | None = None,
+    transpose_state_layout: bool = False,
+    state_v_first: bool = False,
     cu_seqlens: torch.Tensor | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Stub for both `chunk_kda` and `fused_recurrent_kda`: the fused wrappers
-    L2-normalize q/k in-kernel and default the scale, then run the recurrence."""
+    L2-normalize q/k in-kernel, default the scale, optionally compute the
+    gate and `sigmoid(beta)` in-kernel (K3), then run the recurrence. With
+    `transpose_state_layout` / `state_v_first` the state crosses the API as
+    `[B, H, V, K]`; the recurrence itself always runs `[K, V]`."""
     if cu_seqlens is not None:
         raise NotImplementedError("kimi parity stub: varlen cu_seqlens not exercised")
     if use_qk_l2norm_in_kernel:
         q, k = _l2norm(q), _l2norm(k)
-    return _naive_recurrent_kda(
+    if use_gate_in_kernel:
+        g = _in_kernel_gate(g, A_log, dt_bias, lower_bound)
+    if use_beta_sigmoid_in_kernel:
+        beta = beta.float().sigmoid()
+    v_first = transpose_state_layout or state_v_first
+    if v_first and initial_state is not None:
+        initial_state = initial_state.transpose(-1, -2)
+    out, final_state = _naive_recurrent_kda(
         q, k, v, g, beta, initial_state=initial_state, output_final_state=output_final_state
     )
+    if v_first and final_state is not None:
+        final_state = final_state.transpose(-1, -2).contiguous()
+    return out, final_state
 
 
 def _fused_kda_gate(
@@ -325,6 +376,32 @@ def kimi_reference() -> Any:
     finally:
         # The reference bound the compat wrapper at import; every other
         # family must keep seeing the 5.14-native function.
+        restore()
+    _patch_reference_cache_protocol(reference)
+    return reference
+
+
+@pytest.fixture(scope="module")
+def kimi_k3_reference() -> Any:
+    """Import the vendored Kimi K3 text model (`modeling_kimi_linear.py`)
+    with the `fla` stub installed.
+
+    Skips when the reference isn't vendored (run
+    `uv run python scripts/kimi_linear/clone_kimi_k3_reference.py`).
+    """
+    if not (K3_REFERENCE_DIR / "modeling_kimi_linear.py").exists():
+        pytest.skip(
+            f"Kimi K3 reference not vendored at {K3_REFERENCE_DIR}; "
+            "run `uv run python scripts/kimi_linear/clone_kimi_k3_reference.py`"
+        )
+    restore = shim_transformers_for_reference()
+    install_fla_stub()
+    parent = str(K3_REFERENCE_DIR.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    try:
+        reference = importlib.import_module("kimi_k3_reference.modeling_kimi_linear")
+    finally:
         restore()
     _patch_reference_cache_protocol(reference)
     return reference

@@ -1,34 +1,54 @@
-"""Kimi Linear family (moonshotai/Kimi-Linear-48B-A3B): owned implementation.
+"""Kimi Linear family (moonshotai/Kimi-Linear-48B-A3B, Kimi K3 text stack): owned implementation.
 
 From-scratch port of Moonshot's hybrid linear-attention architecture
 (arXiv:2510.26692), the attention foundation of Kimi K3. The parity
-reference is the checkpoint's `modeling_kimi.py` (trust_remote_code, vendored
-by `scripts/kimi_linear/clone_kimi_linear_reference.py`) driving the FLA `kda` kernels;
+references are the checkpoints' own remote code (trust_remote_code, vendored
+by `scripts/kimi_linear/clone_kimi_linear_reference.py` and
+`scripts/kimi_linear/clone_kimi_k3_reference.py`) driving the FLA `kda` kernels;
 `mini_infer.models.blocks.kda` lists the pinned semantics.
 
-Architecturally, a 27-layer decoder that interleaves two attention kinds at
-~3:1 (per the config's 1-indexed `kda_layers` / `full_attn_layers` lists):
+Architecturally, a decoder that interleaves two attention kinds at ~3:1 (per
+the config's 1-indexed `kda_layers` / `full_attn_layers` lists):
 
   - **KDA layers** (`blocks/kda.py`): q/k/v projections through short causal
     convs (kernel 4, SiLU), L2-normalized q/k, a per-channel decay gate
     `-exp(A_log) * softplus(low_rank(x) + dt_bias)`, the gated delta rule
-    over a `(32, 128, 128)` matrix state, then a sigmoid-gated RMSNorm and
+    over a `(heads, 128, 128)` matrix state, then a sigmoid-gated RMSNorm and
     output projection. Decode state is the matrix + three conv tails,
     constant per request.
-  - **MLA layers**: DeepSeek-V3-shaped latent attention with `q_lora = None`
-    and **NoPE**: no rotary embedding exists anywhere in this family; the
-    `qk_rope_head_dim` split of q and the shared `kv_a` output is used
-    UNROTATED (all position information comes from the KDA layers' decay
-    and convolutions). Cache is the compressed `kv_a_proj_with_mqa` output
-    (`512 + 64` per token), re-decompressed on read like `blocks/mla.py`.
+  - **MLA layers**: DeepSeek-V3-shaped latent attention with **NoPE**: no
+    rotary embedding exists anywhere in this family; the `qk_rope_head_dim`
+    split of q and the shared `kv_a` output is used UNROTATED (all position
+    information comes from the KDA layers' decay and convolutions). Cache is
+    the compressed `kv_a_proj_with_mqa` output (`512 + 64` per token),
+    re-decompressed on read like `blocks/mla.py`.
 
-The FFN is dense SwiGLU on layer 0 (`first_k_dense_replace = 1`) and a
-256-expert top-8 MoE elsewhere. The router is sigmoid-scored with an
-aux-loss-free `e_score_correction_bias`, BUT unlike DeepSeek-V3 / GLM
-(`GlmNoAuxTcGate`, where the bias tilts selection only), the reference adds
-the bias to the sigmoid scores IN PLACE, so the gathered expert weights are
-the BIASED scores. `_KimiMoeGate` reproduces that faithfully; it is a
-separate gate on purpose (HF code wins over the DeepSeek convention).
+The FFN is dense on layer 0 (`first_k_dense_replace = 1`) and a sigmoid-routed
+MoE elsewhere, with an aux-loss-free `e_score_correction_bias`.
+
+Kimi K3 (`moonshotai/Kimi-K3`, 2.8T, 93 layers) is the same stack with six
+config-gated additions, each pinned from its reference `modeling_kimi_linear.py`:
+
+  - `hidden_act = "situ"`: SiTU-GLU in the dense MLP, the experts and the
+    shared experts (`blocks/activations.situ`);
+  - `q_lora_rank`: low-rank Q (`q_a_proj` -> RMSNorm -> `q_b_proj`) and
+    `mla_use_output_gate`: a sigmoid gate `g_proj(x)` on the MLA output
+    before `o_proj`;
+  - `linear_attn_config.use_full_rank_gate` (one `g_proj` instead of the
+    low-rank `g_a/g_b` output-gate pair) and `gate_lower_bound` (the bounded
+    decay gate `lower_bound * sigmoid(exp(A_log) * (raw + dt_bias))`);
+  - `routed_expert_hidden_size`: latent MoE, one shared down projection
+    before dispatch, experts in the latent width, RMSNorm + shared up
+    projection after (the gate and the shared experts see the full width);
+  - `attn_res_block_size`: AttnRes, attention over residual-stream snapshots
+    before every sublayer and before the final norm (`attn_res.py`).
+
+Two conventions differ between the two reference files and are selected by
+`KimiLinearConfig.moe_weights_from_biased_scores`: the Kimi Linear file adds
+the correction bias to the sigmoid scores IN PLACE, so the gathered expert
+weights are the BIASED scores; the K3 file keeps the bias out of the weights
+(the DeepSeek-V3 / GLM convention) and masks dropped groups with `-inf`
+instead of `0.0`. `from_hf` keys the choice on the K3-only config fields.
 
 Serving: `USES_STATE_CACHE = True` routes the family to the per-request
 `KimiStateCache` and the `StateCacheContinuousScheduler`, via the same
@@ -36,10 +56,10 @@ Serving: `USES_STATE_CACHE = True` routes the family to the per-request
 as DeepSeek-V4. Because the whole family is position-free (NoPE + linear
 attention), `forward_prefill_with_cache` also supports CONTINUATION from
 `state_cache.start_pos > 0`, i.e. chunked prefill, which V4's state path
-does not. Single-rank only for now (TP would shard the KDA conv channels
-and the per-head state; a follow-up like Inkling). Cross-request prefix
-sharing (`StatePrefixCache`) is V4-only; the KDA state-snapshot equivalent
-is a follow-up.
+does not. AttnRes mixes per token, so it adds no decode state. Single-rank
+only for now (TP would shard the KDA conv channels and the per-head state;
+a follow-up like Inkling). Cross-request prefix sharing (`StatePrefixCache`)
+is V4-only; the KDA state-snapshot equivalent is a follow-up.
 """
 
 from __future__ import annotations
@@ -54,17 +74,20 @@ from torch.nn import functional
 
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
+from mini_infer.models.blocks.activations import GateUpActivation, situ_activation, swiglu
 from mini_infer.models.blocks.kda import (
     causal_conv1d_prefill,
     gated_rmsnorm,
     kda_chunkwise,
     kda_gate,
+    kda_lower_bound_gate,
     kda_recurrent,
     l2norm,
 )
 from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.swiglu import SwiGLU
+from mini_infer.models.kimi_linear.attn_res import attn_res_mix
 from mini_infer.models.kimi_linear.state_cache import (
     KimiKdaLayerState,
     KimiKdaStateSpec,
@@ -74,14 +97,18 @@ from mini_infer.models.kimi_linear.state_cache import (
     KimiStateLayerSpec,
 )
 
+# The reference builds `q_a_layernorm` / `kv_a_layernorm` as `KimiRMSNorm(rank)`
+# with the class default eps, NOT `config.rms_norm_eps` (1e-5 on both checkpoints).
+_LATENT_NORM_EPS = 1e-6
+
 
 @dataclass
 class KimiLinearConfig:
     vocab_size: int
     hidden_size: int
     num_hidden_layers: int
-    # MLA (full-attention) layers' shape. `q_lora_rank` is always None and
-    # `mla_use_nope` always True on this family; `from_hf` enforces both.
+    # MLA (full-attention) layers' shape. `mla_use_nope` is always True on
+    # this family; `from_hf` enforces it.
     num_attention_heads: int
     kv_lora_rank: int
     qk_nope_head_dim: int
@@ -96,7 +123,7 @@ class KimiLinearConfig:
     kda_layers: list[int]
     full_attn_layers: list[int]
     # FFN.
-    intermediate_size: int  # dense-layer SwiGLU width
+    intermediate_size: int  # dense-layer width
     moe_intermediate_size: int  # per-expert width
     num_experts: int | None
     num_experts_per_token: int
@@ -110,6 +137,20 @@ class KimiLinearConfig:
     moe_layer_freq: int
     rms_norm_eps: float
     tie_word_embeddings: bool
+    # ---- Kimi K3 delta (all off for Kimi Linear 48B) ----
+    hidden_act: str = "silu"  # "silu" | "situ"
+    situ_beta: float = 1.0
+    situ_linear_beta: float | None = None
+    q_lora_rank: int | None = None
+    mla_use_output_gate: bool = False
+    kda_use_full_rank_gate: bool = False
+    kda_gate_lower_bound: float | None = None
+    routed_expert_hidden_size: int | None = None
+    latent_moe_use_norm: bool = False
+    attn_res_block_size: int | None = None
+    # Kimi Linear's reference gathers the BIASED sigmoid scores as expert
+    # weights (in-place `+=` through a view); K3's gathers the unbiased ones.
+    moe_weights_from_biased_scores: bool = True
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> KimiLinearConfig:
@@ -119,8 +160,6 @@ class KimiLinearConfig:
                 "KimiLinearConfig requires `linear_attn_config` (the hybrid "
                 "KDA/MLA layout); a config without it is not this family"
             )
-        if getattr(hf_config, "q_lora_rank", None) is not None:
-            raise ValueError("Kimi Linear ships q_lora_rank=None; low-rank Q is not this family")
         if not getattr(hf_config, "mla_use_nope", False):
             raise ValueError(
                 "Kimi Linear MLA layers are NoPE (mla_use_nope=True); a RoPE'd "
@@ -139,7 +178,17 @@ class KimiLinearConfig:
         activation_func = str(getattr(hf_config, "moe_router_activation_func", "sigmoid"))
         if activation_func not in ("sigmoid", "softmax"):
             raise ValueError(f"unsupported moe_router_activation_func {activation_func!r}")
+        hidden_act = str(getattr(hf_config, "hidden_act", "silu") or "silu")
+        if hidden_act not in ("silu", "situ"):
+            raise ValueError(f"unsupported hidden_act {hidden_act!r} (expected silu or situ)")
         num_experts = getattr(hf_config, "num_experts", None)
+        q_lora_rank = getattr(hf_config, "q_lora_rank", None)
+        situ_linear_beta = getattr(hf_config, "activation_situ_linear_beta", None)
+        gate_lower_bound = linear_attn.get("gate_lower_bound", None)
+        attn_res_block_size = getattr(hf_config, "attn_res_block_size", None)
+        if attn_res_block_size is not None and int(attn_res_block_size) <= 0:
+            raise ValueError(f"attn_res_block_size must be positive, got {attn_res_block_size}")
+        routed_expert_hidden_size = getattr(hf_config, "routed_expert_hidden_size", None)
         return cls(
             vocab_size=int(hf_config.vocab_size),
             hidden_size=int(hf_config.hidden_size),
@@ -168,6 +217,21 @@ class KimiLinearConfig:
             moe_layer_freq=int(getattr(hf_config, "moe_layer_freq", 1)),
             rms_norm_eps=float(getattr(hf_config, "rms_norm_eps", 1e-5)),
             tie_word_embeddings=bool(getattr(hf_config, "tie_word_embeddings", False)),
+            hidden_act=hidden_act,
+            situ_beta=float(getattr(hf_config, "activation_situ_beta", None) or 1.0),
+            situ_linear_beta=float(situ_linear_beta) if situ_linear_beta is not None else None,
+            q_lora_rank=int(q_lora_rank) if q_lora_rank is not None else None,
+            mla_use_output_gate=bool(getattr(hf_config, "mla_use_output_gate", False)),
+            kda_use_full_rank_gate=bool(linear_attn.get("use_full_rank_gate", False)),
+            kda_gate_lower_bound=float(gate_lower_bound) if gate_lower_bound is not None else None,
+            routed_expert_hidden_size=(
+                int(routed_expert_hidden_size) if routed_expert_hidden_size is not None else None
+            ),
+            latent_moe_use_norm=bool(getattr(hf_config, "latent_moe_use_norm", False)),
+            attn_res_block_size=(
+                int(attn_res_block_size) if attn_res_block_size is not None else None
+            ),
+            moe_weights_from_biased_scores=not _ships_k3_modeling_code(hf_config, linear_attn),
         )
 
     def is_kda_layer(self, layer_idx: int) -> bool:
@@ -180,6 +244,29 @@ class KimiLinearConfig:
             and layer_idx >= self.first_k_dense_replace
             and layer_idx % self.moe_layer_freq == 0
         )
+
+    def gate_up_activation(self) -> GateUpActivation:
+        """The FFN combiner for `hidden_act` (dense MLP, experts, shared experts)."""
+        if self.hidden_act == "situ":
+            return situ_activation(self.situ_beta, self.situ_linear_beta)
+        return swiglu
+
+
+def _ships_k3_modeling_code(hf_config: Any, linear_attn: dict[str, Any]) -> bool:
+    """Does this config belong to the K3-generation `modeling_kimi_linear.py`?
+
+    The two reference files differ in router convention (see the module
+    docstring). The K3 file's config class is the only one that knows these
+    fields, so any of them being set marks a K3-generation checkpoint.
+    """
+    return (
+        getattr(hf_config, "attn_res_block_size", None) is not None
+        or getattr(hf_config, "routed_expert_hidden_size", None) is not None
+        or getattr(hf_config, "activation_situ_beta", None) is not None
+        or bool(getattr(hf_config, "mla_use_output_gate", False))
+        or "use_full_rank_gate" in linear_attn
+        or "gate_lower_bound" in linear_attn
+    )
 
 
 def build_kimi_state_cache_specs(
@@ -243,22 +330,29 @@ class _KimiDeltaAttention(nn.Module):
         self.q_conv1d = _KimiConv1d(projection_size, cfg.kda_conv_kernel_size)
         self.k_conv1d = _KimiConv1d(projection_size, cfg.kda_conv_kernel_size)
         self.v_conv1d = _KimiConv1d(projection_size, cfg.kda_conv_kernel_size)
-        # Per-head decay rate, checkpoint layout (1, 1, H, 1); init matches
+        # Per-head decay rate, stored flat `(H,)` (K3's layout; Kimi Linear
+        # ships `(1, 1, H, 1)` and the load remap flattens it). Init matches
         # the reference's log-uniform(1, 16) so a fresh model is finite.
         self.A_log = nn.Parameter(
-            torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)).view(
-                1, 1, -1, 1
-            )
+            torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16))
         )
         # The reference leaves dt_bias uninitialized (torch.empty); zeros keep
         # a fresh model finite, and checkpoints always overwrite it.
         self.dt_bias = nn.Parameter(torch.zeros(projection_size, dtype=torch.float32))
-        # Low-rank decay-gate and output-gate feature projections.
+        # Low-rank decay-gate feature projection and the delta-rule step size.
         self.f_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
         self.b_proj = nn.Linear(hidden, self.num_heads, bias=False)
-        self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
-        self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
+        # Output gate: low-rank `g_a/g_b` (Kimi Linear) or one full-rank
+        # `g_proj` (K3, `use_full_rank_gate`).
+        self.use_full_rank_gate = cfg.kda_use_full_rank_gate
+        if self.use_full_rank_gate:
+            self.g_proj = nn.Linear(hidden, projection_size, bias=False)
+        else:
+            self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
+            self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
+        # Decay gate form: softplus (Kimi Linear) or bounded sigmoid (K3).
+        self.gate_lower_bound = cfg.kda_gate_lower_bound
         # FusedRMSNormGated equivalent: per-head RMSNorm weight, shared
         # across heads, sigmoid gate applied in fp32 (blocks/kda.gated_rmsnorm).
         self.o_norm_weight = nn.Parameter(torch.ones(self.head_dim))
@@ -279,7 +373,13 @@ class _KimiDeltaAttention(nn.Module):
         k_raw, new_conv_k = causal_conv1d_prefill(self.k_proj(x), self.k_conv1d.weight, conv_k)
         v_raw, new_conv_v = causal_conv1d_prefill(self.v_proj(x), self.v_conv1d.weight, conv_v)
 
-        decay = kda_gate(self.f_b_proj(self.f_a_proj(x)), self.A_log, self.dt_bias, self.head_dim)
+        gate_features = self.f_b_proj(self.f_a_proj(x))
+        if self.gate_lower_bound is None:
+            decay = kda_gate(gate_features, self.A_log, self.dt_bias, self.head_dim)
+        else:
+            decay = kda_lower_bound_gate(
+                gate_features, self.A_log, self.dt_bias, self.head_dim, self.gate_lower_bound
+            )
         beta = self.b_proj(x).float().sigmoid()
 
         # L2-normalize q/k and scale q BEFORE the recurrence (the reference
@@ -290,8 +390,8 @@ class _KimiDeltaAttention(nn.Module):
         v = v_raw.view(batch, seq_len, self.num_heads, self.head_dim)
 
         initial = layer_state.recurrent_state if layer_state is not None else None
-        # Reference mode split: fused_recurrent for spans <= 64, chunked
-        # beyond. Both are the same math (pinned by test_kda_block).
+        # Recurrent form for short spans, chunked beyond. Both are the same
+        # math (pinned by test_kda_block), as are the reference's two kernels.
         if seq_len <= 64:
             out, final_state = kda_recurrent(q, k, v, decay, beta, initial_state=initial)
         else:
@@ -303,7 +403,8 @@ class _KimiDeltaAttention(nn.Module):
             layer_state.conv_k.copy_(new_conv_k)
             layer_state.conv_v.copy_(new_conv_v)
 
-        gate = self.g_b_proj(self.g_a_proj(x)).view(batch, seq_len, self.num_heads, self.head_dim)
+        gate = self.g_proj(x) if self.use_full_rank_gate else self.g_b_proj(self.g_a_proj(x))
+        gate = gate.view(batch, seq_len, self.num_heads, self.head_dim)
         out = gated_rmsnorm(out, gate, self.o_norm_weight, self.o_norm_eps)
         result: torch.Tensor = self.o_proj(out.reshape(batch, seq_len, -1))
         return result
@@ -315,7 +416,8 @@ class _KimiMlaAttention(nn.Module):
     Same decompression math as `blocks/mla.py` (cache the shared
     `kv_a_proj_with_mqa` output, rebuild per-head K/V on read) but NO rotary
     embedding anywhere, and reads/writes a dense per-request buffer instead
-    of PagedKVCache streams.
+    of PagedKVCache streams. K3 adds low-rank Q (`q_lora_rank`) and a sigmoid
+    output gate (`mla_use_output_gate`).
     """
 
     def __init__(self, cfg: KimiLinearConfig, layer_idx: int) -> None:
@@ -330,16 +432,27 @@ class _KimiMlaAttention(nn.Module):
         self.softmax_scale = self.qk_head_dim**-0.5
 
         hidden = cfg.hidden_size
-        self.q_proj = nn.Linear(hidden, self.num_heads * self.qk_head_dim, bias=False)
+        self.q_lora_rank = cfg.q_lora_rank
+        if self.q_lora_rank is None:
+            self.q_proj = nn.Linear(hidden, self.num_heads * self.qk_head_dim, bias=False)
+        else:
+            self.q_a_proj = nn.Linear(hidden, self.q_lora_rank, bias=False)
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=_LATENT_NORM_EPS)
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False
+            )
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=cfg.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=_LATENT_NORM_EPS)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
+        self.use_output_gate = cfg.mla_use_output_gate
+        if self.use_output_gate:
+            self.g_proj = nn.Linear(hidden, self.num_heads * self.v_head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
 
     def forward(
@@ -356,7 +469,11 @@ class _KimiMlaAttention(nn.Module):
             Uniform for (chunked) prefill; per-row for ragged decode.
         """
         batch, seq_len, _ = x.shape
-        queries = self.q_proj(x).view(batch, seq_len, self.num_heads, self.qk_head_dim)
+        if self.q_lora_rank is None:
+            q_states = self.q_proj(x)
+        else:
+            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        queries = q_states.view(batch, seq_len, self.num_heads, self.qk_head_dim)
 
         kv_new = self.kv_a_proj_with_mqa(x)  # (batch, seq_len, kv_lora + rope)
         if layer_state is None:
@@ -402,19 +519,21 @@ class _KimiMlaAttention(nn.Module):
         valid = key_positions.view(1, 1, 1, total_k) <= query_positions
         scores = scores.masked_fill(~valid, float("-inf"))
         weights = scores.softmax(dim=-1).to(x.dtype)
-        attn = torch.einsum("bhqk,bkhd->bqhd", weights, values)
-        result: torch.Tensor = self.o_proj(attn.reshape(batch, seq_len, -1))
+        attn = torch.einsum("bhqk,bkhd->bqhd", weights, values).reshape(batch, seq_len, -1)
+        if self.use_output_gate:
+            attn = attn * torch.sigmoid(self.g_proj(x))
+        result: torch.Tensor = self.o_proj(attn)
         return result
 
 
 class _KimiMoeGate(nn.Module):
-    """Kimi router: sigmoid (or softmax) scores + IN-PLACE correction bias.
+    """Kimi router: sigmoid (or softmax) scores + aux-loss-free correction bias.
 
-    Faithful to the reference `KimiMoEGate`, which differs from the
-    DeepSeek-V3 / GLM `noaux_tc` convention in two load-bearing ways:
-      - the bias is added to the scores in place, so the gathered expert
-        WEIGHTS are the biased scores (GLM gathers unbiased ones);
-      - non-kept groups are masked to `0.0` (not `-inf`) before the top-k.
+    Faithful to each reference `KimiMoEGate`. The bias steers SELECTION in
+    both; `weights_from_biased_scores` picks which scores become the expert
+    weights (Kimi Linear: the biased ones, via its in-place `+=` through a
+    view; K3: the unbiased ones, the DeepSeek-V3 / GLM convention) and how
+    dropped groups are masked before the top-k (`0.0` vs `-inf`).
     """
 
     def __init__(self, cfg: KimiLinearConfig) -> None:
@@ -427,6 +546,7 @@ class _KimiMoeGate(nn.Module):
         self.moe_renormalize = cfg.moe_renormalize
         self.routed_scaling_factor = cfg.routed_scaling_factor
         self.activation_func = cfg.moe_router_activation_func
+        self.weights_from_biased_scores = cfg.moe_weights_from_biased_scores
         self.weight = nn.Parameter(torch.empty(cfg.num_experts, cfg.hidden_size))
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         # Reference ships this uninitialized (torch.empty); zeros keep a
@@ -435,7 +555,7 @@ class _KimiMoeGate(nn.Module):
 
     def forward(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Route `(tokens, hidden)`; returns `(top_k_indices, top_k_weights)`,
-        weights fp32, gathered from the BIASED scores, renormalized, scaled."""
+        weights fp32, renormalized, scaled."""
         logits = functional.linear(x_flat.float(), self.weight.float())
         scores = logits.sigmoid() if self.activation_func == "sigmoid" else logits.softmax(dim=1)
         choice = scores + self.e_score_correction_bias.float()
@@ -453,45 +573,66 @@ class _KimiMoeGate(nn.Module):
             .expand(num_tokens, self.num_expert_group, per_group)
             .reshape(num_tokens, -1)
         )
-        masked_choice = choice.masked_fill(~score_mask.bool(), 0.0)
+        dropped = 0.0 if self.weights_from_biased_scores else float("-inf")
+        masked_choice = choice.masked_fill(~score_mask.bool(), dropped)
         topk_indices = torch.topk(masked_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weights = choice.gather(1, topk_indices)
+        weight_source = choice if self.weights_from_biased_scores else scores
+        topk_weights = weight_source.gather(1, topk_indices)
         if self.top_k > 1 and self.moe_renormalize:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
         return topk_indices, topk_weights * self.routed_scaling_factor
 
 
 class _KimiMoe(nn.Module):
-    """Sparse FFN: `_KimiMoeGate` + routed `MixtralExpert`s + shared SwiGLU.
+    """Sparse FFN: `_KimiMoeGate` + routed `MixtralExpert`s + shared FFN.
 
     Expert tensors keep the checkpoint's names (`experts.N.w1/w2/w3`,
     `shared_experts.gate/up/down_proj`) so loading is a direct copy. Routed
     contributions accumulate in fp32, matching the reference's fp32 combine.
+
+    With `routed_expert_hidden_size` (K3's latent MoE) the routed path runs
+    in a narrower latent width: `routed_expert_down_proj` once before
+    dispatch, experts at the latent width, an optional RMSNorm on the
+    combined output, `routed_expert_up_proj` back to the hidden width. The
+    gate and the shared experts always see the full-width input.
     """
 
     def __init__(self, cfg: KimiLinearConfig) -> None:
         super().__init__()
         assert cfg.num_experts is not None
         self.num_experts = cfg.num_experts
+        activation = cfg.gate_up_activation()
+        self.latent_size = cfg.routed_expert_hidden_size
+        expert_width = self.latent_size if self.latent_size is not None else cfg.hidden_size
         self.experts = nn.ModuleList(
             [
-                MixtralExpert(cfg.hidden_size, cfg.moe_intermediate_size)
+                MixtralExpert(expert_width, cfg.moe_intermediate_size, activation=activation)
                 for _ in range(cfg.num_experts)
             ]
         )
         self.gate = _KimiMoeGate(cfg)
         self.shared_experts: SwiGLU | None = (
-            SwiGLU(cfg.hidden_size, cfg.moe_intermediate_size * cfg.num_shared_experts)
+            SwiGLU(
+                cfg.hidden_size,
+                cfg.moe_intermediate_size * cfg.num_shared_experts,
+                activation=activation,
+            )
             if cfg.num_shared_experts > 0
             else None
         )
+        if self.latent_size is not None:
+            self.routed_expert_down_proj = nn.Linear(cfg.hidden_size, self.latent_size, bias=False)
+            self.routed_expert_up_proj = nn.Linear(self.latent_size, cfg.hidden_size, bias=False)
+            if cfg.latent_moe_use_norm:
+                self.routed_expert_norm = RMSNorm(self.latent_size, eps=cfg.rms_norm_eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_shape = x.shape
         flat = x.view(-1, x.shape[-1])
         topk_indices, topk_weights = self.gate(flat)
+        routed_in = self.routed_expert_down_proj(flat) if self.latent_size is not None else flat
 
-        routed = torch.zeros(flat.shape, dtype=torch.float32, device=flat.device)
+        routed = torch.zeros(routed_in.shape, dtype=torch.float32, device=flat.device)
         expert_mask = functional.one_hot(topk_indices, num_classes=self.num_experts).permute(
             2, 1, 0
         )
@@ -501,21 +642,33 @@ class _KimiMoe(nn.Module):
                 continue
             weights = topk_weights[token_idx, top_k_pos, None]
             routed.index_add_(
-                0, token_idx, self.experts[expert_idx](flat[token_idx]).float() * weights
+                0, token_idx, self.experts[expert_idx](routed_in[token_idx]).float() * weights
             )
         out = routed.to(x.dtype)
+        if self.latent_size is not None:
+            if hasattr(self, "routed_expert_norm"):
+                out = self.routed_expert_norm(out)
+            out = self.routed_expert_up_proj(out)
         if self.shared_experts is not None:
             out = out + self.shared_experts(flat)
         return out.view(input_shape)
 
 
 class _KimiDecoderLayer(nn.Module):
-    """Pre-norm block: (KDA | NoPE-MLA) attention, then (SwiGLU | MoE) FFN."""
+    """Pre-norm block: (KDA | NoPE-MLA) attention, then (dense | MoE) FFN.
+
+    With `attn_res_block_size` (K3) the residual stream is replaced by
+    AttnRes (`attn_res.py`): the layer receives the running sum and the
+    block snapshots, picks each sublayer's input by attention over them,
+    snapshots the running sum every `attn_res_block_size` layers, and
+    returns the updated pair.
+    """
 
     def __init__(self, cfg: KimiLinearConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.is_kda = cfg.is_kda_layer(layer_idx)
+        self.rms_norm_eps = cfg.rms_norm_eps
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.self_attn: nn.Module = (
@@ -527,29 +680,79 @@ class _KimiDecoderLayer(nn.Module):
         if cfg.is_moe_layer(layer_idx):
             self.block_sparse_moe = _KimiMoe(cfg)
         else:
-            self.mlp = SwiGLU(cfg.hidden_size, cfg.intermediate_size)
+            self.mlp = SwiGLU(
+                cfg.hidden_size, cfg.intermediate_size, activation=cfg.gate_up_activation()
+            )
+        self.attn_res_block_size = cfg.attn_res_block_size
+        if self.attn_res_block_size is not None:
+            self.self_attention_res_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False)
+            self.mlp_res_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False)
+
+    def _attention(
+        self,
+        x: torch.Tensor,
+        layer_state: KimiKdaLayerState | KimiMlaLayerState | None,
+        row_starts: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.is_kda:
+            assert layer_state is None or isinstance(layer_state, KimiKdaLayerState)
+            out: torch.Tensor = self.self_attn(x, layer_state)
+            return out
+        assert layer_state is None or isinstance(layer_state, KimiMlaLayerState)
+        out = self.self_attn(x, layer_state, row_starts)
+        return out
+
+    def _ffn(self, x: torch.Tensor) -> torch.Tensor:
+        out: torch.Tensor = (
+            self.block_sparse_moe(x) if hasattr(self, "block_sparse_moe") else self.mlp(x)
+        )
+        return out
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         layer_state: KimiKdaLayerState | KimiMlaLayerState | None,
         row_starts: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        x = self.input_layernorm(hidden_states)
-        if self.is_kda:
-            assert layer_state is None or isinstance(layer_state, KimiKdaLayerState)
-            x = self.self_attn(x, layer_state)
-        else:
-            assert layer_state is None or isinstance(layer_state, KimiMlaLayerState)
-            x = self.self_attn(x, layer_state, row_starts)
-        hidden_states = residual + x
+        block_residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Returns `(hidden_states, block_residual)`; the second is None
+        without AttnRes and `(batch, seq_len, num_blocks, hidden)` with it."""
+        if self.attn_res_block_size is None:
+            x = self._attention(self.input_layernorm(hidden_states), layer_state, row_starts)
+            hidden_states = hidden_states + x
+            x = self._ffn(self.post_attention_layernorm(hidden_states))
+            return hidden_states + x, block_residual
 
-        residual = hidden_states
-        x = self.post_attention_layernorm(hidden_states)
-        x = self.block_sparse_moe(x) if hasattr(self, "block_sparse_moe") else self.mlp(x)
-        out: torch.Tensor = residual + x
-        return out
+        assert block_residual is not None
+        prefix_sum: torch.Tensor | None = hidden_states
+        attn_input = hidden_states
+        if block_residual.shape[-2] > 0:
+            attn_input = attn_res_mix(
+                hidden_states,
+                block_residual,
+                self.self_attention_res_proj.weight,
+                self.self_attention_res_norm.weight,
+                self.rms_norm_eps,
+            )
+        if self.layer_idx % self.attn_res_block_size == 0:
+            # Snapshot the running sum as a new block and restart it.
+            block_residual = torch.cat([block_residual, hidden_states.unsqueeze(-2)], dim=-2)
+            prefix_sum = None
+
+        attn_out = self._attention(self.input_layernorm(attn_input), layer_state, row_starts)
+        prefix_sum = attn_out if prefix_sum is None else prefix_sum + attn_out
+
+        ffn_input = attn_res_mix(
+            prefix_sum,
+            block_residual,
+            self.mlp_res_proj.weight,
+            self.mlp_res_norm.weight,
+            self.rms_norm_eps,
+        )
+        ffn_out = self._ffn(self.post_attention_layernorm(ffn_input))
+        return prefix_sum + ffn_out, block_residual
 
 
 class _KimiInnerModel(nn.Module):
@@ -562,6 +765,9 @@ class _KimiInnerModel(nn.Module):
             [_KimiDecoderLayer(cfg, i) for i in range(cfg.num_hidden_layers)]
         )
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        if cfg.attn_res_block_size is not None:
+            self.output_attn_res_norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            self.output_attn_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False)
 
 
 # HF wraps each KDA conv in FLA's ShortConvolution (nn.Conv1d): (C, 1, W) -> (C, W).
@@ -595,9 +801,20 @@ class KimiLinearForCausalLM(BaseCausalLM):
         row_starts: torch.Tensor,
     ) -> torch.Tensor:
         hidden = self.model.embed_tokens(input_ids)
+        block_residual: torch.Tensor | None = None
+        if self.cfg.attn_res_block_size is not None:
+            block_residual = hidden.new_zeros(*hidden.shape[:-1], 0, hidden.shape[-1])
         for layer_idx, layer_module in enumerate(self.model.layers):
             layer_state = state_cache.layer(layer_idx) if state_cache is not None else None
-            hidden = layer_module(hidden, layer_state, row_starts)
+            hidden, block_residual = layer_module(hidden, layer_state, row_starts, block_residual)
+        if block_residual is not None:
+            hidden = attn_res_mix(
+                hidden,
+                block_residual,
+                self.model.output_attn_res_proj.weight,
+                self.model.output_attn_res_norm.weight,
+                self.cfg.rms_norm_eps,
+            )
         hidden = self.model.norm(hidden)
         logits: torch.Tensor = self.lm_head(hidden)
         return logits
@@ -741,7 +958,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         missing_set = set(missing) - model.expected_missing_state_keys()
         if missing_set or unexpected:
             raise ValueError(
-                f"weight load mismatch for KimiLinearForCausalLM: "
+                f"weight load mismatch for {type(model).__name__}: "
                 f"missing={sorted(missing_set)}, unexpected={sorted(unexpected)}"
             )
 
@@ -750,9 +967,10 @@ def _remap_kimi_state(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch
     """HF tensors -> our module keys.
 
     The module tree deliberately mirrors the reference names, so almost
-    everything copies straight through. Two exceptions: the KDA conv weights
-    lose HF's Conv1d singleton dim, and `o_norm.weight` maps to our flat
-    `o_norm_weight` parameter.
+    everything copies straight through. Three exceptions: the KDA conv
+    weights lose HF's Conv1d singleton dim, `o_norm.weight` maps to our flat
+    `o_norm_weight` parameter, and `A_log` is flattened to `(H,)` (Kimi
+    Linear ships `(1, 1, H, 1)`, K3 ships `(H,)`).
     """
     remapped: dict[str, torch.Tensor] = {}
     for key, tensor in hf_state_dict.items():
@@ -763,6 +981,9 @@ def _remap_kimi_state(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch
         o_norm = _O_NORM_RE.match(key)
         if o_norm is not None:
             remapped[f"{o_norm.group(1)}.o_norm_weight"] = tensor
+            continue
+        if key.endswith(".A_log"):
+            remapped[key] = tensor.reshape(-1)
             continue
         remapped[key] = tensor
     return remapped

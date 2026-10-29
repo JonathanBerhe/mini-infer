@@ -20,7 +20,11 @@ conventions pinned from that stack:
     `head_dim_k ** -0.5` BEFORE the recurrence (the kernels do this inside
     when `use_qk_l2norm_in_kernel=True`; we keep it explicit at the call
     site in the layer, so these functions are the bare delta rule),
-  - the decay gate is `g = -exp(A_log) * softplus(raw + dt_bias)` in fp32,
+  - the decay gate is `g = -exp(A_log) * softplus(raw + dt_bias)` in fp32
+    (Kimi Linear), or the bounded form
+    `g = lower_bound * sigmoid(exp(A_log) * (raw + dt_bias))` when the
+    config sets `linear_attn_config.gate_lower_bound` (Kimi K3, -5.0; FLA's
+    `lower_bound` kernels), so `g` stays in `(lower_bound, 0)`,
   - the layer's inputs pass through short causal convolutions (kernel 4,
     SiLU) whose rolling per-request state is `(channels, kernel)` holding
     the last `kernel` RAW inputs, newest last (FLA cache layout).
@@ -63,6 +67,29 @@ def kda_gate(
     gate = raw.float().view(*raw.shape[:-1], num_heads, head_dim)
     gate = gate + dt_bias.float().view(num_heads, head_dim)
     return -a_log.float().view(num_heads, 1).exp() * functional.softplus(gate)
+
+
+def kda_lower_bound_gate(
+    raw: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    head_dim: int,
+    lower_bound: float,
+) -> torch.Tensor:
+    """Bounded log-space decay gate: `lower_bound * sigmoid(exp(A_log) * (raw + dt_bias))`.
+
+    Mirrors FLA's KDA kernels with `lower_bound` set (what the Kimi K3
+    reference passes as `use_gate_in_kernel=True, lower_bound=-5.0`): the
+    softplus form of `kda_gate` is replaced by a sigmoid scaled into
+    `(lower_bound, 0)`, so a channel can never decay faster than
+    `exp(lower_bound)` per token. Same shapes and dtype contract as `kda_gate`.
+    """
+    if lower_bound >= 0:
+        raise ValueError(f"gate lower_bound must be negative, got {lower_bound}")
+    num_heads = raw.shape[-1] // head_dim
+    gate = raw.float().view(*raw.shape[:-1], num_heads, head_dim)
+    gate = gate + dt_bias.float().view(num_heads, head_dim)
+    return lower_bound * torch.sigmoid(a_log.float().view(num_heads, 1).exp() * gate)
 
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

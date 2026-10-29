@@ -9,6 +9,9 @@ with the FLA kernel package replaced by its naive-reference semantics.
 """
 
 from tests.unit.models.deepseek_v4._v4_reference_helpers import reference_module
-from tests.unit.models.kimi_linear._kimi_reference_helpers import kimi_reference
+from tests.unit.models.kimi_linear._kimi_reference_helpers import (
+    kimi_k3_reference,
+    kimi_reference,
+)
 
-__all__ = ["kimi_reference", "reference_module"]
+__all__ = ["kimi_k3_reference", "kimi_reference", "reference_module"]

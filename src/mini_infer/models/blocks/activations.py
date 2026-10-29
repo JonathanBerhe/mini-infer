@@ -11,6 +11,8 @@ gate and up projections and returns the gated activation:
   gate alone, and cannot be expressed by swapping the SiLU in `swiglu`.
 - `clamped_swiglu` is DeepSeek-V4's experts (`swiglu_limit`): the same two
   clamps as `swigluoai`, then plain `silu(gate) * up`.
+- `situ` is Kimi K3's SiTU-GLU (`hidden_act = "situ"`): a tanh-bounded SiLU on
+  the gate and a tanh-bounded identity on the up branch, computed in fp32.
 
 Blocks that were SiLU-only (`SwiGLU`, `MixtralExpert`, `Fp8Expert`, `GlmMoeFFN`)
 take an `activation` combiner defaulting to `swiglu`, so existing families are
@@ -72,3 +74,32 @@ def swigluoai(
     g = gate.clamp(max=limit)
     u = up.clamp(min=-limit, max=limit)
     return (u + 1.0) * g * torch.sigmoid(alpha * g)
+
+
+def situ(
+    gate: torch.Tensor, up: torch.Tensor, *, beta: float, linear_beta: float | None
+) -> torch.Tensor:
+    """SiTU-GLU (Kimi K3's `hidden_act = "situ"`; reference `SituAndMul`).
+
+        a   = beta * tanh(gate / beta) * sigmoid(gate)
+        u   = linear_beta * tanh(up / linear_beta)   if linear_beta is set, else up
+        out = a * u
+
+    Both branches run in fp32 and the product is cast back to `gate.dtype`,
+    as the reference does on its concatenated gate-up tensor. `beta` bounds
+    the gate's SiLU to `(-beta, beta)`; `linear_beta` bounds the up branch
+    the same way. K3 ships `beta = 4.0`, `linear_beta = 25.0`.
+    """
+    g = gate.float()
+    u = up.float()
+    a = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+    if linear_beta is not None:
+        u = linear_beta * torch.tanh(u / linear_beta)
+    return (a * u).to(gate.dtype)
+
+
+def situ_activation(beta: float | None, linear_beta: float | None) -> GateUpActivation:
+    """The SiTU combiner for a config's `activation_situ_beta` /
+    `activation_situ_linear_beta` (a falsy `beta` falls back to 1.0, the
+    reference's `_get_situ_activation_params` rule)."""
+    return partial(situ, beta=beta or 1.0, linear_beta=linear_beta)
