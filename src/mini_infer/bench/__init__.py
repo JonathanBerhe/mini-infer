@@ -12,12 +12,15 @@ from mini_infer.bench.harness import (
     Technique,
     Workload,
     drive_scheduler,
+    format_step_profiles,
     format_table,
     make_scheduler_technique,
     parity_violations,
+    profile_scheduler_steps,
     run_suite,
 )
 from mini_infer.bench.registry import DEFAULT_PROMPTS, build_registry
+from mini_infer.bench.step_profile import format_step_summary
 
 __all__ = [
     "DEFAULT_PROMPTS",
@@ -28,8 +31,11 @@ __all__ = [
     "Workload",
     "build_registry",
     "drive_scheduler",
+    "format_step_profiles",
+    "format_step_summary",
     "format_table",
     "make_scheduler_technique",
     "parity_violations",
+    "profile_scheduler_steps",
     "run_suite",
 ]
