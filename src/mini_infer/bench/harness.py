@@ -95,8 +95,9 @@ class BenchResult:
     # to assert every LOSSLESS technique decoded the same tokens (greedy => they
     # must). Lossy techniques (INT8, quantized KV) are exempt; see `lossless`.
     output_signature: tuple[tuple[int, ...], ...]
-    # False for techniques that deliberately change the math (INT8 weights,
-    # quantized KV); those are expected to diverge from the baseline and are
+    # False for techniques whose tokens are allowed to differ from the baseline:
+    # lossy quant (INT8 weights, quantized KV) changes the math on purpose, and a
+    # different attention kernel (FlashInfer) rounds differently. Both are
     # excluded from the parity check.
     lossless: bool = True
     # The step profile of `profile_scheduler_steps` when the workload asks for
@@ -147,7 +148,7 @@ class Technique:
     pending: str = ""
     note: str = ""
     # See `BenchResult.lossless`: False exempts the technique from the parity
-    # check (lossy quant is expected to diverge from the baseline).
+    # check (lossy quant and a different attention kernel diverge from the baseline).
     lossless: bool = True
 
     def applicability(self, env: BenchEnv) -> tuple[bool, str]:
@@ -494,11 +495,13 @@ def parity_violations(results: Sequence[BenchResult]) -> list[tuple[str, str]]:
     """Return lossless-technique pairs whose tokens differ at the same concurrency.
 
     Greedy decoding is deterministic, so every LOSSLESS technique (cache
-    strategy, scheduler, attention-backend swap, tensor parallelism, exact spec
-    decode) must produce identical tokens on the same workload; a mismatch
-    there is a real correctness bug. Lossy techniques (INT8 weights, quantized
-    KV) deliberately change the math and are expected to diverge from the
-    baseline, so `lossless=False` results are excluded from this check.
+    strategy, scheduler, tensor parallelism, exact spec decode) must produce
+    identical tokens on the same workload, and a mismatch there is a real
+    correctness bug. Techniques marked `lossless=False` are excluded: lossy
+    quant (INT8 weights, quantized KV) changes the math on purpose, and a
+    different attention kernel (FlashInfer against the SDPA path) rounds
+    differently, so greedy decoding can pick another token while both are
+    correct.
     """
     by_concurrency: dict[int, list[BenchResult]] = {}
     for result in results:

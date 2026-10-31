@@ -122,7 +122,7 @@ def main() -> None:
         for ref, other in violations:
             print(f"  - {ref} != {other}")
     else:
-        print("Parity: all lossless techniques agree (lossy quant excluded by design).")
+        print("Parity: all lossless techniques agree (techniques marked lossy excluded).")
 
     profiles = format_step_profiles(results)
     if profiles:

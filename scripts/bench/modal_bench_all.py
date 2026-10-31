@@ -137,7 +137,7 @@ def bench(
         lines.append("PARITY VIOLATIONS (lossless techniques decoded different tokens; a bug):")
         lines.extend(f"  - {ref} != {other}" for ref, other in violations)
     else:
-        lines.append("Parity: all lossless techniques agree (lossy quant excluded by design).")
+        lines.append("Parity: all lossless techniques agree (techniques marked lossy excluded).")
     profiles = format_step_profiles(results)
     if profiles:
         lines.extend(["", profiles])
