@@ -14,8 +14,9 @@ the CPU dequant fallback), and prefix_cache. All run single-process on one GPU.
 
 The FlashInfer techniques (attn_flashinfer, kv_fp8, kv_nvfp4) are opt-in via
 `--techniques` and currently constrained:
-  - FlashInfer JIT-compiles its kernels at first use, which is slow; budget
-    generous time or precompile the kernels into the image.
+  - FlashInfer JIT-compiles its kernels at first use, which is slow; pass
+    `--technique-timeout 1200` so the compile fits inside the per-technique
+    bound, or precompile the kernels into the image.
   - The FP8-KV prefill kernel does not compile on Hopper (SM90) for
     head_dim=128 ("no eligible GMMA operator"); run kv_fp8 / kv_nvfp4 on
     Blackwell with a FlashInfer build that supports them.
@@ -91,10 +92,13 @@ def bench(
     techniques: list[str],
     attention_backend: str,
     profile: bool,
+    technique_timeout: float,
 ) -> str:
     """Run the harness registry on the GPU; return the formatted table + parity line.
 
     With `profile`, the step profile of each technique follows the parity line.
+    `technique_timeout` bounds each technique in seconds; a FlashInfer run needs
+    a larger one than the default, because the first use compiles the kernels.
     """
     from mini_infer.bench import (
         DEFAULT_PROMPTS,
@@ -120,7 +124,7 @@ def bench(
         wanted = set(techniques)
         registry = [technique for technique in registry if technique.name in wanted]
 
-    results, skipped = run_suite(workload, registry, per_technique_timeout=_PER_TECHNIQUE_TIMEOUT_S)
+    results, skipped = run_suite(workload, registry, per_technique_timeout=technique_timeout)
     lines = [
         f"Workload: model={workload.model} device=cuda "
         f"concurrency={workload.concurrency_levels} max_tokens={workload.max_tokens}",
@@ -150,7 +154,12 @@ def main(
     techniques: str = "baseline,int8_w8a16,prefix_cache",
     attention_backend: str = "torch",
     profile: bool = False,
+    technique_timeout: float = _PER_TECHNIQUE_TIMEOUT_S,
 ) -> None:
     levels = [int(part.strip()) for part in concurrency.split(",") if part.strip()]
     names = [part.strip() for part in techniques.split(",") if part.strip()]
-    print(bench.remote(model, levels, max_tokens, names, attention_backend, profile))
+    print(
+        bench.remote(
+            model, levels, max_tokens, names, attention_backend, profile, technique_timeout
+        )
+    )
