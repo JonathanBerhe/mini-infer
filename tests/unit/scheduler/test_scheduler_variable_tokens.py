@@ -333,3 +333,28 @@ def test_plain_path_runs_to_max_tokens_unchanged() -> None:
     assert runner.block_pool.num_free_blocks == runner.block_pool.num_blocks
     # Prefill, then one decode. The last emitted token is never fed back.
     assert [c["cu_seqlens_q"] for c in runner.calls] == [[0, 3, 8], [0, 1, 2]]
+
+
+def test_sample_decoders_samples_every_decoder_in_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two decoders cost one batched sample, and get the tokens the per-request path gave."""
+    import mini_infer.scheduler.continuous_scheduler as module
+
+    shapes: list[tuple[int, ...]] = []
+    real = module.sample_batch
+
+    def counting(logits: torch.Tensor, params: Any) -> list[int]:
+        shapes.append(tuple(logits.shape))
+        return real(logits, params)
+
+    monkeypatch.setattr(module, "sample_batch", counting)
+    sched, _ = _sched()
+    short = _enqueue(sched, "abc", max_tokens=4)
+    long = _enqueue(sched, "abcde", max_tokens=4)
+
+    sched._step()  # prefill both
+    sampled = sched._sample_decoders()
+
+    assert sampled == {id(short): [0], id(long): [0]}
+    assert len(shapes) == 1 and shapes[0][0] == 2

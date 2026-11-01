@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 
-from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticDecodeStep
 from mini_infer.device import is_cuda_device, require_cuda_device
 
 try:
@@ -59,29 +59,38 @@ _workspace_buffer: torch.Tensor | None = None
 # pools lose fa3 silently. Per-class wrappers give fa2 for fp8 KV and fa3 for bf16.
 _prefill_wrappers: dict[str, Any] = {}
 _decode_wrapper: Any = None
-# The last plan: (wrapper, page indptr tensor, query boundaries, attention parameters).
-# `flashinfer_attention_forward` skips `plan()` while these are unchanged, so one plan
-# per step serves every layer. The engine runs one forward at a time, so one slot is
-# enough.
-_last_plan: tuple[Any, torch.Tensor, tuple[int, ...], tuple[Any, ...]] | None = None
+# The last plan: (wrapper, page indptr tensor, cache layout serial, query boundaries,
+# attention parameters). `flashinfer_attention_forward` skips `plan()` while these are
+# unchanged, so one plan per step serves every layer. The engine runs one forward at a
+# time, so one slot is enough.
+_last_plan: tuple[Any, torch.Tensor, int, tuple[int, ...], tuple[Any, ...]] | None = None
+# Fixed-buffer wrappers of the captured decode steps, by (KV class, batch, capacity).
+_graph_wrappers: dict[tuple[str, int, int], Any] = {}
 
 
 def _planned(
-    wrapper: Any, indptr: torch.Tensor, qo_indptr: tuple[int, ...], params: tuple[Any, ...]
+    wrapper: Any,
+    indptr: torch.Tensor,
+    serial: int,
+    qo_indptr: tuple[int, ...],
+    params: tuple[Any, ...],
 ) -> bool:
     """Whether `wrapper` already holds the plan for this page index and these parameters.
 
     The cache rebuilds its page index when the layout changes, so the same `indptr`
-    object means the same step of the same cache. `_last_plan` keeps a reference to
-    the tensor, so its identity cannot pass to another tensor while it is the key.
+    object at the same layout serial means the same step of the same cache. The
+    serial matters for a captured step, whose buffers keep their identity across
+    steps. `_last_plan` keeps a reference to the tensor, so its identity cannot pass
+    to another tensor while it is the key.
     """
     last = _last_plan
     return (
         last is not None
         and last[0] is wrapper
         and last[1] is indptr
-        and last[2] == qo_indptr
-        and last[3] == params
+        and last[2] == serial
+        and last[3] == qo_indptr
+        and last[4] == params
     )
 
 
@@ -91,6 +100,34 @@ def _wrapper_key(kv_quant: str | None) -> str:
     In one class the (q, kv) dtypes never change, so the first-plan backend stays correct.
     """
     return kv_quant if kv_quant is not None else "default"
+
+
+def _graph_wrapper(device: torch.device, kv_quant: str | None, step: StaticDecodeStep) -> Any:
+    """The fixed-buffer prefill wrapper of a captured step: one per KV class and batch size.
+
+    FlashInfer keeps the batch size of a CUDA-graph wrapper fixed and copies every
+    plan into the buffers given here, so a captured `run()` reads the latest plan.
+    The wrapper shares the workspace of the eager wrappers; a plan and its run never
+    interleave with another wrapper's.
+    """
+    global _workspace_buffer
+    if _workspace_buffer is None:
+        _workspace_buffer = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+    assert flashinfer is not None  # _FLASHINFER_AVAILABLE checked at call site
+    key = (_wrapper_key(kv_quant), step.batch, step.capacity)
+    wrapper = _graph_wrappers.get(key)
+    if wrapper is None:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            _workspace_buffer,
+            kv_layout="NHD",
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.empty(step.batch + 1, dtype=torch.int32, device=device),
+            paged_kv_indptr_buf=torch.empty(step.batch + 1, dtype=torch.int32, device=device),
+            paged_kv_indices_buf=torch.empty(step.capacity, dtype=torch.int32, device=device),
+            paged_kv_last_page_len_buf=torch.empty(step.batch, dtype=torch.int32, device=device),
+        )
+        _graph_wrappers[key] = wrapper
+    return wrapper
 
 
 def supports_flashinfer_backend(device: torch.device | str) -> bool:
@@ -185,6 +222,10 @@ def flashinfer_attention_forward(
     page_size = cache._pool.block_size
 
     prefill_wrapper, decode_wrapper = _ensure_wrappers(device, cache._pool.kv_quant)
+    step = cache.static_step
+    if step is not None:
+        # A captured decode step runs on a wrapper with fixed buffers for its batch size.
+        prefill_wrapper = _graph_wrapper(device, cache._pool.kv_quant, step)
 
     # The CSR page index triple that FlashInfer wants, built by the cache once
     # per step and shared by every layer (see `PagedKVCache.page_index`).
@@ -262,9 +303,20 @@ def flashinfer_attention_forward(
         window,
         softmax_scale,
     )
-    if not _planned(prefill_wrapper, paged_kv_indptr, qo_indptr_list, params):
+    serial = cache.layout_serial
+    if not _planned(prefill_wrapper, paged_kv_indptr, serial, qo_indptr_list, params):
+        if is_cuda_device(device) and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer plan() cannot run inside a CUDA graph capture; "
+                "plan the static decode step before the capture (plan_static_decode)"
+            )
+        qo_indptr = (
+            step.qo_indptr
+            if step is not None
+            else cu_seqlens_q.to(dtype=torch.int32, device=device)
+        )
         prefill_wrapper.plan(
-            cu_seqlens_q.to(dtype=torch.int32, device=device),
+            qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
             paged_kv_last_page_len,
@@ -279,7 +331,9 @@ def flashinfer_attention_forward(
             kv_data_type=kv_data_type,
             window_left=(window - 1) if window is not None else -1,
         )
-        _last_plan = (prefill_wrapper, paged_kv_indptr, qo_indptr_list, params)
+        _last_plan = (prefill_wrapper, paged_kv_indptr, serial, qo_indptr_list, params)
+        if step is not None:
+            step.plan_params = params
     if kv_cache_sf is not None:
         out: torch.Tensor = prefill_wrapper.run(
             q, kv_cache, k_scale=k_scale, v_scale=v_scale, kv_cache_sf=kv_cache_sf
@@ -289,3 +343,53 @@ def flashinfer_attention_forward(
     else:
         out = prefill_wrapper.run(q, kv_cache)
     return out
+
+
+def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
+    """Plan the static decode step of `cache` before a graph replay.
+
+    The first run of a captured step is eager and records the attention
+    parameters on the step. A replay runs no Python, so this call makes the
+    plan that the captured `run()` reads: it copies the step's page index into
+    the wrapper's fixed buffers and reads the boundaries on the host, one sync
+    per step. Before the first eager run there are no parameters yet, and the
+    run plans for itself.
+
+    The plan runs in inference mode, like every plan inside a forward. The
+    wrapper and its buffers come to life inside such a forward, so they are
+    inference tensors, and a write into them outside inference mode raises.
+    """
+    global _last_plan
+    step = cache.static_step
+    if step is None:
+        raise RuntimeError("plan_static_decode needs a static decode step in progress")
+    if step.plan_params is None:
+        return
+    wrapper = _graph_wrapper(device, cache._pool.kv_quant, step)
+    num_q_heads, num_kv_heads, head_dim, page_size, q_dtype, kv_dtype, window, softmax_scale = (
+        step.plan_params
+    )
+    with torch.inference_mode():
+        wrapper.plan(
+            step.qo_indptr,
+            step.indptr,
+            step.indices,
+            step.last_page_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            pos_encoding_mode="NONE",
+            sm_scale=softmax_scale,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+            window_left=(window - 1) if window is not None else -1,
+        )
+    _last_plan = (
+        wrapper,
+        step.indptr,
+        cache.layout_serial,
+        tuple(step.cu_seqlens_q),
+        step.plan_params,
+    )
