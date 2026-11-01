@@ -18,6 +18,7 @@ about `ModelRunner` / schedulers lives in `scripts/bench/bench_all.py`.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import statistics
 import threading
@@ -43,6 +44,12 @@ class Workload:
     # "flash_attn" (CPU falls back to SDPA automatically); the GPU wrapper sets
     # "torch" because its image doesn't ship flash-attn.
     attention_backend: str = "flash_attn"
+    # With `profile`, each scheduler technique profiles its steps at the first
+    # concurrency level after its timed sweep (`profile_scheduler_steps`) and
+    # attaches the summary to that level's `BenchResult.step_profile`.
+    # `profile_trace_dir` keeps one Chrome trace per technique in that directory.
+    profile: bool = False
+    profile_trace_dir: str | None = None
 
     def prompts_for(self, concurrency: int) -> list[str]:
         """Replicate the source prompts to fill `concurrency` slots.
@@ -88,10 +95,15 @@ class BenchResult:
     # to assert every LOSSLESS technique decoded the same tokens (greedy => they
     # must). Lossy techniques (INT8, quantized KV) are exempt; see `lossless`.
     output_signature: tuple[tuple[int, ...], ...]
-    # False for techniques that deliberately change the math (INT8 weights,
-    # quantized KV); those are expected to diverge from the baseline and are
+    # False for techniques whose tokens are allowed to differ from the baseline:
+    # lossy quant (INT8 weights, quantized KV) changes the math on purpose, and a
+    # different attention kernel (FlashInfer) rounds differently. Both are
     # excluded from the parity check.
     lossless: bool = True
+    # The step profile of `profile_scheduler_steps` when the workload asks for
+    # one (`Workload.profile`), on the first concurrency level only. A profile
+    # that did not run holds `{"skipped": reason}` instead.
+    step_profile: dict[str, Any] | None = None
 
     @property
     def tokens_per_sec(self) -> float:
@@ -136,7 +148,7 @@ class Technique:
     pending: str = ""
     note: str = ""
     # See `BenchResult.lossless`: False exempts the technique from the parity
-    # check (lossy quant is expected to diverge from the baseline).
+    # check (lossy quant and a different attention kernel diverge from the baseline).
     lossless: bool = True
 
     def applicability(self, env: BenchEnv) -> tuple[bool, str]:
@@ -193,6 +205,141 @@ def drive_scheduler(
     return wall_end - wall_start, total_tokens, latencies, signature
 
 
+def _forward_phase(cu_seqlens_q: Sequence[int]) -> str:
+    """The phase of a packed forward from its query lengths.
+
+    A request with one query token decodes; one with more prefills a chunk.
+    """
+    q_lens = [b - a for a, b in itertools.pairwise(cu_seqlens_q)]
+    if all(q == 1 for q in q_lens):
+        return "decode"
+    if all(q > 1 for q in q_lens):
+        return "prefill"
+    return "mixed"
+
+
+def profile_scheduler_steps(
+    runner: Any,
+    scheduler: Any,
+    prompts: list[str],
+    max_tokens: int,
+    *,
+    trace_path: str | None = None,
+    top: int = 25,
+) -> dict[str, Any]:
+    """Profile every scheduler step of one sweep over `prompts` from the outside.
+
+    The step unit is `scheduler._step`, one scheduler iteration: sample the
+    decoders, reap, admit, run one packed forward. It is the unit of the
+    scheduler's own `trace_out` timeline, and it holds the host work around
+    the forward (sampling, admission, input lists) that a forward-only range
+    misses. The runner's `forward_step_packed` gets its own range inside the
+    step, and its arguments give the phase (prefill, decode or mixed), the
+    batch size and the packed token count of the step. A loop poll with no
+    request in flight and no forward is not a step and does not count.
+
+    `torch.profiler` records the thread that enters it, so the profiler wraps
+    `scheduler._engine_loop` on the engine thread. All wrappers sit on the
+    instances and come off at the end, as do the module labels of
+    `label_modules`. The model, the scheduler and the runner stay unchanged.
+    Covers `ContinuousScheduler` and its subclasses; a scheduler without
+    `_step` and `_engine_loop` raises `TypeError`.
+    """
+    import torch
+
+    from mini_infer.bench import step_profile
+    from mini_infer.device import is_cuda_device
+
+    for attribute in ("_step", "_engine_loop"):
+        if not callable(getattr(scheduler, attribute, None)):
+            raise TypeError(
+                f"{type(scheduler).__name__} has no {attribute}; the step profile covers "
+                "ContinuousScheduler-shaped schedulers"
+            )
+    model = runner._model
+    on_cuda = is_cuda_device(next(model.parameters()).device)
+    forwards: list[dict[str, Any]] = []
+    steps: list[dict[str, Any]] = []
+    holder: dict[str, Any] = {}
+    original_forward = runner.forward_step_packed
+    original_step = scheduler._step
+    original_loop = scheduler._engine_loop
+
+    def forward_step_packed(
+        cache: Any,
+        packed_input_ids: list[int],
+        cu_seqlens_q: list[int],
+        position_offsets: list[int],
+        **kwargs: Any,
+    ) -> Any:
+        forwards.append(
+            {
+                "phase": _forward_phase(cu_seqlens_q),
+                "batch": len(cu_seqlens_q) - 1,
+                "tokens": cu_seqlens_q[-1],
+            }
+        )
+        with torch.profiler.record_function(step_profile.RUNNER_LABEL):
+            return original_forward(
+                cache, packed_input_ids, cu_seqlens_q, position_offsets, **kwargs
+            )
+
+    def step() -> None:
+        in_flight = bool(scheduler._running)
+        before = len(forwards)
+        with torch.profiler.record_function(step_profile.STEP_LABEL):
+            original_step()
+        ran = len(forwards) > before
+        info = forwards[before] if ran else {"phase": "no forward", "batch": 0, "tokens": 0}
+        steps.append({**info, "real": in_flight or ran})
+
+    def engine_loop() -> None:
+        with step_profile.new_profiler(on_cuda) as profiler:
+            try:
+                original_loop()
+            finally:
+                if on_cuda:
+                    torch.cuda.synchronize()
+        holder["profiler"] = profiler
+
+    runner.forward_step_packed = forward_step_packed
+    scheduler._step = step
+    scheduler._engine_loop = engine_loop
+    restore = step_profile.label_modules(model)
+    try:
+        drive_scheduler(scheduler, prompts, max_tokens)
+    finally:
+        restore()
+        del runner.__dict__["forward_step_packed"]
+        del scheduler.__dict__["_step"]
+        del scheduler.__dict__["_engine_loop"]
+
+    events = step_profile.trace_events(holder["profiler"], trace_path)
+    step_events = sorted(
+        (
+            e
+            for e in events
+            if e.get("cat") == "user_annotation"
+            and e.get("name") == step_profile.STEP_LABEL
+            and e.get("ph") == "X"
+        ),
+        key=lambda e: e["ts"],
+    )
+    if len(step_events) != len(steps):
+        raise RuntimeError(
+            f"the trace holds {len(step_events)} step ranges for {len(steps)} profiled steps"
+        )
+    idle = {id(e) for e, info in zip(step_events, steps, strict=True) if not info["real"]}
+    summary = step_profile.summarize_step_trace(
+        [e for e in events if id(e) not in idle], step_self_category="scheduler", top=top
+    )
+    real_steps = [info for info in steps if info["real"]]
+    for row, info in zip(summary["steps"], real_steps, strict=True):
+        row.update(phase=info["phase"], batch=info["batch"], tokens=info["tokens"])
+    summary["step_unit"] = f"{type(scheduler).__name__}._step"
+    return summary
+
+
 def make_scheduler_technique(
     name: str,
     build_runner: Callable[[Workload], Any],
@@ -211,6 +358,12 @@ def make_scheduler_technique(
     distinguishing `ModelRunner.from_pretrained` kwargs (quant, kv_quant,
     attention_backend, prefix_cache, ...); `make_scheduler` wraps the runner
     in the right scheduler (`ContinuousScheduler`, `PDScheduler`, ...).
+
+    With `workload.profile`, the same runner then runs the first concurrency
+    level once more under `profile_scheduler_steps` on a fresh scheduler, and
+    the summary lands on that level's `BenchResult.step_profile`. A profile
+    that cannot run (a scheduler without `_step`) or that fails leaves the
+    timed results alone and records the reason there.
     """
 
     def _run(workload: Workload, env: BenchEnv) -> list[BenchResult]:
@@ -232,6 +385,22 @@ def make_scheduler_technique(
                     lossless=lossless,
                 )
             )
+        if workload.profile and results:
+            first = results[0]
+            trace_path = None
+            if workload.profile_trace_dir:
+                trace_path = f"{workload.profile_trace_dir}/{name}-c{first.concurrency}.json"
+            try:
+                first.step_profile = profile_scheduler_steps(
+                    runner,
+                    make_scheduler(runner),
+                    workload.prompts_for(first.concurrency),
+                    workload.max_tokens,
+                    trace_path=trace_path,
+                )
+            except Exception as exc:  # the timed results survive a profile that fails
+                logger.warning("Step profile of %r skipped: %s", name, exc)
+                first.step_profile = {"skipped": str(exc)}
         return results
 
     return Technique(
@@ -326,11 +495,13 @@ def parity_violations(results: Sequence[BenchResult]) -> list[tuple[str, str]]:
     """Return lossless-technique pairs whose tokens differ at the same concurrency.
 
     Greedy decoding is deterministic, so every LOSSLESS technique (cache
-    strategy, scheduler, attention-backend swap, tensor parallelism, exact spec
-    decode) must produce identical tokens on the same workload; a mismatch
-    there is a real correctness bug. Lossy techniques (INT8 weights, quantized
-    KV) deliberately change the math and are expected to diverge from the
-    baseline, so `lossless=False` results are excluded from this check.
+    strategy, scheduler, tensor parallelism, exact spec decode) must produce
+    identical tokens on the same workload, and a mismatch there is a real
+    correctness bug. Techniques marked `lossless=False` are excluded: lossy
+    quant (INT8 weights, quantized KV) changes the math on purpose, and a
+    different attention kernel (FlashInfer against the SDPA path) rounds
+    differently, so greedy decoding can pick another token while both are
+    correct.
     """
     by_concurrency: dict[int, list[BenchResult]] = {}
     for result in results:
@@ -376,3 +547,31 @@ def format_table(results: Sequence[BenchResult], skipped: Sequence[SkippedTechni
         lines.append("Skipped:")
         lines.extend(f"  - {item.technique}: {item.reason}" for item in skipped)
     return "\n".join(lines)
+
+
+def format_step_profiles(results: Sequence[BenchResult]) -> str:
+    """Render the step profiles the results carry, one section per technique.
+
+    A result without a profile adds nothing, so the text is empty when the
+    workload did not ask for profiles. A profile that did not run shows its
+    reason. The profiler slows the host, so the wall times in a profile are
+    larger than in the timed table and only the shares count.
+    """
+    from mini_infer.bench.step_profile import format_step_summary
+
+    sections = []
+    for result in results:
+        profile = result.step_profile
+        if profile is None:
+            continue
+        header = f"=== step profile: {result.technique} at concurrency {result.concurrency} ==="
+        if "skipped" in profile:
+            sections.append(f"{header}\nskipped: {profile['skipped']}")
+            continue
+        sections.append(
+            f"{header}\n"
+            f"step unit: {profile['step_unit']}; the profiler slows the host, so the\n"
+            "wall times here are larger than in the timed table and only the shares count.\n"
+            f"{format_step_summary(profile)}"
+        )
+    return "\n\n".join(sections)

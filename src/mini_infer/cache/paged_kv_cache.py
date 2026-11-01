@@ -59,14 +59,18 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         # device tensor on the host (`int(t)`, `t.tolist()`) or copying a host
         # list to the device makes the CPU wait for the GPU. Done once per
         # layer, that stalls the GPU dozens of times per token on MPS.
-        # `_layout_changed` drops the two indices when slot lengths or block
-        # ids change.
+        # `_layout_changed` drops the indices when slot lengths or block ids
+        # change.
         self._step_cu_seqlens_q: torch.Tensor | None = None
         self._step_cu_seqlens_q_list: list[int] = []
         # (cu_seqlens_q, device, pool block ids, pool slots) of this step's new tokens.
         self._write_index: tuple[list[int], torch.device, torch.Tensor, torch.Tensor] | None = None
         # (device, pool block ids, pool slots, cu_seqlens_k) of every cached token.
         self._gather_index: tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
+            None
+        )
+        # (device, page indptr, page indices, last page lengths) of every cached token.
+        self._page_index: tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
             None
         )
 
@@ -822,6 +826,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         """Drop the per-step indices. Call before any change to slot lengths or block ids."""
         self._write_index = None
         self._gather_index = None
+        self._page_index = None
 
     def _block_slot_index(
         self, ranges: list[tuple[int, int]], device: torch.device
@@ -882,6 +887,40 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             cu_seqlens_k = torch.tensor(self.cu_seqlens_k_list(), dtype=torch.int32, device=device)
             cached = (device, block_ids, slots, cu_seqlens_k)
             self._gather_index = cached
+        return cached[1], cached[2], cached[3]
+
+    def page_index(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The page index of every cached token on `device`, built once per step.
+
+        Returns `(indptr, indices, last_page_len)`, all int32, in the CSR form
+        that paged attention kernels (FlashInfer) take:
+          indptr        : `(batch_size + 1,)` cumulative page count per slot.
+          indices       : `(total pages,)` pool block ids of the used pages.
+          last_page_len : `(batch_size,)` tokens in each slot's last page: in
+              `[1, block_size]` for a slot with tokens (a full last page reports
+              `block_size`, not 0), and 0 for an empty slot.
+
+        The three lists are built on the host and reach the device in one copy.
+        Every layer of the step gets the same tensors, so a kernel plan made
+        from them serves the whole step.
+        """
+        cached = self._page_index
+        if cached is None or cached[0] != device:
+            block_size = self._pool.block_size
+            indptr = [0]
+            indices: list[int] = []
+            last_page_lens: list[int] = []
+            for batch_idx, seq_len in enumerate(self._num_tokens):
+                num_pages = (seq_len + block_size - 1) // block_size
+                indices.extend(self._block_ids[batch_idx][:num_pages])
+                indptr.append(indptr[-1] + num_pages)
+                remainder = seq_len % block_size
+                last_page_lens.append(block_size if seq_len and remainder == 0 else remainder)
+            flat = torch.tensor(indptr + indices + last_page_lens, dtype=torch.int32).to(device)
+            end_indptr = len(indptr)
+            end_indices = end_indptr + len(indices)
+            cached = (device, flat[:end_indptr], flat[end_indptr:end_indices], flat[end_indices:])
+            self._page_index = cached
         return cached[1], cached[2], cached[3]
 
     def _write_packed_kv_fp8(

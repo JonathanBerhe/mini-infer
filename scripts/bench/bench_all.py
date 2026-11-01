@@ -20,6 +20,15 @@ Run:
     uv run python scripts/bench/bench_all.py
     uv run python scripts/bench/bench_all.py --concurrency 1,4,8 --max-tokens 16
     uv run python scripts/bench/bench_all.py --techniques baseline,int8_w8a16 --device cpu
+    uv run python scripts/bench/bench_all.py --techniques baseline --concurrency 1 --profile
+
+`--profile` runs each technique once more at its first concurrency level
+under `torch.profiler`, with every scheduler step and model module labelled
+from the outside (`mini_infer.bench.profile_scheduler_steps`), and prints the
+per-step and per-part tables after the main table. On a CPU the tables show
+the wall time per step and the host time by part of the model; on a GPU they
+add the GPU time, the kernels and the host syncs. `--profile-trace DIR` keeps
+one Chrome trace per technique in DIR.
 
 The technique registry is shared with the Modal GPU wrapper; see
 `mini_infer.bench.registry`.
@@ -34,6 +43,7 @@ from mini_infer.bench import (
     DEFAULT_PROMPTS,
     Workload,
     build_registry,
+    format_step_profiles,
     format_table,
     parity_violations,
     run_suite,
@@ -63,6 +73,18 @@ def main() -> None:
         default="",
         help="comma-separated technique names to include (default: all registered)",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="after the timed sweep of a technique, profile its scheduler steps at the "
+        "first concurrency level with torch.profiler and print the tables",
+    )
+    parser.add_argument(
+        "--profile-trace",
+        default=None,
+        metavar="DIR",
+        help="keep one Chrome trace per profiled technique in DIR (default: not kept)",
+    )
     args = parser.parse_args()
 
     workload = Workload(
@@ -72,6 +94,8 @@ def main() -> None:
         max_tokens=args.max_tokens,
         device=args.device,
         attention_backend=args.attention_backend,
+        profile=args.profile or args.profile_trace is not None,
+        profile_trace_dir=args.profile_trace,
     )
 
     registry = build_registry()
@@ -98,7 +122,12 @@ def main() -> None:
         for ref, other in violations:
             print(f"  - {ref} != {other}")
     else:
-        print("Parity: all lossless techniques agree (lossy quant excluded by design).")
+        print("Parity: all lossless techniques agree (techniques marked lossy excluded).")
+
+    profiles = format_step_profiles(results)
+    if profiles:
+        print()
+        print(profiles)
 
 
 if __name__ == "__main__":

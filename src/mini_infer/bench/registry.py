@@ -104,7 +104,8 @@ def build_registry() -> list[Technique]:
             runner_with(override_backend="flashinfer"),
             continuous,
             requires_cuda=True,
-            note="FlashInfer attention backend",
+            note="FlashInfer attention backend, not bit-equal to the SDPA path",
+            lossless=False,
         ),
         make_scheduler_technique(
             "kv_fp8",
