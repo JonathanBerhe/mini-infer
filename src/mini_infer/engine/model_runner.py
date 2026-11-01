@@ -7,6 +7,7 @@ import torch
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
+from mini_infer.engine.paged_decode_graph import DEFAULT_BUCKETS, PagedDecodeGraph
 from mini_infer.engine.tokenizer import Tokenizer
 from mini_infer.models import load_model
 from mini_infer.models.base import BaseCausalLM
@@ -66,6 +67,8 @@ class ModelRunner:
         self._tokenizer = tokenizer
         self.device = device
         self._block_pool = block_pool
+        # Set by `enable_decode_graph`: decode-only steps then replay a CUDA graph.
+        self._decode_graph: PagedDecodeGraph | None = None
 
     @classmethod
     def from_pretrained(
@@ -81,7 +84,14 @@ class ModelRunner:
         quant_lm_head: bool = False,
         kv_quant: str | None = None,
         attention_backend: str = "flash_attn",
+        cuda_graph: bool = False,
     ) -> "ModelRunner":
+        """Load a model and build its block pool.
+
+        `cuda_graph=True` captures the decode step per batch size right away
+        (`enable_decode_graph`), and raises `ValueError` when the device, the
+        attention backend, the KV format or the model cannot take it.
+        """
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
         logger.info("Loading %s on %s with dtype=%s", model_name, resolved, actual_dtype)
@@ -135,7 +145,10 @@ class ModelRunner:
             layer_streams=model.per_layer_streams(),
         )
 
-        return cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)
+        runner = cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)
+        if cuda_graph:
+            runner.enable_decode_graph()
+        return runner
 
     @property
     def tokenizer(self) -> Tokenizer:
@@ -144,6 +157,21 @@ class ModelRunner:
     @property
     def block_pool(self) -> BlockPool:
         return self._block_pool
+
+    @property
+    def decode_graph(self) -> PagedDecodeGraph | None:
+        """The captured decode steps, once `enable_decode_graph` ran."""
+        return self._decode_graph
+
+    def enable_decode_graph(self, buckets: tuple[int, ...] = DEFAULT_BUCKETS) -> None:
+        """Capture the decode step for each batch size in `buckets` and replay it from then on.
+
+        See `PagedDecodeGraph` for what the model, the pool and the device must
+        provide. A step that the graph does not serve keeps running eagerly.
+        """
+        self._decode_graph = PagedDecodeGraph(
+            self._model, self._block_pool, self.device, buckets=buckets
+        )
 
     @property
     def supports_hidden_state_taps(self) -> bool:
@@ -230,6 +258,11 @@ class ModelRunner:
                 f"cu_seqlens_q has {len(cu_seqlens_q)} entries; expected batch_size+1="
                 f"{batch_size + 1}"
             )
+
+        graph = self._decode_graph
+        if graph is not None and tap_layers is None and graph.accepts(cu_seqlens_q):
+            # One new token per request: the captured step of this batch size.
+            return graph.replay(cache, packed_input_ids, position_offsets)
 
         device = self.device
         input_ids = torch.tensor([packed_input_ids], device=device, dtype=torch.long)
