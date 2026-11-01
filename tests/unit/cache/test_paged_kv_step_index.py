@@ -327,3 +327,114 @@ def test_page_index_is_built_once_per_step() -> None:
         assert all(indptr is step_indptrs[0] for indptr in step_indptrs)
         assert all(indptr is not previous for previous in seen for indptr in step_indptrs)
         seen.append(step_indptrs[0])
+
+
+def test_static_decode_step_matches_the_eager_append() -> None:
+    """A static step writes the same K/V where the eager append writes it, advances the
+    same counts, pads into the scratch block, and leaves the cache eager again."""
+    from mini_infer.cache.paged_kv_cache import StaticDecodeStep
+
+    eager = PagedKVCache(make_pool())
+    static = PagedKVCache(make_pool())
+    for cache in (eager, static):
+        cache.add_request_slot()
+        cache.add_request_slot()
+    generator = torch.Generator().manual_seed(1)
+    cu_prefill = torch.tensor([0, 6, 9], dtype=torch.int32)
+    for layer_idx in range(NUM_LAYERS):
+        k = torch.randn(9, NUM_KV_HEADS, HEAD_DIM, generator=generator)
+        v = torch.randn(9, NUM_KV_HEADS, HEAD_DIM, generator=generator)
+        eager.append_kv_packed(k, v, cu_prefill, layer_idx)
+        static.append_kv_packed(k, v, cu_prefill, layer_idx)
+
+    device = torch.device("cpu")
+    scratch = static._pool.allocate()
+    step = StaticDecodeStep.allocate(batch=4, scratch_block=scratch, num_blocks=64, device=device)
+    cu_decode = torch.tensor([0, 1, 2], dtype=torch.int32)
+    for _ in range(3):  # slot 0 crosses a block boundary at 8 tokens
+        new_k = [
+            torch.randn(2, NUM_KV_HEADS, HEAD_DIM, generator=generator) for _ in range(NUM_LAYERS)
+        ]
+        new_v = [
+            torch.randn(2, NUM_KV_HEADS, HEAD_DIM, generator=generator) for _ in range(NUM_LAYERS)
+        ]
+        for layer_idx in range(NUM_LAYERS):
+            eager.append_kv_packed(new_k[layer_idx], new_v[layer_idx], cu_decode, layer_idx)
+
+        static.begin_static_decode(step, active=2)
+        assert static.static_step is step and step.active == 2
+        assert static.seq_lens_list() == eager.seq_lens_list()
+        assert static.cu_seqlens_q_list(cu_decode) == [0, 1, 2, 3, 4]
+        indptr, indices, last_page_len = static.page_index(device)
+        assert indptr is step.indptr
+        real_indptr, real_indices, real_last = old_page_index(static)
+        last_page = real_indptr[-1]
+        assert indptr.tolist() == [*real_indptr, last_page + 1, last_page + 2]
+        assert indices[: len(real_indices) + 2].tolist() == [*real_indices, scratch, scratch]
+        assert last_page_len.tolist() == [*real_last, 1, 1]
+        padding = torch.ones(2, NUM_KV_HEADS, HEAD_DIM)
+        for layer_idx in range(NUM_LAYERS):
+            static.append_kv_packed(
+                torch.cat([new_k[layer_idx], padding]),
+                torch.cat([new_v[layer_idx], padding]),
+                step.qo_indptr,
+                layer_idx,
+            )
+        static.end_static_decode()
+        assert static.static_step is None
+
+        for layer_idx in range(NUM_LAYERS):
+            eager_k, eager_v, _, _ = eager.materialize_packed_kv(layer_idx)
+            static_k, static_v, _, _ = static.materialize_packed_kv(layer_idx)
+            assert torch.equal(static_k, eager_k)
+            assert torch.equal(static_v, eager_v)
+            k_pool, _ = static._pool.storage_for_layer(layer_idx)
+            assert torch.all(k_pool[scratch, 0] == 1)
+
+
+def test_static_decode_step_out_of_memory_leaves_the_counts_in_place() -> None:
+    """An allocation failure happens before any write, with no slot advanced."""
+    from mini_infer.cache.paged_kv_cache import StaticDecodeStep
+
+    pool = BlockPool(
+        num_blocks=3,
+        block_size=BLOCK_SIZE,
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cache.add_request_slot()
+    kv = torch.randn(8, NUM_KV_HEADS, HEAD_DIM)
+    cache.append_kv_packed(kv, kv, torch.tensor([0, 4, 8], dtype=torch.int32), layer_idx=0)
+    step = StaticDecodeStep.allocate(
+        batch=2, scratch_block=pool.allocate(), num_blocks=3, device=torch.device("cpu")
+    )
+    with pytest.raises(Exception, match="no free blocks"):
+        cache.begin_static_decode(step, active=2)
+    assert cache.static_step is None
+    assert cache.seq_lens_list() == [4, 4]
+
+
+def test_static_decode_step_checks_its_batch() -> None:
+    from mini_infer.cache.paged_kv_cache import StaticDecodeStep
+
+    cache = PagedKVCache(make_pool())
+    cache.add_request_slot()
+    step = StaticDecodeStep.allocate(
+        batch=1, scratch_block=cache._pool.allocate(), num_blocks=64, device=torch.device("cpu")
+    )
+    with pytest.raises(ValueError, match="must equal batch_size"):
+        cache.begin_static_decode(step, active=0)
+    cache.add_request_slot()
+    with pytest.raises(ValueError, match="do not fit"):
+        cache.begin_static_decode(step, active=2)
+    cache.remove_request(1)
+    cache.begin_static_decode(step, active=1)
+    with pytest.raises(RuntimeError, match="already in progress"):
+        cache.begin_static_decode(step, active=1)
+    cache.end_static_decode()
+    assert cache.seq_lens_list() == [1]

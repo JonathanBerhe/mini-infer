@@ -108,6 +108,14 @@ def build_registry() -> list[Technique]:
             lossless=False,
         ),
         make_scheduler_technique(
+            "paged_graph",
+            runner_with(override_backend="flashinfer", cuda_graph=True),
+            continuous,
+            requires_cuda=True,
+            note="FlashInfer attention, decode steps replayed from a CUDA graph per batch size",
+            lossless=False,
+        ),
+        make_scheduler_technique(
             "kv_fp8",
             runner_with(override_backend="flashinfer", kv_quant="fp8"),
             continuous,

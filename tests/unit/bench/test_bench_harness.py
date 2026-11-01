@@ -230,6 +230,7 @@ def test_build_registry_lists_expected_techniques() -> None:
         "pd_serial",
         "pd_parallel",
         "attn_flashinfer",
+        "paged_graph",
         "kv_fp8",
         "kv_nvfp4",
         "spec_decode",

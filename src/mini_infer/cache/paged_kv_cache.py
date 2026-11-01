@@ -1,3 +1,4 @@
+import dataclasses
 from typing import Any
 
 import torch
@@ -9,6 +10,71 @@ from mini_infer.cache.turbo_kernel import (
     fused_materialize_packed_kv,
     supports_fused_kernel,
 )
+from mini_infer.device import is_cuda_device
+
+
+@dataclasses.dataclass
+class StaticDecodeStep:
+    """The fixed device buffers of one captured decode step over `batch` rows.
+
+    A CUDA graph replays the step with the same tensors every time, so the
+    per-step index that `append_kv_packed` and `page_index` build must live in
+    buffers that `begin_static_decode` refills in place. Rows `[active, batch)`
+    are padding: they write their K/V into `scratch_block`, attend to it, and
+    the caller drops their logits.
+
+    `flat` holds every integer buffer on the device and `staging` is its host
+    twin (pinned on CUDA), so one copy per step moves them all. The views
+    `write_block_ids`, `write_slots`, `indptr`, `indices` and `last_page_len`
+    slice `flat`. `indices` has room for `capacity` pages: the pool's block
+    count plus one scratch page per row.
+    """
+
+    batch: int
+    scratch_block: int
+    capacity: int
+    flat: torch.Tensor
+    staging: torch.Tensor
+    write_block_ids: torch.Tensor
+    write_slots: torch.Tensor
+    indptr: torch.Tensor
+    indices: torch.Tensor
+    last_page_len: torch.Tensor
+    # `[0, 1, ..., batch]`: one query token per row, as a device tensor and a host list.
+    qo_indptr: torch.Tensor
+    cu_seqlens_q: list[int]
+    active: int = 0
+    # The attention parameters the FlashInfer backend planned with, recorded on
+    # the first eager run of the step and reused to plan before each replay.
+    plan_params: tuple[Any, ...] | None = None
+    # A CUDA event after the last copy out of `staging`; None on other devices.
+    copy_done: Any = None
+
+    @classmethod
+    def allocate(
+        cls, batch: int, scratch_block: int, num_blocks: int, device: torch.device
+    ) -> "StaticDecodeStep":
+        capacity = num_blocks + batch
+        length = 2 * batch + (batch + 1) + capacity + batch
+        flat = torch.zeros(length, dtype=torch.int32, device=device)
+        staging = torch.zeros(length, dtype=torch.int32, pin_memory=is_cuda_device(device))
+        slots_end = 2 * batch
+        indptr_end = slots_end + batch + 1
+        indices_end = indptr_end + capacity
+        return cls(
+            batch=batch,
+            scratch_block=scratch_block,
+            capacity=capacity,
+            flat=flat,
+            staging=staging,
+            write_block_ids=flat[:batch],
+            write_slots=flat[batch:slots_end],
+            indptr=flat[slots_end:indptr_end],
+            indices=flat[indptr_end:indices_end],
+            last_page_len=flat[indices_end:],
+            qo_indptr=torch.arange(batch + 1, dtype=torch.int32, device=device),
+            cu_seqlens_q=list(range(batch + 1)),
+        )
 
 
 class PagedKVCache(DynamicCache):  # type: ignore[misc]
@@ -73,10 +139,24 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._page_index: tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor] | None = (
             None
         )
+        # The captured decode step in progress, if any (see `begin_static_decode`),
+        # and a count of layout changes that a kernel plan can key on.
+        self._static_step: StaticDecodeStep | None = None
+        self._layout_serial = 0
 
     @property
     def batch_size(self) -> int:
         return len(self._num_tokens)
+
+    @property
+    def layout_serial(self) -> int:
+        """Counts the layout changes; two reads with the same value saw the same layout."""
+        return self._layout_serial
+
+    @property
+    def static_step(self) -> "StaticDecodeStep | None":
+        """The captured decode step in progress, between `begin_static_decode` and its end."""
+        return self._static_step
 
     def add_request_slot(self, prompt_token_ids: list[int] | None = None) -> int:
         """Append a request slot; returns its batch_idx.
@@ -267,6 +347,8 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         reads it again, so a tensor that a caller updates in place between
         steps stays correct.
         """
+        if self._static_step is not None:
+            return self._static_step.cu_seqlens_q
         if cu_seqlens_q is not self._step_cu_seqlens_q:
             return self._read_cu_seqlens_q(cu_seqlens_q)
         return self._step_cu_seqlens_q_list
@@ -331,6 +413,12 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         `pool.read_compressed_block`, which decompresses + inverse-rotates
         each block back to bf16 before slicing the relevant prefix.
         """
+        step = self._static_step
+        if step is not None and step.active < step.batch:
+            raise RuntimeError(
+                "a padded static decode step reads its K/V through FlashInfer, "
+                "not through materialize_packed_kv"
+            )
         num_kv_heads = self._pool.num_kv_heads_for_layer(layer_idx)
         head_dim = self._pool.head_dim_for_layer(layer_idx)
         block_size = self._pool.block_size
@@ -543,7 +631,13 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         Block allocation only happens on layer 0 (counts advance once per step).
         Layer 0 also reads `cu_seqlens_q_new` from the device, once for the
         whole step; later layers reuse that host copy.
+
+        Inside a static decode step the host work already happened in
+        `begin_static_decode`, and every layer writes through the step's index.
         """
+        if self._static_step is not None:
+            self._write_static(layer_idx, packed_k, packed_v)
+            return
         if cu_seqlens_q_new.shape[0] != self.batch_size + 1:
             raise ValueError(
                 f"cu_seqlens_q_new has {cu_seqlens_q_new.shape[0]} entries; "
@@ -827,6 +921,7 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         self._write_index = None
         self._gather_index = None
         self._page_index = None
+        self._layout_serial += 1
 
     def _block_slot_index(
         self, ranges: list[tuple[int, int]], device: torch.device
@@ -904,6 +999,9 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         Every layer of the step gets the same tensors, so a kernel plan made
         from them serves the whole step.
         """
+        step = self._static_step
+        if step is not None:
+            return step.indptr, step.indices, step.last_page_len
         cached = self._page_index
         if cached is None or cached[0] != device:
             block_size = self._pool.block_size
@@ -922,6 +1020,89 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             cached = (device, flat[:end_indptr], flat[end_indptr:end_indices], flat[end_indices:])
             self._page_index = cached
         return cached[1], cached[2], cached[3]
+
+    def begin_static_decode(self, step: StaticDecodeStep, active: int) -> None:
+        """Do the host work of a one-token-per-slot decode step, then switch to `step`.
+
+        Until `end_static_decode`, `append_kv_packed` writes through the step's
+        index, `page_index` returns the step's buffers and `cu_seqlens_q_list`
+        returns its boundaries, all without a host read, so a CUDA graph can
+        replay the layers. The slots advance and get their blocks here, slot by
+        slot, as layer 0 of `append_kv_packed` does, so an `OutOfMemoryError`
+        leaves the same state for the caller's rollback. `active` must equal the
+        batch size, because every slot takes one token. The other rows of
+        `step` are padding and point at its scratch block.
+        """
+        if active != self.batch_size:
+            raise ValueError(f"active={active} must equal batch_size={self.batch_size}")
+        if active > step.batch:
+            raise ValueError(f"active={active} rows do not fit a step of {step.batch} rows")
+        if self._pool.kv_quant is not None:
+            raise RuntimeError("the static decode step writes the uncompressed KV pool only")
+        if self._static_step is not None:
+            raise RuntimeError("a static decode step is already in progress")
+        if step.copy_done is not None:
+            # The previous copy out of `staging` must finish before this one overwrites it.
+            step.copy_done.synchronize()
+        self._layout_changed()
+        block_size = self._pool.block_size
+        batch = step.batch
+        write_block_ids: list[int] = []
+        write_slots: list[int] = []
+        indptr = [0]
+        indices: list[int] = []
+        last_page_lens: list[int] = []
+        for batch_idx in range(active):
+            new_total = self._num_tokens[batch_idx] + 1
+            required_blocks = (new_total + block_size - 1) // block_size
+            while len(self._block_ids[batch_idx]) < required_blocks:
+                self._block_ids[batch_idx].append(self._pool.allocate())
+            self._num_tokens[batch_idx] = new_total
+            position = new_total - 1
+            write_block_ids.append(self._block_ids[batch_idx][position // block_size])
+            write_slots.append(position % block_size)
+            indices.extend(self._block_ids[batch_idx][:required_blocks])
+            indptr.append(indptr[-1] + required_blocks)
+            remainder = new_total % block_size
+            last_page_lens.append(block_size if remainder == 0 else remainder)
+        for _ in range(active, batch):
+            write_block_ids.append(step.scratch_block)
+            write_slots.append(0)
+            indices.append(step.scratch_block)
+            indptr.append(indptr[-1] + 1)
+            last_page_lens.append(1)
+        if len(indices) > step.capacity:
+            raise RuntimeError(
+                f"{len(indices)} pages exceed the step's capacity of {step.capacity}"
+            )
+        staging = step.staging
+        head = write_block_ids + write_slots + indptr
+        staging[: len(head)] = torch.tensor(head, dtype=torch.int32)
+        start = len(head)
+        staging[start : start + len(indices)] = torch.tensor(indices, dtype=torch.int32)
+        start += step.capacity
+        staging[start:] = torch.tensor(last_page_lens, dtype=torch.int32)
+        step.flat.copy_(staging, non_blocking=True)
+        if is_cuda_device(step.flat.device):
+            step.copy_done = torch.cuda.Event()  # type: ignore[no-untyped-call]
+            step.copy_done.record()
+        step.active = active
+        self._static_step = step
+        self._step_cu_seqlens_q = None
+        self._step_cu_seqlens_q_list = step.cu_seqlens_q
+
+    def end_static_decode(self) -> None:
+        """Leave the static decode step; the next eager layer 0 rebuilds its own indices."""
+        self._static_step = None
+        self._layout_changed()
+
+    def _write_static(self, layer_idx: int, packed_k: torch.Tensor, packed_v: torch.Tensor) -> None:
+        """Write one layer's new K/V of a static decode step through its fixed index."""
+        step = self._static_step
+        assert step is not None
+        k_pool, v_pool = self._pool.storage_for_layer(layer_idx)
+        k_pool[step.write_block_ids, step.write_slots] = packed_k.to(k_pool.dtype)
+        v_pool[step.write_block_ids, step.write_slots] = packed_v.to(v_pool.dtype)
 
     def _write_packed_kv_fp8(
         self,

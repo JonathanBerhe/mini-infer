@@ -403,3 +403,81 @@ def test_plan_runs_once_per_step(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(fake.plans) == 4
     assert fake.plans[3]["indptr"] == [0, 1]
     assert fake.plans[3]["last_page_len"] == [4]
+
+
+def test_static_step_plans_before_the_forward_on_a_fixed_buffer_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first run of a static step plans on the graph wrapper and records the
+    parameters; from then on `plan_static_decode` plans before the forward and the
+    layers plan nothing. An eager step afterwards plans on the eager wrapper again."""
+    from mini_infer.cache import flashinfer_backend
+    from mini_infer.cache.paged_kv_cache import StaticDecodeStep
+
+    eager_fake, graph_fake = _FakePrefillWrapper(), _FakePrefillWrapper()
+    monkeypatch.setattr(flashinfer_backend, "_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(flashinfer_backend, "require_cuda_device", lambda device, what: None)
+    monkeypatch.setattr(
+        flashinfer_backend, "_ensure_wrappers", lambda device, kv_quant: (eager_fake, None)
+    )
+    monkeypatch.setattr(
+        flashinfer_backend, "_graph_wrapper", lambda device, kv_quant, step: graph_fake
+    )
+    monkeypatch.setattr(flashinfer_backend, "_last_plan", None)
+    forward = flashinfer_backend.flashinfer_attention_forward
+    device = torch.device("cpu")
+
+    num_layers = 3
+    pool = BlockPool(
+        num_blocks=16,
+        block_size=4,
+        num_layers=num_layers,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        device="cpu",
+        attention_backend="flashinfer",
+    )
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cu_prefill = torch.tensor([0, 3], dtype=torch.int32)
+    for layer_idx in range(num_layers):
+        kv = torch.randn(3, 2, 8)
+        cache.append_kv_packed(kv, kv, cu_prefill, layer_idx)
+    step = StaticDecodeStep.allocate(
+        batch=2, scratch_block=pool.allocate(), num_blocks=16, device=device
+    )
+
+    # First static run: no parameters yet, so the forward plans and records them.
+    cache.begin_static_decode(step, active=1)
+    flashinfer_backend.plan_static_decode(cache, device)
+    assert graph_fake.plans == []
+    for layer_idx in range(num_layers):
+        q = torch.randn(2, 4, 8)
+        assert forward(q, cache, layer_idx, step.qo_indptr, softmax_scale=0.5) is q
+    cache.end_static_decode()
+    assert len(graph_fake.plans) == 1 and eager_fake.plans == []
+    assert graph_fake.plans[0]["qo_indptr"] == [0, 1, 2]
+    assert graph_fake.plans[0]["indptr"] == [0, 1, 2]
+    assert graph_fake.plans[0]["last_page_len"] == [4, 1]
+    assert step.plan_params is not None and step.plan_params[:3] == (4, 2, 8)
+
+    # Second static run: the plan happens before the forward, the layers reuse it.
+    cache.begin_static_decode(step, active=1)
+    flashinfer_backend.plan_static_decode(cache, device)
+    assert len(graph_fake.plans) == 2
+    assert graph_fake.plans[1]["indptr"] == [0, 2, 3]
+    assert graph_fake.plans[1]["last_page_len"] == [1, 1]
+    for layer_idx in range(num_layers):
+        forward(torch.randn(2, 4, 8), cache, layer_idx, step.qo_indptr, softmax_scale=0.5)
+    cache.end_static_decode()
+    assert len(graph_fake.plans) == 2 and graph_fake.runs == 2 * num_layers
+
+    # An eager step afterwards plans once on the eager wrapper.
+    cu_decode = torch.tensor([0, 1], dtype=torch.int32)
+    for layer_idx in range(num_layers):
+        kv = torch.randn(1, 2, 8)
+        cache.append_kv_packed(kv, kv, cu_decode, layer_idx)
+        forward(torch.randn(1, 4, 8), cache, layer_idx, cu_decode, softmax_scale=0.5)
+    assert len(eager_fake.plans) == 1 and len(graph_fake.plans) == 2
+    assert eager_fake.plans[0]["indptr"] == [0, 2]

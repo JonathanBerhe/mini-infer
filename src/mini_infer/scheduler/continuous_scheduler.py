@@ -58,7 +58,7 @@ from mini_infer.engine.dspark.spec import (
     verify_block,
 )
 from mini_infer.engine.model_runner import ModelRunner
-from mini_infer.engine.sampler import sample
+from mini_infer.engine.sampler import sample, sample_batch
 from mini_infer.exceptions import EngineNotRunningError, OutOfMemoryError
 from mini_infer.scheduler.request_state import (
     FinishReason,
@@ -598,14 +598,20 @@ class ContinuousScheduler:
         """
         sampled: dict[int, list[int]] = {}
         tokenizer = self._runner.tokenizer
-        for req in [
-            r for r in self._running if r.state == RequestState.DECODING and r.spec is None
-        ]:
+        decoders = [r for r in self._running if r.state == RequestState.DECODING and r.spec is None]
+        # One batched sample for every decoder with fresh logits: the ids reach
+        # the host in one copy, instead of one wait on the GPU per request.
+        fresh = [r for r in decoders if r.pending_decode_tokens is None]
+        next_tokens: dict[int, int] = {}
+        if fresh:
+            logits = torch.stack([self._fresh_logits(r) for r in fresh])
+            tokens = sample_batch(logits, [r.request.sampling_params for r in fresh])
+            next_tokens = {id(r): token for r, token in zip(fresh, tokens, strict=True)}
+        for req in decoders:
             if req.pending_decode_tokens is not None:
                 sampled[id(req)] = req.pending_decode_tokens
                 continue
-            assert req.last_logits is not None
-            next_token = sample(req.last_logits, req.request.sampling_params)
+            next_token = next_tokens[id(req)]
             if next_token == tokenizer.eos_token_id:
                 self._finish(req, "stop")
                 continue
@@ -617,6 +623,11 @@ class ContinuousScheduler:
             req.pending_decode_tokens = [next_token]
             sampled[id(req)] = req.pending_decode_tokens
         return sampled
+
+    @staticmethod
+    def _fresh_logits(req: RunningRequest) -> torch.Tensor:
+        assert req.last_logits is not None, "a decoder without pending tokens has logits"
+        return req.last_logits
 
     def _emit_new_text(self, req: RunningRequest, num_tokens: int) -> None:
         """Decode-and-diff: re-decode all tokens so far and emit the new suffix.
