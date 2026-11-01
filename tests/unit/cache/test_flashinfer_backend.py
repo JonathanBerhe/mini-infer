@@ -329,6 +329,8 @@ class _FakePrefillWrapper:
                 "indices": paged_kv_indices.tolist(),
                 "last_page_len": paged_kv_last_page_len.tolist(),
                 "window_left": kwargs["window_left"],
+                "non_blocking": kwargs.get("non_blocking"),
+                "tensors": (qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len),
             }
         )
 
@@ -468,6 +470,15 @@ def test_static_step_plans_before_the_forward_on_a_fixed_buffer_wrapper(
     assert len(graph_fake.plans) == 2
     assert graph_fake.plans[1]["indptr"] == [0, 2, 3]
     assert graph_fake.plans[1]["last_page_len"] == [1, 1]
+    # The pre-replay plan gets the pinned host views for the boundaries, the
+    # device buffer for the indices, and asks for non-blocking copies.
+    planned = graph_fake.plans[1]["tensors"]
+    assert isinstance(planned, tuple)
+    assert planned[0] is step.host_qo_indptr
+    assert planned[1] is step.host_indptr
+    assert planned[2] is step.indices
+    assert planned[3] is step.host_last_page_len
+    assert graph_fake.plans[1]["non_blocking"] is True
     for layer_idx in range(num_layers):
         forward(torch.randn(2, 4, 8), cache, layer_idx, step.qo_indptr, softmax_scale=0.5)
     cache.end_static_decode()

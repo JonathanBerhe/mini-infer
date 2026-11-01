@@ -43,6 +43,13 @@ class StaticDecodeStep:
     # `[0, 1, ..., batch]`: one query token per row, as a device tensor and a host list.
     qo_indptr: torch.Tensor
     cu_seqlens_q: list[int]
+    # Pinned host views of `indptr` and `last_page_len` inside `staging`, and a
+    # pinned host copy of `qo_indptr`. FlashInfer reads the boundaries on the
+    # host when it plans, and host tensors spare it a copy back from the device
+    # that waits for the GPU.
+    host_indptr: torch.Tensor
+    host_last_page_len: torch.Tensor
+    host_qo_indptr: torch.Tensor
     active: int = 0
     # The attention parameters the FlashInfer backend planned with, recorded on
     # the first eager run of the step and reused to plan before each replay.
@@ -56,8 +63,12 @@ class StaticDecodeStep:
     ) -> "StaticDecodeStep":
         capacity = num_blocks + batch
         length = 2 * batch + (batch + 1) + capacity + batch
+        on_cuda = is_cuda_device(device)
         flat = torch.zeros(length, dtype=torch.int32, device=device)
-        staging = torch.zeros(length, dtype=torch.int32, pin_memory=is_cuda_device(device))
+        staging = torch.zeros(length, dtype=torch.int32, pin_memory=on_cuda)
+        host_qo_indptr = torch.arange(batch + 1, dtype=torch.int32)
+        if on_cuda:
+            host_qo_indptr = host_qo_indptr.pin_memory()
         slots_end = 2 * batch
         indptr_end = slots_end + batch + 1
         indices_end = indptr_end + capacity
@@ -74,6 +85,9 @@ class StaticDecodeStep:
             last_page_len=flat[indices_end:],
             qo_indptr=torch.arange(batch + 1, dtype=torch.int32, device=device),
             cu_seqlens_q=list(range(batch + 1)),
+            host_indptr=staging[slots_end:indptr_end],
+            host_last_page_len=staging[indices_end:],
+            host_qo_indptr=host_qo_indptr,
         )
 
 

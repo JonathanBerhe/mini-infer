@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch.profiler import record_function
 
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.flashinfer_backend import plan_static_decode
@@ -127,26 +128,32 @@ class PagedDecodeGraph:
         step = self._steps[batch]
         input_ids, position_ids, staging = self._inputs[batch]
         on_cuda = is_cuda_device(self._device)
-        copied = self._inputs_copied.get(batch)
-        if copied is not None:
-            copied.synchronize()  # the previous copy out of `staging` must be done
-        staging.zero_()
-        staging[0, :active] = torch.tensor(token_ids, dtype=torch.long)
-        staging[1, :active] = torch.tensor(positions, dtype=torch.long)
-        input_ids.copy_(staging[0].unsqueeze(0), non_blocking=on_cuda)
-        position_ids.copy_(staging[1].unsqueeze(0), non_blocking=on_cuda)
-        if on_cuda:
-            event = torch.cuda.Event()  # type: ignore[no-untyped-call]
-            event.record()
-            self._inputs_copied[batch] = event
+        # The phases carry profiler labels, so the step profile shows the host
+        # time of each one next to the replay.
+        with record_function("decode_graph.inputs"):
+            copied = self._inputs_copied.get(batch)
+            if copied is not None:
+                copied.synchronize()  # the previous copy out of `staging` must be done
+            staging.zero_()
+            staging[0, :active] = torch.tensor(token_ids, dtype=torch.long)
+            staging[1, :active] = torch.tensor(positions, dtype=torch.long)
+            input_ids.copy_(staging[0].unsqueeze(0), non_blocking=on_cuda)
+            position_ids.copy_(staging[1].unsqueeze(0), non_blocking=on_cuda)
+            if on_cuda:
+                event = torch.cuda.Event()  # type: ignore[no-untyped-call]
+                event.record()
+                self._inputs_copied[batch] = event
         # Inference mode throughout, like the capture: the plan writes into
         # buffers born inside a forward, and torch 2.5 fills the graph's RNG
         # state on replay. Both are inference tensors.
         with torch.inference_mode():
-            cache.begin_static_decode(step, active)
+            with record_function("decode_graph.begin"):
+                cache.begin_static_decode(step, active)
             try:
-                plan_static_decode(cache, self._device)
-                self._graphs[batch].replay()
+                with record_function("decode_graph.plan"):
+                    plan_static_decode(cache, self._device)
+                with record_function("decode_graph.replay"):
+                    self._graphs[batch].replay()
                 logits = self._logits[batch][:, :active].clone()
             finally:
                 cache.end_static_decode()

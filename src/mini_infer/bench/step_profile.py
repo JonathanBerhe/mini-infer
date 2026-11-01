@@ -83,7 +83,7 @@ CategoryRule = tuple[str, Literal["label", "kernel"], "re.Pattern[str]"]
 DEFAULT_CATEGORY_RULES: tuple[CategoryRule, ...] = (
     ("NCCL collectives", "kernel", re.compile(r"nccl", re.IGNORECASE)),
     ("sampling", "label", re.compile(rf"^{SAMPLING_LABEL}$")),
-    ("runner glue", "label", re.compile(rf"^{RUNNER_LABEL}$")),
+    ("runner glue", "label", re.compile(rf"^{RUNNER_LABEL}$|^decode_graph\.")),
     ("MoE shared expert", "label", re.compile(r"shared_experts")),
     ("MoE gate", "label", re.compile(r"\.gate(:|$)")),
     (
