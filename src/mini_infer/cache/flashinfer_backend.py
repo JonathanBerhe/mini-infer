@@ -350,10 +350,16 @@ def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
 
     The first run of a captured step is eager and records the attention
     parameters on the step. A replay runs no Python, so this call makes the
-    plan that the captured `run()` reads: it copies the step's page index into
-    the wrapper's fixed buffers and reads the boundaries on the host, one sync
-    per step. Before the first eager run there are no parameters yet, and the
-    run plans for itself.
+    plan that the captured `run()` reads. Before the first eager run there are
+    no parameters yet, and the run plans for itself.
+
+    The plan does not wait for the GPU. FlashInfer reads the boundaries on the
+    host, so they go in as the step's pinned host views, and it copies them
+    into its fixed buffers with `non_blocking=True`. The page indices go in as
+    the step's device buffer, because FlashInfer copies host indices with a
+    blocking copy. The copies are stream-ordered after the replay in flight,
+    and the step's `copy_done` event keeps the next `begin_static_decode` from
+    rewriting the host views before they are read.
 
     The plan runs in inference mode, like every plan inside a forward. The
     wrapper and its buffers come to life inside such a forward, so they are
@@ -371,10 +377,10 @@ def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
     )
     with torch.inference_mode():
         wrapper.plan(
-            step.qo_indptr,
-            step.indptr,
+            step.host_qo_indptr,
+            step.host_indptr,
             step.indices,
-            step.last_page_len,
+            step.host_last_page_len,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -385,7 +391,11 @@ def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             window_left=(window - 1) if window is not None else -1,
+            non_blocking=True,
         )
+    if step.copy_done is not None:
+        step.copy_done = torch.cuda.Event()  # type: ignore[no-untyped-call]
+        step.copy_done.record()
     _last_plan = (
         wrapper,
         step.indptr,
