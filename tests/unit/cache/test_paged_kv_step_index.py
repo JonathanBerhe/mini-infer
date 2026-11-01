@@ -438,3 +438,78 @@ def test_static_decode_step_checks_its_batch() -> None:
         cache.begin_static_decode(step, active=1)
     cache.end_static_decode()
     assert cache.seq_lens_list() == [1]
+
+
+def _row_writer(
+    k_pool: torch.Tensor, v_pool: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> Callable[[torch.Tensor, torch.Tensor], None]:
+    """The indexed store that `append_kv_packed` does, as a writer for `append_kv_with`."""
+
+    def write(block_ids: torch.Tensor, slots: torch.Tensor) -> None:
+        k_pool[block_ids, slots] = k
+        v_pool[block_ids, slots] = v
+
+    return write
+
+
+def test_append_kv_with_matches_append_kv_packed() -> None:
+    """A caller that stores the rows itself gets the same bookkeeping, row order and
+    publication as `append_kv_packed`, across a serving workload."""
+    packed = PagedKVCache(make_pool())
+    custom = PagedKVCache(make_pool())
+    prompt_a = list(range(100, 110))
+    for cache in (packed, custom):
+        for prompt in (prompt_a, list(range(200, 207)), prompt_a):
+            cache.add_request_slot(prompt_token_ids=prompt)
+    generator = torch.Generator().manual_seed(4)
+
+    def step(new_tokens: list[int]) -> None:
+        cu_list = [0]
+        for count in new_tokens:
+            cu_list.append(cu_list[-1] + count)
+        cu_seqlens = torch.tensor(cu_list, dtype=torch.int32)
+        total = cu_list[-1]
+        for layer_idx in range(NUM_LAYERS):
+            k = torch.randn(total, NUM_KV_HEADS, HEAD_DIM, generator=generator)
+            v = torch.randn(total, NUM_KV_HEADS, HEAD_DIM, generator=generator)
+            packed.append_kv_packed(k, v, cu_seqlens, layer_idx)
+            k_pool, v_pool = custom._pool.storage_for_layer(layer_idx)
+            custom.append_kv_with(cu_seqlens, layer_idx, _row_writer(k_pool, v_pool, k, v))
+        assert custom.seq_lens_list() == packed.seq_lens_list()
+        for batch_idx in range(custom.batch_size):
+            assert custom.block_ids_for_request(batch_idx) == packed.block_ids_for_request(
+                batch_idx
+            )
+        for layer_idx in range(NUM_LAYERS):
+            custom_k, custom_v, _, _ = custom.materialize_packed_kv(layer_idx)
+            packed_k, packed_v, _, _ = packed.materialize_packed_kv(layer_idx)
+            assert torch.equal(custom_k, packed_k)
+            assert torch.equal(custom_v, packed_v)
+
+    # Slot 2's first block swaps for the one slot 0 publishes on the last layer.
+    step([4, 7, 4])
+    assert custom.block_ids_for_request(2)[0] == custom.block_ids_for_request(0)[0]
+    step([4, 1, 4])
+    step([1, 1, 1])
+    step([0, 3, 1])
+
+
+def test_append_kv_with_uses_the_static_step_index() -> None:
+    from mini_infer.cache.paged_kv_cache import StaticDecodeStep
+
+    cache = PagedKVCache(make_pool())
+    cache.add_request_slot()
+    kv = torch.randn(3, NUM_KV_HEADS, HEAD_DIM)
+    cache.append_kv_packed(kv, kv, torch.tensor([0, 3], dtype=torch.int32), layer_idx=0)
+    step = StaticDecodeStep.allocate(
+        batch=2, scratch_block=cache._pool.allocate(), num_blocks=64, device=torch.device("cpu")
+    )
+    seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+    cache.begin_static_decode(step, active=1)
+    cache.append_kv_with(
+        torch.zeros(3, dtype=torch.int32), 0, lambda ids, slots: seen.append((ids, slots))
+    )
+    cache.end_static_decode()
+    assert len(seen) == 1
+    assert seen[0][0] is step.write_block_ids and seen[0][1] is step.write_slots
+    assert cache.seq_lens_list() == [4]

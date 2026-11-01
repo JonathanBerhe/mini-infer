@@ -6,6 +6,7 @@ catches drift in the math (RoPE half-rotation, RMSNorm fp32 promotion,
 SwiGLU activation order). These run on CPU; no model download needed.
 """
 
+import pytest
 import torch
 
 from mini_infer.models.blocks import RMSNorm, RotaryEmbedding, SwiGLU, apply_rotary_pos_emb
@@ -192,3 +193,81 @@ def test_fused_rms_norm_knob_reaches_every_norm_of_the_shared_block() -> None:
     norm_plain = RMSNorm(32, eps=1e-6)
     x = torch.randn(3, 5, 32)
     assert torch.equal(norm_fused(x), norm_plain(x))
+
+
+def test_gqa_fused_rotary_write_matches_the_torch_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the kernel gate forced on and a PyTorch stand-in for the kernel, the block
+    gives the same output and the same cache content as its PyTorch path."""
+    import mini_infer.models.blocks.gqa as gqa_module
+    from mini_infer.cache.block_pool import BlockPool
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+    from mini_infer.models.blocks import GroupedQueryAttention
+
+    calls: list[int] = []
+
+    def stand_in(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        block_ids: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        q_rot, k_rot = apply_rotary_pos_emb(
+            q.unsqueeze(0).transpose(1, 2),
+            k.unsqueeze(0).transpose(1, 2),
+            cos.unsqueeze(0),
+            sin.unsqueeze(0),
+        )
+        k_pool[block_ids, slots] = k_rot.transpose(1, 2).squeeze(0)
+        v_pool[block_ids, slots] = v
+        calls.append(1)
+        return q_rot.transpose(1, 2).squeeze(0).contiguous()
+
+    torch.manual_seed(0)
+    block = GroupedQueryAttention(
+        hidden_size=32, num_q_heads=4, num_kv_heads=2, head_dim=8, qkv_bias=True, layer_idx=0
+    )
+    rotary = RotaryEmbedding(8)
+
+    def pool() -> BlockPool:
+        return BlockPool(
+            num_blocks=8,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+            device="cpu",
+            attention_backend="torch",
+        )
+
+    def run(cache: PagedKVCache) -> torch.Tensor:
+        cache.add_request_slot()
+        cache.add_request_slot()
+        x = torch.randn(1, 5, 32, generator=torch.Generator().manual_seed(1))
+        # The engine runs every forward in inference mode; the cache write is in place.
+        with torch.inference_mode():
+            cos, sin = rotary(x, torch.tensor([[0, 1, 2, 0, 1]]))
+            out: torch.Tensor = block(
+                x, (cos, sin), cache, torch.tensor([0, 3, 5], dtype=torch.int32)
+            )
+        return out
+
+    plain_cache = PagedKVCache(pool())
+    expected = run(plain_cache)
+    assert calls == []
+
+    monkeypatch.setattr(gqa_module, "supports_rope_write_kernel", lambda *tensors: True)
+    monkeypatch.setattr(gqa_module, "rope_and_write_kv", stand_in)
+    fused_cache = PagedKVCache(pool())
+    got = run(fused_cache)
+    assert calls == [1]
+    assert torch.equal(got, expected)
+    plain_k, plain_v, _, _ = plain_cache.materialize_packed_kv(0)
+    fused_k, fused_v, _, _ = fused_cache.materialize_packed_kv(0)
+    assert torch.equal(fused_k, plain_k)
+    assert torch.equal(fused_v, plain_v)
