@@ -9,9 +9,12 @@ via `attention_backend="flashinfer"` on the engine.
 A single `BatchPrefillWithPagedKVCacheWrapper` and
 `BatchDecodeWithPagedKVCacheWrapper` share one persistent 128 MiB
 uint8 workspace buffer per process, lazy-initialized on first use.
-`plan()` runs once per attention call (per layer per step) and is
-cheap; `run()` executes the attention math against the paged K/V
-cache.
+`plan()` runs once per step: the paged cache builds its page index once
+per step, and `flashinfer_attention_forward` plans again only when that
+index, the query boundaries or the attention parameters changed. A plan
+per layer made the host wait for the GPU several times per layer.
+`run()` executes the attention math against the paged K/V cache, once
+per layer.
 
 CUDA-only. Imports are guarded so non-CUDA installs (M1, CI) still
 load this module without flashinfer-python installed.
@@ -56,6 +59,30 @@ _workspace_buffer: torch.Tensor | None = None
 # pools lose fa3 silently. Per-class wrappers give fa2 for fp8 KV and fa3 for bf16.
 _prefill_wrappers: dict[str, Any] = {}
 _decode_wrapper: Any = None
+# The last plan: (wrapper, page indptr tensor, query boundaries, attention parameters).
+# `flashinfer_attention_forward` skips `plan()` while these are unchanged, so one plan
+# per step serves every layer. The engine runs one forward at a time, so one slot is
+# enough.
+_last_plan: tuple[Any, torch.Tensor, tuple[int, ...], tuple[Any, ...]] | None = None
+
+
+def _planned(
+    wrapper: Any, indptr: torch.Tensor, qo_indptr: tuple[int, ...], params: tuple[Any, ...]
+) -> bool:
+    """Whether `wrapper` already holds the plan for this page index and these parameters.
+
+    The cache rebuilds its page index when the layout changes, so the same `indptr`
+    object means the same step of the same cache. `_last_plan` keeps a reference to
+    the tensor, so its identity cannot pass to another tensor while it is the key.
+    """
+    last = _last_plan
+    return (
+        last is not None
+        and last[0] is wrapper
+        and last[1] is indptr
+        and last[2] == qo_indptr
+        and last[3] == params
+    )
 
 
 def _wrapper_key(kv_quant: str | None) -> str:
@@ -137,6 +164,7 @@ def flashinfer_attention_forward(
     Returns:
         `(total_q, num_q_heads, head_dim)` attention output.
     """
+    global _last_plan
     if not _FLASHINFER_AVAILABLE:
         raise RuntimeError(
             "flashinfer-python not installed; install via the [cuda] extra "
@@ -158,34 +186,9 @@ def flashinfer_attention_forward(
 
     prefill_wrapper, decode_wrapper = _ensure_wrappers(device, cache._pool.kv_quant)
 
-    # CSR-style page index triple. FlashInfer wants:
-    #   paged_kv_indptr     (B+1,) int32 — cumulative pages per request
-    #   paged_kv_indices    (sum_pages,) int32 — flat block IDs
-    #   paged_kv_last_page_len (B,) int32 — tokens valid in each
-    #       request's last page (must be in [1, page_size]; pages with
-    #       seq_len % page_size == 0 report page_size, not 0).
-    seq_lens = cache.seq_lens_list()
-    indptr = [0]
-    indices: list[int] = []
-    last_page_lens: list[int] = []
-    running = 0
-    for batch_idx, seq_len in enumerate(seq_lens):
-        if seq_len == 0:
-            indptr.append(running)
-            last_page_lens.append(0)
-            continue
-        block_ids = cache._block_ids[batch_idx]
-        num_pages = (seq_len + page_size - 1) // page_size
-        indices.extend(block_ids[:num_pages])
-        running += num_pages
-        indptr.append(running)
-        rem = seq_len % page_size
-        last_page_lens.append(page_size if rem == 0 else rem)
-
-    paged_kv_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
-    paged_kv_indices = torch.tensor(indices, dtype=torch.int32, device=device)
-    paged_kv_last_page_len = torch.tensor(last_page_lens, dtype=torch.int32, device=device)
-    qo_indptr = cu_seqlens_q.to(dtype=torch.int32, device=device)
+    # The CSR page index triple that FlashInfer wants, built by the cache once
+    # per step and shared by every layer (see `PagedKVCache.page_index`).
+    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = cache.page_index(device)
 
     # Layer slice. For uncompressed pools the storage is bf16; for fp8
     # pools we read from `_fp8_storage` and pass per-head scales to
@@ -244,22 +247,39 @@ def flashinfer_attention_forward(
     # via `qo_indptr` (q_len=1 per request collapses to the decode case
     # internally).
     _ = decode_wrapper  # kept for future re-enable on power-of-2 GQA models
-    prefill_wrapper.plan(
-        qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
+    # One plan per step. The page index and the query boundaries are the same
+    # for every layer, and `plan()` makes the host wait for the GPU several
+    # times, so the layers after the first reuse the plan. A layer with other
+    # parameters (a sliding window, other head counts) plans again.
+    qo_indptr_list = tuple(cache.cu_seqlens_q_list(cu_seqlens_q))
+    params = (
         num_q_heads,
         num_kv_heads,
         head_dim,
         page_size,
-        causal=True,
-        pos_encoding_mode="NONE",
-        sm_scale=softmax_scale,
-        q_data_type=q.dtype,
-        kv_data_type=kv_data_type,
-        window_left=(window - 1) if window is not None else -1,
+        q.dtype,
+        kv_data_type,
+        window,
+        softmax_scale,
     )
+    if not _planned(prefill_wrapper, paged_kv_indptr, qo_indptr_list, params):
+        prefill_wrapper.plan(
+            cu_seqlens_q.to(dtype=torch.int32, device=device),
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            pos_encoding_mode="NONE",
+            sm_scale=softmax_scale,
+            q_data_type=q.dtype,
+            kv_data_type=kv_data_type,
+            window_left=(window - 1) if window is not None else -1,
+        )
+        _last_plan = (prefill_wrapper, paged_kv_indptr, qo_indptr_list, params)
     if kv_cache_sf is not None:
         out: torch.Tensor = prefill_wrapper.run(
             q, kv_cache, k_scale=k_scale, v_scale=v_scale, kv_cache_sf=kv_cache_sf

@@ -249,3 +249,81 @@ def test_write_casts_to_the_pool_dtype() -> None:
     keys, _, _, _ = cache.materialize_packed_kv(0)
     assert keys.dtype == torch.float32
     assert torch.equal(keys, k.to(torch.float32))
+
+
+def old_page_index(cache: PagedKVCache) -> tuple[list[int], list[int], list[int]]:
+    """The page index that `flashinfer_attention_forward` built for every layer before."""
+    indptr = [0]
+    indices: list[int] = []
+    last_page_lens: list[int] = []
+    running = 0
+    for batch_idx, seq_len in enumerate(cache.seq_lens_list()):
+        if seq_len == 0:
+            indptr.append(running)
+            last_page_lens.append(0)
+            continue
+        num_pages = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        indices.extend(cache.block_ids_for_request(batch_idx)[:num_pages])
+        running += num_pages
+        indptr.append(running)
+        rem = seq_len % BLOCK_SIZE
+        last_page_lens.append(BLOCK_SIZE if rem == 0 else rem)
+    return indptr, indices, last_page_lens
+
+
+def page_index_lists(cache: PagedKVCache) -> tuple[list[int], list[int], list[int]]:
+    indptr, indices, last_page_len = cache.page_index(torch.device("cpu"))
+    assert indptr.dtype == indices.dtype == last_page_len.dtype == torch.int32
+    return indptr.tolist(), indices.tolist(), last_page_len.tolist()
+
+
+def test_page_index_matches_old_code_across_a_serving_workload() -> None:
+    """Empty slot, full last page, partial last page, prefix swap, rollback and removal."""
+    cache = PagedKVCache(make_pool())
+    prompt_a = list(range(100, 110))
+    for prompt in (prompt_a, list(range(200, 207)), prompt_a):
+        cache.add_request_slot(prompt_token_ids=prompt)
+    cache.add_request_slot()  # stays empty
+    empty = ([0, 0, 0, 0, 0], [], [0, 0, 0, 0])
+    assert page_index_lists(cache) == old_page_index(cache) == empty
+
+    def step(new_tokens: list[int]) -> None:
+        cu_list = [0]
+        for count in new_tokens:
+            cu_list.append(cu_list[-1] + count)
+        cu_seqlens = torch.tensor(cu_list, dtype=torch.int32)
+        for layer_idx in range(NUM_LAYERS):
+            kv = torch.randn(cu_list[-1], NUM_KV_HEADS, HEAD_DIM)
+            cache.append_kv_packed(kv, kv, cu_seqlens, layer_idx)
+            assert page_index_lists(cache) == old_page_index(cache)
+
+    # Slot 0 fills one block exactly; the last layer swaps slot 2's block for it.
+    step([4, 7, 4, 0])
+    assert cache.block_ids_for_request(2)[0] == cache.block_ids_for_request(0)[0]
+    assert page_index_lists(cache)[2] == [BLOCK_SIZE, 3, BLOCK_SIZE, 0]
+    step([4, 1, 4, 0])
+    step([1, 1, 1, 0])
+    cache.truncate_to(1, cache.seq_lens_list()[1] - 2)
+    assert page_index_lists(cache) == old_page_index(cache)
+    cache.remove_request(0)
+    assert page_index_lists(cache) == old_page_index(cache)
+    step([1, 1, 2])
+
+
+def test_page_index_is_built_once_per_step() -> None:
+    """Every layer of a step gets the same tensors; the next step gets new ones."""
+    cache = PagedKVCache(make_pool())
+    cache.add_request_slot()
+    cache.add_request_slot()
+    seen: list[torch.Tensor] = []
+    for new_tokens in ([6, 3], [1, 1], [1, 1]):
+        cu_seqlens = torch.tensor([0, new_tokens[0], sum(new_tokens)], dtype=torch.int32)
+        total = sum(new_tokens)
+        step_indptrs = []
+        for layer_idx in range(NUM_LAYERS):
+            kv = torch.randn(total, NUM_KV_HEADS, HEAD_DIM)
+            cache.append_kv_packed(kv, kv, cu_seqlens, layer_idx)
+            step_indptrs.append(cache.page_index(torch.device("cpu"))[0])
+        assert all(indptr is step_indptrs[0] for indptr in step_indptrs)
+        assert all(indptr is not previous for previous in seen for indptr in step_indptrs)
+        seen.append(step_indptrs[0])

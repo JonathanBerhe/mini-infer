@@ -104,6 +104,9 @@ _PROFILED_STEPS = 4
 # and the prompt length of row 0 (row `b` adds 8 tokens per row).
 _BATCH_MAX_SEQ_LEN = 1024
 _BATCH_PROMPT_TOKENS = 24
+# The profile method (module labels, trace reduction) is the shared
+# `mini_infer.bench.step_profile`. This script keeps its own step label, method
+# list and category table, so the report keeps the shape of the 2026-10-23 one.
 # The profiler range around each profiled decode step.
 _STEP_LABEL = "decode_step"
 # Decode methods that run outside `Module.__call__`, so module hooks miss them.
@@ -134,13 +137,8 @@ _CATEGORY_RULES = (
     ("lm_head", "label", re.compile(r"^lm_head")),
     ("RoPE tables", "label", re.compile(r"rotary_emb")),
 )
-_KERNEL_LAUNCHES = frozenset(
-    {"cudaLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernel", "cuLaunchKernelEx"}
-)
-_HOST_SYNCS = frozenset(
-    {"cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize", "cudaMemcpy"}
-)
-_DEVICE_EVENTS = frozenset({"kernel", "gpu_memcpy", "gpu_memset"})
+# The label of the grouped expert matmuls, which run outside `Module.__call__`.
+_ROUTED_EXPERTS_LABEL = "mlp.routed_experts"
 
 app = modal.App("mini-infer-v4-flash-generate")
 
@@ -323,280 +321,6 @@ def _compare_one_rank(
     }
 
 
-def _profile_label(model: Any, name: str) -> str:
-    """A short profiler range name for the submodule `name` of `model`.
-
-    Layer and expert indices become `*` so that all layers share one name, and
-    each `self_attn` carries its class (CSA, HCA or SWA attention).
-    """
-    parts = []
-    prefix: list[str] = []
-    for part in name.split(".") if name else []:
-        prefix.append(part)
-        if part == "self_attn":
-            part = f"self_attn[{type(model.get_submodule('.'.join(prefix))).__name__}]"
-        parts.append(part)
-    label = re.sub(r"\.\d+(?=\.|$)", ".*", ".".join(parts)).removeprefix("model.")
-    return label or "model"
-
-
-def _label_modules(model: Any) -> Callable[[], None]:
-    """Put each module call and decode method of `model` in its own profiler range.
-
-    Module hooks name every `Module.__call__`. The methods in
-    `_LABELLED_METHODS` and the grouped expert matmuls run outside it, so
-    instance and class wrappers name them. Returns the function that removes
-    all of it.
-    """
-    import functools
-
-    import torch
-
-    from mini_infer.models.blocks.moe.mixtral_moe import PackedSwigluExperts
-    from mini_infer.models.deepseek_v4.fp4_expert import PackedFp4Experts
-
-    labels = {module: _profile_label(model, name) for name, module in model.named_modules()}
-    open_ranges: list[Any] = []
-
-    def enter(module: Any, args: Any) -> None:
-        label = labels.get(module)
-        if label is not None:
-            open_ranges.append(torch.profiler.record_function(label).__enter__())
-
-    def leave(module: Any, args: Any, output: Any) -> None:
-        if module in labels:
-            open_ranges.pop().__exit__(None, None, None)
-
-    def labelled(method: Callable[..., Any], label: str) -> Callable[..., Any]:
-        @functools.wraps(method)
-        def run(*args: Any, **kwargs: Any) -> Any:
-            with torch.profiler.record_function(label):
-                return method(*args, **kwargs)
-
-        return run
-
-    hooks = [
-        torch.nn.modules.module.register_module_forward_pre_hook(enter),
-        torch.nn.modules.module.register_module_forward_hook(leave),
-    ]
-    wrapped: list[tuple[Any, str]] = []
-    for module, label in labels.items():
-        for method in _LABELLED_METHODS:
-            if hasattr(type(module), method):
-                setattr(module, method, labelled(getattr(module, method), f"{label}:{method}"))
-                wrapped.append((module, method))
-    pack_runs = [(cls, cls.run) for cls in (PackedFp4Experts, PackedSwigluExperts)]
-    for cls, run in pack_runs:
-        cls.run = labelled(run, "mlp.routed_experts")
-
-    def restore() -> None:
-        for hook in hooks:
-            hook.remove()
-        for module, method in wrapped:
-            del module.__dict__[method]
-        for cls, run in pack_runs:
-            cls.run = run
-
-    return restore
-
-
-def _category(label: str | None, kernel: str) -> str:
-    """The part of the model a kernel belongs to, see `_CATEGORY_RULES`."""
-    for category, field, pattern in _CATEGORY_RULES:
-        text = kernel if field == "kernel" else label
-        if text is not None and pattern.search(text):
-            return category
-    return "other"
-
-
-def _short_kernel(name: str) -> str:
-    """A kernel name without its return type, template arguments and parameters."""
-    name = name.removeprefix("void ")
-    return re.split(r"[<(]", name, maxsplit=1)[0][:72]
-
-
-def _innermost(ranges: list[dict], points: list[float]) -> list[dict | None]:
-    """The innermost of the nested `ranges` that holds each of the sorted `points`."""
-    ranges = sorted(ranges, key=lambda r: (r["ts"], -r["dur"]))
-    found: list[dict | None] = []
-    stack: list[dict] = []
-    index = 0
-    for point in points:
-        while index < len(ranges) and ranges[index]["ts"] <= point:
-            while stack and stack[-1]["ts"] + stack[-1]["dur"] < ranges[index]["ts"]:
-                stack.pop()
-            stack.append(ranges[index])
-            index += 1
-        while stack and stack[-1]["ts"] + stack[-1]["dur"] < point:
-            stack.pop()
-        found.append(stack[-1] if stack else None)
-    return found
-
-
-def _self_times(ranges: list[dict]) -> dict[str, float]:
-    """Microseconds inside each named range and outside its nested ranges."""
-    totals: dict[str, float] = {}
-    stack: list[dict] = []
-    for item in sorted(ranges, key=lambda r: (r["ts"], -r["dur"])):
-        while stack and stack[-1]["ts"] + stack[-1]["dur"] <= item["ts"]:
-            stack.pop()
-        totals[item["name"]] = totals.get(item["name"], 0.0) + item["dur"]
-        if stack:
-            totals[stack[-1]["name"]] -= item["dur"]
-        stack.append(item)
-    return totals
-
-
-def _busy_us(intervals: list[tuple[float, float]]) -> float:
-    """The length of the union of `(start, end)` intervals."""
-    busy, end = 0.0, float("-inf")
-    for start, stop in sorted(intervals):
-        if stop > end:
-            busy += stop - max(start, end)
-            end = stop
-    return busy
-
-
-def _summarize_decode_trace(events: list[dict], top: int = 25) -> dict[str, Any]:
-    """Reduce a Chrome trace of `_STEP_LABEL` ranges to per-step tables.
-
-    Each kernel, copy and set on the GPU belongs to the host call that launched
-    it (same correlation id). That call gives the decode step, the innermost
-    profiler range (the part of the model) and the innermost ATen op. Times are
-    milliseconds per step, averaged over the profiled steps.
-    """
-    from bisect import bisect_right
-
-    complete = [e for e in events if e.get("ph") == "X" and "dur" in e]
-    annotations = [e for e in complete if e.get("cat") == "user_annotation"]
-    steps = sorted((e for e in annotations if e["name"] == _STEP_LABEL), key=lambda e: e["ts"])
-    ranges = [e for e in annotations if e["name"] != _STEP_LABEL]
-    ops = [e for e in complete if e.get("cat") == "cpu_op"]
-    host_calls = sorted(
-        (e for e in complete if e.get("cat") in ("cuda_runtime", "cuda_driver")),
-        key=lambda e: e["ts"],
-    )
-    if not steps:
-        raise ValueError(f"the trace has no {_STEP_LABEL!r} ranges")
-    n_steps = len(steps)
-    step_starts = [s["ts"] for s in steps]
-
-    def step_of(ts: float) -> int | None:
-        index = bisect_right(step_starts, ts) - 1
-        if index >= 0 and ts <= steps[index]["ts"] + steps[index]["dur"]:
-            return index
-        return None
-
-    # Innermost range and op of each host call, per thread: ranges nest per thread.
-    call_info: dict[int, tuple[int | None, str | None, str | None]] = {}
-    per_step: list[dict[str, float]] = [
-        {"launches": 0, "launch_ms": 0.0, "syncs": 0, "sync_ms": 0.0} for _ in steps
-    ]
-    sync_labels: dict[str, int] = {}
-    for tid in {e["tid"] for e in host_calls}:
-        calls = [e for e in host_calls if e["tid"] == tid]
-        points = [e["ts"] for e in calls]
-        in_range = _innermost([r for r in ranges if r["tid"] == tid], points)
-        in_op = _innermost([o for o in ops if o["tid"] == tid], points)
-        for call, label_range, op in zip(calls, in_range, in_op, strict=True):
-            step = step_of(call["ts"])
-            label = label_range["name"] if label_range else None
-            correlation = call.get("args", {}).get("correlation")
-            if correlation is not None:
-                call_info[correlation] = (step, label, op["name"] if op else None)
-            if step is None:
-                continue
-            if call["name"] in _KERNEL_LAUNCHES:
-                per_step[step]["launches"] += 1
-                per_step[step]["launch_ms"] += call["dur"] / 1e3
-            elif call["name"] in _HOST_SYNCS:
-                per_step[step]["syncs"] += 1
-                per_step[step]["sync_ms"] += call["dur"] / 1e3
-                where = f"{label or 'unlabelled'} ({op['name'] if op else 'no op'})"
-                sync_labels[where] = sync_labels.get(where, 0) + 1
-
-    busy: list[list[tuple[float, float]]] = [[] for _ in steps]
-    counts: list[dict[str, int]] = [{} for _ in steps]
-    by_category: dict[str, dict[str, float]] = {}
-    by_label: dict[tuple[str, str], dict[str, float]] = {}
-    by_kernel: dict[tuple[str, str], dict[str, Any]] = {}
-    unattributed = 0
-    for event in complete:
-        if event.get("cat") not in _DEVICE_EVENTS:
-            continue
-        launch = call_info.get(event.get("args", {}).get("correlation"))
-        step_index = launch[0] if launch is not None else None
-        if launch is None or step_index is None:
-            unattributed += 1
-            continue
-        _, range_name, op_name = launch
-        busy[step_index].append((event["ts"], event["ts"] + event["dur"]))
-        counts[step_index][event["cat"]] = counts[step_index].get(event["cat"], 0) + 1
-        category = _category(range_name, event["name"])
-        ms = event["dur"] / 1e3
-        cat_entry = by_category.setdefault(category, {"gpu_ms": 0.0, "kernels": 0, "host_ms": 0.0})
-        cat_entry["gpu_ms"] += ms
-        cat_entry["kernels"] += 1
-        label_entry = by_label.setdefault(
-            (range_name or "unlabelled", category), {"gpu_ms": 0.0, "kernels": 0}
-        )
-        label_entry["gpu_ms"] += ms
-        label_entry["kernels"] += 1
-        kernel_entry = by_kernel.setdefault(
-            (_short_kernel(event["name"]), op_name or event["cat"]),
-            {"gpu_ms": 0.0, "kernels": 0, "categories": {}},
-        )
-        kernel_entry["gpu_ms"] += ms
-        kernel_entry["kernels"] += 1
-        kernel_entry["categories"][category] = kernel_entry["categories"].get(category, 0) + 1
-
-    # Host time per category: each range's own time, outside its nested ranges.
-    for label, us in _self_times(ranges).items():
-        entry = by_category.setdefault(
-            _category(label, ""), {"gpu_ms": 0.0, "kernels": 0, "host_ms": 0.0}
-        )
-        entry["host_ms"] += us / 1e3
-
-    def per_step_rows(table: dict[Any, dict[str, Any]]) -> list[dict[str, Any]]:
-        rows = [
-            {
-                "key": key,
-                "gpu_ms": entry["gpu_ms"] / n_steps,
-                "kernels": entry["kernels"] / n_steps,
-                **({"host_ms": entry["host_ms"] / n_steps} if "host_ms" in entry else {}),
-                **(
-                    {"category": max(entry["categories"], key=entry["categories"].get)}
-                    if "categories" in entry
-                    else {}
-                ),
-            }
-            for key, entry in table.items()
-        ]
-        return sorted(rows, key=lambda row: -row["gpu_ms"])
-
-    return {
-        "steps": [
-            {
-                "wall_ms": step["dur"] / 1e3,
-                "gpu_busy_ms": _busy_us(busy[index]) / 1e3,
-                "kernels": counts[index].get("kernel", 0),
-                "memcpys": counts[index].get("gpu_memcpy", 0),
-                "memsets": counts[index].get("gpu_memset", 0),
-                **per_step[index],
-            }
-            for index, step in enumerate(steps)
-        ],
-        "categories": per_step_rows(by_category),
-        "labels": per_step_rows(by_label)[:top],
-        "kernels": per_step_rows(by_kernel)[:top],
-        "sync_sites": sorted(
-            ((where, count / n_steps) for where, count in sync_labels.items()),
-            key=lambda item: -item[1],
-        ),
-        "unattributed_device_events": unattributed,
-    }
-
-
 def _time_steps(run_step: Callable[..., None], on_cuda: bool) -> list[float]:
     """Run `_WARMUP_STEPS` steps, then return the wall time of `_TIMED_STEPS` steps in ms.
 
@@ -632,39 +356,39 @@ def _profile_steps(
 
     Other ranks run the same steps unprofiled, because each step all-reduces
     across the ranks. With `model`, every module call and decode method of
-    the model gets its own profiler range (`_label_modules`).
+    the model gets its own profiler range (`label_modules`), each `self_attn`
+    tagged with its class (CSA, HCA or SWA attention), and the trace reduces
+    with this script's `_CATEGORY_RULES`.
     """
     import gzip
-    import json
     import tempfile
 
-    import torch
+    from mini_infer.bench.step_profile import profile_steps
+    from mini_infer.models.blocks.moe.mixtral_moe import PackedSwigluExperts
+    from mini_infer.models.deepseek_v4.fp4_expert import PackedFp4Experts
 
     if rank != 0:
         for _ in range(_PROFILED_STEPS):
             run_step()
         return
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if on_cuda:
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-    restore = _label_modules(model) if model is not None else None
-    try:
-        with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
-            for _ in range(_PROFILED_STEPS):
-                with torch.profiler.record_function(_STEP_LABEL):
-                    run_step(labelled=True)
-            if on_cuda:
-                torch.cuda.synchronize()
-    finally:
-        if restore is not None:
-            restore()
-    _checkpoint(rank, "reducing the trace...")
-    trace_path = Path(tempfile.mkdtemp(prefix="v4-decode-")) / "trace.json"
-    prof.export_chrome_trace(str(trace_path))
-    trace_bytes = trace_path.read_bytes()
-    entry["profile"] = _summarize_decode_trace(json.loads(trace_bytes)["traceEvents"])
-    if keep_trace:
-        entry["trace_gz"] = gzip.compress(trace_bytes)
+    trace_path = Path(tempfile.mkdtemp(prefix="v4-decode-")) / "trace.json" if keep_trace else None
+    _checkpoint(rank, "profiling the steps and reducing the trace...")
+    entry["profile"] = profile_steps(
+        lambda: run_step(labelled=True),
+        steps=_PROFILED_STEPS,
+        model=model,
+        on_cuda=on_cuda,
+        step_label=_STEP_LABEL,
+        methods=_LABELLED_METHODS,
+        class_methods=[
+            (cls, "run", _ROUTED_EXPERTS_LABEL) for cls in (PackedFp4Experts, PackedSwigluExperts)
+        ],
+        tagged=("self_attn",),
+        category_rules=_CATEGORY_RULES,
+        trace_path=trace_path,
+    )
+    if trace_path is not None:
+        entry["trace_gz"] = gzip.compress(trace_path.read_bytes())
 
 
 def _profile_one_rank(

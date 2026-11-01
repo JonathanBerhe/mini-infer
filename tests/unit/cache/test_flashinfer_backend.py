@@ -304,3 +304,102 @@ def test_flashinfer_decode_qwen_7b_shape() -> None:
 
     cos = _cosine_sim(out_flashinfer, out_flash_attn)
     assert cos > 0.999, f"7B-shape FlashInfer vs flash-attn cosine sim {cos:.6f} below 0.999"
+
+
+class _FakePrefillWrapper:
+    """Records plan() calls and runs attention as identity."""
+
+    def __init__(self) -> None:
+        self.plans: list[dict[str, object]] = []
+        self.runs = 0
+
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        self.plans.append(
+            {
+                "qo_indptr": qo_indptr.tolist(),
+                "indptr": paged_kv_indptr.tolist(),
+                "indices": paged_kv_indices.tolist(),
+                "last_page_len": paged_kv_last_page_len.tolist(),
+                "window_left": kwargs["window_left"],
+            }
+        )
+
+    def run(self, q: torch.Tensor, kv_cache: object, **kwargs: object) -> torch.Tensor:
+        self.runs += 1
+        return q
+
+
+def test_plan_runs_once_per_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every layer of a step reuses one plan; a new step, other parameters or a
+    layout change plan again. Runs on the CPU with a fake wrapper."""
+    from mini_infer.cache import flashinfer_backend
+
+    fake = _FakePrefillWrapper()
+    monkeypatch.setattr(flashinfer_backend, "_FLASHINFER_AVAILABLE", True)
+    monkeypatch.setattr(flashinfer_backend, "require_cuda_device", lambda device, what: None)
+    monkeypatch.setattr(
+        flashinfer_backend, "_ensure_wrappers", lambda device, kv_quant: (fake, None)
+    )
+    monkeypatch.setattr(flashinfer_backend, "_last_plan", None)
+    forward = flashinfer_backend.flashinfer_attention_forward
+
+    num_layers, block_size = 3, 4
+    pool = BlockPool(
+        num_blocks=16,
+        block_size=block_size,
+        num_layers=num_layers,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        device="cpu",
+        attention_backend="flashinfer",
+    )
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cache.add_request_slot()
+
+    def step(new_tokens: list[int]) -> None:
+        cu_seqlens = torch.tensor([0, new_tokens[0], sum(new_tokens)], dtype=torch.int32)
+        total = sum(new_tokens)
+        for layer_idx in range(num_layers):
+            kv = torch.randn(total, 2, 8)
+            cache.append_kv_packed(kv, kv, cu_seqlens, layer_idx)
+            q = torch.randn(total, 4, 8)
+            assert forward(q, cache, layer_idx, cu_seqlens, softmax_scale=0.5) is q
+
+    step([5, 3])
+    assert fake.runs == num_layers
+    assert len(fake.plans) == 1
+    expected_indices = cache.block_ids_for_request(0) + cache.block_ids_for_request(1)
+    assert fake.plans[0]["qo_indptr"] == [0, 5, 8]
+    assert fake.plans[0]["indptr"] == [0, 2, 3]
+    assert fake.plans[0]["indices"] == expected_indices
+    assert fake.plans[0]["last_page_len"] == [1, 3]
+    assert fake.plans[0]["window_left"] == -1
+
+    step([1, 1])
+    assert fake.runs == 2 * num_layers
+    assert len(fake.plans) == 2
+    assert fake.plans[1]["last_page_len"] == [2, 4]
+
+    # A layer with a sliding window in the same step plans again, with the window.
+    cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int32)
+    forward(torch.randn(2, 4, 8), cache, 1, cu_seqlens, softmax_scale=0.5, window=3)
+    assert len(fake.plans) == 3
+    assert fake.plans[2]["window_left"] == 2
+
+    # A layout change between steps plans again, on the new index.
+    cache.remove_request(0)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    forward(torch.randn(1, 4, 8), cache, 0, cu_seqlens, softmax_scale=0.5)
+    assert len(fake.plans) == 4
+    assert fake.plans[3]["indptr"] == [0, 1]
+    assert fake.plans[3]["last_page_len"] == [4]
