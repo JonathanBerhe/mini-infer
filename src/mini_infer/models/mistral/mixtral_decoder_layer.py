@@ -35,9 +35,12 @@ class MixtralDecoderLayer(nn.Module):
         top_k: int,
         rms_norm_eps: float,
         layer_idx: int,
+        fused_rms_norm: bool = False,
     ) -> None:
         super().__init__()
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # `fused_rms_norm` runs both norms as one Triton kernel on CUDA
+        # (`RMSNorm(fused=True)`, ADR-045); other devices keep the PyTorch path.
+        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, fused=fused_rms_norm)
         self.self_attn = GroupedQueryAttention(
             hidden_size=hidden_size,
             num_q_heads=num_q_heads,
@@ -46,7 +49,7 @@ class MixtralDecoderLayer(nn.Module):
             qkv_bias=False,
             layer_idx=layer_idx,
         )
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, fused=fused_rms_norm)
         self.block_sparse_moe = MoEFFN(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
