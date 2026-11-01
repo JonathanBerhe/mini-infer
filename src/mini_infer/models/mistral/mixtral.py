@@ -43,6 +43,9 @@ class MixtralConfig:
     num_local_experts: int
     num_experts_per_tok: int
     tie_word_embeddings: bool
+    # Run every RMSNorm as one Triton kernel on CUDA (`RMSNorm(fused=True)`).
+    # Its sum runs in another order, so a few outputs differ in the last bit.
+    fused_rms_norm: bool = True
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> MixtralConfig:
@@ -90,11 +93,12 @@ class _MixtralInnerModel(nn.Module):
                     top_k=cfg.num_experts_per_tok,
                     rms_norm_eps=cfg.rms_norm_eps,
                     layer_idx=i,
+                    fused_rms_norm=cfg.fused_rms_norm,
                 )
                 for i in range(cfg.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, fused=cfg.fused_rms_norm)
 
 
 @register_model

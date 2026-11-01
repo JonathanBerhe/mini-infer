@@ -150,3 +150,45 @@ def test_swiglu_matches_hf_qwen2() -> None:
     out_theirs = theirs(x)
     assert _cos_sim(out_ours, out_theirs) > 0.999
     assert torch.allclose(out_ours, out_theirs, atol=1e-5)
+
+
+def test_fused_rms_norm_knob_reaches_every_norm_of_the_shared_block() -> None:
+    """`fused_rms_norm` on the Llama, Qwen2 and Qwen3 configs sets `fused` on every
+    RMSNorm the model builds, the per-head q and k norms included. On the CPU the
+    flag changes nothing, because the kernel needs CUDA."""
+    import dataclasses
+
+    from mini_infer.models.llama.llama import LlamaConfig, LlamaForCausalLM
+    from mini_infer.models.qwen.qwen2 import Qwen2Config, Qwen2ForCausalLM
+    from mini_infer.models.qwen.qwen3 import Qwen3Config, Qwen3ForCausalLM
+
+    dims = {
+        "vocab_size": 64,
+        "hidden_size": 32,
+        "intermediate_size": 48,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": False,
+    }
+    families = (
+        (LlamaConfig, LlamaForCausalLM, 5),
+        (Qwen2Config, Qwen2ForCausalLM, 5),
+        (Qwen3Config, Qwen3ForCausalLM, 9),  # plus a q norm and a k norm per layer
+    )
+    for config_cls, model_cls, expected_norms in families:
+        default = config_cls(**dims)
+        assert default.fused_rms_norm is True
+        for fused in (True, False):
+            model = model_cls(dataclasses.replace(default, fused_rms_norm=fused))
+            norms = [module for module in model.modules() if isinstance(module, RMSNorm)]
+            assert len(norms) == expected_norms, config_cls.__name__
+            assert all(norm.fused is fused for norm in norms), config_cls.__name__
+
+    norm_fused = RMSNorm(32, eps=1e-6, fused=True)
+    norm_plain = RMSNorm(32, eps=1e-6)
+    x = torch.randn(3, 5, 32)
+    assert torch.equal(norm_fused(x), norm_plain(x))

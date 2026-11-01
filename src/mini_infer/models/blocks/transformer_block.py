@@ -33,14 +33,17 @@ class TransformerBlock(nn.Module):
         qkv_bias: bool,
         layer_idx: int,
         with_qk_norm: bool = False,
+        fused_rms_norm: bool = False,
     ) -> None:
         super().__init__()
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # `fused_rms_norm` runs every norm of the block as one Triton kernel on
+        # CUDA (`RMSNorm(fused=True)`, ADR-045); other devices keep the PyTorch path.
+        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, fused=fused_rms_norm)
         # Qwen3 (and similar) apply per-head RMSNorm on Q and K after the
         # projections, before RoPE. Standard RMSNorm here (not Gemma's
         # offset variant — those models use `GemmaDecoderLayer` instead).
-        q_norm = RMSNorm(head_dim, eps=rms_norm_eps) if with_qk_norm else None
-        k_norm = RMSNorm(head_dim, eps=rms_norm_eps) if with_qk_norm else None
+        q_norm = RMSNorm(head_dim, eps=rms_norm_eps, fused=fused_rms_norm) if with_qk_norm else None
+        k_norm = RMSNorm(head_dim, eps=rms_norm_eps, fused=fused_rms_norm) if with_qk_norm else None
         self.self_attn = GroupedQueryAttention(
             hidden_size=hidden_size,
             num_q_heads=num_q_heads,
@@ -51,7 +54,7 @@ class TransformerBlock(nn.Module):
             q_norm=q_norm,
             k_norm=k_norm,
         )
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, fused=fused_rms_norm)
         self.mlp = SwiGLU(hidden_size, intermediate_size)
 
     def forward(
