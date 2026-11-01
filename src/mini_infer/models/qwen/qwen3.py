@@ -44,6 +44,9 @@ class Qwen3Config:
     rms_norm_eps: float
     rope_theta: float
     tie_word_embeddings: bool
+    # Run every RMSNorm, the per-head q and k norms included, as one Triton
+    # kernel on CUDA (`RMSNorm(fused=True)`). A few outputs differ in the last bit.
+    fused_rms_norm: bool = True
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> Qwen3Config:
@@ -93,11 +96,12 @@ class _Qwen3InnerModel(nn.Module):
                     qkv_bias=False,
                     layer_idx=i,
                     with_qk_norm=True,
+                    fused_rms_norm=cfg.fused_rms_norm,
                 )
                 for i in range(cfg.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, fused=cfg.fused_rms_norm)
 
 
 @register_model
