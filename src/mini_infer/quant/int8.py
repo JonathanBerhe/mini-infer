@@ -10,11 +10,11 @@ mechanism that HuggingFace `load_in_8bit`, bitsandbytes' `Linear8bitLt`, and
 vLLM's W8A16 path use; we implement it from scratch so the integration is
 explicit and the math is readable.
 
-The forward path here is naive: `W_dq = W_q.to(dtype) * scales` followed by
-`F.linear(x, W_dq, bias)`. The dequant is `O(out * in)` regardless of batch
-size, so for large batches it amortizes; for batch=1 decode it's a fixed cost
-on top of the matmul. A fused dequant-matmul kernel (Triton) would be a
-future fast path.
+On CUDA the forward goes through `int8_kernel.fused_w8a16_linear`: a decode
+step of up to 64 rows reads the int8 weight as is in a split-K Triton kernel,
+and a larger batch dequantizes the weight and runs cuBLAS. Elsewhere the
+forward is the naive `W_dq = W_q.to(dtype) * scales` followed by
+`F.linear(x, W_dq, bias)`.
 """
 
 from __future__ import annotations
