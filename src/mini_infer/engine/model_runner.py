@@ -1,5 +1,6 @@
 import inspect
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -7,6 +8,7 @@ import torch
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
+from mini_infer.engine.device_tokens import DeviceTokens
 from mini_infer.engine.paged_decode_graph import DEFAULT_BUCKETS, PagedDecodeGraph
 from mini_infer.engine.tokenizer import Tokenizer
 from mini_infer.models import load_model
@@ -213,7 +215,7 @@ class ModelRunner:
     def forward_step_packed(
         self,
         cache: PagedKVCache,
-        packed_input_ids: list[int],
+        packed_input_ids: Sequence[int] | DeviceTokens,
         cu_seqlens_q: list[int],
         position_offsets: list[int],
         *,
@@ -228,6 +230,10 @@ class ModelRunner:
                 request's slot in place.
             packed_input_ids: every request's q-tokens flattened into one list,
                 in cache-slot order. Total length equals `cu_seqlens_q[-1]`.
+                A `DeviceTokens` gives one token per slot from a tensor on the
+                device instead, so the step starts without a host read of the
+                ids; it fits a decode step only (`cu_seqlens_q[-1]` equals the
+                batch size).
             cu_seqlens_q: cumulative q-length boundaries; `cu_seqlens_q[-1]` is
                 the packed total length.
             position_offsets: per-request absolute position of each request's
@@ -259,13 +265,22 @@ class ModelRunner:
                 f"{batch_size + 1}"
             )
 
+        if isinstance(packed_input_ids, DeviceTokens) and len(packed_input_ids) != batch_size:
+            raise ValueError(
+                f"DeviceTokens holds {len(packed_input_ids)} rows for a batch of {batch_size}; "
+                "device-side ids serve one-token-per-slot decode steps only"
+            )
+
         graph = self._decode_graph
         if graph is not None and tap_layers is None and graph.accepts(cu_seqlens_q):
             # One new token per request: the captured step of this batch size.
             return graph.replay(cache, packed_input_ids, position_offsets)
 
         device = self.device
-        input_ids = torch.tensor([packed_input_ids], device=device, dtype=torch.long)
+        if isinstance(packed_input_ids, DeviceTokens):
+            input_ids = packed_input_ids.gather().unsqueeze(0)
+        else:
+            input_ids = torch.tensor([packed_input_ids], device=device, dtype=torch.long)
 
         # Per-request position ids: positions reset per request so RoPE applies
         # the right rotation for each request's absolute position.

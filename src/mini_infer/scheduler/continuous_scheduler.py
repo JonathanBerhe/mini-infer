@@ -34,11 +34,21 @@ Speculators add two phases:
 (INV): the target slot length equals the draft cache length plus the context
 rows. See ADR-031.
 
+With `async_sampling` on (the default on CUDA), step 5 also samples the next
+token of every plain decoder on the device and starts its copy to the host
+without waiting. When the next step is a plain decode step with nothing to
+admit, step 1 feeds those ids to the device through `DeviceTokens`, launches
+the forward, and reads the ids on the host only after that, to emit them and
+apply the finish conditions. The host work of a step then overlaps the GPU
+work of the step before it. A request that hit EOS or `max_tokens` runs one
+extra step, whose row nobody reads.
+
 Throughput-wise this is "Approach 2": prefill chunks and decode tokens share
 the same forward pass. The matmul cost amortizes across all in-flight q-tokens.
 """
 
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -46,10 +56,13 @@ import queue
 import threading
 import time
 from collections.abc import Iterator
+from typing import Any
 
 import torch
 
 from mini_infer.cache.paged_kv_cache import PagedKVCache
+from mini_infer.device import is_cuda_device
+from mini_infer.engine.device_tokens import DeviceTokens
 from mini_infer.engine.dspark.spec import (
     DSparkSpec,
     DSparkStats,
@@ -58,7 +71,7 @@ from mini_infer.engine.dspark.spec import (
     verify_block,
 )
 from mini_infer.engine.model_runner import ModelRunner
-from mini_infer.engine.sampler import sample, sample_batch
+from mini_infer.engine.sampler import sample, sample_batch, sample_tokens
 from mini_infer.exceptions import EngineNotRunningError, OutOfMemoryError
 from mini_infer.scheduler.request_state import (
     FinishReason,
@@ -72,6 +85,39 @@ from mini_infer.scheduler.request_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _DeferredTokens:
+    """The next tokens of the last forward: sampled on the device, not yet read by the host.
+
+    `tokens` is the `(rows,)` id tensor on the device, one row per request in
+    `requests`. `host` is its pinned copy in flight and `ready` the CUDA event
+    behind that copy (None off CUDA). The next step can feed `tokens` to the
+    device through `DeviceTokens`; `read` gives the host the values.
+    """
+
+    tokens: torch.Tensor
+    requests: list[RunningRequest]
+    host: torch.Tensor
+    ready: Any
+    _ids: list[int] | None = dataclasses.field(default=None, init=False)
+    _rows: dict[int, int] = dataclasses.field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        self._rows = {id(req): row for row, req in enumerate(self.requests)}
+
+    def row_of(self, req: RunningRequest) -> int | None:
+        """The row of `req` in `tokens`, or None when the last forward did not sample for it."""
+        return self._rows.get(id(req))
+
+    def read(self) -> list[int]:
+        """The ids on the host. The first call waits for the copy."""
+        if self._ids is None:
+            if self.ready is not None:
+                self.ready.synchronize()
+            self._ids = self.host.tolist()
+        return self._ids
 
 
 class ContinuousScheduler:
@@ -125,6 +171,7 @@ class ContinuousScheduler:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         trace_out: str | None = None,
         dspark: DSparkSpec | None = None,
+        async_sampling: bool | None = None,
     ) -> None:
         # Prefix-cache hits skip the forward, so they give no tapped hidden
         # states, and the short context breaks (INV). See ADR-031.
@@ -147,6 +194,13 @@ class ContinuousScheduler:
         self._max_concurrent = max_concurrent
         self._decode_headroom = decode_headroom_blocks
         self._chunk_size = chunk_size
+        # Sample on the device and read the ids one step late, so the host work
+        # of a step overlaps the GPU work of the step before it. None: on CUDA.
+        if async_sampling is None:
+            async_sampling = is_cuda_device(getattr(runner, "device", "cpu"))
+        self._async_sampling = async_sampling
+        # The ids of the last forward while the host has not read them.
+        self._deferred: _DeferredTokens | None = None
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
         self._running: list[RunningRequest] = []
         self._batched_cache: PagedKVCache | None = None
@@ -244,6 +298,7 @@ class ContinuousScheduler:
         changes this state. A `submit()` during `stop()` can enqueue after the
         drain. Its handle then fails through the liveness check.
         """
+        self._deferred = None
         leftover = [r for r in self._running if r.state != RequestState.DONE]
         while True:
             try:
@@ -368,10 +423,17 @@ class ContinuousScheduler:
         The reap comes before admission, so that a request that finished (in
         the last verify, by a cancel, or in this step's sampling) frees its
         slot and blocks for a waiting request in this same forward.
+
+        A step whose every request takes its next token from the deferred ids
+        of the last forward runs `_async_decode_step` instead, and reads those
+        ids after its own forward started.
         """
         step_start = time.perf_counter() if self._trace_events is not None else 0.0
 
         self._cancel_pending()
+        if self._deferred is not None and self._next_step_is_async():
+            self._async_decode_step(step_start)
+            return
         sampled_decode_tokens = self._sample_decoders()
         sampled_decode_tokens.update(self._draft_speculators())
         self._reap_done()
@@ -407,27 +469,152 @@ class ContinuousScheduler:
             self._verify_speculators(alive, packed_logits, cu_seqlens_q, sink)
 
         if alive and self._trace_events is not None:
-            if self._trace_t0 is None:
-                self._trace_t0 = step_start
             assert trace_phase is not None
-            self._trace_events.append(
-                {
-                    "name": "step",
-                    "ph": "X",
-                    "ts": (step_start - self._trace_t0) * 1e6,
-                    "dur": (time.perf_counter() - step_start) * 1e6,
-                    "pid": 0,
-                    "tid": 0,
-                    # Step cost follows total_q (q-tokens), not B (requests).
-                    # Prefill chunks and verify windows make total_q exceed B.
-                    "args": {
-                        "B": len(alive),
-                        "phase": trace_phase,
-                        "total_q": total_q,
-                        "n_verify": n_verify,
-                    },
-                }
+            self._record_step(step_start, trace_phase, len(alive), total_q, n_verify)
+
+    def _record_step(
+        self, step_start: float, phase: str, batch: int, total_q: int, n_verify: int
+    ) -> None:
+        """Append the duration event of a step that ran a forward to the trace."""
+        if self._trace_events is None:
+            return
+        if self._trace_t0 is None:
+            self._trace_t0 = step_start
+        self._trace_events.append(
+            {
+                "name": "step",
+                "ph": "X",
+                "ts": (step_start - self._trace_t0) * 1e6,
+                "dur": (time.perf_counter() - step_start) * 1e6,
+                "pid": 0,
+                "tid": 0,
+                # Step cost follows total_q (q-tokens), not B (requests).
+                # Prefill chunks and verify windows make total_q exceed B.
+                "args": {
+                    "B": batch,
+                    "phase": phase,
+                    "total_q": total_q,
+                    "n_verify": n_verify,
+                },
+            }
+        )
+
+    def _next_step_is_async(self) -> bool:
+        """Whether the coming step can take every input id from `_deferred` unread.
+
+        After the reap, every request in flight must be a plain decoder whose
+        next token sits in the deferred tensor, and admission must have nothing
+        to seat. Then the step is a decode step of one device-side token per
+        slot. Any other step reads the tokens first and runs the usual path.
+        """
+        deferred = self._deferred
+        assert deferred is not None
+        self._reap_done()
+        alive = [r for r in self._running if r.state != RequestState.DONE]
+        if not alive:
+            return False
+        for req in alive:
+            if (
+                req.state != RequestState.DECODING
+                or req.spec is not None
+                or req.pending_decode_tokens is not None
+                or deferred.row_of(req) is None
+            ):
+                return False
+        return len(alive) >= self._max_concurrent or self._waiting.empty()
+
+    def _async_decode_step(self, step_start: float) -> None:
+        """A decode step that starts before the host reads the tokens it feeds.
+
+        The forward takes each slot's next token from the deferred tensor of
+        the last forward (`DeviceTokens`) and samples its own outputs on the
+        device. Only then does the host read the ids of the last forward, emit
+        them and apply the finish conditions. So the GPU has this step queued
+        while the host handles the previous one. A request that finished at
+        the last step has run this step too; nobody reads its row, and the
+        reap frees its slot before the next step.
+        """
+        deferred = self._deferred
+        assert deferred is not None and self._batched_cache is not None
+        cache = self._batched_cache
+        alive = [r for r in self._running if r.state != RequestState.DONE]
+        rows: list[int] = []
+        for index, req in enumerate(alive):
+            # `index` is both the packed position and the slot, as in `_packed_forward`.
+            assert req.batch_idx is not None and req.batch_idx == index
+            row = deferred.row_of(req)
+            assert row is not None, "every decoder of an async step has a deferred token"
+            rows.append(row)
+        cache_seq_lens = cache.seq_lens_list()
+        cu_seqlens_q = list(range(len(alive) + 1))
+        self._pre_forward_seq_lens = cache_seq_lens
+        packed_logits = self._runner.forward_step_packed(
+            cache, DeviceTokens(deferred.tokens, rows), cu_seqlens_q, cache_seq_lens
+        )
+        self._pre_forward_seq_lens = None
+        for index, req in enumerate(alive):
+            req.last_logits = packed_logits[0, index, :]
+        # Sample this step on the device before the host reads the last one,
+        # so the read never stands between two forwards.
+        self._deferred = self._defer_sampling(alive, packed_logits[0, : len(alive)])
+        self._consume_deferred(deferred)
+        self._record_step(step_start, "decode", len(alive), len(alive), 0)
+
+    def _consume_deferred(self, deferred: _DeferredTokens) -> None:
+        """Emit the ids of the last forward and finish the requests that are done.
+
+        A request that is no longer a plain decoder with nothing pending (it was
+        cancelled, or it finished) takes nothing from here.
+        """
+        ids = deferred.read()
+        for req, token in zip(deferred.requests, ids, strict=True):
+            if req.state == RequestState.DECODING and req.pending_decode_tokens is None:
+                self._consume_token(req, token)
+
+    def _defer_after_forward(
+        self, alive: list[RunningRequest], packed_logits: torch.Tensor, cu_seqlens_q: list[int]
+    ) -> _DeferredTokens | None:
+        """Sample on the device for every plain decoder of the forward that just ran.
+
+        A request that finished its prefill in this forward counts: its last
+        row holds the logits of its first token. With no such request, None.
+        """
+        decoders = [
+            (index, req)
+            for index, req in enumerate(alive)
+            if req.state == RequestState.DECODING and req.spec is None
+        ]
+        if not decoders:
+            return None
+        last_rows = [cu_seqlens_q[index + 1] - 1 for index, _ in decoders]
+        if last_rows == list(range(len(alive))):
+            logits = packed_logits[0, : len(alive)]
+        else:
+            on_cuda = is_cuda_device(packed_logits.device)
+            index = torch.tensor(last_rows, dtype=torch.long, pin_memory=on_cuda)
+            logits = packed_logits[0].index_select(
+                0, index.to(packed_logits.device, non_blocking=on_cuda)
             )
+        return self._defer_sampling([req for _, req in decoders], logits)
+
+    def _defer_sampling(
+        self, requests: list[RunningRequest], logits: torch.Tensor
+    ) -> _DeferredTokens:
+        """Sample one id per row on the device and start its copy to the host.
+
+        Nothing here waits for the GPU. The ids feed the next step through
+        `DeviceTokens`, and `_DeferredTokens.read` waits for the copy when the
+        host needs the values.
+        """
+        tokens = sample_tokens(logits, [req.request.sampling_params for req in requests])
+        on_cuda = is_cuda_device(tokens.device)
+        host = torch.empty(len(requests), dtype=torch.long, pin_memory=on_cuda)
+        host.copy_(tokens, non_blocking=on_cuda)
+        ready = None
+        if on_cuda:
+            ready = torch.cuda.Event()  # type: ignore[no-untyped-call]
+            ready.record()
+        return _DeferredTokens(tokens=tokens, requests=list(requests), host=host, ready=ready)
 
     @staticmethod
     def _classify_phase(alive: list[RunningRequest]) -> str:
@@ -595,34 +782,53 @@ class ContinuousScheduler:
         After a recoverable OOM, a request resends `pending_decode_tokens` and
         does NOT sample again: it already emitted them, and the stream cannot
         take a token back.
+
+        A request whose next token the last forward sampled on the device
+        (`_deferred`) takes it from there. That read waits for the forward.
         """
         sampled: dict[int, list[int]] = {}
-        tokenizer = self._runner.tokenizer
+        deferred = self._deferred
+        self._deferred = None
         decoders = [r for r in self._running if r.state == RequestState.DECODING and r.spec is None]
-        # One batched sample for every decoder with fresh logits: the ids reach
-        # the host in one copy, instead of one wait on the GPU per request.
         fresh = [r for r in decoders if r.pending_decode_tokens is None]
         next_tokens: dict[int, int] = {}
-        if fresh:
-            logits = torch.stack([self._fresh_logits(r) for r in fresh])
-            tokens = sample_batch(logits, [r.request.sampling_params for r in fresh])
-            next_tokens = {id(r): token for r, token in zip(fresh, tokens, strict=True)}
+        if deferred is not None:
+            ids = deferred.read()
+            for req in fresh:
+                row = deferred.row_of(req)
+                if row is not None:
+                    next_tokens[id(req)] = ids[row]
+        # One batched sample for every other decoder with fresh logits: the ids
+        # reach the host in one copy, instead of one wait on the GPU per request.
+        to_sample = [r for r in fresh if id(r) not in next_tokens]
+        if to_sample:
+            logits = torch.stack([self._fresh_logits(r) for r in to_sample])
+            tokens = sample_batch(logits, [r.request.sampling_params for r in to_sample])
+            next_tokens.update({id(r): token for r, token in zip(to_sample, tokens, strict=True)})
         for req in decoders:
             if req.pending_decode_tokens is not None:
                 sampled[id(req)] = req.pending_decode_tokens
                 continue
             next_token = next_tokens[id(req)]
-            if next_token == tokenizer.eos_token_id:
-                self._finish(req, "stop")
-                continue
-            req.tokens_generated.append(next_token)
-            self._emit_new_text(req, 1)
-            if len(req.tokens_generated) >= req.request.max_tokens:
-                self._finish(req, "length")
-                continue
-            req.pending_decode_tokens = [next_token]
-            sampled[id(req)] = req.pending_decode_tokens
+            if self._consume_token(req, next_token):
+                req.pending_decode_tokens = [next_token]
+                sampled[id(req)] = req.pending_decode_tokens
         return sampled
+
+    def _consume_token(self, req: RunningRequest, next_token: int) -> bool:
+        """Emit a sampled token, or finish the request on EOS or `max_tokens`.
+
+        Returns True when the request keeps decoding.
+        """
+        if next_token == self._runner.tokenizer.eos_token_id:
+            self._finish(req, "stop")
+            return False
+        req.tokens_generated.append(next_token)
+        self._emit_new_text(req, 1)
+        if len(req.tokens_generated) >= req.request.max_tokens:
+            self._finish(req, "length")
+            return False
+        return True
 
     @staticmethod
     def _fresh_logits(req: RunningRequest) -> torch.Tensor:
@@ -824,6 +1030,8 @@ class ContinuousScheduler:
             else:
                 req.last_logits = packed_logits[0, last_pos, :]
                 req.pending_decode_tokens = None
+        if self._async_sampling:
+            self._deferred = self._defer_after_forward(alive, packed_logits, cu_seqlens_q)
         return packed_logits, cu_seqlens_q, sink
 
     def _verify_speculators(
@@ -942,6 +1150,7 @@ class ContinuousScheduler:
         if not self._running and self._batched_cache is not None:
             # Nothing in flight: drop the empty cache so the next admit starts clean.
             self._batched_cache = None
+            self._deferred = None
 
     def _finish(self, req: RunningRequest, reason: FinishReason) -> None:
         """Mark a request DONE and emit the terminal step with its finish_reason.
