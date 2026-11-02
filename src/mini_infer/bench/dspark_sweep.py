@@ -258,8 +258,15 @@ def run_point(
     if not prompts:
         raise ValueError("a sweep point needs at least one prompt")
     params = sampling if sampling is not None else SamplingParams(temperature=0.0)
+    # The sweep times the phases of the usual step, which an async decode step
+    # does not run through, so the plain points keep the host-side sampling.
     sched = InstrumentedScheduler(
-        runner, timed=timed, sync=sync, max_concurrent=concurrency, dspark=dspark
+        runner,
+        timed=timed,
+        sync=sync,
+        max_concurrent=concurrency,
+        dspark=dspark,
+        async_sampling=False,
     )
 
     sched.start()

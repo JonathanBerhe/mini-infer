@@ -20,6 +20,7 @@ through `ModelRunner.forward_step_packed`.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -29,6 +30,7 @@ from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.flashinfer_backend import plan_static_decode
 from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticDecodeStep
 from mini_infer.device import is_cuda_device
+from mini_infer.engine.device_tokens import DeviceTokens
 
 DEFAULT_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 # Eager runs before the capture, so lazy initialization (cuBLAS handles,
@@ -114,9 +116,14 @@ class PagedDecodeGraph:
         raise ValueError(f"{active} rows exceed the largest bucket {self.max_batch}")
 
     def replay(
-        self, cache: PagedKVCache, token_ids: list[int], positions: list[int]
+        self, cache: PagedKVCache, token_ids: Sequence[int] | DeviceTokens, positions: list[int]
     ) -> torch.Tensor:
         """Run one decode step: token `token_ids[b]` at `positions[b]` for every slot `b`.
+
+        With a `DeviceTokens`, the ids go from the sampled tensor into the
+        input buffer on the device, and the host never waits for them. The
+        padding rows then keep the ids of an earlier step, which are valid
+        ids whose logits nobody reads.
 
         Returns `(1, len(token_ids), vocab)` logits in a fresh tensor, so the
         caller can keep rows across the next replay.
@@ -135,10 +142,13 @@ class PagedDecodeGraph:
             if copied is not None:
                 copied.synchronize()  # the previous copy out of `staging` must be done
             staging.zero_()
-            staging[0, :active] = torch.tensor(token_ids, dtype=torch.long)
             staging[1, :active] = torch.tensor(positions, dtype=torch.long)
-            input_ids.copy_(staging[0].unsqueeze(0), non_blocking=on_cuda)
             position_ids.copy_(staging[1].unsqueeze(0), non_blocking=on_cuda)
+            if isinstance(token_ids, DeviceTokens):
+                input_ids[0, :active].copy_(token_ids.gather())
+            else:
+                staging[0, :active] = torch.tensor(token_ids, dtype=torch.long)
+                input_ids.copy_(staging[0].unsqueeze(0), non_blocking=on_cuda)
             if on_cuda:
                 event = torch.cuda.Event()  # type: ignore[no-untyped-call]
                 event.record()
