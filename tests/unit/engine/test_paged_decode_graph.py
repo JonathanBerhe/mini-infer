@@ -124,6 +124,25 @@ def test_replay_matches_the_eager_decode_step(monkeypatch: pytest.MonkeyPatch) -
     assert plans_in_inference_mode == [True, True, True]
 
 
+def test_replay_with_device_ids_matches_the_replay_with_host_ids() -> None:
+    """The ids of a `DeviceTokens` land in the input buffer like the host ids do."""
+    from mini_infer.engine.device_tokens import DeviceTokens
+
+    host_runner, host_cache = _prefilled(seed=6)
+    device_runner, device_cache = _prefilled(seed=6)
+    host_graph = _fake_graph(host_runner._model, host_runner.block_pool, (2,))
+    device_graph = _fake_graph(device_runner._model, device_runner.block_pool, (2,))
+    for graph, cache in ((host_graph, host_cache), (device_graph, device_cache)):
+        stand_in = graph._graphs[2]
+        assert isinstance(stand_in, _EagerStandIn)
+        stand_in.cache = cache
+    sampled = torch.tensor([4, 7, 5])  # slot 0 takes row 2, slot 1 takes row 1
+    expected = host_graph.replay(host_cache, [5, 7], [6, 3])
+    got = device_graph.replay(device_cache, DeviceTokens(sampled, [2, 1]), [6, 3])
+    assert torch.equal(got, expected)
+    assert torch.equal(device_graph._inputs[2][0], host_graph._inputs[2][0])
+
+
 def test_padded_replay_needs_flashinfer_on_this_pool() -> None:
     runner, cache = _prefilled(seed=0)
     graph = _fake_graph(runner._model, runner.block_pool, (4,))
