@@ -1,42 +1,34 @@
-"""Fused INT8-weight x bf16-activation matmul (W8A16 GEMM) via Triton.
+"""INT8-weight x bf16-activation matmul (W8A16) for the decode step, via Triton.
 
 The naive ``Int8Linear.forward`` materializes the dequantized weight matrix
 to HBM on every call (`W.to(bf16) * scales`) and then passes it to
 ``F.linear``. That round-trip burns the bandwidth savings of having the
 weights stored as INT8.
 
-This module's ``fused_w8a16_linear`` keeps the weights as INT8 in HBM,
-loads small tiles into registers / shared memory, dequantizes there, and
-feeds the bf16 result straight into the matmul accumulator. The fp32
-accumulator is cast to the activation dtype at the end (same precision
-contract as cuBLAS bf16 GEMM).
+``fused_w8a16_linear`` keeps the weights as INT8 in HBM for the shapes where
+the weight bytes set the time: a decode step of up to `_DECODE_ROWS` rows.
+Two kernels serve it. `_w8a16_splitk_kernel` runs one program per (n-tile,
+K split), loads int8 tiles, dequantizes them in registers and accumulates in
+fp32; the K split gives enough programs in flight to keep the memory system
+busy on the narrow shapes (`down_proj` of Qwen2.5-7B has N=3584 and
+K=18944). `_w8a16_reduce_kernel` sums the splits in a fixed order, applies
+the per-channel scale and the bias, and casts, so the result is
+deterministic. On one H100 the pair reads the int8 weights of the 7B MLP
+shapes at 2.1 to 2.25 TB/s, 1.6 to 1.7 times faster than cuBLAS bf16.
 
-Two block-size profiles are selected at launch time:
+Above `_DECODE_ROWS` rows (a prefill chunk) the GEMM is compute-bound and
+the byte saving does not pay, so the weight is dequantized to the activation
+dtype and cuBLAS runs it. A K that the tile does not divide takes the same
+path.
 
-- **Decode profile** (M ≤ 16): `BLOCK_M=16, BLOCK_N=64, BLOCK_K=64`,
-  `num_warps=2`. Triton's ``tl.dot`` requires BLOCK_M ≥ 16, so a true
-  M=1 decode pads M with masking.
-- **Prefill profile** (M > 16): `BLOCK_M=64, BLOCK_N=64, BLOCK_K=32`,
-  `num_warps=4`. Moderate tile that keeps the (BLOCK_M, BLOCK_N) fp32
-  accumulator within the per-warp register budget on Ampere SMs.
-
-(An attempt to add `@triton.autotune` over a wider config space
-regressed badly because the autotune key included `M`, and continuous
-batching produces many distinct M values per run, each firing a fresh
-8-config sweep. The proper fix is splitting decode and prefill into
-separate narrowly-autotuned kernels; tracked as an ADR-012 follow-up.)
-
-The kernel assumes K is divisible by `BLOCK_K`. Qwen2.5-0.5B's linear
-layers have K ∈ {896, 4864}, and Qwen2.5-7B has K ∈ {896, 3584, 18944},
-all multiples of 32 and 64, so this holds for the models we benchmark.
-For models with K not BLOCK_K-aligned, pad K externally or reintroduce
-K masking.
-
-CUDA-only. Calls on non-CUDA devices fall back via the dispatch in
-``Int8Linear.forward``.
+Runs on CUDA; on CPU tensors only under `TRITON_INTERPRET=1`. Calls on
+other devices fall back via the dispatch in ``Int8Linear.forward``.
 """
 
 from __future__ import annotations
+
+import dataclasses
+import os
 
 import torch
 
@@ -59,6 +51,53 @@ except ImportError:  # macOS / no-CUDA installs typically lack triton
 # naive on the same model load. Not a public API; internal-only knob.
 _FUSED_DISABLED_FOR_BENCH = False
 
+# The split-K kernel serves up to this many rows; `tl.dot` pads them to 16, 32 or 64.
+_DECODE_ROWS = 64
+# The split-K path aims at this many programs, about four per SM of an H100.
+_DECODE_TARGET_PROGRAMS = 512
+_REDUCE_BLOCK_N = 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class DecodeTile:
+    """The tile of the split-K decode kernel. `split_k=0` picks the split from the shape.
+
+    The defaults come from a sweep on one H100 over the Qwen2.5-7B shapes at
+    1 and 8 rows: 128 by 128 tiles with 8 warps sat within a few percent of
+    the best tile of every shape, at 2.1 to 2.25 TB/s of int8 weight reads
+    on the MLP shapes.
+    """
+
+    block_n: int = 128
+    block_k: int = 128
+    split_k: int = 0
+    num_warps: int = 8
+    num_stages: int = 3
+
+
+# The tile in use; a bench can swap it to sweep the configurations.
+_DECODE_TILE = DecodeTile()
+
+
+def split_k_for(k_dim: int, block_k: int, n_tiles: int) -> int:
+    """The largest power-of-two split that lifts the program count toward the target.
+
+    K must stay divisible by `split * block_k`, so every program sees whole
+    tiles and the kernel needs no K mask.
+    """
+    split = 1
+    while n_tiles * split < _DECODE_TARGET_PROGRAMS and k_dim % (split * 2 * block_k) == 0:
+        split *= 2
+    return split
+
+
+def block_m_for(m_dim: int) -> int:
+    """The smallest of 16, 32 and 64 that holds `m_dim` rows."""
+    for block_m in (16, 32, 64):
+        if m_dim <= block_m:
+            return block_m
+    raise ValueError(f"{m_dim} rows exceed the {_DECODE_ROWS} rows of the decode kernel")
+
 
 def supports_fused_kernel(device: torch.device | str) -> bool:
     """Whether the fused W8A16 kernel can run on this device.
@@ -77,86 +116,91 @@ def supports_fused_kernel(device: torch.device | str) -> bool:
 if _TRITON_AVAILABLE:
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def _w8a16_gemm_kernel(  # type: ignore[no-untyped-def]
+    def _w8a16_splitk_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         w_ptr,
-        scales_ptr,
-        bias_ptr,
-        out_ptr,
+        part_ptr,
         M,
         N,
-        K,
+        K_PER_SPLIT,
         stride_xm,
         stride_xk,
         stride_wn,
         stride_wk,
-        stride_om,
-        stride_on,
+        stride_ps,
+        stride_pm,
+        stride_pn,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
     ) -> None:
-        """One program per (m-tile, n-tile). K loop runs inside.
+        """One program per (n-tile, K split), partial sums in fp32.
 
-        Structure adapted directly from Triton's matmul tutorial:
-
-        - `% M` / `% N` on the load offsets keeps reads in-bounds even on
-          partial tiles; the store mask zeros out the bogus output rows /
-          cols at the end. (Avoids 2D `mask=` on every load, which has
-          tripped a Triton MLIR lowering assertion in some configurations.)
-        - K masking via `offs_k < K - k * BLOCK_K` clamps the tail K tile.
-        - **Per-output-channel scales are applied AFTER the K reduction.**
-          Mathematically equivalent because `scales[n]` factors out of
-          `sum_k (x[m,k] * w_int8[n,k] * scales[n])`. Cheaper too: one
-          multiply per `(M, N)` element instead of per K iter.
+        Each program keeps one `(BLOCK_M, BLOCK_N)` accumulator over its
+        slice of K and stores it to `part[split, m, n]`. Rows at or past `M`
+        load a real row again (`% M`) and are dropped at the store, as are
+        columns past `N`.
         """
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-
-        # `% M` / `% N`: out-of-range rows/cols load valid-but-irrelevant
-        # memory; the store mask discards those positions.
-        offs_xm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-        offs_wn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
-        offs_k = tl.arange(0, BLOCK_K)
-
+        pid_n = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_xm = offs_m % M
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_wn = offs_n % N
+        offs_k = pid_s * K_PER_SPLIT + tl.arange(0, BLOCK_K)
         x_ptrs = x_ptr + (offs_xm[:, None] * stride_xm + offs_k[None, :] * stride_xk)
         w_ptrs = w_ptr + (offs_k[:, None] * stride_wk + offs_wn[None, :] * stride_wn)
-
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        # K is BLOCK_K-divisible by contract (caller's responsibility); the
-        # `range(0, K, BLOCK_K)` form generates a constant-trip-count loop
-        # that Triton can unroll/lower more cleanly than `range(0, cdiv)`.
-        # Empirically this avoids an MLIR pass assertion that fires when the
-        # loop bound is `tl.cdiv` AND the body has int8→fp casts AND per-iter
-        # masked loads.
-        for _ in range(0, K, BLOCK_K):
+        for _ in range(0, K_PER_SPLIT, BLOCK_K):
             x_chunk = tl.load(x_ptrs)
             w_int8 = tl.load(w_ptrs)
-            # Dequant cast: int8 -> activation dtype (bf16 or fp16).
-            w_chunk = w_int8.to(x_chunk.dtype)
-            accumulator = tl.dot(x_chunk, w_chunk, accumulator)
-
+            accumulator = tl.dot(x_chunk, w_int8.to(x_chunk.dtype), accumulator)
             x_ptrs += BLOCK_K * stride_xk
             w_ptrs += BLOCK_K * stride_wk
+        part_ptrs = (
+            part_ptr + pid_s * stride_ps + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
+        )
+        part_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(part_ptrs, accumulator, mask=part_mask)
 
-        # Apply per-output-channel scales (one per N column) after the K
-        # reduction. Math-equivalent to multiplying inside the loop.
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _w8a16_reduce_kernel(  # type: ignore[no-untyped-def]
+        part_ptr,
+        scales_ptr,
+        bias_ptr,
+        out_ptr,
+        N,
+        SPLIT_K,
+        stride_ps,
+        stride_pm,
+        stride_pn,
+        stride_om,
+        stride_on,
+        BLOCK_N: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ) -> None:
+        """Sum the K splits of one row, apply the per-channel scale and the bias, cast."""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = offs_n < N
+        total = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for split in range(0, SPLIT_K):
+            total += tl.load(
+                part_ptr + split * stride_ps + pid_m * stride_pm + offs_n * stride_pn,
+                mask=n_mask,
+                other=0.0,
+            )
         scales = tl.load(scales_ptr + offs_n, mask=n_mask, other=0.0)
-        accumulator = accumulator * scales[None, :].to(tl.float32)
-
+        total = total * scales.to(tl.float32)
         if HAS_BIAS:
             bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
-            accumulator = accumulator + bias[None, :].to(tl.float32)
-
-        out_block = accumulator.to(scales.dtype)
-        offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        out_ptrs = out_ptr + stride_om * offs_cm[:, None] + stride_on * offs_n[None, :]
-        out_mask = (offs_cm[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(out_ptrs, out_block, mask=out_mask)
+            total = total + bias.to(tl.float32)
+        tl.store(
+            out_ptr + pid_m * stride_om + offs_n * stride_on,
+            total.to(out_ptr.dtype.element_ty),
+            mask=n_mask,
+        )
 
 
 def fused_w8a16_linear(
@@ -165,7 +209,7 @@ def fused_w8a16_linear(
     scales: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Fused INT8-weight x float-activation matmul. Output dtype matches x.
+    """INT8-weight x float-activation matmul. Output dtype matches x.
 
     Shapes:
         x:      `(..., K)` bf16/fp16. Any leading dims are flattened.
@@ -175,12 +219,17 @@ def fused_w8a16_linear(
 
     Returns:
         `(..., N)` in `x.dtype`. Same numerical contract as
-        ``F.linear(x, weight.to(x.dtype) * scales[:, None], bias)`` but
-        without ever materializing the dequantized weight in HBM.
+        ``F.linear(x, weight.to(x.dtype) * scales[:, None], bias)``. Up to
+        `_DECODE_ROWS` rows the split-K kernels read the int8 weight as is;
+        more rows, or a K that the tile does not divide, dequantize it and
+        run cuBLAS.
+
+    Runs on CPU tensors only under `TRITON_INTERPRET=1`.
     """
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton not available; cannot run fused W8A16 kernel")
-    require_cuda_device(x.device, "fused_w8a16_linear")
+    if os.environ.get("TRITON_INTERPRET") != "1":
+        require_cuda_device(x.device, "fused_w8a16_linear")
     if weight.dtype != torch.int8:
         raise ValueError(f"weight must be int8, got {weight.dtype}")
     if x.shape[-1] != weight.shape[1]:
@@ -195,6 +244,12 @@ def fused_w8a16_linear(
     m_dim = x_2d.shape[0]
     n_dim = weight.shape[0]
 
+    tile = _DECODE_TILE
+    if m_dim > _DECODE_ROWS or k_dim % tile.block_k != 0:
+        w_dq = weight.to(x.dtype) * scales.to(x.dtype).unsqueeze(1)
+        bias_dq = bias.to(x.dtype) if bias is not None else None
+        return torch.nn.functional.linear(x, w_dq, bias_dq)
+
     # Scales / bias must match x's dtype so the dequant + accumulator match.
     scales_x = scales.to(x.dtype).contiguous()
     if bias is not None:
@@ -205,49 +260,61 @@ def fused_w8a16_linear(
         # in the kernel is dead-code-eliminated under the constexpr branch.
         bias_x = torch.zeros(1, device=x.device, dtype=x.dtype)
         has_bias = False
-
     out = torch.empty((m_dim, n_dim), dtype=x.dtype, device=x.device)
+    _decode_split_k(x_2d, weight, scales_x, bias_x, has_bias, out, tile)
+    return out.reshape(*orig_shape[:-1], n_dim)
 
-    # Block-size profile + warp count selected per regime. Sized to keep the
-    # fp32 accumulator (BLOCK_M * BLOCK_N elements) inside the per-warp
-    # register budget on Ampere SMs. (An earlier iteration tried
-    # `@triton.autotune` keyed on `(M, N, K)`; it regressed badly because
-    # M varies per call in continuous batching, and every new M value
-    # triggered a fresh 8-config sweep that dominated runtime. See ADR-012
-    # follow-ups: the fix is to split decode and prefill into two narrowly-
-    # autotuned kernels, but hand-picked tiles ship until that lands.)
-    if m_dim <= 16:
-        # Decode (M ≤ 16): tiny M tile, 2 warps. Accumulator 16*64 = 4 KB total.
-        block_m, block_n, block_k = 16, 64, 64
-        num_warps = 2
-    else:
-        # Prefill (M > 16): moderate 64x64 tile at 4 warps. Accumulator
-        # 64*64 fp32 = 16 KB total; 4 KB per warp comfortably fits.
-        block_m, block_n, block_k = 64, 64, 32
-        num_warps = 4
 
-    grid = (triton.cdiv(m_dim, block_m), triton.cdiv(n_dim, block_n))
-
-    _w8a16_gemm_kernel[grid](
+def _decode_split_k(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    bias: torch.Tensor,
+    has_bias: bool,
+    out: torch.Tensor,
+    tile: DecodeTile,
+) -> None:
+    """Two launches: partial sums per K split into fp32, then the reduce into `out`."""
+    m_dim, k_dim = x_2d.shape
+    n_dim = weight.shape[0]
+    n_tiles = triton.cdiv(n_dim, tile.block_n)
+    split = tile.split_k if tile.split_k > 0 else split_k_for(k_dim, tile.block_k, n_tiles)
+    if k_dim % (split * tile.block_k) != 0:
+        raise ValueError(f"K={k_dim} is not divisible by split {split} x block {tile.block_k}")
+    part = torch.empty((split, m_dim, n_dim), dtype=torch.float32, device=x_2d.device)
+    _w8a16_splitk_kernel[(n_tiles, split)](
         x_2d,
         weight,
-        scales_x,
-        bias_x,
-        out,
+        part,
         m_dim,
         n_dim,
-        k_dim,
+        k_dim // split,
         x_2d.stride(0),
         x_2d.stride(1),
         weight.stride(0),
         weight.stride(1),
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
+        BLOCK_M=block_m_for(m_dim),
+        BLOCK_N=tile.block_n,
+        BLOCK_K=tile.block_k,
+        num_warps=tile.num_warps,
+        num_stages=tile.num_stages,
+    )
+    _w8a16_reduce_kernel[(m_dim, triton.cdiv(n_dim, _REDUCE_BLOCK_N))](
+        part,
+        scales,
+        bias,
+        out,
+        n_dim,
+        split,
+        part.stride(0),
+        part.stride(1),
+        part.stride(2),
         out.stride(0),
         out.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
+        BLOCK_N=_REDUCE_BLOCK_N,
         HAS_BIAS=has_bias,
-        num_warps=num_warps,
+        num_warps=4,
     )
-
-    return out.reshape(*orig_shape[:-1], n_dim)
