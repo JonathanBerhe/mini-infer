@@ -29,11 +29,16 @@ from mini_infer.distributed.group import (
     init_distributed,
     is_initialized,
 )
-from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
+from mini_infer.distributed.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from mini_infer.distributed.loader import load_state_dict_with_tp
 
 __all__ = [
     "ColumnParallelLinear",
+    "QKVParallelLinear",
     "RowParallelLinear",
     "VocabParallelEmbedding",
     "all_gather_along_dim",

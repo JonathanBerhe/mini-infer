@@ -37,8 +37,9 @@ def test_quantizes_qwen2_linears_excluding_lm_head_by_default() -> None:
     """Default `quant='int8'` replaces all Linears except `lm_head`."""
     runner = ModelRunner.from_pretrained(MODEL_NAME, quant="int8")
     n_nn, n_int8 = _count_modules(runner._model)
-    # Qwen2.5-0.5B has 169 Linears total: 168 in layers + 1 lm_head.
-    assert n_int8 == 168, f"expected 168 Int8Linear, got {n_int8}"
+    # Qwen2.5-0.5B has 121 Linears total: 120 in the 24 layers (the merged
+    # q, k and v projection, o_proj and the three MLP projections) + 1 lm_head.
+    assert n_int8 == 120, f"expected 120 Int8Linear, got {n_int8}"
     assert n_nn == 1, f"expected exactly 1 remaining nn.Linear (lm_head), got {n_nn}"
     assert isinstance(runner._model.lm_head, nn.Linear)
     assert not isinstance(runner._model.lm_head, Int8Linear)
@@ -49,7 +50,7 @@ def test_quantize_lm_head_flag_replaces_lm_head() -> None:
     """`quant_lm_head=True` flips lm_head to Int8Linear too."""
     runner = ModelRunner.from_pretrained(MODEL_NAME, quant="int8", quant_lm_head=True)
     n_nn, n_int8 = _count_modules(runner._model)
-    assert n_int8 == 169, f"expected 169 Int8Linear (incl. lm_head), got {n_int8}"
+    assert n_int8 == 121, f"expected 121 Int8Linear (incl. lm_head), got {n_int8}"
     assert n_nn == 0, f"expected 0 remaining nn.Linear, got {n_nn}"
     assert isinstance(runner._model.lm_head, Int8Linear)
 

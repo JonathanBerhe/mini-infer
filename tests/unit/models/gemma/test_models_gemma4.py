@@ -124,22 +124,23 @@ def test_unknown_layer_type_raises() -> None:
         model.per_layer_attention()
 
 
-def test_full_layer_v_proj_is_none_under_k_eq_v() -> None:
-    """`attention_k_eq_v=True` ⇒ full layers have no v_proj parameter."""
+def test_full_layer_has_no_v_rows_under_k_eq_v() -> None:
+    """`attention_k_eq_v=True` ⇒ the merged projection of a full layer has no v rows."""
     cfg = _make_cfg()
     model = Gemma4ForCausalLM(cfg)
     sliding_layer = model.model.layers[0]
     full_layer = model.model.layers[5]
-    assert sliding_layer.self_attn.v_proj is not None  # sliding always builds v_proj
-    assert full_layer.self_attn.v_proj is None
+    assert sliding_layer.self_attn.qkv_proj.with_v  # sliding layers always project v
+    assert not full_layer.self_attn.qkv_proj.with_v
+    assert len(full_layer.self_attn.qkv_proj.split_sizes) == 2
 
 
-def test_attention_k_eq_v_off_keeps_v_proj_everywhere() -> None:
-    """If the config disables k_eq_v, full layers still build v_proj."""
+def test_attention_k_eq_v_off_keeps_v_rows_everywhere() -> None:
+    """If the config disables k_eq_v, full layers still project v."""
     cfg = _make_cfg(attention_k_eq_v=False)
     model = Gemma4ForCausalLM(cfg)
     full_layer = model.model.layers[5]
-    assert full_layer.self_attn.v_proj is not None
+    assert full_layer.self_attn.qkv_proj.with_v
 
 
 def test_expected_missing_state_keys_handles_tied_lm_head() -> None:

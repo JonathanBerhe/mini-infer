@@ -94,13 +94,16 @@ def test_rmsnorm_with_scale_false_matches_hf_gemma4() -> None:
     assert torch.allclose(out_ours, out_theirs, atol=1e-5)
 
 
-def test_gqa_attention_k_eq_v_skips_v_proj() -> None:
-    """`GroupedQueryAttention(attention_k_eq_v=True)` does not construct v_proj.
+def test_gqa_attention_k_eq_v_projects_q_and_k_only() -> None:
+    """`GroupedQueryAttention(attention_k_eq_v=True)` builds a merged projection
+    with q and k rows and no v rows.
 
-    Gemma 4 full layers reuse the post-`k_proj` tensor as V. The model
-    file relies on `self.v_proj is None` to know it should not build a
-    parameter and to filter the corresponding safetensors keys at load.
+    Gemma 4 full layers reuse the post-projection k tensor as V. The loader
+    relies on `attention_k_eq_v` to look for no `v_proj` tensor, and the
+    Gemma 4 model file drops the checkpoint copies of it.
     """
+    from mini_infer.cache.block_pool import BlockPool
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
     from mini_infer.models.blocks import GroupedQueryAttention
 
     gqa = GroupedQueryAttention(
@@ -112,11 +115,31 @@ def test_gqa_attention_k_eq_v_skips_v_proj() -> None:
         layer_idx=0,
         attention_k_eq_v=True,
     )
-    assert gqa.v_proj is None
-    # state_dict should not contain v_proj keys.
-    assert not any(k.startswith("v_proj.") for k in gqa.state_dict())
+    assert not gqa.qkv_proj.with_v
+    assert gqa.qkv_proj.split_sizes == (4 * 16, 2 * 16)
+    assert gqa.qkv_proj.weight.shape == ((4 + 2) * 16, 64)
+    assert set(gqa.state_dict()) == {"qkv_proj.weight", "o_proj.weight"}
 
-    # Sanity-check the homogeneous (default) path still wires v_proj.
+    # The block runs with k standing in for v.
+    pool = BlockPool(
+        num_blocks=4,
+        block_size=4,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=16,
+        dtype=torch.float32,
+        device="cpu",
+        attention_backend="torch",
+    )
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    x = torch.randn(1, 3, 64)
+    cos, sin = RotaryEmbedding(16)(x, torch.tensor([[0, 1, 2]]))
+    with torch.inference_mode():
+        out = gqa(x, (cos, sin), cache, torch.tensor([0, 3], dtype=torch.int32))
+    assert out.shape == (1, 3, 64)
+
+    # The homogeneous (default) block projects all three.
     gqa_default = GroupedQueryAttention(
         hidden_size=64,
         num_q_heads=4,
@@ -125,8 +148,9 @@ def test_gqa_attention_k_eq_v_skips_v_proj() -> None:
         qkv_bias=False,
         layer_idx=0,
     )
-    assert gqa_default.v_proj is not None
-    assert any(k.startswith("v_proj.") for k in gqa_default.state_dict())
+    assert gqa_default.qkv_proj.with_v
+    assert gqa_default.qkv_proj.split_sizes == (4 * 16, 2 * 16, 2 * 16)
+    assert gqa_default.qkv_proj.weight.shape == ((4 + 2 + 2) * 16, 64)
 
 
 def test_swiglu_matches_hf_qwen2() -> None:
@@ -271,3 +295,98 @@ def test_gqa_fused_rotary_write_matches_the_torch_path(monkeypatch: pytest.Monke
     fused_k, fused_v, _, _ = fused_cache.materialize_packed_kv(0)
     assert torch.equal(fused_k, plain_k)
     assert torch.equal(fused_v, plain_v)
+
+
+_TINY_QWEN2_DIMS = {
+    "vocab_size": 64,
+    "hidden_size": 32,
+    "intermediate_size": 48,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 8,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10000.0,
+    "tie_word_embeddings": False,
+}
+
+
+def test_load_weights_merges_the_hf_q_k_v_tensors() -> None:
+    """`load_weights` concatenates the HF `q_proj`, `k_proj` and `v_proj` weights and
+    biases into `qkv_proj`, q then k then v, and a block with one of them missing
+    fails the load loudly."""
+    from mini_infer.models.qwen.qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+    cfg = Qwen2Config(**_TINY_QWEN2_DIMS)
+    torch.manual_seed(0)
+    model = Qwen2ForCausalLM(cfg)
+    hidden, q_size, kv_size = 32, 4 * 8, 2 * 8
+    hf_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    hf_parts: dict[str, torch.Tensor] = {}
+    for i in range(cfg.num_hidden_layers):
+        prefix = f"model.layers.{i}.self_attn."
+        for suffix in ("weight", "bias"):
+            del hf_state[f"{prefix}qkv_proj.{suffix}"]
+            for name, rows in (("q_proj", q_size), ("k_proj", kv_size), ("v_proj", kv_size)):
+                shape = (rows, hidden) if suffix == "weight" else (rows,)
+                hf_parts[f"{prefix}{name}.{suffix}"] = torch.randn(shape)
+    hf_state.update(hf_parts)
+
+    Qwen2ForCausalLM.load_weights(model, hf_state)
+
+    assert not any(".q_proj." in key or ".k_proj." in key or ".v_proj." in key for key in hf_state)
+    for i in range(cfg.num_hidden_layers):
+        prefix = f"model.layers.{i}.self_attn."
+        layer = model.model.layers[i].self_attn.qkv_proj
+        for suffix, param in (("weight", layer.weight), ("bias", layer.bias)):
+            expected = torch.cat(
+                [hf_parts[f"{prefix}{name}.{suffix}"] for name in ("q_proj", "k_proj", "v_proj")]
+            )
+            assert torch.equal(param.detach(), expected), f"{prefix}{suffix}"
+
+    fresh = Qwen2ForCausalLM(cfg)
+    partial = {key: value.detach().clone() for key, value in fresh.state_dict().items()}
+    del partial["model.layers.0.self_attn.qkv_proj.weight"]
+    partial["model.layers.0.self_attn.q_proj.weight"] = torch.randn(q_size, hidden)
+    partial["model.layers.0.self_attn.k_proj.weight"] = torch.randn(kv_size, hidden)
+    with pytest.raises(ValueError, match=r"qkv_proj\.weight"):
+        Qwen2ForCausalLM.load_weights(fresh, partial)
+
+
+def test_gqa_splits_the_output_of_a_replaced_projection_layer() -> None:
+    """The int8 quantizer swaps `qkv_proj` for an `Int8Linear` that only gives the
+    merged output; the block splits it into q, k and v itself."""
+    from mini_infer.cache.block_pool import BlockPool
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+    from mini_infer.models.blocks import GroupedQueryAttention
+    from mini_infer.quant.int8 import Int8Linear, quantize_model_to_int8
+
+    torch.manual_seed(0)
+    block = GroupedQueryAttention(
+        hidden_size=32, num_q_heads=4, num_kv_heads=2, head_dim=8, qkv_bias=False, layer_idx=0
+    )
+    assert quantize_model_to_int8(block) == 2  # qkv_proj and o_proj
+    assert isinstance(block.qkv_proj, Int8Linear)
+
+    x = torch.randn(1, 5, 32)
+    q, k, v = block._project(x)
+    assert v is not None
+    assert (q.shape, k.shape, v.shape) == ((1, 5, 32), (1, 5, 16), (1, 5, 16))
+
+    pool = BlockPool(
+        num_blocks=4,
+        block_size=4,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        device="cpu",
+        attention_backend="torch",
+    )
+    cache = PagedKVCache(pool)
+    cache.add_request_slot()
+    cos, sin = RotaryEmbedding(8)(x, torch.tensor([[0, 1, 2, 3, 4]]))
+    with torch.inference_mode():
+        out = block(x, (cos, sin), cache, torch.tensor([0, 5], dtype=torch.int32))
+    assert out.shape == (1, 5, 32)
+    assert torch.isfinite(out).all()

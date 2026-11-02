@@ -53,7 +53,7 @@ from mini_infer.distributed.embedding import VocabParallelEmbedding
 from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
-from mini_infer.models.blocks import RMSNorm, RotaryEmbedding
+from mini_infer.models.blocks import RMSNorm, RotaryEmbedding, merge_qkv_weights
 from mini_infer.models.gemma.gemma4_decoder_layer import Gemma4DecoderLayer
 
 if TYPE_CHECKING:
@@ -318,6 +318,7 @@ class Gemma4ForCausalLM(BaseCausalLM):
 
         from mini_infer.distributed.loader import load_state_dict_with_tp
 
+        merge_qkv_weights(model, remapped)
         missing, unexpected = load_state_dict_with_tp(model, remapped)
         whitelist = model.expected_missing_state_keys()
         missing = {m for m in missing if m not in whitelist}

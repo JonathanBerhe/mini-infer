@@ -26,7 +26,11 @@ import pytest
 import torch
 from torch import nn
 
-from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
+from mini_infer.distributed.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from tests.unit._distributed_test_utils import is_multi_process_available, run_multi_process
 
 # ----------------------------- world_size=1 contract -----------------------------
@@ -52,19 +56,22 @@ def test_gqa_block_constructs_at_world_size_1() -> None:
         layer_idx=0,
     )
 
-    assert isinstance(block.q_proj, ColumnParallelLinear)
-    assert isinstance(block.k_proj, ColumnParallelLinear)
-    assert isinstance(block.v_proj, ColumnParallelLinear)
+    assert isinstance(block.qkv_proj, QKVParallelLinear)
+    assert isinstance(block.qkv_proj, ColumnParallelLinear)
     assert isinstance(block.o_proj, RowParallelLinear)
-    # At world_size=1 the per-rank slices are the entire matrix.
-    assert block.q_proj.weight.shape == (num_q_heads * head_dim, hidden)
-    assert block.k_proj.weight.shape == (num_kv_heads * head_dim, hidden)
-    assert block.v_proj.weight.shape == (num_kv_heads * head_dim, hidden)
+    # At world_size=1 the per-rank slices are the entire matrix: the q rows,
+    # then the k rows, then the v rows.
+    assert block.qkv_proj.weight.shape == ((num_q_heads + 2 * num_kv_heads) * head_dim, hidden)
+    assert block.qkv_proj.split_sizes == (
+        num_q_heads * head_dim,
+        num_kv_heads * head_dim,
+        num_kv_heads * head_dim,
+    )
     assert block.o_proj.weight.shape == (hidden, num_q_heads * head_dim)
 
 
 def test_gqa_block_world_size_1_matches_nn_linear_projections() -> None:
-    """A GQA's q_proj/k_proj/v_proj/o_proj at world_size=1 produce the
+    """A GQA's q, k, v and o projections at world_size=1 produce the
     same outputs as plain `nn.Linear` modules with the same weights.
     Bit-identical: this is what makes the existing 393 single-device
     tests indifferent to whether TP-aware linears are used."""
@@ -91,16 +98,20 @@ def test_gqa_block_world_size_1_matches_nn_linear_projections() -> None:
     k_ref = nn.Linear(hidden, num_kv_heads * head_dim, bias=False)
     v_ref = nn.Linear(hidden, num_kv_heads * head_dim, bias=False)
     o_ref = nn.Linear(num_q_heads * head_dim, hidden, bias=False)
+    q_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
     with torch.no_grad():
-        q_ref.weight.copy_(block.q_proj.weight)
-        k_ref.weight.copy_(block.k_proj.weight)
-        v_ref.weight.copy_(block.v_proj.weight)
+        q_ref.weight.copy_(block.qkv_proj.weight[:q_size])
+        k_ref.weight.copy_(block.qkv_proj.weight[q_size : q_size + kv_size])
+        v_ref.weight.copy_(block.qkv_proj.weight[q_size + kv_size :])
         o_ref.weight.copy_(block.o_proj.weight)
 
     x = torch.randn(2, 5, hidden)
-    torch.testing.assert_close(block.q_proj(x), q_ref(x), rtol=0, atol=0)
-    torch.testing.assert_close(block.k_proj(x), k_ref(x), rtol=0, atol=0)
-    torch.testing.assert_close(block.v_proj(x), v_ref(x), rtol=0, atol=0)
+    q, k, v = block.qkv_proj.project(x)
+    assert v is not None
+    torch.testing.assert_close(q, q_ref(x), rtol=0, atol=0)
+    torch.testing.assert_close(k, k_ref(x), rtol=0, atol=0)
+    torch.testing.assert_close(v, v_ref(x), rtol=0, atol=0)
     # Row-parallel input is sharded; at ws=1 sharded == full.
     o_input = torch.randn(2, 5, num_q_heads * head_dim)
     torch.testing.assert_close(block.o_proj(o_input), o_ref(o_input), rtol=0, atol=0)
@@ -139,9 +150,9 @@ def _gqa_projection_worker(
         qkv_bias=False,
         layer_idx=0,
     )
-    block.q_proj.load_full_weight(full_q_weight)
-    block.k_proj.load_full_weight(full_k_weight)
-    block.v_proj.load_full_weight(full_v_weight)
+    # The merged layer takes the three full weights concatenated, q then k
+    # then v, and keeps this rank's heads of each.
+    block.qkv_proj.load_full_weight(torch.cat([full_q_weight, full_k_weight, full_v_weight]))
     block.o_proj.load_full_weight(full_o_weight)
 
     # The o_proj input is column-sharded (consumes the upstream Q's
@@ -151,10 +162,12 @@ def _gqa_projection_worker(
     o_start = rank * o_per_rank
     o_input_local = o_input_full[..., o_start : o_start + o_per_rank].contiguous()
 
+    q, k, v = block.qkv_proj.project(x)
+    assert v is not None
     return {
-        "q": block.q_proj(x).detach().cpu(),
-        "k": block.k_proj(x).detach().cpu(),
-        "v": block.v_proj(x).detach().cpu(),
+        "q": q.detach().cpu(),
+        "k": k.detach().cpu(),
+        "v": v.detach().cpu(),
         "o": block.o_proj(o_input_local).detach().cpu(),
     }
 

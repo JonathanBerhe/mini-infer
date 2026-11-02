@@ -113,9 +113,9 @@ def _run_one_rank(rank: int, world_size: int, prompt: str) -> dict:
             embedded = model.model.embed_tokens(input_ids)
             assert torch.isfinite(embedded).all(), f"rank {rank}: embedded has NaN/Inf"
             _cos, _sin = model.rotary_emb(embedded, position_ids)
-            # First decoder layer's q_proj to validate column-parallel weights.
+            # First decoder layer's q projection to validate column-parallel weights.
             layer0 = model.model.layers[0]
-            q_local = layer0.self_attn.q_proj(embedded)
+            q_local, _k_local, _v_local = layer0.self_attn.qkv_proj.project(embedded)
             return {
                 "rank": rank,
                 "world_size": world_size,
