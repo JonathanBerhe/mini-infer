@@ -6,17 +6,20 @@ appends new K/V to the paged cache, dispatches the packed varlen
 attention kernel, and applies the output projection. One layer
 forward = one call to `packed_attention_forward`.
 
-Parameter names (`q_proj`, `k_proj`, `v_proj`, `o_proj`) align with HF
-Llama/Qwen2 so weight loading via `state_dict` is identity-rename.
+`o_proj` aligns with the HF Llama/Qwen2 name. The q, k and v projections
+live in one `qkv_proj` (`QKVParallelLinear`), so a step runs one GEMM for
+the three; `merge_qkv_weights` concatenates the HF `q_proj`, `k_proj` and
+`v_proj` tensors into it at load time.
 
 Tensor parallelism
 ------------------
-Q/K/V projections are column-parallel along the head axis (each rank
-holds a contiguous slice of heads). The output projection is
-row-parallel along its input. This is the standard Megatron pairing
-for self-attention: one all-reduce per block, none in between. The
-softmax / SDPA kernel itself operates per-head and so is unchanged
-under TP. At `world_size=1` both wrappers reduce to plain `nn.Linear`.
+The Q/K/V projection is column-parallel along the head axis (each rank
+holds a contiguous slice of heads of each of q, k and v). The output
+projection is row-parallel along its input. This is the standard
+Megatron pairing for self-attention: one all-reduce per block, none in
+between. The softmax / SDPA kernel itself operates per-head and so is
+unchanged under TP. At `world_size=1` both wrappers reduce to plain
+`nn.Linear`.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import torch
 from torch import nn
 
 from mini_infer.cache.packed_attention import packed_attention_forward
-from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
+from mini_infer.distributed.linear import QKVParallelLinear, RowParallelLinear
 from mini_infer.models.blocks.rope import apply_rotary_pos_emb
 from mini_infer.models.blocks.rope_write_kernel import (
     rope_and_write_kv,
@@ -61,20 +64,22 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = head_dim
         self.layer_idx = layer_idx
         self.attention_k_eq_v = attention_k_eq_v
-        # Q/K/V are column-parallel: each rank gets `num_*_heads // world_size`
-        # heads. Both `num_q_heads` and `num_kv_heads` therefore must divide
-        # `world_size`; ColumnParallelLinear validates that internally
-        # (because it sees `num_*_heads * head_dim` as the output dim and
-        # each head is `head_dim` columns).
-        self.q_proj = ColumnParallelLinear(hidden_size, num_q_heads * head_dim, bias=qkv_bias)
-        self.k_proj = ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
-        # Gemma 4 full layers (`attention_k_eq_v=True`) reuse the post-`k_proj`
-        # tensor as V — there is no separate v_proj parameter. We keep the
-        # attribute as `None` so weight-load filters can detect the absence.
-        if attention_k_eq_v:
-            self.v_proj: ColumnParallelLinear | None = None
-        else:
-            self.v_proj = ColumnParallelLinear(hidden_size, num_kv_heads * head_dim, bias=qkv_bias)
+        # One column-parallel layer holds q, k and v, so a step runs one GEMM
+        # for the three. Each rank gets `num_*_heads // world_size` heads of
+        # each; the layer checks that both head counts divide `world_size`.
+        # Gemma 4 full layers (`attention_k_eq_v=True`) reuse the k projection
+        # as V, so their layer has no v rows and the loader skips `v_proj`.
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            bias=qkv_bias,
+            with_v=not attention_k_eq_v,
+        )
+        # Kept apart from the layer: a quantizer can swap the layer for one
+        # that only knows the merged output.
+        self._qkv_sizes = self.qkv_proj.split_sizes
         # Row-parallel output projection: input dim is the sharded
         # head-merged activation, output is the replicated hidden state.
         # Triggers exactly one all-reduce per attention block.
@@ -106,23 +111,24 @@ class GroupedQueryAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         # (1, total_q, num_*_heads, head_dim): the packed layout, head dim last.
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        # On CUDA the three are views into the one projection output.
+        q, k, v = self._project(hidden_states)
+        query_states = q.view(hidden_shape)
+        key_states = k.view(hidden_shape)
         # Gemma 4 full layers: V reuses the post-projection K tensor BEFORE
         # k_norm and BEFORE RoPE. Capturing here keeps `value_states`
-        # pointing at the un-normalized k_proj output even after the
+        # pointing at the un-normalized k output even after the
         # `key_states = self.k_norm(...)` reassignment below (Python rebinds
         # the name; the original tensor stays alive via `value_states`).
-        if self.v_proj is not None:
-            value_states = self.v_proj(hidden_states).view(hidden_shape)
-        else:
-            value_states = key_states
+        value_states = key_states if v is None else v.view(hidden_shape)
 
-        # Per-head Q/K norm (Gemma 3+). Acts on the last dim (head_dim).
+        # Per-head Q/K norm (Gemma 3+). Acts on the last dim (head_dim). The
+        # fused norm kernel wants rows it can view as a 2-D matrix, which the
+        # views into the merged output are not, so they become contiguous first.
         if self.q_norm is not None:
-            query_states = self.q_norm(query_states)
+            query_states = self.q_norm(query_states.contiguous())
         if self.k_norm is not None:
-            key_states = self.k_norm(key_states)
+            key_states = self.k_norm(key_states.contiguous())
 
         # v_norm is applied AFTER V is captured (so for k_eq_v layers, it
         # operates on the un-k_normed, un-RoPE'd K tensor). Gemma 4's v_norm
@@ -147,6 +153,18 @@ class GroupedQueryAttention(nn.Module):
         attn_output = attn_packed.unsqueeze(0).reshape(*input_shape, -1).contiguous()
         out: torch.Tensor = self.o_proj(attn_output)
         return out
+
+    def _project(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """`(q, k, v)` of the packed hidden states; `v` is None when k doubles as v."""
+        proj = self.qkv_proj
+        if isinstance(proj, QKVParallelLinear):
+            return proj.project(hidden_states)
+        # A replacement layer (the int8 quantizer swaps in `Int8Linear`) gives
+        # the merged output; split it the way the merged layer would.
+        parts = torch.split(proj(hidden_states), list(self._qkv_sizes), dim=-1)
+        return parts[0], parts[1], parts[2] if len(parts) == 3 else None
 
     def _rope_and_append(
         self,
@@ -205,3 +223,26 @@ class GroupedQueryAttention(nn.Module):
             new_keys_packed, new_values_packed, cu_seqlens_q, self.layer_idx
         )
         return queries_packed
+
+
+def merge_qkv_weights(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Turn the `q_proj`, `k_proj` and `v_proj` entries of an HF state dict into
+    the `qkv_proj` entry of every `GroupedQueryAttention` in `model`, in place.
+
+    For each block the weights, and the biases when present, are concatenated in
+    the order of `QKVParallelLinear`: q, k, then v for a block with a v projection.
+    A block whose entries are not all present is left alone, so the loader
+    reports what is missing. Entries already named `qkv_proj` stay as they are.
+    """
+    for name, module in model.named_modules():
+        if not isinstance(module, GroupedQueryAttention):
+            continue
+        prefix = f"{name}." if name else ""
+        projections = ["q_proj", "k_proj"]
+        if not module.attention_k_eq_v:
+            projections.append("v_proj")
+        for suffix in ("weight", "bias"):
+            keys = [f"{prefix}{projection}.{suffix}" for projection in projections]
+            if all(key in state_dict for key in keys):
+                merged = torch.cat([state_dict.pop(key) for key in keys])
+                state_dict[f"{prefix}qkv_proj.{suffix}"] = merged
