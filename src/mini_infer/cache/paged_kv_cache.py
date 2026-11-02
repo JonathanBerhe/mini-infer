@@ -1,4 +1,5 @@
 import dataclasses
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -652,30 +653,73 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
         if self._static_step is not None:
             self._write_static(layer_idx, packed_k, packed_v)
             return
+        self._check_new_token_boundaries(cu_seqlens_q_new)
+        if layer_idx == 0:
+            self._reserve_new_tokens(cu_seqlens_q_new)
+        self._write_packed_kv(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
+        self._publish_step(layer_idx)
+
+    def append_kv_with(
+        self,
+        cu_seqlens_q_new: torch.Tensor,
+        layer_idx: int,
+        write: Callable[[torch.Tensor, torch.Tensor], None],
+    ) -> None:
+        """`append_kv_packed` for a caller that stores the K/V rows itself.
+
+        The cache does the bookkeeping of `append_kv_packed` and calls
+        `write(block_ids, slots)` with the pool position of every new token in
+        packed row order, so a fused kernel can store K and V straight into the
+        pool tensors of `storage_for_layer`. Uncompressed pools only. Inside a
+        static decode step `write` gets the step's fixed index.
+        """
+        if self._pool.kv_quant is not None:
+            raise RuntimeError("append_kv_with writes the uncompressed KV pool only")
+        step = self._static_step
+        if step is not None:
+            write(step.write_block_ids, step.write_slots)
+            return
+        self._check_new_token_boundaries(cu_seqlens_q_new)
+        if layer_idx == 0:
+            self._reserve_new_tokens(cu_seqlens_q_new)
+        cu_seqlens = self.cu_seqlens_q_list(cu_seqlens_q_new)
+        device = self._pool.storage_for_layer(layer_idx)[0].device
+        write(*self._step_write_index(cu_seqlens, device))
+        self._publish_step(layer_idx)
+
+    def _check_new_token_boundaries(self, cu_seqlens_q_new: torch.Tensor) -> None:
         if cu_seqlens_q_new.shape[0] != self.batch_size + 1:
             raise ValueError(
                 f"cu_seqlens_q_new has {cu_seqlens_q_new.shape[0]} entries; "
                 f"expected batch_size+1 = {self.batch_size + 1}"
             )
-        if layer_idx == 0:
-            # Before any change, so an allocation failure part way through
-            # leaves no stale index behind.
-            self._layout_changed()
-            cu_seqlens = self._read_cu_seqlens_q(cu_seqlens_q_new)
-            block_size = self._pool.block_size
-            for batch_idx in range(self.batch_size):
-                new_tokens = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
-                if new_tokens == 0:
-                    continue
-                new_total = self._num_tokens[batch_idx] + new_tokens
-                required_blocks = (new_total + block_size - 1) // block_size
-                while len(self._block_ids[batch_idx]) < required_blocks:
-                    self._block_ids[batch_idx].append(self._pool.allocate())
-                self._num_tokens[batch_idx] = new_total
-        self._write_packed_kv(layer_idx, packed_k, packed_v, cu_seqlens_q_new)
-        # Publish prompt blocks that just filled, but only on the LAST layer:
-        # earlier layers' K/V isn't written yet, so the cached entry would be
-        # incomplete. By the last layer's append, every layer has been written.
+
+    def _reserve_new_tokens(self, cu_seqlens_q_new: torch.Tensor) -> None:
+        """Layer 0 of a step: advance each slot's count and allocate its blocks.
+
+        Before any change, so an allocation failure part way through leaves no
+        stale index behind. Reads `cu_seqlens_q_new` from the device once for
+        the whole step; later layers reuse that host copy.
+        """
+        self._layout_changed()
+        cu_seqlens = self._read_cu_seqlens_q(cu_seqlens_q_new)
+        block_size = self._pool.block_size
+        for batch_idx in range(self.batch_size):
+            new_tokens = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
+            if new_tokens == 0:
+                continue
+            new_total = self._num_tokens[batch_idx] + new_tokens
+            required_blocks = (new_total + block_size - 1) // block_size
+            while len(self._block_ids[batch_idx]) < required_blocks:
+                self._block_ids[batch_idx].append(self._pool.allocate())
+            self._num_tokens[batch_idx] = new_total
+
+    def _publish_step(self, layer_idx: int) -> None:
+        """Publish prompt blocks that just filled, on the LAST layer only.
+
+        Earlier layers' K/V is not written yet, so the cached entry would be
+        incomplete. By the last layer's append, every layer has been written.
+        """
         if self._prefix_cache is not None and layer_idx == self._pool.num_layers - 1:
             for batch_idx in range(self.batch_size):
                 self._publish_filled_blocks(batch_idx)

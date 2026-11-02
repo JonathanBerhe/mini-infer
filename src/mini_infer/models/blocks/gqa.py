@@ -29,6 +29,10 @@ from torch import nn
 from mini_infer.cache.packed_attention import packed_attention_forward
 from mini_infer.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mini_infer.models.blocks.rope import apply_rotary_pos_emb
+from mini_infer.models.blocks.rope_write_kernel import (
+    rope_and_write_kv,
+    supports_rope_write_kernel,
+)
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -101,17 +105,16 @@ class GroupedQueryAttention(nn.Module):
         # packed-batch convention; per-request boundaries live in cu_seqlens_q.
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        # (1, total_q, num_*_heads, head_dim) -> (1, num_*_heads, total_q, head_dim)
-        # because apply_rotary_pos_emb expects head dim at index 1 with unsqueeze_dim=1.
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # (1, total_q, num_*_heads, head_dim): the packed layout, head dim last.
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
         # Gemma 4 full layers: V reuses the post-projection K tensor BEFORE
         # k_norm and BEFORE RoPE. Capturing here keeps `value_states`
         # pointing at the un-normalized k_proj output even after the
         # `key_states = self.k_norm(...)` reassignment below (Python rebinds
         # the name; the original tensor stays alive via `value_states`).
         if self.v_proj is not None:
-            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape)
         else:
             value_states = key_states
 
@@ -121,23 +124,15 @@ class GroupedQueryAttention(nn.Module):
         if self.k_norm is not None:
             key_states = self.k_norm(key_states)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         # v_norm is applied AFTER V is captured (so for k_eq_v layers, it
         # operates on the un-k_normed, un-RoPE'd K tensor). Gemma 4's v_norm
         # uses `with_scale=False` so it's a pure RMS rescale.
         if self.v_norm is not None:
             value_states = self.v_norm(value_states)
 
-        # Pack to (total_q, num_*_heads, head_dim) for both the cache append and
-        # the varlen attention call.
-        new_keys_packed = key_states.transpose(1, 2).squeeze(0).contiguous()
-        new_values_packed = value_states.transpose(1, 2).squeeze(0).contiguous()
-        queries_packed = query_states.transpose(1, 2).squeeze(0).contiguous()
-
-        past_key_values.append_kv_packed(
-            new_keys_packed, new_values_packed, cu_seqlens_q, self.layer_idx
+        cos, sin = position_embeddings
+        queries_packed = self._rope_and_append(
+            query_states, key_states, value_states, cos, sin, past_key_values, cu_seqlens_q
         )
 
         attn_packed = packed_attention_forward(
@@ -152,3 +147,61 @@ class GroupedQueryAttention(nn.Module):
         attn_output = attn_packed.unsqueeze(0).reshape(*input_shape, -1).contiguous()
         out: torch.Tensor = self.o_proj(attn_output)
         return out
+
+    def _rope_and_append(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Rotate q and k, append the new k and v to the cache, return packed q.
+
+        The inputs are `(1, total_q, heads, head_dim)`. On CUDA with an
+        uncompressed pool one Triton kernel (`rope_write_kernel.py`) rotates q
+        and k and stores k and v straight into the pool pages, with the
+        rounding of the PyTorch path. Other devices rotate with
+        `apply_rotary_pos_emb` and append through `append_kv_packed`.
+        """
+        pool = past_key_values._pool
+        if pool.kv_quant is None:
+            q_packed = query_states.squeeze(0)
+            k_packed = key_states.squeeze(0)
+            v_packed = value_states.squeeze(0)
+            cos_rows, sin_rows = cos.squeeze(0), sin.squeeze(0)
+            if supports_rope_write_kernel(q_packed, k_packed, v_packed, cos_rows, sin_rows):
+                k_pool, v_pool = pool.storage_for_layer(self.layer_idx)
+                rotated: list[torch.Tensor] = []
+
+                def write(block_ids: torch.Tensor, slots: torch.Tensor) -> None:
+                    rotated.append(
+                        rope_and_write_kv(
+                            q_packed,
+                            k_packed,
+                            v_packed,
+                            cos_rows,
+                            sin_rows,
+                            k_pool,
+                            v_pool,
+                            block_ids,
+                            slots,
+                        )
+                    )
+
+                past_key_values.append_kv_with(cu_seqlens_q, self.layer_idx, write)
+                return rotated[0]
+
+        # The PyTorch path: `apply_rotary_pos_emb` wants the head dim at index 1.
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states.transpose(1, 2), key_states.transpose(1, 2), cos, sin
+        )
+        new_keys_packed = key_states.transpose(1, 2).squeeze(0).contiguous()
+        new_values_packed = value_states.squeeze(0).contiguous()
+        queries_packed = query_states.transpose(1, 2).squeeze(0).contiguous()
+        past_key_values.append_kv_packed(
+            new_keys_packed, new_values_packed, cu_seqlens_q, self.layer_idx
+        )
+        return queries_packed
