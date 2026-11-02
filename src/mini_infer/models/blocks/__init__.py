@@ -6,7 +6,7 @@ A block that only one family uses lives in that family's package instead
 
 from mini_infer.cache.block_pool import StreamSpec
 from mini_infer.models.blocks.gemma_rmsnorm import GemmaRMSNorm
-from mini_infer.models.blocks.gqa import GroupedQueryAttention
+from mini_infer.models.blocks.gqa import GroupedQueryAttention, merge_qkv_weights
 from mini_infer.models.blocks.mla import MLAAttention
 from mini_infer.models.blocks.moe.glm_moe_gate import GlmMoeFFN, GlmNoAuxTcGate
 from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert, MoEFFN
@@ -29,5 +29,6 @@ __all__ = [
     "SwiGLU",
     "TransformerBlock",
     "apply_rotary_pos_emb",
+    "merge_qkv_weights",
     "rotate_half",
 ]
