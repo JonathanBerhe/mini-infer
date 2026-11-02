@@ -56,6 +56,25 @@ def test_split_k_grows_to_the_program_target_within_the_divisibility() -> None:
     assert split_k_for(3584, 64, 1024) == 1
 
 
+def test_the_tile_follows_the_architecture_and_the_k(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(int8_kernel, "_DECODE_TILE", None)
+    monkeypatch.setattr(int8_kernel, "is_cuda_device", lambda device: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    assert int8_kernel.decode_tile_for("cuda", 18944) == int8_kernel._HOPPER_TILE
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
+    assert int8_kernel.decode_tile_for("cuda", 3584) == int8_kernel._BLACKWELL_TILE
+    assert int8_kernel.decode_tile_for("cuda", 18944) == int8_kernel._BLACKWELL_LONG_K_TILE
+    # A tile set by a bench wins everywhere.
+    chosen = DecodeTile(block_n=32, block_k=64, split_k=2, num_warps=4, num_stages=2)
+    monkeypatch.setattr(int8_kernel, "_DECODE_TILE", chosen)
+    assert int8_kernel.decode_tile_for("cuda", 18944) == chosen
+    # Off CUDA (the interpreter) the H100 tile serves.
+    monkeypatch.setattr(int8_kernel, "_DECODE_TILE", None)
+    monkeypatch.setattr(int8_kernel, "is_cuda_device", lambda device: False)
+    assert int8_kernel.decode_tile_for("cpu", 3584) == int8_kernel._HOPPER_TILE
+
+
 def test_block_m_pads_the_rows_to_the_next_tile() -> None:
     assert [block_m_for(rows) for rows in (1, 16, 17, 32, 33, 64)] == [16, 16, 32, 32, 64, 64]
     with pytest.raises(ValueError, match="64 rows"):

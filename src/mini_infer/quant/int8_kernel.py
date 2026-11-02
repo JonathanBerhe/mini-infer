@@ -60,13 +60,7 @@ _REDUCE_BLOCK_N = 1024
 
 @dataclasses.dataclass(frozen=True)
 class DecodeTile:
-    """The tile of the split-K decode kernel. `split_k=0` picks the split from the shape.
-
-    The defaults come from a sweep on one H100 over the Qwen2.5-7B shapes at
-    1 and 8 rows: 128 by 128 tiles with 8 warps sat within a few percent of
-    the best tile of every shape, at 2.1 to 2.25 TB/s of int8 weight reads
-    on the MLP shapes.
-    """
+    """The tile of the split-K decode kernel. `split_k=0` picks the split from the shape."""
 
     block_n: int = 128
     block_k: int = 128
@@ -75,8 +69,30 @@ class DecodeTile:
     num_stages: int = 3
 
 
-# The tile in use; a bench can swap it to sweep the configurations.
-_DECODE_TILE = DecodeTile()
+# The tiles come from sweeps over the Qwen2.5-7B shapes at 1 and 8 rows, with
+# the calls captured in a CUDA graph. On one H100, 128 by 128 tiles with 8
+# warps sat within a few percent of the best tile of every shape, at 2.1 to
+# 2.25 TB/s of int8 reads on the MLP shapes. On one B200 the best tiles use 4
+# warps, and the long-K shape (`down_proj`, K=18944) wants 64-wide K tiles
+# with an 8-way split and one more pipeline stage.
+_HOPPER_TILE = DecodeTile(block_n=128, block_k=128, split_k=0, num_warps=8, num_stages=3)
+_BLACKWELL_TILE = DecodeTile(block_n=128, block_k=128, split_k=0, num_warps=4, num_stages=3)
+_BLACKWELL_LONG_K_TILE = DecodeTile(block_n=128, block_k=64, split_k=0, num_warps=4, num_stages=4)
+_LONG_K = 8192
+
+# A tile set here wins over `decode_tile_for`; a bench swaps it to sweep the configurations.
+_DECODE_TILE: DecodeTile | None = None
+
+
+def decode_tile_for(device: torch.device | str, k_dim: int) -> DecodeTile:
+    """The tile for this GPU and this K: Blackwell gets its own, every other device the H100's."""
+    if _DECODE_TILE is not None:
+        return _DECODE_TILE
+    if is_cuda_device(device) and torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability(device)
+        if major >= 10:
+            return _BLACKWELL_LONG_K_TILE if k_dim >= _LONG_K else _BLACKWELL_TILE
+    return _HOPPER_TILE
 
 
 def split_k_for(k_dim: int, block_k: int, n_tiles: int) -> int:
@@ -244,7 +260,7 @@ def fused_w8a16_linear(
     m_dim = x_2d.shape[0]
     n_dim = weight.shape[0]
 
-    tile = _DECODE_TILE
+    tile = decode_tile_for(x.device, k_dim)
     if m_dim > _DECODE_ROWS or k_dim % tile.block_k != 0:
         w_dq = weight.to(x.dtype) * scales.to(x.dtype).unsqueeze(1)
         bias_dq = bias.to(x.dtype) if bias is not None else None
