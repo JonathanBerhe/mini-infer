@@ -189,11 +189,43 @@ the end of every call. On the B200 it saves 0.09 ms. The H100 still gains
 at concurrency 1, 195 against 187 tokens per second, because the shorter
 graph launches faster.
 
+## Follow-up on 2026-11-03: the residual add after the FFN, and the H100 tile
+
+Each block now returns its FFN output and its residual without the last
+add. The input norm of the next block adds the two and normalizes the sum
+in one kernel, and after the last block the final norm does the same. One
+H100 and one B200 ran the change against the loop of main, in one container
+each. The tokens were identical.
+
+| Configuration at concurrency 8 | H100 GPU ms per decode step | H100 kernels | B200 GPU ms per decode step | B200 kernels |
+|---|---:|---:|---:|---:|
+| bf16, the loop of main | 6.23 | 376 | 3.44 | 404 |
+| bf16, the add in the next norm | 6.18 | 348 | 3.40 | 376 |
+| int8, the loop of main | 4.69 | 348 | 3.13 | 376 |
+| int8, the add in the next norm | 4.60 | 320 | 3.09 | 348 |
+
+The change removes 28 kernels per step and 0.04 to 0.09 ms of GPU time.
+
+The same run swept the tiles of the int8 kernel on the H100, every call in
+a CUDA graph. The H100 tile came from the sweep of #66, when the reduce ran
+as its own kernel. With the reduce in the kernel it is far from the best.
+
+| Shape on the H100 at 8 rows | Tile of main, us | Two kernels as in #66, us | Best tile, us |
+|---|---:|---:|---:|
+| gate and up, 18944 by 3584 | 38.5 | 33.7 | 29.4 |
+| down, 3584 by 18944 | 33.8 | 35.9 | 30.1 |
+| q, k and v, 4608 by 3584 | 10.4 | 11.2 | 8.3 |
+| o, 3584 by 3584 | 7.1 | 8.9 | 6.8 |
+
+Per layer the best tiles take 104 us against 128 us for the tile of main,
+about 0.68 ms of an int8 decode step. All of them use 4 warps, as the
+Blackwell tiles do.
+
 ## What is next
 
-- On the H100 the int8 kernel with its own reduce takes about 0.13 ms per
-  step more than the split-K kernel and the reduce kernel together. A sweep
-  of the split count with the fused reduce is the first thing to try.
+- The H100 tile of the int8 kernel. A sweep that records every tile, not
+  only the best per shape, gives one rule for all shapes and batch sizes.
+  The B200 tiles also date from before the reduce moved into the kernel.
 - One GEMM for gate and up saves 1.8 us per layer with int8, because it
   pays the fixed cost of a call once. It saves nothing with bf16.
 - The eager prefill step pays about 20 to 50 us of host time per launch. A

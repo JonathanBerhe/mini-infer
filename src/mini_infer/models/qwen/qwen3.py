@@ -26,7 +26,13 @@ from mini_infer.distributed.embedding import VocabParallelEmbedding
 from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
-from mini_infer.models.blocks import RMSNorm, RotaryEmbedding, TransformerBlock, merge_qkv_weights
+from mini_infer.models.blocks import (
+    RMSNorm,
+    RotaryEmbedding,
+    TransformerBlock,
+    merge_qkv_weights,
+    run_decoder_layers,
+)
 
 if TYPE_CHECKING:
     from mini_infer.cache.paged_kv_cache import PagedKVCache
@@ -144,12 +150,16 @@ class Qwen3ForCausalLM(BaseCausalLM):
         """
         x = self.model.embed_tokens(input_ids)
         position_embeddings = self.rotary_emb(x, position_ids)
-        for i, layer in enumerate(self.model.layers):
-            x = layer(x, position_embeddings, past_key_values, cu_seqlens_q)
-            if tap_layers is not None and i in tap_layers:
-                assert hidden_state_sink is not None
-                hidden_state_sink[i] = x
-        x = self.model.norm(x)
+        x = run_decoder_layers(
+            self.model.layers,
+            self.model.norm,
+            x,
+            position_embeddings,
+            past_key_values,
+            cu_seqlens_q,
+            tap_layers=tap_layers,
+            hidden_state_sink=hidden_state_sink,
+        )
         logits: torch.Tensor = self.lm_head(x)
         return logits
 
