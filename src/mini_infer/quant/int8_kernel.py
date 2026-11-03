@@ -72,13 +72,16 @@ class DecodeTile:
     num_stages: int = 3
 
 
-# The tiles come from sweeps over the Qwen2.5-7B shapes at 1 and 8 rows, with
-# the calls captured in a CUDA graph. On one H100, 128 by 128 tiles with 8
-# warps sat within a few percent of the best tile of every shape, at 2.1 to
-# 2.25 TB/s of int8 reads on the MLP shapes. On one B200 the best tiles use 4
-# warps, and the long-K shape (`down_proj`, K=18944) wants 64-wide K tiles
-# with an 8-way split and one more pipeline stage.
-_HOPPER_TILE = DecodeTile(block_n=128, block_k=128, split_k=0, num_warps=8, num_stages=3)
+# The tiles come from sweeps over the Qwen2.5-7B shapes at 1 to 16 rows, with
+# the calls captured in a CUDA graph and the reduce in the kernel. Each pair
+# is the one with the lowest per-layer time at 1 and 8 rows. On one H100 the
+# best tiles are 64 wide with 4 warps: 104 us per layer at 8 rows against
+# 127 us for the 128 by 128, 8-warp tile of the separate-reduce kernel. The
+# long-K shape (`down_proj`, K=18944) wants two more pipeline stages, and the
+# split from the shape is 4. On one B200 the best tiles are 128 wide with 4
+# warps, and the long-K shape wants 64-wide K tiles and one more stage.
+_HOPPER_TILE = DecodeTile(block_n=64, block_k=128, split_k=0, num_warps=4, num_stages=3)
+_HOPPER_LONG_K_TILE = DecodeTile(block_n=64, block_k=128, split_k=0, num_warps=4, num_stages=5)
 _BLACKWELL_TILE = DecodeTile(block_n=128, block_k=128, split_k=0, num_warps=4, num_stages=3)
 _BLACKWELL_LONG_K_TILE = DecodeTile(block_n=128, block_k=64, split_k=0, num_warps=4, num_stages=4)
 _LONG_K = 8192
@@ -98,11 +101,12 @@ def decode_tile_for(device: torch.device | str, k_dim: int) -> DecodeTile:
     """The tile for this GPU and this K: Blackwell gets its own, every other device the H100's."""
     if _DECODE_TILE is not None:
         return _DECODE_TILE
+    long_k = k_dim >= _LONG_K
     if is_cuda_device(device) and torch.cuda.is_available():
         major, _ = torch.cuda.get_device_capability(device)
         if major >= 10:
-            return _BLACKWELL_LONG_K_TILE if k_dim >= _LONG_K else _BLACKWELL_TILE
-    return _HOPPER_TILE
+            return _BLACKWELL_LONG_K_TILE if long_k else _BLACKWELL_TILE
+    return _HOPPER_LONG_K_TILE if long_k else _HOPPER_TILE
 
 
 def split_k_for(k_dim: int, block_k: int, n_tiles: int) -> int:
