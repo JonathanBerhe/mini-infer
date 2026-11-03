@@ -7,7 +7,7 @@ Model: `Qwen/Qwen2.5-7B` in bf16, and the same weights as weight-only int8
 Workload: the eight bench prompts, greedy decode, 32 new tokens, concurrency
 1 and 8, through `ContinuousScheduler` on `PagedKVCache`
 Engine: mini-infer from `1aed800` (the `--profile` flag) to `4a97186` (the
-split-K int8 kernel), decisions in
+split-K int8 kernel), plus the follow-up of 2026-11-03 at the end, decisions in
 [ADR-050](../decisions/ADR-050-paged-decode-cuda-graph.md) and
 [ADR-051](../decisions/ADR-051-paged-decode-fewer-kernels.md)
 Scripts: `scripts/bench/modal_bench_all.py --profile` for the first profile,
@@ -93,12 +93,56 @@ weights at 2.1 to 2.25 TB/s. On the B200 cuBLAS reaches 6 TB/s on bf16 and
 the Triton kernel about 4 TB/s of int8 bytes, so int8 wins by 1.2 to 1.25
 times there against 1.6 to 1.7 on the H100.
 
+## Follow-up on 2026-11-03: one launch per int8 linear
+
+The reduce of the split-K kernel moved into the kernel. Each program stores
+its partial sums and adds one to a counter of its n-tile. The program that
+arrives last sums the splits in split order, applies the scale and the bias,
+casts the result and resets the counter. The sum runs in the same order as
+in the reduce kernel, so the result is bit for bit the same. The linears
+without a bias also stop filling a one-element dummy bias per call, which
+was 112 fills per step. Two host changes came with it: the sampled ids skip
+the gather kernel when the batch is the first rows of the buffer, and the
+scheduler decodes the text of a request one id at a time instead of all its
+ids per step.
+
+One B200, one container, the three configurations in turn, concurrency 8
+then 1, 32 new tokens. The kernel test ran first: on four shapes and three
+row counts, 0 of 320 calls differed from the two-kernel path. The two int8
+configurations decoded identical tokens.
+
+| Configuration | B200 tok/s at 8 | B200 tok/s at 1 | GPU ms per decode step at 8 | Graph nodes | Prefill launches |
+|---|---:|---:|---:|---:|---:|
+| Graph, async sampling, bf16 | 2040 | 254 | 3.60 | 460 | 405 |
+| Int8, split-K kernel and reduce kernel | 2163 | 265 | 3.31 | 684 | 657 |
+| Int8, the reduce fused into the kernel | 2184 | 294 | 3.23 | 432 | 405 |
+
+The int8 graph now has fewer nodes than the bf16 graph. The GPU time of the
+decode step fell by 0.08 ms. The fused kernel takes 2.25 ms per step against
+1.81 plus 0.39 ms for the pair, so the fusion itself costs 0.05 ms, and the
+112 dummy fills that went away gave 0.13 ms back. At concurrency 8 the two
+int8 rows are within the run-to-run variance of each other. At concurrency
+1 the step is shorter by 11 percent, because the launch of a graph of 432
+nodes costs less than one of 684. In this run int8 beat bf16 by 7 percent
+at concurrency 8 and by 16 percent at concurrency 1, where the chain run
+above saw a wash. The two runs differ by the variance of about 6 percent,
+not by a change in the kernel.
+
+The profile corrects the guess above that a 3.4 ms step is host-bound. In
+every configuration the host waits about 2 ms per decode step for the GPU,
+so with the graph the decode step on the B200 is GPU-bound and the host has
+slack. The prefill step runs eagerly, and its launches set its host time.
+The int8 prefill now launches 405 kernels, the same count as bf16, against
+657 with the separate reduce. The profiler gives one prefill sample per
+configuration, and those samples did not follow the launch count, so this
+run does not show the prefill gain.
+
 ## What is next
 
-- The H100 step with int8 is 4.6 ms of GPU time and about 2.3 ms of host
-  work plus the launch of 657 graph nodes, so the host is close to the limit
-  again. The same holds on the B200 at 3.4 ms. The next lever on both is
-  node count and scheduler work: fuse the reduce into the int8 kernel, and
-  trim the Python of a step.
+- The H100 did not run with the fused reduce. By the same count its int8
+  graph goes from 657 to about 433 nodes, and its step loses the 0.32 ms of
+  the reduce kernel less the cost of the fusion.
 - The int8 kernel on Blackwell needs TMA loads to reach the bandwidth that
   cuBLAS reaches. That is a kernel of its own.
+- The eager prefill step pays about 20 to 50 us of host time per launch. A
+  graph per prefill bucket, or fewer launches per layer, would cut it.

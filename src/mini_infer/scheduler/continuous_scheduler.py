@@ -72,6 +72,7 @@ from mini_infer.engine.dspark.spec import (
 )
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample, sample_batch, sample_tokens
+from mini_infer.engine.tokenizer import TextStream
 from mini_infer.exceptions import EngineNotRunningError, OutOfMemoryError
 from mini_infer.scheduler.request_state import (
     FinishReason,
@@ -836,15 +837,28 @@ class ContinuousScheduler:
         return req.last_logits
 
     def _emit_new_text(self, req: RunningRequest, num_tokens: int) -> None:
-        """Decode-and-diff: re-decode all tokens so far and emit the new suffix.
+        """Emit the text of the last `num_tokens` ids of `req` as ONE step.
 
-        Handles multi-byte UTF-8 correctly at O(n) cost per call. One call emits
-        ONE step, and `num_tokens` says how many tokens it carries.
+        The request's `TextStream` decodes the new ids with a short window of
+        the ids before them, so the cost of a step does not grow with the
+        output. A tokenizer without a streaming backend re-decodes all the ids
+        and the step carries the new suffix.
         """
-        current_text = self._runner.tokenizer.decode(req.tokens_generated)
-        delta = current_text[len(req.last_text) :]
-        req.last_text = current_text
+        stream = req.text_stream
+        if stream is None:
+            stream = req.text_stream = self._text_stream()
+        delta = stream.push(req.tokens_generated[-num_tokens:])
+        req.last_text = stream.text
         self._emit(req, GenerationStep(text=delta, num_tokens=num_tokens))
+
+    def _text_stream(self) -> TextStream:
+        """A fresh `TextStream` of the runner's tokenizer, or of its plain `decode`."""
+        tokenizer = self._runner.tokenizer
+        make = getattr(tokenizer, "text_stream", None)
+        if make is not None:
+            stream: TextStream = make()
+            return stream
+        return TextStream(tokenizer.decode)
 
     def _draft_speculators(self) -> dict[int, list[int]]:
         """Draft one block per speculating DECODING request. Return verify inputs.
