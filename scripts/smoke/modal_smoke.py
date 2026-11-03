@@ -35,21 +35,23 @@ if _IS_BLACKWELL:
     # prebuilt wheel is pinned to torch 2.5; FlashInfer covers attention.
     image = (
         modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-        .pip_install("torch>=2.6", extra_index_url="https://download.pytorch.org/whl/cu128")
+        .pip_install(
+            "torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128"
+        )
         .pip_install(
             "transformers>=4.40",
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",
             "pydantic>=2.5",
         )
-        .pip_install("flashinfer-python>=0.6.10rc1")
+        .pip_install("flashinfer-python==0.6.10")
         .add_local_python_source("mini_infer")
     )
 else:
     image = (
         modal.Image.debian_slim(python_version="3.11")
         .pip_install(
-            "torch>=2.4",
+            "torch==2.10.0",
             "transformers>=4.40",
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",

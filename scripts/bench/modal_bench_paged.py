@@ -12,7 +12,7 @@ app = modal.App("mini-infer-paged-bench")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "torch>=2.4",
+        "torch==2.10.0",
         "transformers>=4.40",
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",

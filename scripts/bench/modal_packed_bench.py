@@ -91,15 +91,17 @@ if _IS_BLACKWELL:
     # the prebuilt flash-attn 2.8.3 wheel is pinned to torch 2.5 anyway.
     image = (
         modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-        .pip_install("torch>=2.6", extra_index_url="https://download.pytorch.org/whl/cu128")
+        .pip_install(
+            "torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128"
+        )
         .pip_install(
             "transformers>=4.40",
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",
             "pydantic>=2.5",
-            "triton>=3.0",
+            "triton==3.6.0",
         )
-        .pip_install("flashinfer-python>=0.6.10rc1")
+        .pip_install("flashinfer-python==0.6.10")
         .add_local_file(
             str(Path(__file__).parent.parent / "data" / "technical_passage.md"),
             "/root/scripts/data/technical_passage.md",
@@ -119,10 +121,10 @@ else:
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",
             "pydantic>=2.5",
-            "triton>=3.0",
+            "triton==3.1.0",
         )
         .pip_install(FLASH_ATTN_WHEEL)
-        .pip_install("flashinfer-python>=0.6.10rc1")
+        .pip_install("flashinfer-python==0.6.10")
         .add_local_file(
             str(Path(__file__).parent.parent / "data" / "technical_passage.md"),
             "/root/scripts/data/technical_passage.md",

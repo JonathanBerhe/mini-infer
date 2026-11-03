@@ -44,11 +44,11 @@ image = (
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",
-        "triton>=3.0",
+        "triton==3.1.0",
         "pytest>=8.0",
     )
     .pip_install(FLASH_ATTN_WHEEL)
-    .pip_install("flashinfer-python>=0.6.10rc1")
+    .pip_install("flashinfer-python==0.6.10")
     # `tests/unit/conftest.py` imports other test modules, so the image gets the whole tree.
     # `pyproject.toml` supplies the marker definitions.
     .add_local_dir(str(_REPO / "tests"), "/root/tests")

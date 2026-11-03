@@ -41,7 +41,7 @@ _TEST_TIMEOUT = int(os.environ.get("MINI_INFER_TEST_TIMEOUT", "300"))
 # Inkling pins the torch attention backend, so no flash-attn or FlashInfer.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch>=2.7", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
     .pip_install(
         "transformers>=5.14,<5.15",
         "safetensors",

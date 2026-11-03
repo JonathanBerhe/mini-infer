@@ -71,7 +71,7 @@ hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
 # straight onto the GPU instead of through 55 GB of host memory.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch>=2.7", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
     .pip_install(
         "transformers>=5.14,<5.15",
         "accelerate",

@@ -74,9 +74,9 @@ app = modal.App("mini-infer-v4-projection-dtype-probe")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch>=2.6", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("transformers>=4.40", "safetensors>=0.4", "huggingface_hub>=0.20")
-    .pip_install("flashinfer-python>=0.6.10rc1")
+    .pip_install("flashinfer-python==0.6.10")
 )
 for _rel in _PROMPT_FILES:
     image = image.add_local_file(str(_REPO_ROOT / _rel), f"{_REMOTE_PROMPT_DIR}/{Path(_rel).name}")
