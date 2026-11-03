@@ -11,6 +11,12 @@ It keeps the PyTorch path's casts and their order, but its sum of squares
 runs in another order than PyTorch's reduction. So a few outputs differ
 from the PyTorch path in the last bit (ADR-045).
 
+`fused_add_rms_norm` also adds a residual before the norm, the pattern of a
+decoder block after its attention. It stores the sum rounded to its dtype,
+as PyTorch's add does, and normalizes that rounded sum with the arithmetic
+of `_rms_norm_kernel`. So its two outputs equal a PyTorch add followed by
+`fused_rms_norm` bit for bit, in one launch instead of two.
+
 CUDA-only. `rmsnorm.RMSNorm(fused=True)` and `rmsnorm.head_rms_norm(fused=True)`
 dispatch here when `rms_norm_rows` accepts the input, and keep the PyTorch
 path otherwise.
@@ -100,6 +106,47 @@ if _TRITON_AVAILABLE:
                 y = tl.load(w_ptr + cols, mask=ok, other=0.0).to(tl.float32) * y
         tl.store(out_ptr + row * n_cols + cols, y.to(out_ty), mask=ok)
 
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _add_rms_norm_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        r_ptr,
+        w_ptr,
+        out_ptr,
+        sum_ptr,
+        n_cols,
+        stride_x,
+        stride_r,
+        eps,
+        inv_n,
+        BLOCK: tl.constexpr,
+        HAS_WEIGHT: tl.constexpr,
+    ) -> None:
+        """`_rms_norm_kernel` of `r + x`, one program per row.
+
+        The sum is rounded to the dtype of `sum_ptr` and stored, then the norm
+        reads the rounded values, as `RMSNorm` reads the output of a PyTorch
+        add. The norm is `_rms_norm_kernel`'s `SCALE_FIRST=False` order.
+        """
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.arange(0, BLOCK)
+        ok = cols < n_cols
+        sum_ty = sum_ptr.dtype.element_ty
+        x = tl.load(x_ptr + row * stride_x + cols, mask=ok, other=0.0).to(tl.float32)
+        r = tl.load(r_ptr + row * stride_r + cols, mask=ok, other=0.0).to(tl.float32)
+        summed = (r + x).to(sum_ty)
+        tl.store(sum_ptr + row * n_cols + cols, summed, mask=ok)
+        h = summed.to(tl.float32)
+        variance = tl.sum(h * h, axis=0) * inv_n
+        scale = tl.math.rsqrt(variance + eps)
+        y = (h * scale).to(sum_ty).to(tl.float32)
+        if HAS_WEIGHT:
+            y = tl.load(w_ptr + cols, mask=ok, other=0.0).to(tl.float32) * y
+        tl.store(out_ptr + row * n_cols + cols, y.to(out_ptr.dtype.element_ty), mask=ok)
+
+
+def _num_warps(block: int) -> int:
+    return min(max(block // 512, 1), 8)
+
 
 def fused_rms_norm(
     rows: torch.Tensor,
@@ -133,6 +180,52 @@ def fused_rms_norm(
         BLOCK=block,
         HAS_WEIGHT=weight is not None,
         SCALE_FIRST=scale_first,
-        num_warps=min(max(block // 512, 1), 8),
+        num_warps=_num_warps(block),
     )
     return out
+
+
+def fused_add_rms_norm(
+    rows: torch.Tensor,
+    residual_rows: torch.Tensor,
+    shape: torch.Size,
+    weight: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(norm(residual + x), residual + x)` in one launch, both in `shape`.
+
+    `rows` and `residual_rows` come from `rms_norm_rows` and have one dtype.
+    The sum has that dtype; the norm has the dtype of `fused_rms_norm`. The
+    launch uses `fused_rms_norm`'s block and warps, so the norm sums its
+    squares in the same order. Runs on CPU tensors only under `TRITON_INTERPRET=1`.
+    """
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("fused_add_rms_norm needs Triton")
+    if rows.shape != residual_rows.shape or rows.dtype != residual_rows.dtype:
+        raise ValueError(
+            f"x rows {tuple(rows.shape)} {rows.dtype} and residual rows "
+            f"{tuple(residual_rows.shape)} {residual_rows.dtype} must match"
+        )
+    n_rows, n_cols = rows.shape
+    dtype = rows.dtype if weight is None else torch.promote_types(weight.dtype, rows.dtype)
+    out = torch.empty(shape, dtype=dtype, device=rows.device)
+    summed = torch.empty(shape, dtype=rows.dtype, device=rows.device)
+    if n_rows == 0:
+        return out, summed
+    block = triton.next_power_of_2(n_cols)
+    _add_rms_norm_kernel[(n_rows,)](
+        rows,
+        residual_rows,
+        rows if weight is None else weight,
+        out,
+        summed,
+        n_cols,
+        rows.stride(0),
+        residual_rows.stride(0),
+        eps,
+        1.0 / n_cols,
+        BLOCK=block,
+        HAS_WEIGHT=weight is not None,
+        num_warps=_num_warps(block),
+    )
+    return out, summed

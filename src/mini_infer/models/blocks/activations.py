@@ -27,12 +27,21 @@ from functools import partial
 import torch
 from torch.nn import functional
 
+from mini_infer.models.blocks.silu_mul_kernel import fused_silu_mul, silu_mul_rows
+
 # A gate-up combiner: (gate_proj(x), up_proj(x)) -> gated activation.
 GateUpActivation = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """Standard SwiGLU: `silu(gate) * up`."""
+    """Standard SwiGLU: `silu(gate) * up`.
+
+    On CUDA one Triton kernel computes it with the roundings of the two
+    PyTorch ops (`silu_mul_kernel.py`); other devices run the two ops.
+    """
+    rows = silu_mul_rows(gate, up)
+    if rows is not None:
+        return fused_silu_mul(*rows, gate.shape)
     return functional.silu(gate) * up
 
 
