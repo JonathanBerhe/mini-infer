@@ -221,11 +221,33 @@ Per layer the best tiles take 104 us against 128 us for the tile of main,
 about 0.68 ms of an int8 decode step. All of them use 4 warps, as the
 Blackwell tiles do.
 
+## Follow-up on 2026-11-03: new H100 tiles for the int8 kernel
+
+A second sweep kept the time of every 4-warp tile and split on the four
+shapes at 1, 4, 8 and 16 rows, on one H100 and one B200. For each GPU it took
+the tile for K below 8192 and the tile for the long-K `down_proj` with the
+lowest per-layer time at 1 and 8 rows. On the H100 the pair is 64 by 128
+tiles with 3 stages, and 5 stages for the long K. Then the int8 model ran
+with the tiles of main and with the new pair, in one container.
+
+| H100, int8 | Tiles of main | New tiles |
+|---|---:|---:|
+| Per-layer GEMM time at 1 row, us | 124.2 | 115.5 |
+| Per-layer GEMM time at 8 rows, us | 127.4 | 103.7 |
+| GPU ms per decode step at concurrency 8 | 4.67 | 4.01 |
+| Tokens per second at concurrency 8 | 1488 | 1671 |
+| Tokens per second at concurrency 1 | 197 | 204 |
+
+The int8 kernel takes 3.00 ms per step against 3.63 ms. A new tile changes
+the order of the sums, so the int8 tokens move: at concurrency 8 five of
+eight requests matched the tiles of main to the end.
+
+On the B200 the best pair is the Blackwell tiles of main, within 0.4 us per
+layer. A switch to 64-wide tiles at 8 rows and more saves 5 us per layer,
+about 2 percent of a step, and the repo does not take it.
+
 ## What is next
 
-- The H100 tile of the int8 kernel. A sweep that records every tile, not
-  only the best per shape, gives one rule for all shapes and batch sizes.
-  The B200 tiles also date from before the reduce moved into the kernel.
 - One GEMM for gate and up saves 1.8 us per layer with int8, because it
   pays the fixed cost of a call once. It saves nothing with bf16.
 - The eager prefill step pays about 20 to 50 us of host time per launch. A
