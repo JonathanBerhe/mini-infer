@@ -2,8 +2,9 @@
 
 LSA (Kubicek et al., arXiv 2610.42147) decides which earlier keys a query
 reads. The attention over the selected keys is ordinary softmax attention, and
-the KV cache is unchanged. This module is the selection only, for the
-distilled flat variant the authors serve on Qwen3.8-27B. The semantics follow
+the KV cache is unchanged. This module holds the selection, for the distilled
+flat variant the authors serve on Qwen3.8-27B, and `attend_selected`, the
+attention of each query over its own selected keys. The semantics follow
 the authors' plain-PyTorch reference (`lsa/core/reference.py` and
 `lsa/core/ward.py` in `Prefrontal-AI/latent-sparse-attention`, Apache-2.0),
 which `tests/unit/models/qwen/test_lsa_parity.py` compares against.
@@ -40,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from torch import nn
 from torch.nn import functional
 
 # Merge rounds before Ward gives up. Each round at least halves the merges
@@ -137,32 +139,41 @@ def index_query_input(query: torch.Tensor, num_kv_heads: int, rotary_dim: int) -
     return grouped.sum(-2, dtype=torch.float32).flatten(-2)
 
 
-class IndexProjection:
+class IndexProjection(nn.Module):
     """One layer's two maps into the index space, in the served numerics.
 
     The maps and the matmuls are bf16. An index key is normalized in fp32 and
     stored bf16. An index query is cast to bf16 before its matmul and stays
     fp32 after the normalization.
+
+    The maps are non-persistent buffers: they move with the model on `.to()`
+    but stay out of its `state_dict`, because they come from their own file
+    and not from the checkpoint. A whole-model dtype cast can widen them, and
+    the matmuls cast them back to bf16, which is exact.
     """
+
+    query_map: torch.Tensor
+    key_map: torch.Tensor
 
     def __init__(self, query_map: torch.Tensor, key_map: torch.Tensor) -> None:
         """`query_map` and `key_map` are `[input_dim, index_dim]`."""
+        super().__init__()
         if query_map.shape != key_map.shape or query_map.dim() != 2:
             raise ValueError(
                 f"the maps must share one [input_dim, index_dim] shape, got "
                 f"{tuple(query_map.shape)} and {tuple(key_map.shape)}"
             )
-        self.query_map = query_map.to(torch.bfloat16)
-        self.key_map = key_map.to(torch.bfloat16)
+        self.register_buffer("query_map", query_map.to(torch.bfloat16), persistent=False)
+        self.register_buffer("key_map", key_map.to(torch.bfloat16), persistent=False)
 
     def index_keys(self, key_input: torch.Tensor) -> torch.Tensor:
         """`(..., input_dim)` -> `(..., index_dim)` bf16 unit rows."""
-        projected = key_input.to(torch.bfloat16) @ self.key_map
+        projected = key_input.to(torch.bfloat16) @ self.key_map.to(torch.bfloat16)
         return functional.normalize(projected.float(), dim=-1).to(torch.bfloat16)
 
     def index_queries(self, query_input: torch.Tensor) -> torch.Tensor:
         """`(..., input_dim)` -> `(..., index_dim)` fp32 unit rows."""
-        projected = query_input.to(torch.bfloat16) @ self.query_map
+        projected = query_input.to(torch.bfloat16) @ self.query_map.to(torch.bfloat16)
         return functional.normalize(projected.float(), dim=-1)
 
 
@@ -380,3 +391,49 @@ def select_keys(
     )
     lengths = expanded_count + window_count + sink_count
     return selected.to(torch.int32), lengths.to(torch.int32)
+
+
+def attend_selected(
+    query: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    selected: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Grouped-query attention of each query over its own selected keys.
+
+    Each query gets its own key list, so each query is its own batch entry.
+    The keys and values of the list are gathered from the buffers, and the
+    -1 padding is masked out. The selected positions are causal by
+    construction, so no causal mask is needed.
+
+    Args:
+        query: `(B, S, num_attention_heads, head_dim)`.
+        k_buffer: `(B, max_seq_len, num_kv_heads, head_dim)` stored keys.
+        v_buffer: `(B, max_seq_len, num_kv_heads, head_dim)` stored values.
+        selected: `(B, S, L)` key positions per query, -1 padded. Every list
+            holds at least the query's own position.
+        scale: softmax scale.
+
+    Returns:
+        `(B, S, num_attention_heads, head_dim)` in the query's dtype.
+    """
+    batch, span, heads, head_dim = query.shape
+    kv_heads = k_buffer.shape[2]
+    width = selected.shape[-1]
+    rows = torch.arange(batch, device=query.device).view(batch, 1, 1)
+    slots = selected.clamp_min(0).long()
+
+    def gather(buffer: torch.Tensor) -> torch.Tensor:
+        # (B, S, L, kv_heads, head_dim) -> (B * S, kv_heads, L, head_dim)
+        picked = buffer[rows, slots].to(query.dtype).permute(0, 1, 3, 2, 4)
+        return picked.reshape(batch * span, kv_heads, width, head_dim)
+
+    # The query heads that share a KV head sit on the query axis, as in the
+    # dense decode path.
+    grouped = query.reshape(batch * span, kv_heads, heads // kv_heads, head_dim)
+    mask = (selected >= 0).view(batch * span, 1, 1, width)
+    out = functional.scaled_dot_product_attention(
+        grouped, gather(k_buffer), gather(v_buffer), attn_mask=mask, scale=scale
+    )
+    return out.reshape(batch, span, heads, head_dim)
