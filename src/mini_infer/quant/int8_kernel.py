@@ -7,14 +7,18 @@ weights stored as INT8.
 
 ``fused_w8a16_linear`` keeps the weights as INT8 in HBM for the shapes where
 the weight bytes set the time: a decode step of up to `_DECODE_ROWS` rows.
-Two kernels serve it. `_w8a16_splitk_kernel` runs one program per (n-tile,
+One kernel serves it. `_w8a16_splitk_kernel` runs one program per (n-tile,
 K split), loads int8 tiles, dequantizes them in registers and accumulates in
 fp32; the K split gives enough programs in flight to keep the memory system
 busy on the narrow shapes (`down_proj` of Qwen2.5-7B has N=3584 and
-K=18944). `_w8a16_reduce_kernel` sums the splits in a fixed order, applies
-the per-channel scale and the bias, and casts, so the result is
-deterministic. On one H100 the pair reads the int8 weights of the 7B MLP
-shapes at 2.1 to 2.25 TB/s, 1.6 to 1.7 times faster than cuBLAS bf16.
+K=18944). Each program stores its partial sums and bumps a counter of its
+n-tile; the program that arrives last sums the splits in a fixed order,
+applies the per-channel scale and the bias, casts, and resets the counter.
+So the result is deterministic, and one launch does the whole call, which
+matters twice: in the decode graph every launch is a node, and in the eager
+prefill every launch costs host time. On one H100 the kernel reads the int8
+weights of the 7B MLP shapes at 2.1 to 2.25 TB/s, 1.6 to 1.7 times faster
+than cuBLAS bf16.
 
 Above `_DECODE_ROWS` rows (a prefill chunk) the GEMM is compute-bound and
 the byte saving does not pay, so the weight is dequantized to the activation
@@ -55,7 +59,6 @@ _FUSED_DISABLED_FOR_BENCH = False
 _DECODE_ROWS = 64
 # The split-K path aims at this many programs, about four per SM of an H100.
 _DECODE_TARGET_PROGRAMS = 512
-_REDUCE_BLOCK_N = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,6 +85,13 @@ _LONG_K = 8192
 
 # A tile set here wins over `decode_tile_for`; a bench swaps it to sweep the configurations.
 _DECODE_TILE: DecodeTile | None = None
+
+# The arrival counters of each weight, one int32 per n-tile, keyed by the
+# weight's storage and tile count. They are zero between two calls: the last
+# program of every n-tile resets its counter, so no call needs a memset. A
+# weight that leaves and another that lands on the same address get a fresh
+# zero tensor when their tile counts differ, and share a zero one otherwise.
+_counters: dict[tuple[int, torch.device, int], torch.Tensor] = {}
 
 
 def decode_tile_for(device: torch.device | str, k_dim: int) -> DecodeTile:
@@ -129,6 +139,21 @@ def supports_fused_kernel(device: torch.device | str) -> bool:
     return is_cuda_device(device)
 
 
+def tile_counters(weight: torch.Tensor, n_tiles: int) -> torch.Tensor:
+    """The zeroed arrival counters of `weight` for `n_tiles` column tiles.
+
+    Allocate them before a CUDA graph capture (the eager warm-up of the
+    decode graph does), so the captured kernel reads a tensor that outlives
+    the graph.
+    """
+    key = (weight.data_ptr(), weight.device, n_tiles)
+    counters = _counters.get(key)
+    if counters is None:
+        counters = torch.zeros(n_tiles, dtype=torch.int32, device=weight.device)
+        _counters[key] = counters
+    return counters
+
+
 if _TRITON_AVAILABLE:
 
     @triton.jit  # type: ignore[untyped-decorator]
@@ -136,9 +161,14 @@ if _TRITON_AVAILABLE:
         x_ptr,
         w_ptr,
         part_ptr,
+        scales_ptr,
+        bias_ptr,
+        out_ptr,
+        counter_ptr,
         M,
         N,
         K_PER_SPLIT,
+        SPLIT_K,
         stride_xm,
         stride_xk,
         stride_wn,
@@ -146,16 +176,22 @@ if _TRITON_AVAILABLE:
         stride_ps,
         stride_pm,
         stride_pn,
+        stride_om,
+        stride_on,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
     ) -> None:
-        """One program per (n-tile, K split), partial sums in fp32.
+        """One program per (n-tile, K split); the last split of a tile finishes it.
 
         Each program keeps one `(BLOCK_M, BLOCK_N)` accumulator over its
         slice of K and stores it to `part[split, m, n]`. Rows at or past `M`
         load a real row again (`% M`) and are dropped at the store, as are
-        columns past `N`.
+        columns past `N`. Then it adds one to the counter of its n-tile. The
+        program that sees `SPLIT_K - 1` arrivals before its own sums the
+        splits of the tile in split order, applies the scale and the bias,
+        stores the cast result and puts the counter back to zero.
         """
         pid_n = tl.program_id(0)
         pid_s = tl.program_id(1)
@@ -173,50 +209,37 @@ if _TRITON_AVAILABLE:
             accumulator = tl.dot(x_chunk, w_int8.to(x_chunk.dtype), accumulator)
             x_ptrs += BLOCK_K * stride_xk
             w_ptrs += BLOCK_K * stride_wk
-        part_ptrs = (
-            part_ptr + pid_s * stride_ps + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
-        )
-        part_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(part_ptrs, accumulator, mask=part_mask)
-
-    @triton.jit  # type: ignore[untyped-decorator]
-    def _w8a16_reduce_kernel(  # type: ignore[no-untyped-def]
-        part_ptr,
-        scales_ptr,
-        bias_ptr,
-        out_ptr,
-        N,
-        SPLIT_K,
-        stride_ps,
-        stride_pm,
-        stride_pn,
-        stride_om,
-        stride_on,
-        BLOCK_N: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-    ) -> None:
-        """Sum the K splits of one row, apply the per-channel scale and the bias, cast."""
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < N
-        total = tl.zeros((BLOCK_N,), dtype=tl.float32)
-        for split in range(0, SPLIT_K):
-            total += tl.load(
-                part_ptr + split * stride_ps + pid_m * stride_pm + offs_n * stride_pn,
-                mask=n_mask,
-                other=0.0,
+        tile_offs = offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
+        tile_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(part_ptr + pid_s * stride_ps + tile_offs, accumulator, mask=tile_mask)
+        # Every thread's partial is stored before one thread announces the
+        # arrival; the release of the atomic makes the stores visible to the
+        # program that acquires the final count.
+        tl.debug_barrier()
+        ticket = tl.atomic_add(counter_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+        if ticket == SPLIT_K - 1:
+            tl.debug_barrier()
+            n_mask = offs_n < N
+            total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for split in range(0, SPLIT_K):
+                # The partials of the other programs sit in L2, so read past L1.
+                total += tl.load(
+                    part_ptr + split * stride_ps + tile_offs,
+                    mask=tile_mask,
+                    other=0.0,
+                    cache_modifier=".cg",
+                )
+            scales = tl.load(scales_ptr + offs_n, mask=n_mask, other=0.0)
+            total = total * scales.to(tl.float32)[None, :]
+            if HAS_BIAS:
+                bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
+                total = total + bias.to(tl.float32)[None, :]
+            tl.store(
+                out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+                total.to(out_ptr.dtype.element_ty),
+                mask=tile_mask,
             )
-        scales = tl.load(scales_ptr + offs_n, mask=n_mask, other=0.0)
-        total = total * scales.to(tl.float32)
-        if HAS_BIAS:
-            bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0)
-            total = total + bias.to(tl.float32)
-        tl.store(
-            out_ptr + pid_m * stride_om + offs_n * stride_on,
-            total.to(out_ptr.dtype.element_ty),
-            mask=n_mask,
-        )
+            tl.store(counter_ptr + pid_n, 0)
 
 
 def fused_w8a16_linear(
@@ -236,7 +259,7 @@ def fused_w8a16_linear(
     Returns:
         `(..., N)` in `x.dtype`. Same numerical contract as
         ``F.linear(x, weight.to(x.dtype) * scales[:, None], bias)``. Up to
-        `_DECODE_ROWS` rows the split-K kernels read the int8 weight as is;
+        `_DECODE_ROWS` rows the split-K kernel reads the int8 weight as is;
         more rows, or a K that the tile does not divide, dequantize it and
         run cuBLAS.
 
@@ -273,8 +296,9 @@ def fused_w8a16_linear(
         has_bias = True
     else:
         # Triton needs a real pointer even when HAS_BIAS=False; the tl.load
-        # in the kernel is dead-code-eliminated under the constexpr branch.
-        bias_x = torch.zeros(1, device=x.device, dtype=x.dtype)
+        # in the kernel is dead code under the constexpr branch, so the
+        # scales stand in and no call allocates a dummy.
+        bias_x = scales_x
         has_bias = False
     out = torch.empty((m_dim, n_dim), dtype=x.dtype, device=x.device)
     _decode_split_k(x_2d, weight, scales_x, bias_x, has_bias, out, tile)
@@ -290,7 +314,7 @@ def _decode_split_k(
     out: torch.Tensor,
     tile: DecodeTile,
 ) -> None:
-    """Two launches: partial sums per K split into fp32, then the reduce into `out`."""
+    """One launch: partial sums per K split into fp32, and the last split writes `out`."""
     m_dim, k_dim = x_2d.shape
     n_dim = weight.shape[0]
     n_tiles = triton.cdiv(n_dim, tile.block_n)
@@ -302,9 +326,14 @@ def _decode_split_k(
         x_2d,
         weight,
         part,
+        scales,
+        bias,
+        out,
+        tile_counters(weight, n_tiles),
         m_dim,
         n_dim,
         k_dim // split,
+        split,
         x_2d.stride(0),
         x_2d.stride(1),
         weight.stride(0),
@@ -312,25 +341,12 @@ def _decode_split_k(
         part.stride(0),
         part.stride(1),
         part.stride(2),
+        out.stride(0),
+        out.stride(1),
         BLOCK_M=block_m_for(m_dim),
         BLOCK_N=tile.block_n,
         BLOCK_K=tile.block_k,
+        HAS_BIAS=has_bias,
         num_warps=tile.num_warps,
         num_stages=tile.num_stages,
-    )
-    _w8a16_reduce_kernel[(m_dim, triton.cdiv(n_dim, _REDUCE_BLOCK_N))](
-        part,
-        scales,
-        bias,
-        out,
-        n_dim,
-        split,
-        part.stride(0),
-        part.stride(1),
-        part.stride(2),
-        out.stride(0),
-        out.stride(1),
-        BLOCK_N=_REDUCE_BLOCK_N,
-        HAS_BIAS=has_bias,
-        num_warps=4,
     )
