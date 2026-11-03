@@ -765,6 +765,19 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
             attention.enable_lsa(lsa, query_map, key_map)
         self.lsa = lsa
 
+    def disable_lsa(self) -> None:
+        """Go back to dense attention in every full-attention layer.
+
+        A state cache built while LSA was on no longer fits the model, so
+        build a new one.
+        """
+        for layer in self.model.layers:
+            attention = getattr(layer, "self_attn", None)
+            if isinstance(attention, _QwenGatedAttention):
+                attention.lsa = None
+                attention.lsa_projection = None
+        self.lsa = None
+
     def can_capture_decode(self, device: torch.device | str) -> bool:
         """Whether `decode_step_static` runs on `device` without a host step.
 

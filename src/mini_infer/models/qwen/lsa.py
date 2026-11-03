@@ -38,11 +38,16 @@ equals dense attention.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import nn
 from torch.nn import functional
+
+# A tensor name in the authors' map files: decoder layer index, then which map.
+_MAP_NAME = re.compile(r"^(\d+)\.(W_Q_idx|W_K_idx)$")
 
 # Merge rounds before Ward gives up. Each round at least halves the merges
 # left in practice, so a 512-key block needs well under 20.
@@ -175,6 +180,36 @@ class IndexProjection(nn.Module):
         """`(..., input_dim)` -> `(..., index_dim)` fp32 unit rows."""
         projected = query_input.to(torch.bfloat16) @ self.query_map.to(torch.bfloat16)
         return functional.normalize(projected.float(), dim=-1)
+
+
+def load_index_maps(path: str | Path) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+    """Read a map file in the authors' export format.
+
+    The file is a flat dict that maps `"<layer>.W_Q_idx"` and
+    `"<layer>.W_K_idx"` to `[input_dim, index_dim]` tensors, keyed by decoder
+    layer index. It is loaded with `weights_only=True`, so it can hold
+    tensors only, never code. The model's `enable_lsa` checks the shapes and
+    that every full-attention layer is present.
+
+    Returns:
+        decoder layer index -> `(query_map, key_map)`, fp32 on the host.
+
+    Raises:
+        ValueError: if the file is not such a dict, or a layer has only one map.
+    """
+    blob = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(blob, dict) or not blob:
+        raise ValueError(f"{path} is not a map file: expected a dict of '<layer>.W_Q_idx' tensors")
+    found: dict[int, dict[str, torch.Tensor]] = {}
+    for name, tensor in blob.items():
+        match = _MAP_NAME.match(str(name))
+        if match is None or not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"{path} holds {name!r}; a map file holds '<layer>.W_Q_idx' / W_K_idx")
+        found.setdefault(int(match.group(1)), {})[match.group(2)] = tensor.float()
+    lonely = sorted(layer for layer, pair in found.items() if len(pair) != 2)
+    if lonely:
+        raise ValueError(f"{path} holds only one of W_Q_idx and W_K_idx for layers {lonely}")
+    return {layer: (pair["W_Q_idx"], pair["W_K_idx"]) for layer, pair in sorted(found.items())}
 
 
 @dataclass
