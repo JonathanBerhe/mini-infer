@@ -67,10 +67,9 @@ class TransformerBlock(nn.Module):
         residual = hidden_states
         x = self.input_layernorm(hidden_states)
         x = self.self_attn(x, position_embeddings, past_key_values, cu_seqlens_q)
-        hidden_states = residual + x
-
-        residual = hidden_states
-        x = self.post_attention_layernorm(hidden_states)
+        # One call adds the attention output to the residual and normalizes the
+        # sum; with the fused norm on CUDA that is one kernel instead of two.
+        x, residual = self.post_attention_layernorm(x, residual)
         x = self.mlp(x)
         out: torch.Tensor = residual + x
         return out

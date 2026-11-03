@@ -14,7 +14,11 @@ import pytest
 import torch
 
 from mini_infer.models.blocks import rms_norm_kernel, rmsnorm
-from mini_infer.models.blocks.rms_norm_kernel import fused_rms_norm, rms_norm_rows
+from mini_infer.models.blocks.rms_norm_kernel import (
+    fused_add_rms_norm,
+    fused_rms_norm,
+    rms_norm_rows,
+)
 from mini_infer.models.blocks.rmsnorm import RMSNorm, head_rms_norm
 
 needs_triton = pytest.mark.skipif(not rms_norm_kernel._TRITON_AVAILABLE, reason="needs triton")
@@ -137,3 +141,78 @@ def test_fused_rmsnorm_keeps_the_torch_path_off_cuda() -> None:
     assert not plain.fused
     assert torch.equal(fused(x), plain(x))
     assert torch.equal(head_rms_norm(x, 1e-6, fused=True), head_rms_norm(x, 1e-6))
+
+
+@needs_triton
+@pytest.mark.parametrize(
+    ("shape", "dtype"), [((3, 4096), torch.bfloat16), ((5, 96), torch.float32)]
+)
+def test_add_kernel_is_the_add_then_the_fused_norm(
+    shape: tuple[int, ...], dtype: torch.dtype
+) -> None:
+    """The sum is PyTorch's add; the norm is `fused_rms_norm` of that sum.
+
+    On CUDA both outputs are bit-equal. The interpreter truncates fp32 to bf16
+    where CUDA rounds, so on the CPU a bf16 sum can differ by one step.
+    """
+    device = _device()
+    generator = torch.Generator().manual_seed(3)
+    x = (torch.randn(*shape, generator=generator) * 3).to(device=device, dtype=dtype)
+    residual = (torch.randn(*shape, generator=generator) * 3).to(device=device, dtype=dtype)
+    weight = (torch.rand(shape[-1], generator=generator) + 0.5).to(device=device, dtype=dtype)
+    normed, summed = fused_add_rms_norm(
+        x.view(-1, shape[-1]), residual.view(-1, shape[-1]), x.shape, weight, 1e-6
+    )
+    want_sum = residual + x
+    # The norm of the kernel's own sum is exact everywhere: same arithmetic, same order.
+    assert torch.equal(normed, fused_rms_norm(summed.view(-1, shape[-1]), x.shape, weight, 1e-6))
+    if device == "cuda" or dtype == torch.float32:
+        assert torch.equal(summed, want_sum)
+    else:
+        torch.testing.assert_close(summed.float(), want_sum.float(), rtol=2**-7, atol=2**-7)
+
+
+@needs_triton
+def test_add_kernel_reads_strided_rows() -> None:
+    device = _device()
+    generator = torch.Generator().manual_seed(4)
+    wide = torch.randn(6, 576, generator=generator).to(device)
+    x, residual = wide[:, :512], wide[:, 64:]
+    assert not x.is_contiguous() and not residual.is_contiguous()
+    rows, residual_rows = x.view(-1, 512), residual.view(-1, 512)
+    normed, summed = fused_add_rms_norm(rows, residual_rows, x.shape, None, 1e-6)
+    assert summed.is_contiguous() and torch.equal(summed, residual + x)
+    assert torch.equal(normed, fused_rms_norm(summed.view(-1, 512), x.shape, None, 1e-6))
+
+
+def test_rmsnorm_with_a_residual_returns_the_norm_and_the_sum() -> None:
+    """Off CUDA the norm adds with PyTorch, so the sum is `residual + x` exactly."""
+    generator = torch.Generator().manual_seed(5)
+    x, residual = torch.randn(4, 64, generator=generator), torch.randn(4, 64, generator=generator)
+    for fused in (False, True):
+        norm = RMSNorm(64, fused=fused)
+        normed, summed = norm(x, residual)
+        assert torch.equal(summed, residual + x)
+        assert torch.equal(normed, norm(residual + x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_rmsnorm_with_a_residual_takes_the_add_kernel_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def spy(*args: object, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(1)
+        return fused_add_rms_norm(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rmsnorm, "fused_add_rms_norm", spy)
+    norm = RMSNorm(4096, fused=True).cuda().bfloat16()
+    x = torch.randn(2, 4096, device="cuda").bfloat16()
+    residual = torch.randn(2, 4096, device="cuda").bfloat16()
+    with torch.no_grad():
+        normed, summed = norm(x, residual)
+        assert torch.equal(summed, residual + x)
+        assert torch.equal(normed, norm(residual + x))
+        norm(x, residual.float())  # dtypes differ: the PyTorch add, then the norm
+    assert calls == [1]

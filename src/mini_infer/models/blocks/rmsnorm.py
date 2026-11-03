@@ -1,9 +1,15 @@
 """RMSNorm: root-mean-square layer norm used by Llama / Qwen2 / Mistral / DeepSeek / Gemma 4."""
 
+from typing import overload
+
 import torch
 from torch import nn
 
-from mini_infer.models.blocks.rms_norm_kernel import fused_rms_norm, rms_norm_rows
+from mini_infer.models.blocks.rms_norm_kernel import (
+    fused_add_rms_norm,
+    fused_rms_norm,
+    rms_norm_rows,
+)
 
 
 class RMSNorm(nn.Module):
@@ -19,8 +25,14 @@ class RMSNorm(nn.Module):
 
     `fused=True` runs the norm as one Triton kernel on CUDA
     (`rms_norm_kernel.py`, ADR-045). Its sum runs in another order, so a few
-    outputs differ from the PyTorch path in the last bit. DeepSeek-V4 sets it
-    (`DeepseekV4Config.fused_rms_norm`); other models keep the PyTorch path.
+    outputs differ from the PyTorch path in the last bit. DeepSeek-V4, Llama,
+    Qwen2, Qwen3 and Mixtral set it through their `fused_rms_norm` config
+    field; other models keep the PyTorch path.
+
+    Called with a `residual`, the norm returns `(norm(residual + x), residual
+    + x)`. With `fused=True` on CUDA one kernel adds, stores the sum and
+    normalizes it, and both outputs equal the separate add and norm bit for
+    bit. The call goes through `forward`, so module hooks see it.
     """
 
     def __init__(
@@ -33,7 +45,40 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.fused = fused
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    @overload
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
+
+    @overload
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            return self._add_and_norm(hidden_states, residual)
+        return self._norm(hidden_states)
+
+    def _add_and_norm(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self.weight if self.with_scale else None
+        if (
+            self.fused
+            and hidden_states.shape == residual.shape
+            and hidden_states.dtype == residual.dtype
+        ):
+            rows = rms_norm_rows(hidden_states, weight)
+            residual_rows = rms_norm_rows(residual)
+            if rows is not None and residual_rows is not None:
+                return fused_add_rms_norm(
+                    rows, residual_rows, hidden_states.shape, weight, self.variance_epsilon
+                )
+        summed = residual + hidden_states
+        return self._norm(summed), summed
+
+    def _norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         weight = self.weight if self.with_scale else None
         if self.fused:
             rows = rms_norm_rows(hidden_states, weight)

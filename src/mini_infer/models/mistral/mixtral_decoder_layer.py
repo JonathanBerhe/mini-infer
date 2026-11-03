@@ -67,10 +67,8 @@ class MixtralDecoderLayer(nn.Module):
         residual = hidden_states
         x = self.input_layernorm(hidden_states)
         x = self.self_attn(x, position_embeddings, past_key_values, cu_seqlens_q)
-        hidden_states = residual + x
-
-        residual = hidden_states
-        x = self.post_attention_layernorm(hidden_states)
+        # The residual add and the norm in one call, one kernel with the fused norm.
+        x, residual = self.post_attention_layernorm(x, residual)
         x = self.block_sparse_moe(x)
         out: torch.Tensor = residual + x
         return out
