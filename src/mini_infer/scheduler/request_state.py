@@ -17,6 +17,7 @@ from mini_infer.exceptions import EngineNotRunningError, RequestFailedError
 
 if TYPE_CHECKING:
     from mini_infer.engine.dspark.spec import SpecDecodeState, SpecSummary
+    from mini_infer.engine.tokenizer import TextStream
 
 # `cancelled` covers both API-side cancellation (client disconnect on a
 # streaming request) and engine-side rejection (admission can't be satisfied
@@ -142,6 +143,10 @@ class RunningRequest:
     `_reap_done` clears it at finish, because the API handle keeps the `RunningRequest`
     alive. `spec_summary` survives the clear: `_finish` writes it before the terminal
     step, so the API thread can read it after the stream ends.
+
+    `text_stream` turns the generated ids into text one emitted step at a time;
+    `last_text` is the text so far. The scheduler makes the stream at the first
+    emitted token.
     """
 
     request: Request
@@ -154,6 +159,7 @@ class RunningRequest:
     tokens_generated: list[int] = dataclasses.field(default_factory=list)
     last_logits: torch.Tensor | None = None
     last_text: str = ""
+    text_stream: "TextStream | None" = None
     pending_decode_tokens: list[int] | None = None
     spec: "SpecDecodeState | None" = None
     spec_summary: "SpecSummary | None" = None

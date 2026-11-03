@@ -17,6 +17,18 @@ def test_gather_takes_the_rows_in_slot_order() -> None:
     assert len(DeviceTokens(source, [1])) == 1
 
 
+def test_leading_rows_in_order_are_a_view_of_the_source() -> None:
+    """No gather kernel when the slots take rows 0, 1, ... of the sampled ids."""
+    source = torch.tensor([10, 11, 12, 13])
+    leading = DeviceTokens(source, [0, 1, 2]).gather()
+    assert leading.tolist() == [10, 11, 12]
+    assert leading.data_ptr() == source.data_ptr()
+    assert DeviceTokens(source, range(4)).gather().data_ptr() == source.data_ptr()
+    # A row out of order, or a skipped row, needs the gather.
+    assert DeviceTokens(source, [0, 2]).gather().data_ptr() != source.data_ptr()
+    assert DeviceTokens(source, [1, 0]).gather().tolist() == [11, 10]
+
+
 def test_rejects_a_bad_row_or_a_matrix() -> None:
     with pytest.raises(ValueError, match="outside"):
         DeviceTokens(torch.tensor([1, 2]), [0, 2])

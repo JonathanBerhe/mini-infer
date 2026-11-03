@@ -104,6 +104,43 @@ def test_decode_split_k_matches_the_naive_path(
 
 
 @needs_triton
+def test_one_launch_per_call_and_the_counters_rest_at_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last split of every n-tile writes the output, so a call is one launch.
+
+    The arrival counters belong to the weight and read zero after the call,
+    ready for the next one without a memset.
+    """
+    device = _device()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    layer = _layer(1000, 1024, bias=False, dtype=dtype, device=device)
+    x = torch.randn(3, 1024, dtype=dtype, device=device)
+    launches: list[tuple[int, ...]] = []
+    kernel = int8_kernel._w8a16_splitk_kernel
+
+    class _Recording:
+        def __getitem__(self, grid: tuple[int, ...]) -> object:
+            launches.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(int8_kernel, "_w8a16_splitk_kernel", _Recording())
+    monkeypatch.setattr(
+        int8_kernel,
+        "_DECODE_TILE",
+        DecodeTile(block_n=128, block_k=128, split_k=4, num_warps=4, num_stages=2),
+    )
+    got = int8_kernel.fused_w8a16_linear(x, layer.weight, layer.scales, layer.bias)
+    assert launches == [(8, 4)]  # 8 n-tiles of 128 columns, 4 K splits
+    torch.testing.assert_close(
+        got.float(), _naive(layer, x).float(), rtol=_tolerance(dtype), atol=_tolerance(dtype)
+    )
+    counters = int8_kernel.tile_counters(layer.weight, 8)
+    assert counters.tolist() == [0] * 8
+    assert int8_kernel.tile_counters(layer.weight, 8) is counters
+
+
+@needs_triton
 @pytest.mark.parametrize(
     "tile",
     [

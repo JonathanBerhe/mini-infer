@@ -45,9 +45,15 @@ class DeviceTokens:
     def gather(self) -> torch.Tensor:
         """The `(len(rows),)` ids in slot order, on the device of `source`, without a host wait.
 
-        The row index travels from pinned memory with a non-blocking copy on
-        CUDA, so this call enqueues work and returns.
+        Rows `0, 1, ..., n-1` are the leading rows of `source` as they are: a
+        view, no kernel. That is every step on which no request finished, and
+        the steps where only the last requests of the batch did. Any other
+        order gathers with an index that travels from pinned memory with a
+        non-blocking copy on CUDA, so this call enqueues work and returns.
         """
+        count = len(self.rows)
+        if all(row == slot for slot, row in enumerate(self.rows)):
+            return self.source[:count]
         device = self.source.device
         on_cuda = is_cuda_device(device)
         index = torch.tensor(list(self.rows), dtype=torch.long, pin_memory=on_cuda)
