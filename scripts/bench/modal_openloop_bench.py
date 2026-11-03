@@ -57,14 +57,14 @@ image = (
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",
-        "triton>=3.0",
+        "triton==3.1.0",
         # httpx for the open-loop driver. Already a transitive of fastapi
         # in most setups, but pin it explicitly so the script doesn't crash
         # if the image base drops it.
         "httpx>=0.27",
     )
     .pip_install(FLASH_ATTN_WHEEL)
-    .pip_install("flashinfer-python>=0.6.10rc1")
+    .pip_install("flashinfer-python==0.6.10")
     .add_local_file(
         str(Path(__file__).parent.parent / "data" / "technical_passage.md"),
         "/root/scripts/data/technical_passage.md",

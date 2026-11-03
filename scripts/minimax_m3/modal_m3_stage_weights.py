@@ -63,7 +63,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     # CPU wheel index: the default PyPI wheel drags in multi-GB CUDA libraries
     # that a CPU-only staging container never uses.
-    .pip_install("torch>=2.4", index_url="https://download.pytorch.org/whl/cpu")
+    .pip_install("torch==2.10.0+cpu", index_url="https://download.pytorch.org/whl/cpu")
     .pip_install(
         "huggingface_hub>=0.20",
         "hf-transfer>=0.1.6",  # parallel, fast LFS downloads
