@@ -56,6 +56,10 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from mini_infer.cache.contiguous_attention import (
+    contiguous_attention,
+    supports_contiguous_kernel,
+)
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import GemmaRMSNorm, RotaryEmbedding, SwiGLU
@@ -501,6 +505,17 @@ class _QwenGatedAttention(nn.Module):
             if self.lsa is not None:
                 attn = self._lsa_attention(query, layer_state, positions, kv_len, host_starts)
                 return self._gated_output(attn, gate)
+            if supports_contiguous_kernel(layer_state.k):
+                # Reads each row only up to its last written key, with no
+                # mask and no per-head copy of K and V.
+                attn = contiguous_attention(
+                    query.transpose(1, 2),
+                    layer_state.k,
+                    layer_state.v,
+                    positions[:, -1] + 1,
+                    head_dim**-0.5,
+                )
+                return self._gated_output(attn, gate)
             if seq_len == 1:
                 attn = self._decode_attention(query, layer_state, positions)
                 return self._gated_output(attn, gate)
@@ -712,8 +727,7 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
     HF_ARCHITECTURE: ClassVar[str] = "Qwen3_5ForConditionalGeneration"
     Config: ClassVar[type] = Qwen35Config
     USES_STATE_CACHE: ClassVar[bool] = True
-    # `decode_step_static` is safe to capture in a CUDA graph where
-    # `can_capture_decode` says so.
+    # `decode_step_static` is safe to capture in a CUDA graph.
     SUPPORTS_DECODE_CUDA_GRAPH: ClassVar[bool] = True
 
     def __init__(self, cfg: Qwen35Config) -> None:
@@ -734,8 +748,8 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         """Make every full-attention layer read only the keys LSA selects.
 
         Call it before building a state cache, which then gets the bucket
-        buffers. A decode step with LSA clusters key blocks on the host, so
-        it no longer runs from a CUDA graph.
+        buffers. A captured decode step cannot cluster the key blocks it
+        closes, so `after_decode_step` does that after each step.
 
         Args:
             maps: decoder layer index -> `(query_map, key_map)`, each
@@ -778,14 +792,24 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
                 attention.lsa_projection = None
         self.lsa = None
 
-    def can_capture_decode(self, device: torch.device | str) -> bool:
-        """Whether `decode_step_static` runs on `device` without a host step.
+    def after_decode_step(self, positions: torch.Tensor, state_cache: Qwen35StateCache) -> None:
+        """Cluster the LSA key blocks that a `decode_step_static` call closed.
 
-        With LSA on, every step may close a key block, and clustering it runs
-        on the host before the attention, so the step cannot be captured.
+        The static step writes each row's key at `positions[b]` but cannot
+        cluster, because Ward merging decides its rounds on the host. A row
+        closes a block when its position is the block's last. `DecodeCudaGraph`
+        calls this after every replay, with the positions it replayed. Host
+        positions cost no sync. Without LSA this does nothing.
         """
-        del device
-        return self.lsa is None
+        if self.lsa is None:
+            return
+        host_starts = [int(p) for p in positions.tolist()]
+        for layer_idx, layer in enumerate(self.model.layers):
+            attention = getattr(layer, "self_attn", None)
+            if isinstance(attention, _QwenGatedAttention):
+                layer_state = state_cache.layer(layer_idx)
+                assert isinstance(layer_state, QwenAttentionLayerState)
+                attention._lsa_close_blocks(layer_state, host_starts, 1)
 
     def _run(
         self,
@@ -946,18 +970,10 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         `(B, 1)` token ids and `(B,)` int64 positions, both on the model's
         device. It has no host sync and no data-dependent shape, and it
         updates `state_cache` only in place, so `DecodeCudaGraph` can capture
-        it. The caller checks capacity and shapes.
-
-        Raises:
-            ValueError: if LSA is on. This step cannot cluster the key blocks
-                it closes, so `forward_decode_with_cache_ragged` runs LSA
-                decode instead.
+        it. The caller checks capacity and shapes. With LSA on, the caller
+        also runs `after_decode_step` after each step, which `DecodeCudaGraph`
+        does.
         """
-        if self.lsa is not None:
-            raise ValueError(
-                "decode_step_static cannot cluster LSA key blocks; "
-                "use forward_decode_with_cache_ragged"
-            )
         return self._run(input_id, state_cache, positions)
 
     def _check_cache(self, state_cache: Qwen35StateCache) -> None:

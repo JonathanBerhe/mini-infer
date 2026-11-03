@@ -223,7 +223,7 @@ def test_disable_lsa_restores_dense_attention():
     model = _model(SPARSE)
     _, sparse_cache = _prefill(model, ids)
     model.disable_lsa()
-    assert model.lsa is None and model.can_capture_decode("cuda")
+    assert model.lsa is None
     assert not any("lsa_projection" in name for name, _ in model.named_modules())
     restored, _ = _prefill(model, ids)
     torch.testing.assert_close(restored, dense, atol=ATOL, rtol=0)
@@ -241,17 +241,42 @@ def test_enable_lsa_refuses_missing_layers_and_wrong_shapes():
     assert model.lsa is None
 
 
-def test_lsa_guards_the_cache_and_the_captured_decode_step():
-    model = _model(None)
-    assert model.can_capture_decode("cuda")
-    stale = model.build_state_cache(max_seq_len=MAX_SEQ_LEN)
-    model = _model(SPARSE)
-    assert not model.can_capture_decode("cuda")
+def test_lsa_refuses_a_cache_built_without_its_buckets():
+    stale = _model(None).build_state_cache(max_seq_len=MAX_SEQ_LEN)
     with pytest.raises(ValueError, match="rebuild the cache"):
-        model.forward_prefill_with_cache(_ids(4), state_cache=stale)
-    cache = model.build_state_cache(max_seq_len=MAX_SEQ_LEN)
-    with pytest.raises(ValueError, match="cannot cluster"):
-        model.decode_step_static(_ids(1), torch.zeros(1, dtype=torch.long), cache)
+        _model(SPARSE).forward_prefill_with_cache(_ids(4), state_cache=stale)
+
+
+@torch.inference_mode()
+def test_static_steps_with_the_after_step_hook_equal_eager_decode():
+    """What `DecodeCudaGraph` runs: `decode_step_static`, which cannot
+    cluster, then `after_decode_step` with the same positions. Two rows at
+    different positions close blocks on different steps."""
+    model = _model(SPARSE)
+    lengths = (45, 62)
+    requests = [_ids(length + 30, seed=20 + i) for i, length in enumerate(lengths)]
+    caches = {name: model.build_state_cache(max_seq_len=MAX_SEQ_LEN, batch_size=2) for name in "ab"}
+    for row, (ids, length) in enumerate(zip(requests, lengths, strict=True)):
+        _, single = _prefill(model, ids[:, :length])
+        for cache in caches.values():
+            cache.copy_row_from(single, src_row=0, dst_row=row)
+
+    for offset in range(30):
+        positions = torch.tensor([length + offset for length in lengths])
+        tokens = torch.stack(
+            [ids[0, pos] for ids, pos in zip(requests, positions, strict=True)]
+        ).view(2, 1)
+        eager = model.forward_decode_with_cache_ragged(
+            tokens, positions=positions, state_cache=caches["a"]
+        )
+        static = model.decode_step_static(tokens, positions, caches["b"])
+        model.after_decode_step(positions, caches["b"])
+        torch.testing.assert_close(static, eager, atol=ATOL, rtol=0)
+
+    for layer_idx, kind in enumerate(model.cfg.layer_types):
+        if kind == FULL_ATTENTION:
+            eager_state, static_state = caches["a"].layer(layer_idx), caches["b"].layer(layer_idx)
+            assert torch.equal(static_state.lsa_members, eager_state.lsa_members)
 
 
 def test_lsa_maps_follow_the_model_but_stay_out_of_its_state_dict():
