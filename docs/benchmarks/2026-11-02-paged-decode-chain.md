@@ -137,12 +137,37 @@ The int8 prefill now launches 405 kernels, the same count as bf16, against
 configuration, and those samples did not follow the launch count, so this
 run does not show the prefill gain.
 
+## Follow-up on 2026-11-03: TMA loads for the int8 kernel
+
+One B200 timed three variants of the int8 kernel against the kernel of the
+repo, every call captured in a CUDA graph, with a tile sweep per variant.
+The TMA variants load through tensor descriptors. The swapped one computes
+`w @ x^T`, so the weight tile is the wide side of the tensor-core MMA. This
+container ran torch 2.15 and Triton 3.9, newer than the runs above, so
+compare its rows only with each other.
+
+| Shape at 8 rows | cuBLAS bf16, us | Repo kernel, us | TMA, us | TMA swapped, us |
+|---|---:|---:|---:|---:|
+| gate and up, 18944 by 3584 | 22.2 | 15.3 | 14.8 | 13.9 |
+| down, 3584 by 18944 | 24.8 | 22.8 | 21.6 | 20.8 |
+| q, k and v, 4608 by 3584 | 6.5 | 8.4 | 7.4 | 7.9 |
+| o, 3584 by 3584 | 9.5 | 7.9 | 7.2 | 7.9 |
+
+The best variant per shape saves about 6.5 us per layer, or about 0.18 ms
+of a decode step. That is below the run-to-run variance of the throughput,
+so the repo keeps the pointer kernel. The kernel of the repo already copies
+its weights with 16-byte asynchronous copies in two stages, and it converts
+int8 to bf16 in about one instruction per weight. Nsight Compute shows few
+memory stalls. Each int8 call has about 1.5 us of fixed cost and reads 5.0
+to 5.4 TB/s at the margin, where cuBLAS bf16 reads 6.1 TB/s. Short calls
+pay the fixed cost most.
+
 ## What is next
 
 - The H100 did not run with the fused reduce. By the same count its int8
   graph goes from 657 to about 433 nodes, and its step loses the 0.32 ms of
   the reduce kernel less the cost of the fusion.
-- The int8 kernel on Blackwell needs TMA loads to reach the bandwidth that
-  cuBLAS reaches. That is a kernel of its own.
+- One GEMM for gate and up saves 1.8 us per layer with int8, because it
+  pays the fixed cost of a call once. It saves nothing with bf16.
 - The eager prefill step pays about 20 to 50 us of host time per launch. A
   graph per prefill bucket, or fewer launches per layer, would cut it.
