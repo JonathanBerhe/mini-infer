@@ -31,9 +31,9 @@ _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "B200")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch>=2.6", extra_index_url="https://download.pytorch.org/whl/cu128")
-    .pip_install("transformers>=4.40", "triton>=3.0")
-    .pip_install("flashinfer-python>=0.6.10rc1")
+    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("transformers>=4.40", "triton==3.6.0")
+    .pip_install("flashinfer-python==0.6.10")
     .add_local_file(
         str(Path(__file__).parent.parent / "data" / "technical_passage.md"),
         "/root/scripts/data/technical_passage.md",

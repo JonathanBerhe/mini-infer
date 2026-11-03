@@ -38,7 +38,7 @@ app = modal.App("mini-infer-v4-flash-serve")
 # in-process TestClient can drive the real /v1/completions endpoint.
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch>=2.6", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
     .pip_install(
         "transformers>=4.40",
         "safetensors>=0.4",
@@ -46,7 +46,7 @@ image = (
         "fastapi>=0.110",
         "httpx>=0.27",
     )
-    .pip_install("flashinfer-python>=0.6.10rc1")
+    .pip_install("flashinfer-python==0.6.10")
     .add_local_python_source("mini_infer")
 )
 
