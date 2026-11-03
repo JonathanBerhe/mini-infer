@@ -217,6 +217,20 @@ def test_ragged_decode_rows_equal_their_own_prefill():
         torch.testing.assert_close(torch.stack(steps[row]), whole[0, length:], atol=1e-4, rtol=0)
 
 
+def test_disable_lsa_restores_dense_attention():
+    ids = _ids(100)
+    dense, _ = _prefill(_model(None), ids)
+    model = _model(SPARSE)
+    _, sparse_cache = _prefill(model, ids)
+    model.disable_lsa()
+    assert model.lsa is None and model.can_capture_decode("cuda")
+    assert not any("lsa_projection" in name for name, _ in model.named_modules())
+    restored, _ = _prefill(model, ids)
+    torch.testing.assert_close(restored, dense, atol=ATOL, rtol=0)
+    with pytest.raises(ValueError, match="rebuild the cache"):
+        model.forward_prefill_with_cache(ids[:, :4], state_cache=sparse_cache)
+
+
 def test_enable_lsa_refuses_missing_layers_and_wrong_shapes():
     model = _model(None)
     good = torch.zeros(INPUT_DIM, SPARSE.index_dim)

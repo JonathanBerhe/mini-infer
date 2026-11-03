@@ -21,6 +21,7 @@ from mini_infer.models.qwen.lsa import (
     cluster_blocks,
     index_key_input,
     index_query_input,
+    load_index_maps,
     select_keys,
 )
 
@@ -114,6 +115,38 @@ def test_index_projection_gives_unit_rows_in_the_served_dtypes():
 def test_index_projection_refuses_maps_of_different_shapes():
     with pytest.raises(ValueError):
         IndexProjection(torch.randn(24, 8), torch.randn(24, 4))
+
+
+def test_load_index_maps_reads_the_authors_export_format(tmp_path):
+    maps = {
+        "3.W_Q_idx": torch.randn(24, 8, dtype=torch.float64),
+        "3.W_K_idx": torch.randn(24, 8),
+        "7.W_Q_idx": torch.randn(24, 8).bfloat16(),
+        "7.W_K_idx": torch.randn(24, 8),
+    }
+    path = tmp_path / "maps.pt"
+    torch.save(maps, path)
+    loaded = load_index_maps(path)
+    assert sorted(loaded) == [3, 7]
+    query_map, key_map = loaded[7]
+    assert query_map.dtype == key_map.dtype == torch.float32
+    torch.testing.assert_close(query_map, maps["7.W_Q_idx"].float())
+    torch.testing.assert_close(loaded[3][1], maps["3.W_K_idx"])
+
+
+@pytest.mark.parametrize(
+    "blob, match",
+    [
+        ({"3.W_Q_idx": torch.zeros(2, 2)}, "only one of"),
+        ({"layers.3.W_Q_idx": torch.zeros(2, 2)}, "holds 'layers"),
+        ({}, "not a map file"),
+    ],
+)
+def test_load_index_maps_refuses_other_files(tmp_path, blob, match):
+    path = tmp_path / "maps.pt"
+    torch.save(blob, path)
+    with pytest.raises(ValueError, match=match):
+        load_index_maps(path)
 
 
 def test_ward_partitions_each_block_into_capped_buckets_of_whole_pools():
