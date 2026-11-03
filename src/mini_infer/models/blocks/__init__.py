@@ -13,7 +13,7 @@ from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert, MoEFFN
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.rope import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
 from mini_infer.models.blocks.swiglu import SwiGLU
-from mini_infer.models.blocks.transformer_block import TransformerBlock
+from mini_infer.models.blocks.transformer_block import TransformerBlock, run_decoder_layers
 
 __all__ = [
     "GemmaRMSNorm",
@@ -31,4 +31,5 @@ __all__ = [
     "apply_rotary_pos_emb",
     "merge_qkv_weights",
     "rotate_half",
+    "run_decoder_layers",
 ]

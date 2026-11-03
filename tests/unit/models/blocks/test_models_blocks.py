@@ -390,3 +390,75 @@ def test_gqa_splits_the_output_of_a_replaced_projection_layer() -> None:
         out = block(x, (cos, sin), cache, torch.tensor([0, 5], dtype=torch.int32))
     assert out.shape == (1, 5, 32)
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("family", ["llama", "qwen2", "qwen3", "mixtral"])
+def test_decoder_layers_with_folded_adds_match_the_plain_loop(family: str) -> None:
+    """`run_decoder_layers` folds each residual add into the next norm. On the CPU
+    every sum is the same `residual + x` as in the plain loop, so the logits and
+    the Qwen3 hidden-state taps are bit-equal."""
+    from mini_infer.cache.block_pool import BlockPool
+    from mini_infer.cache.paged_kv_cache import PagedKVCache
+    from mini_infer.models.llama.llama import LlamaConfig, LlamaForCausalLM
+    from mini_infer.models.mistral.mixtral import MixtralConfig, MixtralForCausalLM
+    from mini_infer.models.qwen.qwen2 import Qwen2Config, Qwen2ForCausalLM
+    from mini_infer.models.qwen.qwen3 import Qwen3Config, Qwen3ForCausalLM
+
+    dims = {**_TINY_QWEN2_DIMS, "num_hidden_layers": 3}
+    builders = {
+        "llama": lambda: LlamaForCausalLM(LlamaConfig(**dims)),
+        "qwen2": lambda: Qwen2ForCausalLM(Qwen2Config(**dims)),
+        "qwen3": lambda: Qwen3ForCausalLM(Qwen3Config(**dims)),
+        "mixtral": lambda: MixtralForCausalLM(
+            MixtralConfig(**dims, num_local_experts=4, num_experts_per_tok=2)
+        ),
+    }
+    torch.manual_seed(0)
+    model = builders[family]().eval()
+    # Random norm weights, so a norm that skipped its residual would show.
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, RMSNorm) and module.with_scale:
+                module.weight.copy_(torch.rand_like(module.weight) + 0.5)
+
+    def cache() -> PagedKVCache:
+        dims_kv = model.kv_cache_dims
+        pool = BlockPool(
+            num_blocks=8,
+            block_size=4,
+            num_layers=dims_kv.num_layers,
+            num_kv_heads=dims_kv.num_kv_heads,
+            head_dim=dims_kv.head_dim,
+            dtype=torch.float32,
+            device="cpu",
+            attention_backend="torch",
+        )
+        made = PagedKVCache(pool)
+        made.add_request_slot()
+        made.add_request_slot()
+        return made
+
+    input_ids = torch.tensor([[3, 9, 27, 5, 11]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+    taps = frozenset({0, 2}) if family == "qwen3" else None
+
+    with torch.inference_mode():
+        sink: dict[int, torch.Tensor] = {}
+        kwargs = {"tap_layers": taps, "hidden_state_sink": sink} if taps else {}
+        got = model(input_ids, position_ids, cache(), cu_seqlens, **kwargs)
+
+        plain_cache = cache()
+        x = model.model.embed_tokens(input_ids)
+        position_embeddings = model.rotary_emb(x, position_ids)
+        expected_taps = {}
+        for i, layer in enumerate(model.model.layers):
+            x = layer(x, position_embeddings, plain_cache, cu_seqlens)
+            if taps and i in taps:
+                expected_taps[i] = x
+        expected = model.lm_head(model.model.norm(x))
+
+    assert torch.equal(got, expected), family
+    assert sink.keys() == expected_taps.keys()
+    for i, tapped in expected_taps.items():
+        assert torch.equal(sink[i], tapped), (family, i)

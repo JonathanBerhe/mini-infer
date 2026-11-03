@@ -63,12 +63,22 @@ class MixtralDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         past_key_values: PagedKVCache,
         cu_seqlens_q: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        x = self.input_layernorm(hidden_states)
+        residual: torch.Tensor | None = None,
+        *,
+        defer_add: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """As `TransformerBlock.forward`: a `residual` of the layer before is added
+        by the input norm, and `defer_add=True` returns `(moe_output, residual)`."""
+        if residual is None:
+            residual = hidden_states
+            x = self.input_layernorm(hidden_states)
+        else:
+            x, residual = self.input_layernorm(hidden_states, residual)
         x = self.self_attn(x, position_embeddings, past_key_values, cu_seqlens_q)
         # The residual add and the norm in one call, one kernel with the fused norm.
         x, residual = self.post_attention_layernorm(x, residual)
         x = self.block_sparse_moe(x)
+        if defer_add:
+            return x, residual
         out: torch.Tensor = residual + x
         return out
