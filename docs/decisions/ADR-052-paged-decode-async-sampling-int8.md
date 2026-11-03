@@ -64,7 +64,8 @@ concurrency 8, each change in its own same-container A/B.
   host first, such as a prefill chunk that joins, takes the old path.
 - On the B200 the throughput at concurrency 8 moves within the run-to-run
   variance of about 6 percent. The int8 kernel reads about 4 TB/s there
-  against 6 TB/s for cuBLAS bf16, so TMA loads are its next step.
+  against 6 TB/s for cuBLAS bf16. TMA loads gained only 5 to 10 percent
+  per call in a later test, so the kernel keeps its pointer loads.
 - The arrival counters of the fused reduce (`tile_counters`) must exist
   before a graph capture. The eager warm-up of the decode graph allocates
   them.
