@@ -162,11 +162,38 @@ memory stalls. Each int8 call has about 1.5 us of fixed cost and reads 5.0
 to 5.4 TB/s at the margin, where cuBLAS bf16 reads 6.1 TB/s. Short calls
 pay the fixed cost most.
 
+## Follow-up on 2026-11-03: two more fusions, and the fused reduce on the H100
+
+After the attention of each layer, one kernel now adds the residual and
+normalizes the sum. One more kernel computes `silu(gate) * up`. Both repeat
+the roundings of the PyTorch ops that they replace. A test on each GPU found
+0 differing values on the 7B shapes. One H100 and one B200 ran five
+configurations each in one container, with torch 2.10 and Triton 3.6. The
+configurations with and without the fusions decoded identical tokens.
+
+| Configuration at concurrency 8 | H100 GPU ms per decode step | H100 kernels | B200 GPU ms per decode step | B200 kernels |
+|---|---:|---:|---:|---:|
+| bf16, before the fusions | 6.09 | 432 | 3.60 | 460 |
+| bf16, with the fusions | 6.00 | 376 | 3.52 | 404 |
+| int8, before the fusions | 4.71 | 404 | 3.24 | 432 |
+| int8, with the fusions | 4.57 | 348 | 3.16 | 376 |
+| int8 with the fusions, two kernels per int8 call as before #68 | 4.46 | 600 | 3.25 | 628 |
+
+The fusions remove 56 kernels per step and 0.08 to 0.14 ms of GPU time.
+The throughput moved within the run-to-run variance on both GPUs.
+
+The last row is the first H100 measurement of the fused reduce of #68. On
+the H100 the fused reduce removes 252 kernels but adds 0.11 ms of GPU time
+per step, because the last program of each tile sums the splits alone at
+the end of every call. On the B200 it saves 0.09 ms. The H100 still gains
+at concurrency 1, 195 against 187 tokens per second, because the shorter
+graph launches faster.
+
 ## What is next
 
-- The H100 did not run with the fused reduce. By the same count its int8
-  graph goes from 657 to about 433 nodes, and its step loses the 0.32 ms of
-  the reduce kernel less the cost of the fusion.
+- On the H100 the int8 kernel with its own reduce takes about 0.13 ms per
+  step more than the split-K kernel and the reduce kernel together. A sweep
+  of the split count with the fused reduce is the first thing to try.
 - One GEMM for gate and up saves 1.8 us per layer with int8, because it
   pays the fixed cost of a call once. It saves nothing with bf16.
 - The eager prefill step pays about 20 to 50 us of host time per launch. A
