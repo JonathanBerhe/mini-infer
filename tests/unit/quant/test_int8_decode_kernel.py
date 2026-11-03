@@ -61,7 +61,8 @@ def test_the_tile_follows_the_architecture_and_the_k(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(int8_kernel, "is_cuda_device", lambda device: True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
-    assert int8_kernel.decode_tile_for("cuda", 18944) == int8_kernel._HOPPER_TILE
+    assert int8_kernel.decode_tile_for("cuda", 3584) == int8_kernel._HOPPER_TILE
+    assert int8_kernel.decode_tile_for("cuda", 18944) == int8_kernel._HOPPER_LONG_K_TILE
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 0))
     assert int8_kernel.decode_tile_for("cuda", 3584) == int8_kernel._BLACKWELL_TILE
     assert int8_kernel.decode_tile_for("cuda", 18944) == int8_kernel._BLACKWELL_LONG_K_TILE
@@ -69,10 +70,26 @@ def test_the_tile_follows_the_architecture_and_the_k(monkeypatch: pytest.MonkeyP
     chosen = DecodeTile(block_n=32, block_k=64, split_k=2, num_warps=4, num_stages=2)
     monkeypatch.setattr(int8_kernel, "_DECODE_TILE", chosen)
     assert int8_kernel.decode_tile_for("cuda", 18944) == chosen
-    # Off CUDA (the interpreter) the H100 tile serves.
+    # Off CUDA (the interpreter) the H100 tiles serve.
     monkeypatch.setattr(int8_kernel, "_DECODE_TILE", None)
     monkeypatch.setattr(int8_kernel, "is_cuda_device", lambda device: False)
     assert int8_kernel.decode_tile_for("cpu", 3584) == int8_kernel._HOPPER_TILE
+    assert int8_kernel.decode_tile_for("cpu", 18944) == int8_kernel._HOPPER_LONG_K_TILE
+
+
+def test_the_h100_tiles_take_the_measured_splits_on_the_7b_shapes() -> None:
+    """With the split from the shape, the H100 tiles give the splits of the sweep."""
+    tile, long_tile = int8_kernel._HOPPER_TILE, int8_kernel._HOPPER_LONG_K_TILE
+    splits = {
+        name: split_k_for(k_dim, chosen.block_k, -(-n_dim // chosen.block_n))
+        for name, n_dim, k_dim, chosen in (
+            ("gate/up", 18944, 3584, tile),
+            ("qkv", 4608, 3584, tile),
+            ("o", 3584, 3584, tile),
+            ("down", 3584, 18944, long_tile),
+        )
+    }
+    assert splits == {"gate/up": 2, "qkv": 4, "o": 4, "down": 4}
 
 
 def test_block_m_pads_the_rows_to_the_next_tile() -> None:
