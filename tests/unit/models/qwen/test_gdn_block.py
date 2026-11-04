@@ -7,6 +7,9 @@ up in bf16. Second, and the load-bearing claim of the whole port, that the
 KDA delta rule in `blocks/kda.py` computes the Gated DeltaNet recurrence when
 its per-channel decay is fed a broadcast per-head scalar. If that second
 claim were false this family would need its own copy of the recurrence.
+Third, that `gdn_chunkwise`, the scalar-gate prefill form, matches the
+reference and the one-token recurrence, and stays at a few dispatched ops
+per chunk.
 
 The reference functions are imported from the pinned transformers install
 rather than vendored, because the checkpoint's own architecture
@@ -18,6 +21,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch.nn import functional
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from mini_infer.models.blocks.kda import (
     causal_conv1d_prefill,
@@ -26,7 +30,12 @@ from mini_infer.models.blocks.kda import (
     kda_recurrent,
     l2norm,
 )
-from mini_infer.models.qwen.gdn import broadcast_gate, gated_rmsnorm_silu, gdn_gate
+from mini_infer.models.qwen.gdn import (
+    broadcast_gate,
+    gated_rmsnorm_silu,
+    gdn_chunkwise,
+    gdn_gate,
+)
 
 transformers_qwen = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
 
@@ -129,6 +138,84 @@ def test_chunkwise_state_feeds_recurrent_decode():
     split = torch.cat(outs, dim=1)
     whole, _ = _ours(q, k, v, gate, beta, dim_k, chunked=True)
     assert torch.allclose(split, whole[:, 16:], atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("batch", "seq_len", "heads", "dim_k", "dim_v"),
+    [
+        (2, 16, 6, 16, 16),
+        (2, 16, 6, 16, 24),  # non-square head dims
+        (2, 80, 6, 16, 16),  # crosses the 64-token chunk boundary
+        (2, 37, 6, 16, 16),  # not a chunk multiple, exercises padding
+        (1, 300, 4, 32, 32),  # several chunks
+    ],
+)
+def test_scalar_gate_chunkwise_matches_reference_and_recurrence(
+    batch, seq_len, heads, dim_k, dim_v
+):
+    """`gdn_chunkwise` (the prefill form) against transformers' chunked rule
+    and against our own one-token recurrence, with a carried-in state."""
+    q, k, v, gate, beta = _inputs(batch, seq_len, heads, dim_k, dim_v, seed=23)
+    initial = torch.randn(batch, heads, dim_k, dim_v) * 0.1
+    ref_out, ref_state = hf_chunk(
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        gate.clone(),
+        beta.clone(),
+        initial_state=initial.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    q_scaled, k_normed = l2norm(q) * (dim_k**-0.5), l2norm(k)
+    out, state = gdn_chunkwise(q_scaled, k_normed, v, gate, beta, initial_state=initial.clone())
+    assert torch.allclose(out, ref_out, atol=1e-5)
+    assert torch.allclose(state, ref_state, atol=1e-5)
+
+    step_out, step_state = _ours(q, k, v, gate, beta, dim_k, initial.clone(), chunked=False)
+    assert torch.allclose(out, step_out, atol=1e-5)
+    assert torch.allclose(state, step_state, atol=1e-5)
+
+
+def test_scalar_gate_chunkwise_continues_across_spans():
+    """A prefill split at an arbitrary point, carrying the state, equals one span."""
+    q, k, v, gate, beta = _inputs(1, 150, 4, 16, 16, seed=29)
+    q, k = l2norm(q) * (16**-0.5), l2norm(k)
+    whole, whole_state = gdn_chunkwise(q, k, v, gate, beta)
+    head, head_state = gdn_chunkwise(q[:, :70], k[:, :70], v[:, :70], gate[:, :70], beta[:, :70])
+    tail, tail_state = gdn_chunkwise(
+        q[:, 70:], k[:, 70:], v[:, 70:], gate[:, 70:], beta[:, 70:], initial_state=head_state
+    )
+    assert torch.allclose(torch.cat([head, tail], dim=1), whole, atol=1e-5)
+    assert torch.allclose(tail_state, whole_state, atol=1e-5)
+
+
+def test_scalar_gate_chunkwise_dispatches_a_few_ops_per_chunk():
+    """Guards the prefill launch count, the reason `gdn_chunkwise` exists.
+
+    The per-channel `kda_chunkwise` loops over the positions of every chunk
+    and dispatches about 1,200 ops per 64-token chunk. Most dispatched ops on
+    a GPU are kernel launches, so a per-position loop creeping back in would
+    make a 27B prefill host-bound again.
+    """
+
+    class _Count(TorchDispatchMode):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ops = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.ops += 1
+            return func(*args, **(kwargs or {}))
+
+    def ops_for(chunks: int) -> int:
+        q, k, v, gate, beta = _inputs(1, 64 * chunks, 2, 8, 8, seed=31)
+        with _Count() as count:
+            gdn_chunkwise(q, k, v, gate, beta)
+        return count.ops
+
+    per_chunk = (ops_for(16) - ops_for(8)) / 8
+    assert per_chunk <= 45, f"{per_chunk} dispatched ops per chunk"
 
 
 def test_fused_conv_prefill_matches_sequential_steps():
