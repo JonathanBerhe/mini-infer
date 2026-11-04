@@ -7,7 +7,7 @@ mini-infer's bf16 `BlockPool._storage` already uses, and is selectable
 via `attention_backend="flashinfer"` on the engine.
 
 A single `BatchPrefillWithPagedKVCacheWrapper` and
-`BatchDecodeWithPagedKVCacheWrapper` share one persistent 128 MiB
+`BatchDecodeWithPagedKVCacheWrapper` share one persistent 256 MiB
 uint8 workspace buffer per process, lazy-initialized on first use.
 `plan()` runs once per step: the paged cache builds its page index once
 per step, and `flashinfer_attention_forward` plans again only when that
@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 
-from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticDecodeStep
+from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticStep
 from mini_infer.device import is_cuda_device, require_cuda_device
 
 try:
@@ -44,11 +44,12 @@ except ImportError:  # macOS / no-CUDA / linux without the wheel installed
 # `_FUSED_DISABLED_FOR_BENCH` pattern in `turbo_kernel.py`.
 _FLASHINFER_DISABLED_FOR_BENCH = False
 
-# Persistent workspace shared by the prefill and decode wrappers. 128 MiB
-# is FlashInfer's recommended default for moderate batch sizes; we
-# allocate lazily on first use rather than at module load so non-CUDA
-# imports stay free.
-_WORKSPACE_BYTES = 128 * 1024 * 1024
+# Persistent workspace shared by the prefill and decode wrappers, allocated
+# lazily on first use so non-CUDA imports stay free. A captured step plans its
+# split-KV buffers for the largest grid of its shape, and that grid grows with
+# the SM count: on a B200 the 512-token bucket of the prefill graph asks for
+# 136 MB, more than FlashInfer's default of 128 MiB.
+_WORKSPACE_BYTES = 256 * 1024 * 1024
 _workspace_buffer: torch.Tensor | None = None
 # One prefill wrapper for each KV storage class (the pool's `kv_quant`). FlashInfer
 # `plan()` resolves backend="auto" once, from the dtypes of its first plan, and stores
@@ -64,8 +65,8 @@ _decode_wrapper: Any = None
 # unchanged, so one plan per step serves every layer. The engine runs one forward at a
 # time, so one slot is enough.
 _last_plan: tuple[Any, torch.Tensor, int, tuple[int, ...], tuple[Any, ...]] | None = None
-# Fixed-buffer wrappers of the captured decode steps, by (KV class, batch, capacity).
-_graph_wrappers: dict[tuple[str, int, int], Any] = {}
+# Fixed-buffer wrappers of the captured steps, by (KV class, slots, rows, capacity).
+_graph_wrappers: dict[tuple[str, int, int, int], Any] = {}
 
 
 def _planned(
@@ -102,29 +103,33 @@ def _wrapper_key(kv_quant: str | None) -> str:
     return kv_quant if kv_quant is not None else "default"
 
 
-def _graph_wrapper(device: torch.device, kv_quant: str | None, step: StaticDecodeStep) -> Any:
-    """The fixed-buffer prefill wrapper of a captured step: one per KV class and batch size.
+def _graph_wrapper(device: torch.device, kv_quant: str | None, step: StaticStep) -> Any:
+    """The fixed-buffer prefill wrapper of a captured step: one per KV class and step shape.
 
-    FlashInfer keeps the batch size of a CUDA-graph wrapper fixed and copies every
-    plan into the buffers given here, so a captured `run()` reads the latest plan.
-    The wrapper shares the workspace of the eager wrappers; a plan and its run never
-    interleave with another wrapper's.
+    FlashInfer keeps the batch size of a CUDA-graph wrapper fixed, takes the row
+    count of its first plan as the most rows of any later plan, and copies every
+    plan into the buffers given here, so a captured `run()` reads the latest
+    plan. Its tile size and grid come from that first row count and the batch
+    size, and its bound on the longest request is `rows - slots + 1`, which is
+    why a step has at least as many rows as slots. Every plan of a static step
+    covers all `rows`, padding included. The wrapper shares the workspace of the
+    eager wrappers; a plan and its run never interleave with another wrapper's.
     """
     global _workspace_buffer
     if _workspace_buffer is None:
         _workspace_buffer = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     assert flashinfer is not None  # _FLASHINFER_AVAILABLE checked at call site
-    key = (_wrapper_key(kv_quant), step.batch, step.capacity)
+    key = (_wrapper_key(kv_quant), step.slots, step.rows, step.capacity)
     wrapper = _graph_wrappers.get(key)
     if wrapper is None:
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             _workspace_buffer,
             kv_layout="NHD",
             use_cuda_graph=True,
-            qo_indptr_buf=torch.empty(step.batch + 1, dtype=torch.int32, device=device),
-            paged_kv_indptr_buf=torch.empty(step.batch + 1, dtype=torch.int32, device=device),
+            qo_indptr_buf=torch.empty(step.slots + 1, dtype=torch.int32, device=device),
+            paged_kv_indptr_buf=torch.empty(step.slots + 1, dtype=torch.int32, device=device),
             paged_kv_indices_buf=torch.empty(step.capacity, dtype=torch.int32, device=device),
-            paged_kv_last_page_len_buf=torch.empty(step.batch, dtype=torch.int32, device=device),
+            paged_kv_last_page_len_buf=torch.empty(step.slots, dtype=torch.int32, device=device),
         )
         _graph_wrappers[key] = wrapper
     return wrapper
@@ -148,7 +153,7 @@ def _ensure_wrappers(device: torch.device, kv_quant: str | None) -> tuple[Any, A
     """Lazy-initialize the persistent workspace + wrapper instances.
 
     Returns `(prefill_wrapper, decode_wrapper)` for use in the
-    dispatcher. All wrappers share one 128 MiB `uint8` buffer. Their uses never overlap,
+    dispatcher. All wrappers share one 256 MiB `uint8` buffer. Their uses never overlap,
     because the engine runs one forward at a time and each attention call runs one wrapper.
     Prefill wrappers are cached for each KV storage class (see `_prefill_wrappers`).
     """
@@ -224,7 +229,7 @@ def flashinfer_attention_forward(
     prefill_wrapper, decode_wrapper = _ensure_wrappers(device, cache._pool.kv_quant)
     step = cache.static_step
     if step is not None:
-        # A captured decode step runs on a wrapper with fixed buffers for its batch size.
+        # A captured step runs on a wrapper with fixed buffers for its shape.
         prefill_wrapper = _graph_wrapper(device, cache._pool.kv_quant, step)
 
     # The CSR page index triple that FlashInfer wants, built by the cache once
@@ -308,7 +313,7 @@ def flashinfer_attention_forward(
         if is_cuda_device(device) and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "FlashInfer plan() cannot run inside a CUDA graph capture; "
-                "plan the static decode step before the capture (plan_static_decode)"
+                "plan the static step before the capture (plan_static_step)"
             )
         qo_indptr = (
             step.qo_indptr
@@ -345,8 +350,8 @@ def flashinfer_attention_forward(
     return out
 
 
-def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
-    """Plan the static decode step of `cache` before a graph replay.
+def plan_static_step(cache: PagedKVCache, device: torch.device) -> None:
+    """Plan the static step of `cache` before a graph replay.
 
     The first run of a captured step is eager and records the attention
     parameters on the step. A replay runs no Python, so this call makes the
@@ -358,7 +363,7 @@ def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
     into its fixed buffers with `non_blocking=True`. The page indices go in as
     the step's device buffer, because FlashInfer copies host indices with a
     blocking copy. The copies are stream-ordered after the replay in flight,
-    and the step's `copy_done` event keeps the next `begin_static_decode` from
+    and the step's `copy_done` event keeps the next `begin_static_step` from
     rewriting the host views before they are read.
 
     The plan runs in inference mode, like every plan inside a forward. The
@@ -368,7 +373,7 @@ def plan_static_decode(cache: PagedKVCache, device: torch.device) -> None:
     global _last_plan
     step = cache.static_step
     if step is None:
-        raise RuntimeError("plan_static_decode needs a static decode step in progress")
+        raise RuntimeError("plan_static_step needs a static step in progress")
     if step.plan_params is None:
         return
     wrapper = _graph_wrapper(device, cache._pool.kv_quant, step)

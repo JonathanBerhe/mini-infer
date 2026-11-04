@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from mini_infer.cache.block_pool import BlockPool
-from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticDecodeStep
+from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticStep
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.paged_decode_graph import PagedDecodeGraph, paged_decode_graph_blocker
 from tests.unit._dspark_doubles import micro_setup
@@ -46,8 +46,8 @@ def _fake_graph(model: Any, pool: BlockPool, buckets: tuple[int, ...]) -> PagedD
     graph._graphs = {}
     graph._logits = {}
     for batch in graph._buckets:
-        graph._steps[batch] = StaticDecodeStep.allocate(
-            batch, graph._scratch_block, pool.num_blocks, graph._device
+        graph._steps[batch] = StaticStep.allocate(
+            batch, batch, graph._scratch_block, pool.num_blocks, graph._device
         )
         graph._inputs[batch] = (
             torch.zeros(1, batch, dtype=torch.long),
@@ -99,13 +99,13 @@ def test_replay_matches_the_eager_decode_step(monkeypatch: pytest.MonkeyPatch) -
     import mini_infer.engine.paged_decode_graph as module
 
     plans_in_inference_mode: list[bool] = []
-    real_plan = module.plan_static_decode
+    real_plan = module.plan_static_step
 
     def checking_plan(cache: PagedKVCache, device: torch.device) -> None:
         plans_in_inference_mode.append(torch.is_inference_mode_enabled())
         real_plan(cache, device)
 
-    monkeypatch.setattr(module, "plan_static_decode", checking_plan)
+    monkeypatch.setattr(module, "plan_static_step", checking_plan)
     eager_runner, eager_cache = _prefilled(seed=3)
     graph_runner, graph_cache = _prefilled(seed=3)
     graph = _fake_graph(graph_runner._model, graph_runner.block_pool, (2,))
@@ -149,7 +149,7 @@ def test_padded_replay_needs_flashinfer_on_this_pool() -> None:
     stand_in = graph._graphs[4]
     assert isinstance(stand_in, _EagerStandIn)
     stand_in.cache = cache
-    with pytest.raises(RuntimeError, match="padded static decode step"):
+    with pytest.raises(RuntimeError, match="padded static step"):
         graph.replay(cache, [5, 7], [6, 3])
     assert cache.static_step is None  # the step closed on the way out
 

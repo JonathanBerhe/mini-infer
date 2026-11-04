@@ -246,9 +246,47 @@ On the B200 the best pair is the Blackwell tiles of main, within 0.4 us per
 layer. A switch to 64-wide tiles at 8 rows and more saves 5 us per layer,
 about 2 percent of a step, and the repo does not take it.
 
+## Follow-up on 2026-11-04: CUDA graphs for prefill and mixed steps
+
+A step that admits a prompt, or that carries a prefill chunk next to the
+decoders, ran eagerly. The prefill graph of
+[ADR-053](../decisions/ADR-053-paged-prefill-cuda-graph.md) captures such a
+step once per bucket of new tokens, 16 to 512, and pads the rest of the
+bucket into a scratch block. One H100 and one B200 ran Qwen2.5-7B with the
+decode graph only and with both graphs, in one container each.
+
+| Prefill step, median wall ms | H100 eager | H100 graph | B200 eager | B200 graph |
+|---|---:|---:|---:|---:|
+| 1 prompt, 16 tokens | 12.86 | 6.46 | 5.62 | 3.57 |
+| 1 prompt, 128 tokens | 12.55 | 7.17 | 5.58 | 4.29 |
+| 1 prompt, 500 tokens | 17.06 | 13.72 | 8.86 | 8.80 |
+| 8 bench prompts, 51 tokens | 12.86 | 7.25 | 5.90 | 3.97 |
+
+| Tokens per second, concurrency 8 / 1 | Decode graph only | Both graphs |
+|---|---:|---:|
+| H100 bf16 | 1203 / 153 | 1251 / 160 |
+| H100 int8 | 1669 / 203 | 1833 / 227 |
+| B200 bf16 | 2109 / 262 | 2168 / 270 |
+| B200 int8 | 2217 / 298 | 2347 / 322 |
+
+A prefill step launches 2 times instead of about 330. In the step profile
+of the H100 the 51-token prefill step takes 5.5 ms of wall time against
+33.9 ms, for about 6 ms of GPU work. The int8 runs gain the most, because an
+eager int8 step pays the Python launch of a Triton kernel for every linear.
+At 500 tokens the B200 step is GPU-bound, and the graph gains nothing.
+
+The tokens were identical on the B200. On the H100 two of eight bf16
+requests at concurrency 8 diverged after 19 and 20 tokens: the attention of a
+graph plans its tiles for the bucket, so it sums in another order than the
+eager attention. The capture takes about 0.3 s and 0.6 GiB per GPU.
+
 ## What is next
 
+- The prefill graph is off by default (`prefill_graph=True` turns it on).
+  As for the decode graph, a run on a second model family comes before a
+  change of the default.
+- A prefill step computes the logits of every new token, but it samples
+  only the last token of each request. A 500-token step runs the `lm_head`
+  over 500 rows where it needs one.
 - One GEMM for gate and up saves 1.8 us per layer with int8, because it
   pays the fixed cost of a call once. It saves nothing with bf16.
-- The eager prefill step pays about 20 to 50 us of host time per launch. A
-  graph per prefill bucket, or fewer launches per layer, would cut it.
