@@ -10,6 +10,11 @@ from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
 from mini_infer.engine.device_tokens import DeviceTokens
 from mini_infer.engine.paged_decode_graph import DEFAULT_BUCKETS, PagedDecodeGraph
+from mini_infer.engine.paged_prefill_graph import (
+    DEFAULT_MAX_REQUESTS,
+    DEFAULT_PREFILL_BUCKETS,
+    PagedPrefillGraph,
+)
 from mini_infer.engine.tokenizer import Tokenizer
 from mini_infer.models import load_model
 from mini_infer.models.base import BaseCausalLM
@@ -71,6 +76,8 @@ class ModelRunner:
         self._block_pool = block_pool
         # Set by `enable_decode_graph`: decode-only steps then replay a CUDA graph.
         self._decode_graph: PagedDecodeGraph | None = None
+        # Set by `enable_prefill_graph`: other packed steps that fit a bucket replay one.
+        self._prefill_graph: PagedPrefillGraph | None = None
 
     @classmethod
     def from_pretrained(
@@ -87,12 +94,15 @@ class ModelRunner:
         kv_quant: str | None = None,
         attention_backend: str = "flash_attn",
         cuda_graph: bool = False,
+        prefill_graph: bool = False,
     ) -> "ModelRunner":
         """Load a model and build its block pool.
 
         `cuda_graph=True` captures the decode step per batch size right away
         (`enable_decode_graph`), and raises `ValueError` when the device, the
         attention backend, the KV format or the model cannot take it.
+        `prefill_graph=True` also captures the other packed steps per bucket of
+        new tokens (`enable_prefill_graph`), under the same conditions.
         """
         resolved = _resolve_device(device)
         actual_dtype = dtype if dtype is not None else _dtype_for(resolved)
@@ -150,6 +160,8 @@ class ModelRunner:
         runner = cls(model=model, tokenizer=tokenizer, device=resolved, block_pool=block_pool)
         if cuda_graph:
             runner.enable_decode_graph()
+        if prefill_graph:
+            runner.enable_prefill_graph()
         return runner
 
     @property
@@ -173,6 +185,31 @@ class ModelRunner:
         """
         self._decode_graph = PagedDecodeGraph(
             self._model, self._block_pool, self.device, buckets=buckets
+        )
+
+    @property
+    def prefill_graph(self) -> PagedPrefillGraph | None:
+        """The captured packed steps, once `enable_prefill_graph` ran."""
+        return self._prefill_graph
+
+    def enable_prefill_graph(
+        self,
+        buckets: tuple[int, ...] = DEFAULT_PREFILL_BUCKETS,
+        max_requests: int = DEFAULT_MAX_REQUESTS,
+    ) -> None:
+        """Capture a packed step for each token count in `buckets` and replay it from then on.
+
+        A step that the decode graph serves keeps going there. Any other step
+        whose new tokens and requests fit a bucket replays it; the rest run
+        eagerly. See `PagedPrefillGraph` for what the model, the pool and the
+        device must provide.
+        """
+        self._prefill_graph = PagedPrefillGraph(
+            self._model,
+            self._block_pool,
+            self.device,
+            buckets=buckets,
+            max_requests=max_requests,
         )
 
     @property
@@ -275,6 +312,15 @@ class ModelRunner:
         if graph is not None and tap_layers is None and graph.accepts(cu_seqlens_q):
             # One new token per request: the captured step of this batch size.
             return graph.replay(cache, packed_input_ids, position_offsets)
+        prefill = self._prefill_graph
+        if (
+            prefill is not None
+            and tap_layers is None
+            and not isinstance(packed_input_ids, DeviceTokens)
+            and prefill.accepts(cu_seqlens_q)
+        ):
+            # Any other step that fits a bucket of new tokens: its captured step.
+            return prefill.replay(cache, packed_input_ids, cu_seqlens_q, position_offsets)
 
         device = self.device
         if isinstance(packed_input_ids, DeviceTokens):

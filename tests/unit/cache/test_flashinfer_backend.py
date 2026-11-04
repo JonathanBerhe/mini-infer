@@ -411,10 +411,10 @@ def test_static_step_plans_before_the_forward_on_a_fixed_buffer_wrapper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first run of a static step plans on the graph wrapper and records the
-    parameters; from then on `plan_static_decode` plans before the forward and the
+    parameters; from then on `plan_static_step` plans before the forward and the
     layers plan nothing. An eager step afterwards plans on the eager wrapper again."""
     from mini_infer.cache import flashinfer_backend
-    from mini_infer.cache.paged_kv_cache import StaticDecodeStep
+    from mini_infer.cache.paged_kv_cache import StaticStep
 
     eager_fake, graph_fake = _FakePrefillWrapper(), _FakePrefillWrapper()
     monkeypatch.setattr(flashinfer_backend, "_FLASHINFER_AVAILABLE", True)
@@ -446,18 +446,18 @@ def test_static_step_plans_before_the_forward_on_a_fixed_buffer_wrapper(
     for layer_idx in range(num_layers):
         kv = torch.randn(3, 2, 8)
         cache.append_kv_packed(kv, kv, cu_prefill, layer_idx)
-    step = StaticDecodeStep.allocate(
-        batch=2, scratch_block=pool.allocate(), num_blocks=16, device=device
+    step = StaticStep.allocate(
+        rows=2, slots=2, scratch_block=pool.allocate(), num_blocks=16, device=device
     )
 
     # First static run: no parameters yet, so the forward plans and records them.
     cache.begin_static_decode(step, active=1)
-    flashinfer_backend.plan_static_decode(cache, device)
+    flashinfer_backend.plan_static_step(cache, device)
     assert graph_fake.plans == []
     for layer_idx in range(num_layers):
         q = torch.randn(2, 4, 8)
         assert forward(q, cache, layer_idx, step.qo_indptr, softmax_scale=0.5) is q
-    cache.end_static_decode()
+    cache.end_static_step()
     assert len(graph_fake.plans) == 1 and eager_fake.plans == []
     assert graph_fake.plans[0]["qo_indptr"] == [0, 1, 2]
     assert graph_fake.plans[0]["indptr"] == [0, 1, 2]
@@ -466,7 +466,7 @@ def test_static_step_plans_before_the_forward_on_a_fixed_buffer_wrapper(
 
     # Second static run: the plan happens before the forward, the layers reuse it.
     cache.begin_static_decode(step, active=1)
-    flashinfer_backend.plan_static_decode(cache, device)
+    flashinfer_backend.plan_static_step(cache, device)
     assert len(graph_fake.plans) == 2
     assert graph_fake.plans[1]["indptr"] == [0, 2, 3]
     assert graph_fake.plans[1]["last_page_len"] == [1, 1]
@@ -481,7 +481,7 @@ def test_static_step_plans_before_the_forward_on_a_fixed_buffer_wrapper(
     assert graph_fake.plans[1]["non_blocking"] is True
     for layer_idx in range(num_layers):
         forward(torch.randn(2, 4, 8), cache, layer_idx, step.qo_indptr, softmax_scale=0.5)
-    cache.end_static_decode()
+    cache.end_static_step()
     assert len(graph_fake.plans) == 2 and graph_fake.runs == 2 * num_layers
 
     # An eager step afterwards plans once on the eager wrapper.
