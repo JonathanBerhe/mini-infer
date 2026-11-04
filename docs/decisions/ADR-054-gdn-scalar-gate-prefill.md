@@ -55,18 +55,21 @@ took 15.5 s of CPU time against 4.3 s of GPU time, and a 32k prompt took
 
 ## Consequences
 
-Measured on one H100, Qwen3.8-27B in bf16, prefill in 4096-token chunks of
-real prose, with the old and the new form in the same container:
+Measured on one H100 and one B200, Qwen3.8-27B in bf16, prefill in
+4096-token chunks of real prose, with the old and the new form in the same
+container:
 
-| Tokens | Old | New | Speedup |
-|---|---:|---:|---:|
-| 4,096 | 10.9 s | 0.8 s | 13.0x |
-| 32,768 | 87.9 s | 8.4 s | 10.5x |
+| GPU | Tokens | Old | New | Speedup |
+|---|---|---:|---:|---:|
+| H100 | 4,096 | 10.9 s | 0.8 s | 13.0x |
+| H100 | 32,768 | 87.9 s | 8.4 s | 10.5x |
+| B200 | 4,096 | 9.2 s | 0.6 s | 15.7x |
+| B200 | 32,768 | 74.1 s | 5.9 s | 12.6x |
 
 - Dispatched operations per layer call for 4096 tokens: 78,003 before,
   2,448 after.
-- The top-1 token is the same at all 16 compared positions. The logits
-  cosine is 0.99929 at 4,096 tokens and 0.99734 at 32,768. In fp32 on CPU
+- The top-1 token is the same at all 16 compared positions on both GPUs.
+  The lowest logits cosine is 0.99734 (H100, 32,768 tokens). In fp32 on CPU
   the two forms agree to about 1e-7. On the GPU each layer rounds its output
   to bf16, and the other operation order changes some of those roundings.
 - The unit tests pin `gdn_chunkwise` to the transformers chunk rule and to

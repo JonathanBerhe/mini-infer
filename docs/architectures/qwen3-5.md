@@ -159,7 +159,8 @@ is about 17 GB.
 A prompt runs through the Gated DeltaNet layers in chunks of 64 tokens with
 `gdn_chunkwise`. On one H100 the 27B prefills 4,096 tokens in 0.8 s and
 32,768 tokens in 8.4 s, against 10.9 s and 87.9 s with the per-channel form
-it replaced ([ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md)).
+it replaced. On one B200 it takes 0.6 s and 5.9 s, against 9.2 s and 74.1 s
+([ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md)).
 [scripts/qwen/modal_qwen38_prefill_ab.py](../../scripts/qwen/modal_qwen38_prefill_ab.py)
 measures the two forms against each other.
 
