@@ -27,12 +27,18 @@ So this module deliberately holds ONLY what genuinely differs from KDA:
     parameters, where KDA's `kda_gate` reads per-channel ones.
   - `broadcast_gate`: the scalar-to-diagonal expansion that lets the KDA
     recurrence consume a GDN gate.
+  - `gdn_chunkwise`: the chunked prefill form for a scalar gate. With one
+    decay per head, the decay between two positions is one number, so each
+    in-chunk interaction matrix is a plain matmul times a decay mask. The
+    per-channel form in `kda_chunkwise` instead loops over the 64 positions
+    of a chunk, which launches about 20k small kernels per layer for 4096
+    tokens.
   - `gated_rmsnorm_silu`: the output norm, which gates with SiLU where KDA
     gates with sigmoid, and applies its affine weight in the INPUT dtype
     rather than in fp32.
 
-Everything else (the delta rule itself, the short causal convolution, the
-L2 normalization) is imported from `kda.py` rather than reimplemented.
+Everything else (the one-token delta rule, the short causal convolution,
+the L2 normalization) is imported from `kda.py` rather than reimplemented.
 
 Numerical conventions pinned from the reference:
   - the recurrence runs in fp32 and outputs cast back,
@@ -94,6 +100,101 @@ def broadcast_gate(gate: torch.Tensor, head_k_dim: int) -> torch.Tensor:
     """
     batch, seq_len, num_heads = gate.shape
     return gate.unsqueeze(-1).expand(batch, seq_len, num_heads, head_k_dim).contiguous()
+
+
+def gdn_chunkwise(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunked-parallel gated delta rule for a per-head SCALAR gate (the prefill form).
+
+    The same WY / UT chunk algorithm as `kda_chunkwise`, which the unit
+    tests pin it against, but with the decay as one number per head and
+    position. Inside a chunk the decay from position `i` to position `c` is
+    `exp(G_c - G_i)` for every key channel, with `G` the in-chunk cumulative
+    log-decay. So the key-key and query-key couplings are a matmul times a
+    `(chunk, chunk)` decay mask, computed for all chunks at once. Only the
+    state hand-off from one chunk to the next stays sequential, at about
+    ten kernels per chunk.
+
+    Sequences are zero-padded to a chunk multiple. Padded positions carry
+    `beta = 0` and `g = 0`, which leave the state untouched.
+
+    Args:
+        q, k: `(batch, seq_len, num_heads, head_dim_k)`, pre-normalized (see
+            the module docstring).
+        v: `(batch, seq_len, num_heads, head_dim_v)`.
+        g: `(batch, seq_len, num_heads)` fp32 log-decays, `<= 0`.
+        beta: `(batch, seq_len, num_heads)` fp32 delta-rule step sizes.
+        initial_state: `(batch, num_heads, head_dim_k, head_dim_v)` fp32, or
+            None for a zero state.
+        chunk_size: positions per chunk.
+
+    Returns:
+        `(o, final_state)`: `o` is `(batch, seq_len, num_heads, head_dim_v)`
+        in `v.dtype`; `final_state` is fp32.
+    """
+    batch, seq_len, num_heads, dim_k = q.shape
+    dim_v = v.shape[-1]
+    pad = (-seq_len) % chunk_size
+    total = seq_len + pad
+    num_chunks = total // chunk_size
+
+    def per_head(t: torch.Tensor) -> torch.Tensor:
+        """`(batch, seq_len, heads, dim)` -> `(batch, heads, chunks, chunk, dim)` fp32."""
+        padded = functional.pad(t.float(), (0, 0, 0, 0, 0, pad))
+        chunked = padded.view(batch, num_chunks, chunk_size, num_heads, -1)
+        return chunked.permute(0, 3, 1, 2, 4).contiguous()
+
+    def per_head_scalar(t: torch.Tensor) -> torch.Tensor:
+        """`(batch, seq_len, heads)` -> `(batch, heads, chunks, chunk)` fp32."""
+        padded = functional.pad(t.float(), (0, 0, 0, pad))
+        return padded.view(batch, num_chunks, chunk_size, num_heads).permute(0, 3, 1, 2)
+
+    qc, kc, vc = per_head(q), per_head(k), per_head(v)
+    beta_c = per_head_scalar(beta)
+    g_cum = per_head_scalar(g).cumsum(dim=-1)
+
+    # decay[c, i] = exp(G_c - G_i) for c >= i, else 0. The upper triangle is
+    # masked before the exp, where its positive differences could overflow.
+    device = qc.device
+    causal = torch.tril(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=device))
+    decay = (g_cum.unsqueeze(-1) - g_cum.unsqueeze(-2)).masked_fill(~causal, float("-inf")).exp()
+
+    # B[c, i] = beta_c * exp(G_c - G_i) * <k_c, k_i> for c > i, and
+    # T = (I + B)^{-1} diag(beta), as in `kda_chunkwise`.
+    gram = (kc @ kc.transpose(-1, -2)) * decay * beta_c.unsqueeze(-1)
+    gram = gram.tril(diagonal=-1)
+    identity = torch.eye(chunk_size, dtype=torch.float32, device=device)
+    transform = torch.linalg.solve_triangular(
+        gram + identity, torch.diag_embed(beta_c), upper=False, unitriangular=True
+    )
+    w = transform @ (g_cum.exp().unsqueeze(-1) * kc)  # decay-adjusted keys entering the state
+    u = transform @ vc  # values with in-chunk overwrites folded in
+
+    # Everything the chunk loop reads that does not depend on the state.
+    attn = (qc @ kc.transpose(-1, -2)) * decay  # in-chunk attention, c >= i
+    q_decayed = qc * g_cum.exp().unsqueeze(-1)
+    end = g_cum[..., -1:]
+    k_to_end = kc * (end - g_cum).exp().unsqueeze(-1)  # each key decayed to the chunk end
+    end_decay = end.exp().unsqueeze(-1)  # (batch, heads, chunks, 1, 1)
+
+    state = qc.new_zeros(batch, num_heads, dim_k, dim_v)
+    if initial_state is not None:
+        state = state + initial_state.float()
+    out = torch.empty_like(vc)
+    for n in range(num_chunks):
+        v_adjusted = u[:, :, n] - w[:, :, n] @ state
+        out[:, :, n] = q_decayed[:, :, n] @ state + attn[:, :, n] @ v_adjusted
+        state = state * end_decay[:, :, n] + k_to_end[:, :, n].transpose(-1, -2) @ v_adjusted
+
+    out_flat = out.permute(0, 2, 3, 1, 4).reshape(batch, total, num_heads, dim_v)[:, :seq_len]
+    return out_flat.to(v.dtype), state
 
 
 def gated_rmsnorm_silu(
