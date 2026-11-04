@@ -7,9 +7,9 @@ one launch. The paged cache does its host work (slot counts, block
 allocation, the write and page indices) before the replay, in
 `PagedKVCache.begin_static_decode`, and FlashInfer plans the attention
 kernel once per step on a wrapper with fixed buffers, in
-`flashinfer_backend.plan_static_decode`. Rows above the real batch are
+`flashinfer_backend.plan_static_step`. Rows above the real batch are
 padding: they write into one scratch block, attend to it, and their logits
-are dropped.
+are dropped. `PagedPrefillGraph` does the same for steps with longer rows.
 
 The graph needs CUDA, the FlashInfer attention backend, an uncompressed KV
 pool and a model whose layers all run full attention with the same head
@@ -27,8 +27,8 @@ import torch
 from torch.profiler import record_function
 
 from mini_infer.cache.block_pool import BlockPool
-from mini_infer.cache.flashinfer_backend import plan_static_decode
-from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticDecodeStep
+from mini_infer.cache.flashinfer_backend import plan_static_step
+from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticStep
 from mini_infer.device import is_cuda_device
 from mini_infer.engine.device_tokens import DeviceTokens
 
@@ -38,22 +38,24 @@ DEFAULT_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 _WARMUP_STEPS = 2
 
 
-def paged_decode_graph_blocker(block_pool: BlockPool, device: torch.device | str) -> str | None:
-    """Why `PagedDecodeGraph` cannot serve this pool on this device, or None when it can."""
+def paged_decode_graph_blocker(
+    block_pool: BlockPool, device: torch.device | str, name: str = "decode graph"
+) -> str | None:
+    """Why a graph of paged steps (`name`) cannot serve this pool on this device, or None."""
     if not is_cuda_device(device):
-        return "the decode graph needs a CUDA device"
+        return f"the {name} needs a CUDA device"
     if block_pool.attention_backend != "flashinfer":
-        return "the decode graph needs the FlashInfer attention backend"
+        return f"the {name} needs the FlashInfer attention backend"
     if block_pool.kv_quant is not None:
-        return "the decode graph writes the uncompressed KV pool only"
+        return f"the {name} writes the uncompressed KV pool only"
     if any(spec != "full" for spec in block_pool.layer_attention):
-        return "the decode graph plans one attention call per step, so every layer must be full"
+        return f"the {name} plans one attention call per step, so every layer must be full"
     shapes = {
         (block_pool.num_kv_heads_for_layer(i), block_pool.head_dim_for_layer(i))
         for i in range(block_pool.num_layers)
     }
     if len(shapes) != 1:
-        return "the decode graph needs the same KV head count and head size in every layer"
+        return f"the {name} needs the same KV head count and head size in every layer"
     return None
 
 
@@ -84,7 +86,7 @@ class PagedDecodeGraph:
         self._buckets = tuple(sorted(set(buckets)))
         # Padding rows write their K/V here and attend to it.
         self._scratch_block = block_pool.allocate()
-        self._steps: dict[int, StaticDecodeStep] = {}
+        self._steps: dict[int, StaticStep] = {}
         # (input ids (1, batch), position ids (1, batch), pinned host staging (2, batch))
         self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._inputs_copied: dict[int, Any] = {}
@@ -161,12 +163,14 @@ class PagedDecodeGraph:
                 cache.begin_static_decode(step, active)
             try:
                 with record_function("decode_graph.plan"):
-                    plan_static_decode(cache, self._device)
+                    plan_static_step(cache, self._device)
                 with record_function("decode_graph.replay"):
                     self._graphs[batch].replay()
                 logits = self._logits[batch][:, :active].clone()
-            finally:
-                cache.end_static_decode()
+            except BaseException:
+                cache.end_static_step(publish=False)
+                raise
+            cache.end_static_step()
         return logits
 
     def _forward(self, batch: int, cache: PagedKVCache) -> torch.Tensor:
@@ -181,8 +185,8 @@ class PagedDecodeGraph:
 
     def _capture(self, batch: int) -> None:
         """Warm up and capture the step of `batch` rows, all of them padding."""
-        step = StaticDecodeStep.allocate(
-            batch, self._scratch_block, self._pool.num_blocks, self._device
+        step = StaticStep.allocate(
+            batch, batch, self._scratch_block, self._pool.num_blocks, self._device
         )
         self._steps[batch] = step
         self._inputs[batch] = (
@@ -199,18 +203,18 @@ class PagedDecodeGraph:
             for _ in range(_WARMUP_STEPS):
                 cache.begin_static_decode(step, active=0)
                 try:
-                    plan_static_decode(cache, self._device)
+                    plan_static_step(cache, self._device)
                     self._forward(batch, cache)
                 finally:
-                    cache.end_static_decode()
+                    cache.end_static_step(publish=False)
         main_stream.wait_stream(side_stream)
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode():
             cache.begin_static_decode(step, active=0)
             try:
-                plan_static_decode(cache, self._device)
+                plan_static_step(cache, self._device)
                 with torch.cuda.graph(graph):
                     self._logits[batch] = self._forward(batch, cache)
             finally:
-                cache.end_static_decode()
+                cache.end_static_step(publish=False)
         self._graphs[batch] = graph
