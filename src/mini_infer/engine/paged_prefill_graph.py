@@ -24,6 +24,7 @@ with more tokens than the largest bucket runs eagerly through
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from typing import Any
 
@@ -75,8 +76,11 @@ class PagedPrefillGraph:
         # Padding rows write their K/V here and attend to it.
         self._scratch_block = block_pool.allocate()
         self._steps: dict[int, StaticStep] = {}
-        # (input ids (1, rows), position ids (1, rows), pinned host staging (2, rows))
-        self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        # (input ids (1, rows), position ids (1, rows), last row of each slot (slots,),
+        #  pinned host staging (3, rows))
+        self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        # A model whose forward takes `logits_rows` runs its head on the last rows only.
+        self._selects_rows = "logits_rows" in inspect.signature(model.forward).parameters
         self._inputs_copied: dict[int, Any] = {}
         self._graphs: dict[int, Any] = {}
         self._logits: dict[int, torch.Tensor] = {}
@@ -124,9 +128,10 @@ class PagedPrefillGraph:
     ) -> torch.Tensor:
         """Run one packed step: the tokens of request `b` start at `position_offsets[b]`.
 
-        Takes the arguments of `ModelRunner.forward_step_packed`. Returns
-        `(1, total tokens, vocab)` logits in a fresh tensor, so the caller can
-        keep rows across the next replay.
+        Takes the arguments of `ModelRunner.forward_step_packed`. Returns the
+        logits of each request's last row, `(1, requests, vocab)`, in a fresh
+        tensor, so the caller can keep rows across the next replay. The
+        captured head runs on one row per slot, not on every row of the bucket.
         """
         requests = len(cu_seqlens_q) - 1
         total = cu_seqlens_q[-1]
@@ -138,7 +143,7 @@ class PagedPrefillGraph:
         if rows is None:
             raise ValueError(f"no bucket holds {total} tokens of {requests} requests")
         step = self._steps[rows]
-        input_ids, position_ids, staging = self._inputs[rows]
+        input_ids, position_ids, last_rows, staging = self._inputs[rows]
         positions: list[int] = []
         for batch_idx, offset in enumerate(position_offsets):
             count = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
@@ -151,8 +156,11 @@ class PagedPrefillGraph:
             staging.zero_()
             staging[0, :total] = torch.tensor(list(token_ids), dtype=torch.long)
             staging[1, :total] = torch.tensor(positions, dtype=torch.long)
+            # Padding slots keep row 0, a valid row whose logits nobody reads.
+            staging[2, :requests] = torch.tensor(cu_seqlens_q[1:], dtype=torch.long) - 1
             input_ids.copy_(staging[0].unsqueeze(0), non_blocking=on_cuda)
             position_ids.copy_(staging[1].unsqueeze(0), non_blocking=on_cuda)
+            last_rows.copy_(staging[2, : last_rows.shape[0]], non_blocking=on_cuda)
             if on_cuda:
                 event = torch.cuda.Event()  # type: ignore[no-untyped-call]
                 event.record()
@@ -167,7 +175,7 @@ class PagedPrefillGraph:
                     plan_static_step(cache, self._device)
                 with record_function("prefill_graph.replay"):
                     self._graphs[rows].replay()
-                logits = self._logits[rows][:, :total].clone()
+                logits = self._logits[rows][:, :requests].clone()
             except BaseException:
                 cache.end_static_step(publish=False)
                 raise
@@ -175,13 +183,18 @@ class PagedPrefillGraph:
         return logits
 
     def _forward(self, rows: int, cache: PagedKVCache) -> torch.Tensor:
-        input_ids, position_ids, _ = self._inputs[rows]
+        """The step's forward with the logits of one row per slot."""
+        input_ids, position_ids, last_rows, _ = self._inputs[rows]
+        extra = {"logits_rows": last_rows} if self._selects_rows else {}
         logits: torch.Tensor = self._model(
             input_ids=input_ids,
             position_ids=position_ids,
             past_key_values=cache,
             cu_seqlens_q=self._steps[rows].qo_indptr,
+            **extra,
         )
+        if not self._selects_rows:
+            logits = logits.index_select(1, last_rows)
         return logits
 
     def _capture(self, rows: int) -> None:
@@ -193,7 +206,8 @@ class PagedPrefillGraph:
         self._inputs[rows] = (
             torch.zeros(1, rows, dtype=torch.long, device=self._device),
             torch.zeros(1, rows, dtype=torch.long, device=self._device),
-            torch.zeros(2, rows, dtype=torch.long, pin_memory=True),
+            torch.zeros(step.slots, dtype=torch.long, device=self._device),
+            torch.zeros(3, rows, dtype=torch.long, pin_memory=True),
         )
         # An empty cache: every slot is padding, so the capture touches no slot.
         cache = PagedKVCache(self._pool)

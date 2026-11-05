@@ -10,6 +10,8 @@ checkpoint is necessary.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from mini_infer.cache.block_pool import BlockPool
@@ -77,6 +79,7 @@ class MicroRunner:
     """Duck-typed ModelRunner over a real (random) Qwen3, CPU fp32."""
 
     supports_hidden_state_taps = True
+    supports_last_rows = True
 
     def __init__(self, model: Qwen3ForCausalLM, pool: BlockPool) -> None:
         self._model = model
@@ -92,15 +95,18 @@ class MicroRunner:
         *,
         tap_layers: frozenset[int] | None = None,
         hidden_state_sink: dict[int, torch.Tensor] | None = None,
+        last_rows_only: bool = False,
     ) -> torch.Tensor:
         position_ids_flat: list[int] = []
         for batch_idx in range(cache.batch_size):
             q_len = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx]
             offset = position_offsets[batch_idx]
             position_ids_flat.extend(range(offset, offset + q_len))
-        extra = {}
+        extra: dict[str, Any] = {}
         if tap_layers is not None:
             extra = {"tap_layers": tap_layers, "hidden_state_sink": hidden_state_sink}
+        if last_rows_only:
+            extra["logits_rows"] = torch.tensor(cu_seqlens_q[1:], dtype=torch.long) - 1
         with torch.inference_mode():
             logits: torch.Tensor = self._model(
                 input_ids=torch.tensor([packed_input_ids], dtype=torch.long),
