@@ -37,13 +37,15 @@ _TEST_GPU = os.environ.get("MINI_INFER_TEST_GPU", "B200")
 # container bills the whole cap, at a high rate on a B200.
 _TEST_TIMEOUT = int(os.environ.get("MINI_INFER_TEST_TIMEOUT", "300"))
 
-# The cu128 wheel has Blackwell (SM_100) kernels and bundles the CUDA runtime.
-# Inkling pins the torch attention backend, so no flash-attn or FlashInfer.
+# The CUDA 13.2 wheel has Blackwell (sm_100) kernels and bundles the CUDA
+# runtime. Inkling pins the torch attention backend, so no flash-attn or
+# FlashInfer.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "transformers>=5.14,<5.15",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors",
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",

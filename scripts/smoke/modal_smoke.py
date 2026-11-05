@@ -12,7 +12,7 @@ import modal
 
 _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "A10")
 _BENCH_MODEL = os.environ.get("MINI_INFER_BENCH_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-_IS_BLACKWELL = _BENCH_GPU.upper().startswith("B200")
+_IS_BLACKWELL = _BENCH_GPU.upper().startswith(("B200", "B300"))
 
 # Gated HF repos (Google Gemma 2/3/4, Meta Llama, ...) need an auth token.
 # Pulled from the local `HF_TOKEN` env var and inlined into the container
@@ -30,16 +30,18 @@ _HF_CACHE = modal.Volume.from_name("hf-cache", create_if_missing=True)
 app = modal.App("mini-infer-cuda-smoke")
 
 if _IS_BLACKWELL:
-    # Blackwell (SM_100) needs the cu128 torch wheel; the cu124 wheel ships
-    # kernels through SM_90 only. flash-attn isn't installed because its
-    # prebuilt wheel is pinned to torch 2.5; FlashInfer covers attention.
+    # The CUDA 13.2 torch wheel has Blackwell (sm_100) kernels, and Modal
+    # runs a B300 only with CUDA 13.1 or newer. flash-attn isn't installed
+    # because its prebuilt wheel is pinned to torch 2.5; FlashInfer covers
+    # attention and compiles its kernels with the image's nvcc.
     image = (
-        modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
+        modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.11")
         .pip_install(
-            "torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128"
+            "torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132"
         )
         .pip_install(
-            "transformers>=4.40",
+            "triton==3.8.0",
+            "transformers==5.14.0",
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",
             "pydantic>=2.5",
@@ -51,8 +53,11 @@ else:
     image = (
         modal.Image.debian_slim(python_version="3.11")
         .pip_install(
-            "torch==2.10.0",
-            "transformers>=4.40",
+            "torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132"
+        )
+        .pip_install(
+            "triton==3.8.0",
+            "transformers==5.14.0",
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",
             "pydantic>=2.5",
@@ -81,7 +86,7 @@ def smoke(model_name: str) -> str:
 
     # Detect Blackwell at runtime via the CUDA compute-capability check.
     # On Blackwell the only working attention path is FlashInfer (flash-attn
-    # isn't installed in the cu128 image), so we flag it explicitly here.
+    # isn't installed in the Blackwell image), so we flag it explicitly here.
     attention_backend = "flashinfer" if is_blackwell_device() else "flash_attn"
     runner = ModelRunner.from_pretrained(model_name, attention_backend=attention_backend)
     assert runner.device == "cuda", f"expected cuda, got {runner.device!r}"

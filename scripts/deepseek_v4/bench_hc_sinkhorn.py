@@ -56,8 +56,8 @@ _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "L40S")
 # importing any module under `mini_infer.models` fires
 # `_register_builtin_models()`, which imports the cache package, which
 # imports `transformers.DynamicCache`.
-# The cu124 wheel is fine for L40S / H100; B200 would need cu128 +
-# torch >= 2.6 (out of scope for this microbench).
+# The cu124 wheel is fine for L40S / H100; a Blackwell GPU would need the
+# CUDA 13.2 image of the other Modal scripts (out of scope for this microbench).
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")

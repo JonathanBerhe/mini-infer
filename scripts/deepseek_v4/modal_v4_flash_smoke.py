@@ -47,16 +47,17 @@ _GPU = "B200:2"
 
 app = modal.App("mini-infer-v4-flash-smoke")
 
-# Blackwell needs the cu128 torch wheel; cu124 ships kernels through SM_90.
-# flash-attn isn't installed for the same reason (prebuilt wheel pinned
-# to an older torch); FlashInfer covers attention. The V4 attention path
-# uses our SDPA reference plus the per-block HCA/CSA dispatchers, so
-# even FlashInfer isn't strictly needed for the smoke.
+# The CUDA 13.2 torch wheel has Blackwell (sm_100) kernels, and Modal runs a
+# B300 only with CUDA 13.1 or newer. flash-attn isn't installed because its
+# prebuilt wheel is pinned to an older torch; FlashInfer covers attention.
+# The V4 attention path uses our SDPA reference plus the per-block HCA/CSA
+# dispatchers, so even FlashInfer isn't strictly needed for the smoke.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
+    modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "transformers>=4.40",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",
