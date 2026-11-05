@@ -1,5 +1,7 @@
 # mini-infer
 
+> mini-infer is a research project. It is not production software, and its APIs can change without notice.
+
 mini-infer is an LLM inference engine, written from scratch. It ports new model architectures soon after they are published. Each port matches the upstream reference implementation bit for bit.
 
 ## Features
@@ -16,6 +18,21 @@ mini-infer has these features:
 * Custom kernels for NVIDIA GPUs (Triton), Google TPUs (Pallas), and AWS Trainium (NKI). Other devices use a PyTorch reference path.
 
 Benchmark results are in [docs/benchmarks/](docs/benchmarks/). Design decisions are in [docs/decisions/](docs/decisions/), one ADR (architecture decision record) per decision.
+
+## Performance
+
+mini-infer runs current open models on NVIDIA Hopper and Blackwell GPUs: the H100, H200, B200 and B300. Each result links to the report or ADR that measured it.
+
+| Workload | Model | GPU | Result |
+|---|---|---|---|
+| [Serving, 32 requests](docs/benchmarks/2026-11-05-b300-paged-decode.md) | Qwen2.5-7B | B200, B300 | About 4,500 tokens per second |
+| [Serving, 8 requests](docs/decisions/ADR-053-paged-prefill-cuda-graph.md) | Qwen2.5-7B | H100 | 1,251 tokens per second, 3x the eager path. 1,833 with int8 weights |
+| [Prefill, 32k-token prompt](docs/decisions/ADR-054-gdn-scalar-gate-prefill.md) | Qwen3.8-27B | B200 | 12.6x faster: 74.1 s to 5.9 s |
+| [Decode step, 1 request](docs/benchmarks/2026-11-05-gpu-support-gate.md) | Qwen3.8-27B | B300 | 5.6x faster with a CUDA graph and a fused kernel: 80.2 ms to 14.2 ms |
+| [Decode, 16 requests](docs/decisions/ADR-046-v4-tp-decode-host-syncs.md) | DeepSeek-V4-Flash | 2x B200 | 399 tokens per second |
+| [Speculative decoding](docs/benchmarks/2026-10-19-dspark-concurrency.md) | Qwen3-4B with the DSpark drafter | L4 | Decode 2.5x (chat) to 4.5x (math) faster |
+| [FP8 MoE experts](docs/decisions/ADR-038-gluon-fp8-grouped-hopper.md) | GLM-5.3 | H100 | 1.6x faster with Gluon kernels. As fast as bf16 with half the expert memory |
+| [Largest model](docs/benchmarks/2026-07-03-minimax-m3-428b-gate.md) | MiniMax-M3, 428B parameters | 4x H200 | Runs with FP8 experts, 121 GB per GPU |
 
 ## Quickstart
 
