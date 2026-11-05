@@ -17,6 +17,7 @@ original training length.
 """
 
 import math
+from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -166,6 +167,10 @@ class RotaryEmbedding(nn.Module):
     Holds only the inverse-frequency buffer (no parameters). Each forward
     builds cos/sin for the given `position_ids` so we never cache against
     HF's static-cache assumption.
+
+    `inv_freq` stays fp32 when the module is cast with `.to(dtype)`,
+    `.half()` or `.bfloat16()` (see `_apply`). The cos/sin tables come out
+    in the dtype of the hidden states.
     """
 
     inv_freq: torch.Tensor
@@ -242,6 +247,30 @@ class RotaryEmbedding(nn.Module):
         else:
             inv_freq = rotated
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _apply(
+        self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True
+    ) -> "RotaryEmbedding":
+        """Apply `fn` to the tensors of the module, but keep `inv_freq` in fp32.
+
+        `nn.Module.to(dtype)`, `.half()` and `.bfloat16()` cast every floating
+        point buffer. In bf16, `inv_freq` has a relative rounding error of up
+        to 2^-8, and the RoPE angle at distance p is `p * inv_freq`. With
+        head_dim 128 and theta 500000, the angle moves by up to 1.8 rad at
+        1000 tokens. transformers builds this table in fp32 when it loads a
+        checkpoint in bf16, so this module keeps it in fp32 too. Device moves
+        still apply.
+        """
+        before = self.inv_freq
+        super()._apply(fn, recurse)  # type: ignore[no-untyped-call]
+        after = self.inv_freq
+        if after.dtype != torch.float32:
+            if before.is_meta or after.is_meta:
+                self.inv_freq = after.to(dtype=torch.float32)
+            else:
+                # Copy the fp32 values from before the cast, not the rounded ones.
+                self.inv_freq = before.to(device=after.device, dtype=torch.float32)
+        return self
 
     def forward(
         self, hidden_states: torch.Tensor, position_ids: torch.Tensor
