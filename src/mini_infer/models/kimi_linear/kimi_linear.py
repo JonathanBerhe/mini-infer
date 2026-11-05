@@ -993,6 +993,58 @@ class KimiLinearForCausalLM(BaseCausalLM):
     def expected_missing_state_keys(self) -> set[str]:
         return {"lm_head.weight"} if self.cfg.tie_word_embeddings else set()
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        name_or_path: str,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> KimiLinearForCausalLM:
+        """Build the model in `dtype` on `device`, then copy the weights in one shard at a time.
+
+        `load_model` builds the model in fp32 on the host and loads the whole
+        state dict onto the device, so the device holds two copies of the
+        weights. Kimi Linear 48B (98 GB in bf16) then needs about 196 GB and
+        does not fit one B200. Here the model is built on the meta device (no
+        storage and no random init), gets empty storage on `device`, and the
+        checkpoint fills it one shard at a time. Peak device memory is the
+        model, and peak host memory is one shard.
+
+        Every parameter is in `dtype`, also `A_log` and `dt_bias`, which the
+        constructor makes in fp32. `load_model` casts them the same way. The
+        family has no buffers, so the checkpoint supplies every value, and the
+        coverage check of `load_weights_streaming` fails on a missing one.
+        `StateCacheGenerator.from_pretrained` calls this method.
+        """
+        from mini_infer.models import _raw_config_namespace
+
+        # Read config.json raw: transformers knows this family only through
+        # hub code, and AutoConfig asks to run that code.
+        cfg = cls.Config.from_hf(_raw_config_namespace(name_or_path))  # type: ignore[attr-defined]
+        with torch.device("meta"):
+            model = cls(cfg)
+        if next(model.buffers(), None) is not None:
+            raise NotImplementedError(
+                f"{cls.__name__} has buffers, and meta construction leaves them without "
+                f"values; compute them on `device` before the model runs"
+            )
+        model = model.to(dtype=dtype).to_empty(device=device)
+        if model.cfg.tie_word_embeddings:
+            # `to_empty` gives each module a new parameter, which unties them.
+            model.lm_head.weight = model.model.embed_tokens.weight
+        model.eval()
+        cls.load_weights_streaming(model, name_or_path)
+        return model
+
+    @staticmethod
+    def text_checkpoint_tensors(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Checkpoint tensors under the text model's checkpoint names.
+
+        The identity for Kimi Linear. Kimi K3 drops its vision tower here.
+        """
+        return hf_tensors
+
     @staticmethod
     def load_weights(model: BaseCausalLM, hf_state_dict: dict[str, torch.Tensor]) -> None:
         if not isinstance(model, KimiLinearForCausalLM):
@@ -1000,14 +1052,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 f"KimiLinearForCausalLM.load_weights expects a KimiLinearForCausalLM, "
                 f"got {type(model).__name__}"
             )
-        from mini_infer.distributed.group import get_world_size
-
-        if get_world_size() != 1:
-            raise NotImplementedError(
-                "KimiLinearForCausalLM is single-rank only for now: TP would "
-                "shard the KDA conv channels and the per-head matrix state. "
-                "A follow-up, like Inkling."
-            )
+        _require_single_rank()
         remapped = _remap_kimi_state(
             hf_state_dict,
             mxfp4_weights=model.cfg.mxfp4_weights,
@@ -1020,6 +1065,62 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 f"weight load mismatch for {type(model).__name__}: "
                 f"missing={sorted(missing_set)}, unexpected={sorted(unexpected)}"
             )
+
+    @staticmethod
+    def load_weights_streaming(model: BaseCausalLM, name_or_path: str) -> None:
+        """Copy a safetensors checkpoint into `model` one shard at a time.
+
+        Same key handling and coverage check as `load_weights`. Each shard is
+        read on the host, copied into the existing parameters (which keep
+        their device and dtype), and released before the next shard loads.
+        An MXFP4 `weight_packed` / `weight_scale` pair must be in one shard,
+        as in the released K3 checkpoint. A split pair fails the remap.
+        """
+        if not isinstance(model, KimiLinearForCausalLM):
+            raise TypeError(
+                f"KimiLinearForCausalLM.load_weights_streaming expects a KimiLinearForCausalLM, "
+                f"got {type(model).__name__}"
+            )
+        _require_single_rank()
+        from mini_infer.models.loader import iter_safetensors_shards
+
+        dtype = next(model.parameters()).dtype
+        model_keys = set(model.state_dict().keys())
+        consumed: set[str] = set()
+        for shard in iter_safetensors_shards(name_or_path, device="cpu", dtype=dtype):
+            remapped = _remap_kimi_state(
+                type(model).text_checkpoint_tensors(shard),
+                mxfp4_weights=model.cfg.mxfp4_weights,
+                kda_num_heads=model.cfg.kda_num_heads,
+            )
+            # Drop this loop's references before the next shard loads, or two
+            # shards are alive at once.
+            del shard
+            if remapped:
+                missing, unexpected = model.load_state_dict(remapped, strict=False)
+                if unexpected:
+                    raise ValueError(
+                        f"weight load mismatch for {type(model).__name__}: "
+                        f"unexpected={sorted(unexpected)}"
+                    )
+                consumed |= model_keys - set(missing)
+            del remapped
+        leftover = model_keys - consumed - model.expected_missing_state_keys()
+        if leftover:
+            raise ValueError(
+                f"weight load mismatch for {type(model).__name__}: missing={sorted(leftover)}"
+            )
+
+
+def _require_single_rank() -> None:
+    from mini_infer.distributed.group import get_world_size
+
+    if get_world_size() != 1:
+        raise NotImplementedError(
+            "KimiLinearForCausalLM is single-rank only for now: TP would "
+            "shard the KDA conv channels and the per-head matrix state. "
+            "A follow-up, like Inkling."
+        )
 
 
 def _remap_kimi_state(
