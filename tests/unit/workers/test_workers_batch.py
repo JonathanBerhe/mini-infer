@@ -13,7 +13,8 @@ If either contract drifts, batching has changed output distribution —
 which would make PD's "speed up without changing answers" claim false.
 
 Marked `requires_model`: needs a real model load. Greedy sampling so the
-parity contract is exact, not approximate.
+parity contract is exact, not approximate. The runner is pinned to the
+CPU, where fp32 makes the contract exact; see the fixture.
 """
 
 from __future__ import annotations
@@ -31,7 +32,14 @@ MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
 @pytest.fixture(scope="module")
 def qwen_runner() -> ModelRunner:
-    return ModelRunner.from_pretrained(MODEL_NAME)
+    # The parity contract is exact at fp32 on the CPU. On MPS in fp16 a
+    # packed forward over the three prompts rounds the two top logits of
+    # "A common greeting is" (ids 330 and 311, 0.0069 apart at fp32, below
+    # the fp16 step of 0.0156 at that magnitude) to the same value, and
+    # argmax then picks the lower id. `ContinuousScheduler` flips the same
+    # way when the prompts share a step, so the flip is a near-tie of the
+    # batch shape, not a PD defect.
+    return ModelRunner.from_pretrained(MODEL_NAME, device="cpu")
 
 
 @pytest.mark.requires_model
