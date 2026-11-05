@@ -70,7 +70,13 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.8.0", extra_index_url="https://download.pytorch.org/whl/cu128")
     .pip_install(FLASH_ATTN_WHEEL)
-    .pip_install("transformers>=5.14,<5.15", "safetensors", "huggingface_hub[hf_xet]", "pytest")
+    .pip_install(
+        "triton==3.4.0",
+        "transformers==5.14.0",
+        "safetensors",
+        "huggingface_hub[hf_xet]",
+        "pytest",
+    )
     .env({"HF_HOME": "/hf-cache"})
     .add_local_python_source("mini_infer")
     .add_local_dir("tests", remote_path="/root/tests")
@@ -448,9 +454,11 @@ def lsa_speed() -> str:
 
     deadline = time.monotonic() + _TEST_TIMEOUT - _END_MARGIN_S
     assert torch.cuda.is_available(), "CUDA not available in Modal container"
+    from mini_infer.fast_paths import fast_path_report
+
     header = (
-        f"gpu={torch.cuda.get_device_name()} torch={torch.__version__} "
-        f"cxx11abi={torch._C._GLIBCXX_USE_CXX11_ABI} model={MODEL_NAME}@{REVISION[:7]}"
+        f"{fast_path_report()} cxx11abi={torch._C._GLIBCXX_USE_CXX11_ABI} "
+        f"model={MODEL_NAME}@{REVISION[:7]}"
     )
     print(header, flush=True)
     try:
