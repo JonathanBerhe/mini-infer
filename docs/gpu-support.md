@@ -50,16 +50,17 @@ kernels.
 | Inkling, paged | Torch attention (required) | Unchecked | Unchecked | Fallback (tiny weights, 2026-10-19): per-expert MoE loop | Unchecked |
 | Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) with a tokenizer and a loader of the smoke script. The library now has both. The library path is not yet run on a GPU | Unchecked |
 | MiniMax-M3 428B, paged, 4 GPUs | Torch attention with the MSA block mask (required), grouped FP8 experts. The MSA decode kernel stays off (0.98x) | No: four 80 GB GPUs are too small | Fast, old stack (4x H200, 2026-07-03, [report](benchmarks/2026-07-03-minimax-m3-428b-gate.md)) | Partial (MSA decode kernel only, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Unchecked |
-| Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Unchecked (the 2026-11-05 run stopped at an fp32 unit test, now fixed) | Fast (2026-10-21) | Unchecked |
+| Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Fast (2026-10-21) | Unchecked |
 | Qwen3.8 27B, own cache | Chunkwise GDN prefill, fused GDN decode kernel, decode CUDA graph | Fast, old stack (2026-11-04, [ADR-054](decisions/ADR-054-gdn-scalar-gate-prefill.md)) | Unchecked | Fast, old stack (2026-11-04) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
 | DSpark drafter on Qwen3-4B | Torch attention | Unchecked (L4 only, main stack passed on 2026-11-05) | Unchecked | Unchecked | Unchecked |
 
 Notes on the matrix:
 
 - On 2026-11-05 the H100 ran the GPU unit tests on the main stack: 116
-  passed and 1 failed. The failure (an fp32 Nemotron-H graph test) is fixed
-  in the code, but no GPU run proves the fix yet.
-- The H200 ran the Qwen2.5-7B bench and six paged models on 2026-11-05.
+  passed and 1 failed. The failure (an fp32 Nemotron-H graph test) is fixed.
+  The Nemotron-H run on the H200 passed that test with the fix.
+- The H200 ran the Qwen2.5-7B bench, six paged models and Nemotron-H on
+  2026-11-05.
 - The B300 ran 25 of 26 GPU test files on the main stack on 2026-11-05
   (PR #77), the Qwen2.5-7B bench of PR #79, Qwen3.8 27B and the GLM tiny
   config.
