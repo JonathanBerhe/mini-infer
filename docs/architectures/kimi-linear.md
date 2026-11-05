@@ -214,11 +214,12 @@ query_states = torch.cat((q_pass, q_rot), dim=-1)
 key_states = torch.cat((k_pass, k_rot), dim=-1)
 ```
 
-Our code (`_KimiMlaAttention.forward`, `kimi_linear/kimi_linear.py:386-392`):
+Our code (`_KimiMlaAttention._attend_decompressed`, the form that a prefill
+span runs):
 
 ```python
 kv_latent, k_rot = torch.split(kv_hist, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-decompressed = self.kv_b_proj(self.kv_a_layernorm(kv_latent)).view(
+decompressed = self.kv_b_proj(kv_latent).view(
     batch, -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
 )
 k_nope, values = torch.split(decompressed, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -226,16 +227,32 @@ k_nope, values = torch.split(decompressed, [self.qk_nope_head_dim, self.v_head_d
 keys = torch.cat([k_nope, k_rot.unsqueeze(2).expand(-1, -1, self.num_heads, -1)], dim=-1)
 ```
 
+The latent in `kv_hist` is already normalized: the layer applies
+`kv_a_layernorm` once per new token, before it writes the state.
+
 In both, `q_rot` and `k_rot` keep their names but are never rotated. The
 configuration still carries `rope_theta`, but nothing reads it. `from_hf`
-rejects a configuration with `mla_use_nope` off or with `q_lora_rank` set
-(`kimi_linear/kimi_linear.py:122-128`), because that is different math.
+rejects a configuration with `mla_use_nope` off, because that is different
+math.
+
+A decode step (one new token per row) runs the absorbed form,
+`_attend_absorbed` ([ADR-057](../decisions/ADR-057-kimi-mla-absorbed-decode.md)). It folds `kv_b_proj` into the query and the
+output, so each head scores the 576-wide state rows directly and nothing is
+rebuilt per history token:
+
+```python
+q_absorbed = torch.cat([torch.einsum("bqhd,hdc->bqhc", q_nope, w_uk), q_rope], dim=-1)
+scores = torch.einsum("bqhc,bkc->bhqk", q_absorbed, rows) * self.softmax_scale
+...
+latent_out = torch.einsum("bhqk,bkc->bqhc", weights, rows[..., : self.kv_lora_rank])
+return torch.einsum("bqhc,hdc->bqhd", latent_out, w_uv).to(queries.dtype)
+```
 
 This layer is a separate class, not the shared `MLAAttention` of
 `blocks/mla.py`. It has no RoPE, and it reads and writes a dense per-request
-buffer instead of paged cache streams. The decompression on read is the same
-idea. The causal mask uses each row's own start position (L394-403), so one
-batch can hold requests of different lengths.
+buffer instead of paged cache streams. The causal mask uses each row's own
+start position, so one batch can hold requests of different lengths. A step
+reads the buffer up to the end of its longest row, never the whole capacity.
 
 The reference forces `flash_attention_2` when the model is built. The parity
 tests set the eager implementation after construction, for CPU runs.
@@ -331,14 +348,15 @@ layer and per batch row:
 |---|---|---|
 | KDA (20 layers) | `recurrent_state`, always fp32 | `(B, 32, 128, 128)` |
 | KDA | `conv_q`, `conv_k`, `conv_v`, the last 4 raw inputs | `(B, 4096, 4)` each |
-| MLA (7 layers) | `kv`, the raw `kv_a_proj_with_mqa` output | `(B, max_seq_len, 576)` |
+| MLA (7 layers) | `kv`, the `kv_a_proj_with_mqa` output with a normalized latent | `(B, max_seq_len, 576)` |
 
 The KDA state does not grow with the context. One request needs 2 MiB of fp32
 state per KDA layer, so 40 MiB for all 20, at any context length. Only the 7
 MLA layers grow.
 
-The MLA buffer stores the compressed 576 values per token (512 latent plus
-64 unrotated dims) and decompresses them on read. The reference
+The MLA buffer stores the compressed 576 values per token (512 latent after
+`kv_a_layernorm`, plus 64 unrotated dims). A prefill span decompresses them on
+read, and a decode step attends to them in the absorbed form. The reference
 `KimiDynamicCache` (L118) stores the decompressed per-head K and V instead:
 32 heads x (192 + 128), so 10240 values per token per layer. NoPE puts
 nothing position-dependent into the cache, so both give the same result.

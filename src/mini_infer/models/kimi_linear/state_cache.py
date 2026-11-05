@@ -11,9 +11,11 @@ which fits the paged one-entry-per-token KV model:
     length; this is where Kimi Linear's 75% cache reduction comes from.
   - **MLA layers** (the 1-in-4 full-attention layers): an append-only
     per-token buffer of the COMPRESSED `kv_a_proj_with_mqa` output
-    (`kv_lora_rank + qk_rope_head_dim` wide, shared across heads). The
-    per-head K/V are re-decompressed on read, exactly like `blocks/mla.py`;
-    Kimi's MLA is NoPE so nothing position-dependent is baked in. On Kimi
+    (`kv_lora_rank + qk_rope_head_dim` wide, shared across heads), with
+    the latent part already through `kv_a_layernorm`. A prefill span
+    rebuilds the per-head K/V on read like `blocks/mla.py`; a decode step
+    attends to the rows directly (the absorbed form). Kimi's MLA is NoPE,
+    so nothing position-dependent is baked in. On Kimi
     K3.1 the MLA layers are DeepSeek Sparse Attention layers, and a second
     append-only buffer holds the indexer key of each token
     (`index_head_dim` wide).
@@ -65,7 +67,8 @@ class KimiMlaStateSpec:
 
     Attributes:
         kv_width: width of one cached entry, `kv_lora_rank +
-            qk_rope_head_dim` (the raw `kv_a_proj_with_mqa` output).
+            qk_rope_head_dim` (the `kv_a_proj_with_mqa` output, its latent
+            part normalized).
         max_seq_len: dense per-request capacity. Sized by the caller to
             prompt + generation budget; unlike the paged path this is a
             hard bound, admission control must respect it.
