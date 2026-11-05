@@ -44,9 +44,10 @@ app = modal.App("mini-infer-llama-tp-smoke")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "torch==2.10.0",
-        "transformers>=4.40",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",

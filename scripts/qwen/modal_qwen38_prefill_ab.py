@@ -53,8 +53,8 @@ hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
-    .pip_install("transformers>=5.14,<5.15", "safetensors", "huggingface_hub[hf_xet]")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
+    .pip_install("triton==3.8.0", "transformers==5.14.0", "safetensors", "huggingface_hub[hf_xet]")
     .env({"HF_HOME": "/hf-cache"})
     .add_local_python_source("mini_infer")
 )
