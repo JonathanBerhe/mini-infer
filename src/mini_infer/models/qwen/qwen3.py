@@ -135,8 +135,12 @@ class Qwen3ForCausalLM(BaseCausalLM):
         *,
         tap_layers: frozenset[int] | None = None,
         hidden_state_sink: dict[int, torch.Tensor] | None = None,
+        logits_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Args beyond the base contract:
+
+        logits_rows: a device index of packed rows; only those rows go
+        through the head. The taps still see every row.
 
         tap_layers / hidden_state_sink: for the DSpark drafter (see
         `engine/dspark/`), which needs POST-block hidden states from a fixed
@@ -160,6 +164,8 @@ class Qwen3ForCausalLM(BaseCausalLM):
             tap_layers=tap_layers,
             hidden_state_sink=hidden_state_sink,
         )
+        if logits_rows is not None:
+            x = x.index_select(1, logits_rows)
         logits: torch.Tensor = self.lm_head(x)
         return logits
 

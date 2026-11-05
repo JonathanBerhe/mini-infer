@@ -9,6 +9,7 @@ the padded buckets run on CUDA only.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import pytest
@@ -35,6 +36,29 @@ class _EagerStandIn:
         self.graph._logits[self.rows] = self.graph._forward(self.rows, self.cache)
 
 
+class _FullRowsModel(torch.nn.Module):
+    """A model whose forward has no `logits_rows`, so its head runs on every row."""
+
+    def __init__(self, inner: torch.nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: PagedKVCache,
+        cu_seqlens_q: torch.Tensor,
+    ) -> torch.Tensor:
+        logits: torch.Tensor = self.inner(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            cu_seqlens_q=cu_seqlens_q,
+        )
+        return logits
+
+
 def _fake_graph(
     model: Any, pool: BlockPool, buckets: tuple[int, ...], max_requests: int
 ) -> PagedPrefillGraph:
@@ -48,18 +72,21 @@ def _fake_graph(
     graph._scratch_block = pool.allocate()
     graph._steps = {}
     graph._inputs = {}
+    graph._selects_rows = "logits_rows" in inspect.signature(model.forward).parameters
     graph._inputs_copied = {}
     graph._graphs = {}
     graph._logits = {}
     graph._memory_pool = None
     for rows in graph._buckets:
-        graph._steps[rows] = StaticStep.allocate(
+        step = StaticStep.allocate(
             rows, graph.slots(rows), graph._scratch_block, pool.num_blocks, graph._device
         )
+        graph._steps[rows] = step
         graph._inputs[rows] = (
             torch.zeros(1, rows, dtype=torch.long),
             torch.zeros(1, rows, dtype=torch.long),
-            torch.zeros(2, rows, dtype=torch.long),
+            torch.zeros(step.slots, dtype=torch.long),
+            torch.zeros(3, rows, dtype=torch.long),
         )
         graph._graphs[rows] = _EagerStandIn(graph, rows)
     return graph
@@ -95,14 +122,24 @@ def test_bucket_takes_the_smallest_that_holds_the_tokens_and_the_requests() -> N
     assert not graph.accepts([0, 70])
 
 
-def test_replay_matches_the_eager_prefill_and_mixed_steps() -> None:
+@pytest.mark.parametrize("selects_rows", [True, False], ids=["head-on-last-rows", "full-head"])
+def test_replay_matches_the_eager_prefill_and_mixed_steps(selects_rows: bool) -> None:
     """A prefill step of two prompts, then a step with a decoder next to a prefill
-    chunk: the static steps and the eager steps agree bit for bit."""
-    eager_runner, eager_cache = _two_slot_cache(seed=3)
-    graph_runner, graph_cache = _two_slot_cache(seed=3)
+    chunk: the static steps and the eager steps agree bit for bit, and both
+    return the last row of each request. A model without `logits_rows` gets the
+    same rows through the graph's own gather."""
+    eager_micro, eager_cache = _two_slot_cache(seed=3)
+    graph_micro, graph_cache = _two_slot_cache(seed=3)
+
+    def model_of(micro: Any) -> Any:
+        return micro._model if selects_rows else _FullRowsModel(micro._model)
+
+    # Both sides run their head on the same rows, so the matmuls agree bit for bit.
+    eager_runner = ModelRunner(model_of(eager_micro), None, "cpu", eager_micro.block_pool)  # type: ignore[arg-type]
     # max_requests=1 gives two slots per bucket, so a two-request step that fills
     # its bucket has no padding.
-    graph = _fake_graph(graph_runner._model, graph_runner.block_pool, (4, 9), max_requests=1)
+    graph = _fake_graph(model_of(graph_micro), graph_micro.block_pool, (4, 9), max_requests=1)
+    assert graph._selects_rows is selects_rows
     for stand_in in graph._graphs.values():
         assert isinstance(stand_in, _EagerStandIn)
         stand_in.cache = graph_cache
@@ -112,12 +149,15 @@ def test_replay_matches_the_eager_prefill_and_mixed_steps() -> None:
     ]
     assert not torch.is_inference_mode_enabled()
     for tokens, cu_seqlens_q, offsets in steps:
-        expected = eager_runner.forward_step_packed(eager_cache, tokens, cu_seqlens_q, offsets)
+        expected = eager_runner.forward_step_packed(
+            eager_cache, tokens, cu_seqlens_q, offsets, last_rows_only=True
+        )
         got = graph.replay(graph_cache, tokens, cu_seqlens_q, offsets)
+        assert got.shape[:2] == (1, 2)
         assert torch.equal(got, expected)
         assert graph_cache.static_step is None
         assert graph_cache.seq_lens_list() == eager_cache.seq_lens_list()
-    for layer_idx in range(graph_runner.block_pool.num_layers):
+    for layer_idx in range(graph_micro.block_pool.num_layers):
         graph_k, graph_v, _, _ = graph_cache.materialize_packed_kv(layer_idx)
         eager_k, eager_v, _, _ = eager_cache.materialize_packed_kv(layer_idx)
         assert torch.equal(graph_k, eager_k) and torch.equal(graph_v, eager_v)
@@ -143,9 +183,10 @@ class _RecordingGraph:
         return self.accept
 
     def replay(self, cache: PagedKVCache, *args: Any) -> torch.Tensor:
+        """One row per request: the decode graph takes (ids, offsets), the prefill graph
+        (ids, cu_seqlens_q, offsets)."""
         self.calls.append(args)
-        total = len(args[0])
-        return torch.zeros(1, total, 7)
+        return torch.zeros(1, len(args[-1]), 7)
 
 
 def test_runner_routes_steps_to_the_prefill_graph_after_the_decode_graph() -> None:
@@ -156,23 +197,59 @@ def test_runner_routes_steps_to_the_prefill_graph_after_the_decode_graph() -> No
     runner._prefill_graph = prefill  # type: ignore[assignment]
     assert runner.prefill_graph is prefill
 
-    out = runner.forward_step_packed(cache, [5, 7, 8], [0, 2, 3], [6, 3])
-    assert prefill.calls == [([5, 7, 8], [0, 2, 3], [6, 3])] and out.shape == (1, 3, 7)
+    out = runner.forward_step_packed(cache, [5, 7, 8], [0, 2, 3], [6, 3], last_rows_only=True)
+    assert prefill.calls == [([5, 7, 8], [0, 2, 3], [6, 3])] and out.shape == (1, 2, 7)
+    runner.forward_step(cache, [5, 7, 8], [0, 2, 3], [6, 3])
+    assert len(prefill.calls) == 2
+
+    # A step that reads every row runs eagerly: the graph keeps the last rows only.
+    full = runner.forward_step_packed(cache, [5, 7, 8], [0, 2, 3], [6, 3])
+    assert len(prefill.calls) == 2 and full.shape[1] == 3
 
     # A decode-only step goes to the decode graph when there is one.
     decode = _RecordingGraph(accept=True)
     runner._decode_graph = decode  # type: ignore[assignment]
-    runner.forward_step_packed(cache, [5, 7], [0, 1, 2], [8, 4])
-    assert len(decode.calls) == 1 and len(prefill.calls) == 1
+    runner.forward_step_packed(cache, [5, 7], [0, 1, 2], [8, 4], last_rows_only=True)
+    assert len(decode.calls) == 1 and len(prefill.calls) == 2
 
     # Device-side ids and hidden-state taps stay off the prefill graph.
     runner._decode_graph = None
     eager = runner.forward_step_packed(
-        cache, DeviceTokens(torch.tensor([5, 7]), [0, 1]), [0, 1, 2], [9, 5]
+        cache, DeviceTokens(torch.tensor([5, 7]), [0, 1]), [0, 1, 2], [9, 5], last_rows_only=True
     )
-    assert len(prefill.calls) == 1 and eager.shape[1] == 2
+    assert len(prefill.calls) == 2 and eager.shape[1] == 2
     sink: dict[int, torch.Tensor] = {}
     tapped = runner.forward_step_packed(
-        cache, [3, 4, 6], [0, 2, 3], [10, 6], tap_layers=frozenset({1}), hidden_state_sink=sink
+        cache,
+        [3, 4, 6],
+        [0, 2, 3],
+        [10, 6],
+        tap_layers=frozenset({1}),
+        hidden_state_sink=sink,
+        last_rows_only=True,
     )
-    assert len(prefill.calls) == 1 and tapped.shape[1] == 3 and set(sink) == {1}
+    assert len(prefill.calls) == 2 and tapped.shape[1] == 2 and set(sink) == {1}
+    assert sink[1].shape[1] == 3  # the taps still see every row
+
+
+@pytest.mark.parametrize("selects_rows", [True, False], ids=["head-on-last-rows", "full-head"])
+def test_last_rows_only_returns_the_last_row_of_each_request(selects_rows: bool) -> None:
+    """The eager step with `last_rows_only` returns the rows that a full step has at
+    `cu_seqlens_q[i + 1] - 1`, whether the model's head picks them or the runner does."""
+    full_micro, full_cache = _two_slot_cache(seed=4)
+    rows_micro, rows_cache = _two_slot_cache(seed=4)
+    full_runner = ModelRunner(full_micro._model, None, "cpu", full_micro.block_pool)  # type: ignore[arg-type]
+    model = rows_micro._model if selects_rows else _FullRowsModel(rows_micro._model)
+    rows_runner = ModelRunner(model, None, "cpu", rows_micro.block_pool)  # type: ignore[arg-type]
+    assert rows_runner._model_selects_rows() is selects_rows
+    for tokens, cu_seqlens_q, offsets in [
+        (list(range(10, 19)), [0, 6, 9], [0, 0]),
+        ([5, 7, 8, 9], [0, 1, 4], [6, 3]),
+    ]:
+        full = full_runner.forward_step_packed(full_cache, tokens, cu_seqlens_q, offsets)
+        last = rows_runner.forward_step_packed(
+            rows_cache, tokens, cu_seqlens_q, offsets, last_rows_only=True
+        )
+        expected = full[:, [cu_seqlens_q[1] - 1, cu_seqlens_q[2] - 1]]
+        assert last.shape == expected.shape
+        torch.testing.assert_close(last, expected, rtol=0, atol=1e-5)
