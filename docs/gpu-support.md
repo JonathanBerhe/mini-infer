@@ -40,7 +40,7 @@ kernels.
 | Family and model | Fast path | H100 | H200 | B200 | B300 |
 |---|---|---|---|---|---|
 | Qwen2 (Qwen2.5-7B), paged | FlashInfer, decode and prefill CUDA graphs, fused norm, RoPE and SiLU kernels, int8 W8A16 with per-arch tiles | Fast, old stack (2026-11-04, [ADR-053](decisions/ADR-053-paged-prefill-cuda-graph.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Fast (2026-11-05, PR #79) | Fast (2026-11-05, PR #79, within 1% of the B200) |
-| Llama, Mistral, Qwen3, paged | Same code as Qwen2 | Unchecked (the 2-GPU TP smoke of 2026-05-15 loads Qwen2.5-7B) | Runs: Mistral 7B and Qwen3 8B with FlashInfer, no graph (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Llama 3.1 8B loads and generates, but the port ignores its `llama3` RoPE scaling | Unchecked | Unchecked |
+| Llama, Mistral, Qwen3, paged | Same code as Qwen2 | Runs: Llama 3.1 8B with FlashInfer, no graph, matches transformers on a 10240-token prompt (2026-11-05, [report](benchmarks/2026-11-05-llama31-rope-parity.md)) | Runs: Mistral 7B and Qwen3 8B with FlashInfer, no graph (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Llama 3.1 8B loads and generates the text of transformers (run before the `llama3` RoPE fix) | Unchecked | Unchecked |
 | Mixtral, paged MoE | As Qwen2, plus grouped bf16 expert matmuls (sm_90+) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Unchecked |
 | Gemma 3, paged | FlashInfer with sliding windows | Unchecked | Fast (1B, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). The 4B, 12B and 27B checkpoints do not load | Unchecked | Unchecked |
 | Gemma 4 31B, paged | Torch attention (head_dim 512 is above the FlashInfer limit) | Unchecked | Unchecked | Fallback by design, old stack (2026-05-06) | Unchecked |
@@ -48,18 +48,19 @@ kernels.
 | DeepSeek-V4-Flash, own cache, 2 GPUs | FP4 experts (W4A8 on sm_100, Gluon or Triton FP4), HC Sinkhorn kernel, fused partial RoPE and norm, decode CUDA graph | Partial (kernels and one layer) | Unchecked | Fast, old stack (2x B200, 2026-10-25, [ADR-046](decisions/ADR-046-v4-tp-decode-host-syncs.md)) | Unchecked |
 | GLM-5.2 and GLM-5.3, paged MLA with DSA | Torch attention (required), grouped FP8 experts (Gluon or Triton) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Partial (tiny config equal to transformers 5.14, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
 | Inkling, paged | Torch attention (required) | Unchecked | Unchecked | Fallback (tiny weights, 2026-10-19): per-expert MoE loop | Unchecked |
-| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Needs the tokenizer and the loader of the smoke script | Unchecked |
+| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). A second run loaded it through `StateCacheGenerator.from_pretrained`, as the API server does, with the same output (2026-11-05, PR #83) | Unchecked |
 | MiniMax-M3 428B, paged, 4 GPUs | Torch attention with the MSA block mask (required), grouped FP8 experts. The MSA decode kernel stays off (0.98x) | No: four 80 GB GPUs are too small | Fast, old stack (4x H200, 2026-07-03, [report](benchmarks/2026-07-03-minimax-m3-428b-gate.md)) | Partial (MSA decode kernel only, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Unchecked |
-| Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Unchecked (the 2026-11-05 run stopped at an fp32 unit test, now fixed) | Fast (2026-10-21) | Unchecked |
+| Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Fast (2026-10-21) | Unchecked |
 | Qwen3.8 27B, own cache | Chunkwise GDN prefill, fused GDN decode kernel, decode CUDA graph | Fast, old stack (2026-11-04, [ADR-054](decisions/ADR-054-gdn-scalar-gate-prefill.md)) | Unchecked | Fast, old stack (2026-11-04) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
 | DSpark drafter on Qwen3-4B | Torch attention | Unchecked (L4 only, main stack passed on 2026-11-05) | Unchecked | Unchecked | Unchecked |
 
 Notes on the matrix:
 
 - On 2026-11-05 the H100 ran the GPU unit tests on the main stack: 116
-  passed and 1 failed. The failure (an fp32 Nemotron-H graph test) is fixed
-  in the code, but no GPU run proves the fix yet.
-- The H200 ran the Qwen2.5-7B bench and six paged models on 2026-11-05.
+  passed and 1 failed. The failure (an fp32 Nemotron-H graph test) is fixed.
+  The Nemotron-H run on the H200 passed that test with the fix.
+- The H200 ran the Qwen2.5-7B bench, six paged models and Nemotron-H on
+  2026-11-05.
 - The B300 ran 25 of 26 GPU test files on the main stack on 2026-11-05
   (PR #77), the Qwen2.5-7B bench of PR #79, Qwen3.8 27B and the GLM tiny
   config.
@@ -77,7 +78,7 @@ Notes on the matrix:
 | Script | Stack | GPUs |
 |---|---|---|
 | `scripts/smoke/modal_gpu_tests.py` | Main stack with FlashInfer. `MINI_INFER_TEST_FLASH_ATTN=1` selects the old torch 2.5.1 image with flash-attn 2.8.3. | All four (the flash-attn image: Hopper only) |
-| `scripts/smoke/modal_smoke.py` | Main stack with FlashInfer, one image for every GPU. State-cache models run through `StateCacheGenerator`. Kimi Linear loads with a tokenizer and a loader of the script. | All four |
+| `scripts/smoke/modal_smoke.py` | Main stack with FlashInfer, one image for every GPU. State-cache models run through `StateCacheGenerator.from_pretrained`, as the API server loads them. | All four |
 | `scripts/bench/modal_openloop_bench.py` | Main stack with FlashInfer. The server takes `MINI_INFER_ATTENTION_BACKEND`. | All four |
 | `scripts/minimax_m3/modal_m3_generate.py`, `modal_msa_kernel_bench.py` | Main stack, `debian_slim` (torch 2.6.0 had no sm_100 kernels) | All four (M3 on H100 needs more than 4 GPUs) |
 | `scripts/glm/modal_glm_smoke.py`, `modal_glm_tp_smoke.py` | Main stack, `debian_slim`, transformers 5.14 as the HF reference | All four |
@@ -129,17 +130,14 @@ These fallbacks are still silent:
   flash-attn or FlashInfer. They test correctness on the torch path.
 - Kimi Linear and Kimi K3 have no GPU kernel for KDA, no grouped MoE path and
   no CUDA graph. Inkling has no grouped MoE path.
-- The Kimi Linear checkpoints ship their tokenizer only as hub code, and
-  `Tokenizer.from_pretrained` runs no hub code. So the API server cannot
-  load Kimi Linear. `modal_smoke.py` loads that tokenizer at a pinned
-  revision in the container.
-- `load_model` builds a model on the host and loads the state dict onto the
-  device, so the device holds two copies of the weights at its peak. A
-  model with its own `from_checkpoint` streams its shards instead. Kimi
-  Linear 48B has none. Two copies of its weights (196 GB) do not fit on one
-  B200 through `StateCacheGenerator.from_pretrained`.
-- The Llama port ignores the `llama3` RoPE scaling of Llama 3.1, 3.2 and
-  3.3. Short prompts change a little, and prompts past 8k tokens are wrong.
+- The Llama port applies the `llama3` RoPE scaling of Llama 3.1, 3.2 and
+  3.3. On an H100 it brings the top-1 agreement with transformers on a
+  10240-token prompt from 87% to 98%
+  ([report](benchmarks/2026-11-05-llama31-rope-parity.md)). A config with
+  another `rope_type` (for example "linear" or "yarn") does not load.
+- Llama 3.1 8B Instruct without a chat template continues "The capital of
+  France is" with " a city of romance, art, fashion" in transformers too. So
+  the "Paris" check of `scripts/smoke/modal_smoke.py` fails on this model.
 - The Gemma 3 port loads `Gemma3ForCausalLM` (1B) only. The 4B, 12B and 27B
   checkpoints are `Gemma3ForConditionalGeneration`.
 - DeepSeek-V4 with bf16 experts sends fp32 activations to
