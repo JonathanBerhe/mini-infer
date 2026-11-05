@@ -118,19 +118,25 @@ to avoid drift on long contexts).
 ### Llama 3.1+ long context
 
 Llama 3.1 introduced 128k-context variants via frequency-scaled RoPE.
-HF's `LlamaRotaryEmbedding` reads `rope_scaling.type` and dispatches
-to one of several schemes (linear / dynamic / Llama3). Our
-`RotaryEmbedding` supports the YaRN-style correction used by DeepSeek
-(V2/V3/V4/Kimi-K2) and is the building block; the Llama 3.1
-`type="llama3"` scaling is a close cousin we don't currently parse out
-of the HF config. Llama 2 and Llama 3 base models load straight through
+HF's `LlamaRotaryEmbedding` reads `rope_scaling.rope_type` and dispatches
+to one of several schemes (linear / dynamic / llama3). The port
+implements the `llama3` scheme. `read_rope_parameters` in
+`blocks/rope.py` reads `rope_theta` and the `llama3` parameters
+(`factor`, `low_freq_factor`, `high_freq_factor`,
+`original_max_position_embeddings`) from the HF config,
+`LlamaConfig.from_hf` stores them, and `apply_llama3_scaling` rescales
+the low-frequency `inv_freq` entries exactly as transformers'
+`_compute_llama3_parameters` does. The table stays in fp32. A
+`rope_type` other than `default` or `llama3` raises `NotImplementedError`
+at config parse. Llama 2 and Llama 3 base models load straight through
 the default branch.
 
-This is a tracked gap, not a blocker: SmolLM2 / TinyLlama / Llama-2-7B /
-Llama-3-8B all use the default `rope_theta` path and validate
-bit-parity end-to-end. Long-context Llama-3.1 variants would need the
-`rope_scaling` dict parsed in `LlamaConfig.from_hf` and threaded into
-`RotaryEmbedding`'s YaRN args.
+The rescale was measured on Llama 3.1 8B Instruct on an H100 with a
+10,240-token prompt, on the last 256 positions, all past the original
+8,192-token context. Top-1 agreement with transformers rose from 87.1 to
+97.3 percent and the mean KL divergence fell from 0.054 to 0.00079 nats.
+A short prompt does not show the effect. See
+[2026-11-05-llama31-rope-parity.md](../benchmarks/2026-11-05-llama31-rope-parity.md).
 
 ## SwiGLU FFN
 
@@ -305,12 +311,13 @@ on this file:
    alternative (load anyway, drop the bias terms) would corrupt the
    numerical contract and surface as a golden-test failure far from
    the cause. Loud failure at the boundary is the project standard.
-3. **Long-context Llama 3.1 RoPE scaling is a tracked gap.** Our
-   `RotaryEmbedding` has the YaRN building block; parsing
-   `rope_scaling.type="llama3"` and threading the `low_freq_factor` /
-   `high_freq_factor` / `original_max_position_embeddings` args is
-   straightforward but not yet wired. Llama 2 / Llama 3 base / SmolLM2 /
-   TinyLlama all validate on the default path.
+3. **Llama 3.1 RoPE scaling follows the HF `llama3` rule.**
+   `read_rope_parameters` parses `rope_scaling` from the HF config and
+   `apply_llama3_scaling` rescales the frequency table. Any other
+   `rope_type` fails at config parse. The rescale was measured against
+   transformers on a 10,240-token prompt, see the long-context section
+   above. Llama 2 / Llama 3 base / SmolLM2 / TinyLlama all validate on
+   the default path.
 
 ## Pointers
 
@@ -325,10 +332,9 @@ on this file:
 
 ## What's still open
 
-- **Llama 3.1+ rope_scaling parsing.** The math is in `RotaryEmbedding`
-  (via the YaRN correction); the HF-config parser in `LlamaConfig.from_hf`
-  doesn't yet read `rope_scaling`. Adding it is ~20 lines + a parity
-  test against HF on a 3.1 checkpoint. Not blocked on hardware.
+- **Other `rope_type` values.** Only `default` and `llama3` load. A
+  config with `linear`, `dynamic` or `yarn` scaling raises at config
+  parse. Wire a scheme when a notable checkpoint needs it.
 - **Biased Llama variants.** Some community fine-tunes set
   `attention_bias=True` or `mlp_bias=True`. Supporting them is a
   block-constructor change in `GroupedQueryAttention` / `SwiGLU` plus

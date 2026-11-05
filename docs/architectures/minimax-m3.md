@@ -34,9 +34,13 @@ release) is architecturally a GQA transformer plus three distinctive pieces:
 Three properties that took source-reading (and one full parity harness) to pin
 down, because the paper or a first reading suggests otherwise:
 
-- **Selection is GLOBAL per query, not per GQA group.** The block scores
-  max-pool over the block's tokens AND the index heads, so every main head of
-  a query shares one selected-block set. The mask is `[B, 1, S, k_len]`.
+- **Selection is PER INDEX HEAD, one block set per GQA group.** The block
+  scores max-pool over the block's tokens only. Each of the 4 index heads
+  keeps its own top-k set, and the mask expands each index head's set
+  across the 16 query heads of its group: `[B, num_query_heads, S, k_len]`.
+  transformers 5.12 pooled the index heads into one shared set per query.
+  transformers 5.14 corrected this to per head, and the port follows 5.14
+  (see [ADR-025](../decisions/ADR-025-inkling-port.md)).
 - **RoPE is PARTIAL: the first `rotary_dim` (64) of 128 dims.** The
   deployment config ships a FLAT `partial_rotary_factor: 0.5` that HF's
   `standardize_rope_params` folds into rope_parameters; the apply slices to
@@ -93,9 +97,9 @@ Selection (`MiniMaxM3Indexer._select_blocks`) then, in this exact order:
 2. right-pad the last partial block to `block_size` with `-inf` (blocks are
    slot-anchored: block `b` owns key slots `[128b, 128b+128)`; only right
    padding preserves that, which is why HF skips left-padding tests);
-3. max-pool over the block's tokens AND over the index heads:
-   `scores.view(B, h, S, n_blocks, 128).amax(-1).amax(1)`. This is the
-   global-selection property: one set per `(batch, query)`;
+3. max-pool over the block's tokens only:
+   `scores.view(B, h, S, n_blocks, 128).amax(-1)`. One set per
+   `(batch, index head, query)`; the index heads are not pooled;
 4. force-include the local block(s) via `scatter_(+inf)` at
    `clamp(q_block - arange(local_blocks), min=0)`;
 5. `topk(min(topk_blocks, n_blocks))`; slots whose score stayed `-inf`
