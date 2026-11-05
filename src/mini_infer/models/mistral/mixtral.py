@@ -128,7 +128,10 @@ class MixtralForCausalLM(BaseCausalLM):
         position_ids: torch.Tensor,
         past_key_values: PagedKVCache,
         cu_seqlens_q: torch.Tensor,
+        *,
+        logits_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """`logits_rows`, a device index of packed rows, keeps only those rows for the head."""
         x = self.model.embed_tokens(input_ids)
         position_embeddings = self.rotary_emb(x, position_ids)
         x = run_decoder_layers(
@@ -139,6 +142,8 @@ class MixtralForCausalLM(BaseCausalLM):
             past_key_values,
             cu_seqlens_q,
         )
+        if logits_rows is not None:
+            x = x.index_select(1, logits_rows)
         logits: torch.Tensor = self.lm_head(x)
         return logits
 

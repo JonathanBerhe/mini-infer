@@ -200,6 +200,9 @@ class ContinuousScheduler:
         if async_sampling is None:
             async_sampling = is_cuda_device(getattr(runner, "device", "cpu"))
         self._async_sampling = async_sampling
+        # Ask the runner for the logits of each request's last row only, when
+        # it takes `last_rows_only`. A step that verifies a proposal needs every row.
+        self._last_rows_only = bool(getattr(runner, "supports_last_rows", False))
         # The ids of the last forward while the host has not read them.
         self._deferred: _DeferredTokens | None = None
         self._waiting: queue.Queue[RunningRequest] = queue.Queue()
@@ -573,12 +576,14 @@ class ContinuousScheduler:
                 self._consume_token(req, token)
 
     def _defer_after_forward(
-        self, alive: list[RunningRequest], packed_logits: torch.Tensor, cu_seqlens_q: list[int]
+        self, alive: list[RunningRequest], packed_logits: torch.Tensor, logit_rows: list[int]
     ) -> _DeferredTokens | None:
         """Sample on the device for every plain decoder of the forward that just ran.
 
-        A request that finished its prefill in this forward counts: its last
-        row holds the logits of its first token. With no such request, None.
+        Request `index` has its rows of `packed_logits` from `logit_rows[index]`
+        up to `logit_rows[index + 1]`. A request that finished its prefill in
+        this forward counts: its last row holds the logits of its first token.
+        With no such request, None.
         """
         decoders = [
             (index, req)
@@ -587,7 +592,7 @@ class ContinuousScheduler:
         ]
         if not decoders:
             return None
-        last_rows = [cu_seqlens_q[index + 1] - 1 for index, _ in decoders]
+        last_rows = [logit_rows[index + 1] - 1 for index, _ in decoders]
         if last_rows == list(range(len(alive))):
             logits = packed_logits[0, : len(alive)]
         else:
@@ -950,10 +955,12 @@ class ContinuousScheduler:
         `self._running` after the reap). `position_offsets` therefore line up
         with `cache.seq_lens_list()`.
 
-        A decoder's q-length is `len(tokens)`. Request `index` has its
-        last-position logits at row `cu_seqlens_q[index + 1] - 1`. Returns
-        `(packed_logits, cu_seqlens_q, sink)` for `_verify_speculators`. `sink`
-        is None when no request speculates. If the forward raises,
+        A decoder's q-length is `len(tokens)`. When a request speculates, the
+        forward returns every row and request `index` has its last-position
+        logits at row `cu_seqlens_q[index + 1] - 1`. Otherwise a runner with
+        `supports_last_rows` returns the last rows only, one per request.
+        Returns `(packed_logits, cu_seqlens_q, sink)` for `_verify_speculators`.
+        `sink` is None when no request speculates. If the forward raises,
         `pending_decode_tokens` stays set, so the retry feeds the same tokens.
         """
         assert self._batched_cache is not None
@@ -1007,6 +1014,14 @@ class ContinuousScheduler:
                 tap_layers=self._dspark.tap_layers,
                 hidden_state_sink=sink,
             )
+        elif self._last_rows_only:
+            packed_logits = self._runner.forward_step_packed(
+                self._batched_cache,
+                packed_input_ids,
+                cu_seqlens_q,
+                position_offsets,
+                last_rows_only=True,
+            )
         else:
             packed_logits = self._runner.forward_step_packed(
                 self._batched_cache, packed_input_ids, cu_seqlens_q, position_offsets
@@ -1014,10 +1029,16 @@ class ContinuousScheduler:
         # Every slot now holds its K/V. Clear the snapshot BEFORE anything else
         # can fail, or a later rollback undoes real writes.
         self._pre_forward_seq_lens = None
+        # The row boundaries of `packed_logits`: one row per request when the
+        # runner returned the last rows only, else the query boundaries.
+        if sink is None and self._last_rows_only:
+            logit_rows = list(range(len(alive) + 1))
+        else:
+            logit_rows = cu_seqlens_q
 
         # Distribute logits and advance prefill state.
         for index, req in enumerate(alive):
-            last_pos = cu_seqlens_q[index + 1] - 1
+            last_pos = logit_rows[index + 1] - 1
             if req.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING):
                 tokens_added = cu_seqlens_q[index + 1] - cu_seqlens_q[index]
                 req.tokens_prefilled += tokens_added
@@ -1045,7 +1066,7 @@ class ContinuousScheduler:
                 req.last_logits = packed_logits[0, last_pos, :]
                 req.pending_decode_tokens = None
         if self._async_sampling:
-            self._deferred = self._defer_after_forward(alive, packed_logits, cu_seqlens_q)
+            self._deferred = self._defer_after_forward(alive, packed_logits, logit_rows)
         return packed_logits, cu_seqlens_q, sink
 
     def _verify_speculators(
