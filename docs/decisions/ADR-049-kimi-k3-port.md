@@ -3,6 +3,9 @@
 Date: 2026-10-27
 Status: Accepted
 
+> Amendment (2026-11-04): Kimi K3.1 Pro is not the same architecture as K3.
+> Its MLA layers are Gated DSA layers. ADR-055 records that port.
+
 ## Context
 
 Kimi K3 (`moonshotai/Kimi-K3`, weights out since 2026-07-27) is a 2.8T MoE
