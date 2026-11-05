@@ -31,7 +31,7 @@ holds only the parts that genuinely differ.
 | Primitive | Reference (`transformers/models/qwen3_5/modeling_qwen3_5.py`) | Our code |
 | --- | --- | --- |
 | Gated DeltaNet layer | `Qwen3_5GatedDeltaNet` | [qwen3_5.py](../../src/mini_infer/models/qwen/qwen3_5.py) `_QwenGatedDeltaNet` |
-| Delta-rule recurrence | `torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule` | [kda.py](../../src/mini_infer/models/blocks/kda.py) `kda_chunkwise`, `kda_recurrent` |
+| Delta-rule recurrence | `torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule` | [gdn.py](../../src/mini_infer/models/qwen/gdn.py) `gdn_chunkwise` (prefill), [kda.py](../../src/mini_infer/models/blocks/kda.py) `kda_recurrent` (one token) |
 | Decay gate | inline `-A_log.exp() * softplus(a + dt_bias)` | [gdn.py](../../src/mini_infer/models/qwen/gdn.py) `gdn_gate` |
 | Gated output norm | `Qwen3_5RMSNormGated` | [gdn.py](../../src/mini_infer/models/qwen/gdn.py) `gated_rmsnorm_silu` |
 | Fused causal conv | `causal_conv1d_fn` / `F.silu(conv1d(...))` fallback | [kda.py](../../src/mini_infer/models/blocks/kda.py) `causal_conv1d_prefill`, `causal_conv1d_step` |
@@ -68,6 +68,13 @@ approximation: measured against the reference in fp32 the max absolute error
 is round-off, around 1e-7, across square and non-square head dims, sequences
 crossing the 64-token chunk boundary, ragged padding and non-zero initial
 states.
+
+Prefill does not use `kda_chunkwise`, though. Its per-channel decay makes it
+loop over the 64 positions of every chunk, which launches about 20k small
+kernels per layer for 4096 tokens. With one scalar per head, the chunk
+couplings become plain matmuls times a decay mask, so prefill runs
+`gdn_chunkwise` instead
+([ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md)).
 
 Before the recurrence, q and k are L2-normalized per head and q is scaled by
 `head_k_dim ** -0.5`. The reference does this inside its kernel via
@@ -147,6 +154,16 @@ the largest shard: for the 4B, about 8.5 GB of fp16 weights plus a 5.3 GB
 shard. The generic `load_model` builds in fp32 first, which for the 4B alone
 is about 17 GB.
 
+## Prefill
+
+A prompt runs through the Gated DeltaNet layers in chunks of 64 tokens with
+`gdn_chunkwise`. On one H100 the 27B prefills 4,096 tokens in 0.8 s and
+32,768 tokens in 8.4 s, against 10.9 s and 87.9 s with the per-channel form
+it replaced. On one B200 it takes 0.6 s and 5.9 s, against 9.2 s and 74.1 s
+([ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md)).
+[scripts/qwen/modal_qwen38_prefill_ab.py](../../scripts/qwen/modal_qwen38_prefill_ab.py)
+measures the two forms against each other.
+
 ## Decode step
 
 A one-token step attends over the whole fixed-length K/V buffer and masks
@@ -219,7 +236,8 @@ rope on purpose, and staying single-rank for this port.
 - Cache: [qwen3_5_state_cache.py](../../src/mini_infer/models/qwen/qwen3_5_state_cache.py)
 - ADRs: [ADR-032](../decisions/ADR-032-qwen38-hybrid-port.md) (port),
   [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode),
-  [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md) (fused Gated DeltaNet step)
+  [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md) (fused Gated DeltaNet step),
+  [ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md) (scalar-gate prefill)
 - Graph runner: [cuda_graph_decode.py](../../src/mini_infer/engine/cuda_graph_decode.py)
 
 ## What is still open
