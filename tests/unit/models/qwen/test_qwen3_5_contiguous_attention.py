@@ -90,7 +90,7 @@ def test_the_flash_path_gives_the_sdpa_logits(monkeypatch):
     monkeypatch.setattr(contiguous, "_FLASH_ATTN_AVAILABLE", True)
     monkeypatch.setattr(contiguous, "flash_attn_with_kvcache", _flash_attn_with_kvcache)
     monkeypatch.setattr(contiguous, "require_cuda_device", lambda device, what: None)
-    monkeypatch.setattr(qwen3_5, "supports_contiguous_kernel", lambda k_buffer: True)
+    monkeypatch.setattr(qwen3_5, "contiguous_backend", lambda k_buffer: "flash_attn")
     calls: list[list[int]] = []
 
     def recorded(query, k_buffer, v_buffer, lengths, scale):

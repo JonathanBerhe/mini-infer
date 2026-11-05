@@ -45,6 +45,7 @@ from dataclasses import dataclass
 
 import torch
 
+from mini_infer.cache.contiguous_attention import ContiguousFlashInferPlan, padded_buffer_len
 from mini_infer.models.qwen.lsa import LsaConfig
 
 
@@ -105,12 +106,17 @@ class QwenGdnLayerState:
 class QwenAttentionLayerState:
     """Mutable per-request state of one gated full-attention layer."""
 
-    k: torch.Tensor  # (B, max_seq_len, num_kv_heads, head_dim), post-norm and post-rope
-    v: torch.Tensor  # (B, max_seq_len, num_kv_heads, head_dim)
+    # The buffers hold `padded_buffer_len(max_seq_len)` positions, whole
+    # FlashInfer pages. Positions past `max_seq_len` are never written.
+    k: torch.Tensor  # (B, buffer_len, num_kv_heads, head_dim), post-norm and post-rope
+    v: torch.Tensor  # (B, buffer_len, num_kv_heads, head_dim)
     # LSA buckets of the closed blocks, block after block. A bucket row is
     # valid once its block closes. A query never reads a later one.
     lsa_centroids: torch.Tensor | None = None  # (B, buckets, index_dim) fp32
     lsa_members: torch.Tensor | None = None  # (B, buckets, bucket_cap) int32, -1 padded
+    # The FlashInfer plan of the current step, shared by every attention
+    # layer of the cache (see `cache/contiguous_attention.py`).
+    plan: ContiguousFlashInferPlan | None = None
 
 
 QwenLayerState = QwenGdnLayerState | QwenAttentionLayerState
@@ -168,7 +174,8 @@ class Qwen35StateCache:
             else:
                 if spec.max_seq_len <= 0:
                     raise ValueError(f"max_seq_len must be positive, got {spec.max_seq_len}")
-                shape = (batch_size, spec.max_seq_len, spec.num_kv_heads, spec.head_dim)
+                buffer_len = padded_buffer_len(spec.max_seq_len)
+                shape = (batch_size, buffer_len, spec.num_kv_heads, spec.head_dim)
                 state = QwenAttentionLayerState(
                     k=torch.zeros(shape, device=self.device, dtype=dtype),
                     v=torch.zeros(shape, device=self.device, dtype=dtype),

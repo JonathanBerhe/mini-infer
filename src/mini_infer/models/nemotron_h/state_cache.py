@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 import torch
 
+from mini_infer.cache.contiguous_attention import ContiguousFlashInferPlan, padded_buffer_len
+
 
 @dataclass(frozen=True)
 class NemotronMambaStateSpec:
@@ -60,8 +62,13 @@ class NemotronMambaLayerState:
 class NemotronAttentionLayerState:
     """Mutable per-request state of one attention layer."""
 
-    k: torch.Tensor  # (B, max_seq_len, num_kv_heads, head_dim)
-    v: torch.Tensor  # (B, max_seq_len, num_kv_heads, head_dim)
+    # The buffers hold `padded_buffer_len(max_seq_len)` positions, whole
+    # FlashInfer pages. Positions past `max_seq_len` are never written.
+    k: torch.Tensor  # (B, buffer_len, num_kv_heads, head_dim)
+    v: torch.Tensor  # (B, buffer_len, num_kv_heads, head_dim)
+    # The FlashInfer plan of the current step, shared by every attention
+    # layer of the cache (see `cache/contiguous_attention.py`).
+    plan: ContiguousFlashInferPlan | None = None
 
 
 NemotronLayerState = NemotronMambaLayerState | NemotronAttentionLayerState | None
@@ -113,7 +120,8 @@ class NemotronHStateCache:
             elif isinstance(spec, NemotronAttentionStateSpec):
                 if spec.max_seq_len <= 0:
                     raise ValueError(f"max_seq_len must be positive, got {spec.max_seq_len}")
-                shape = (batch_size, spec.max_seq_len, spec.num_kv_heads, spec.head_dim)
+                buffer_len = padded_buffer_len(spec.max_seq_len)
+                shape = (batch_size, buffer_len, spec.num_kv_heads, spec.head_dim)
                 self._layers.append(
                     NemotronAttentionLayerState(
                         k=torch.zeros(shape, device=self.device, dtype=dtype),

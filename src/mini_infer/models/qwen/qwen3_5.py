@@ -58,7 +58,8 @@ from torch.nn import functional
 
 from mini_infer.cache.contiguous_attention import (
     contiguous_attention,
-    supports_contiguous_kernel,
+    contiguous_backend,
+    plan_contiguous_step,
 )
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
@@ -505,9 +506,10 @@ class _QwenGatedAttention(nn.Module):
             if self.lsa is not None:
                 attn = self._lsa_attention(query, layer_state, positions, kv_len, host_starts)
                 return self._gated_output(attn, gate)
-            if supports_contiguous_kernel(layer_state.k):
-                # Reads each row only up to its last written key, with no
-                # mask and no per-head copy of K and V.
+            # Both kernels read each row only up to its last written key,
+            # with no mask and no per-head copy of K and V.
+            backend = contiguous_backend(layer_state.k)
+            if backend == "flash_attn":
                 attn = contiguous_attention(
                     query.transpose(1, 2),
                     layer_state.k,
@@ -515,6 +517,11 @@ class _QwenGatedAttention(nn.Module):
                     positions[:, -1] + 1,
                     head_dim**-0.5,
                 )
+                return self._gated_output(attn, gate)
+            if backend == "flashinfer":
+                if layer_state.plan is None:
+                    raise RuntimeError("plan the step first (plan_contiguous_step)")
+                attn = layer_state.plan.run(query.transpose(1, 2), layer_state.k, layer_state.v)
                 return self._gated_output(attn, gate)
             if seq_len == 1:
                 attn = self._decode_attention(query, layer_state, positions)
@@ -792,6 +799,38 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
                 attention.lsa_projection = None
         self.lsa = None
 
+    def _plan_attention(
+        self, state_cache: Qwen35StateCache, lengths: list[int], q_len: int
+    ) -> None:
+        """Plan the FlashInfer attention of one step, when FlashInfer runs it.
+
+        `lengths[b]` is row `b`'s cache length after the span of `q_len`
+        tokens, on the host. LSA layers select their own keys and need no plan.
+        """
+        if self.lsa is not None:
+            return
+        states = [
+            state
+            for state in (state_cache.layer(i) for i in range(state_cache.num_layers))
+            if isinstance(state, QwenAttentionLayerState)
+        ]
+        plan_contiguous_step(
+            states,
+            lengths,
+            q_len,
+            num_q_heads=self.cfg.num_attention_heads,
+            scale=self.cfg.head_dim**-0.5,
+        )
+
+    def before_decode_step(self, positions: torch.Tensor, state_cache: Qwen35StateCache) -> None:
+        """Plan the attention of the `decode_step_static` call that comes next.
+
+        `DecodeCudaGraph` calls this before every replay, with the positions
+        it replays. Host positions cost no sync.
+        """
+        lengths = [int(p) + 1 for p in positions.tolist()]
+        self._plan_attention(state_cache, lengths, 1)
+
     def after_decode_step(self, positions: torch.Tensor, state_cache: Qwen35StateCache) -> None:
         """Cluster the LSA key blocks that a `decode_step_static` call closed.
 
@@ -901,11 +940,13 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         row_starts = torch.full(
             (batch,), state_cache.start_pos, dtype=torch.long, device=input_ids.device
         )
+        end = state_cache.start_pos + seq_len
+        self._plan_attention(state_cache, [end] * batch, seq_len)
         return self._run(
             input_ids,
             state_cache,
             row_starts,
-            state_cache.start_pos + seq_len,
+            end,
             [state_cache.start_pos] * batch,
         )
 
@@ -925,6 +966,7 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         state_cache.check_capacity(start_pos + 1)
         batch = input_id.shape[0]
         positions = torch.full((batch,), start_pos, dtype=torch.long, device=input_id.device)
+        self._plan_attention(state_cache, [start_pos + 1] * batch, 1)
         return self._run(input_id, state_cache, positions, host_starts=[start_pos] * batch)
 
     def forward_decode_with_cache_ragged(
@@ -956,7 +998,11 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
             return self._run(
                 input_id, state_cache, positions.to(torch.long), host_starts=host_starts
             )
-        state_cache.check_capacity(int(positions.max().item()) + 1)
+        # One sync for the host positions, which the capacity check and the
+        # attention plan both need.
+        host_positions = [int(p) for p in positions.tolist()]
+        state_cache.check_capacity(max(host_positions) + 1)
+        self._plan_attention(state_cache, [p + 1 for p in host_positions], 1)
         return self.decode_step_static(input_id, positions.to(torch.long), state_cache)
 
     def decode_step_static(
@@ -970,9 +1016,10 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         `(B, 1)` token ids and `(B,)` int64 positions, both on the model's
         device. It has no host sync and no data-dependent shape, and it
         updates `state_cache` only in place, so `DecodeCudaGraph` can capture
-        it. The caller checks capacity and shapes. With LSA on, the caller
-        also runs `after_decode_step` after each step, which `DecodeCudaGraph`
-        does.
+        it. The caller checks capacity and shapes. When FlashInfer runs the
+        attention, the caller plans the step first with `before_decode_step`.
+        With LSA on, the caller also runs `after_decode_step` after each step.
+        `DecodeCudaGraph` does both.
         """
         return self._run(input_id, state_cache, positions)
 
