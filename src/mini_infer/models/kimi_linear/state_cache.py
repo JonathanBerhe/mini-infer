@@ -13,7 +13,10 @@ which fits the paged one-entry-per-token KV model:
     per-token buffer of the COMPRESSED `kv_a_proj_with_mqa` output
     (`kv_lora_rank + qk_rope_head_dim` wide, shared across heads). The
     per-head K/V are re-decompressed on read, exactly like `blocks/mla.py`;
-    Kimi's MLA is NoPE so nothing position-dependent is baked in.
+    Kimi's MLA is NoPE so nothing position-dependent is baked in. On Kimi
+    K3.1 the MLA layers are DeepSeek Sparse Attention layers, and a second
+    append-only buffer holds the indexer key of each token
+    (`index_head_dim` wide).
 
 This mirrors `StateCache` (the DeepSeek-V4 per-request cache) in lifecycle:
 one instance per request slot (or one batched instance whose rows are
@@ -66,10 +69,13 @@ class KimiMlaStateSpec:
         max_seq_len: dense per-request capacity. Sized by the caller to
             prompt + generation budget; unlike the paged path this is a
             hard bound, admission control must respect it.
+        index_head_dim: width of one DSA indexer key (Kimi K3.1), or 0 for
+            a dense MLA layer, which keeps no indexer keys.
     """
 
     kv_width: int
     max_seq_len: int
+    index_head_dim: int = 0
 
 
 KimiStateLayerSpec = KimiKdaStateSpec | KimiMlaStateSpec
@@ -90,9 +96,11 @@ class KimiKdaLayerState:
 
 @dataclass
 class KimiMlaLayerState:
-    """Mutable MLA state: append-only compressed-KV history."""
+    """Mutable MLA state: append-only compressed-KV history, and on a DSA
+    layer the append-only history of indexer keys."""
 
     kv: torch.Tensor  # (B, max_seq_len, kv_width)
+    index_k: torch.Tensor | None = None  # (B, max_seq_len, index_head_dim)
 
 
 KimiLayerState = KimiKdaLayerState | KimiMlaLayerState
@@ -161,6 +169,19 @@ class KimiStateCache:
             else:
                 if spec.max_seq_len <= 0:
                     raise ValueError(f"max_seq_len must be positive, got {spec.max_seq_len}")
+                if spec.index_head_dim < 0:
+                    raise ValueError(
+                        f"index_head_dim must be non-negative, got {spec.index_head_dim}"
+                    )
+                index_k = None
+                if spec.index_head_dim > 0:
+                    index_k = torch.zeros(
+                        batch_size,
+                        spec.max_seq_len,
+                        spec.index_head_dim,
+                        device=self.device,
+                        dtype=dtype,
+                    )
                 self._layers.append(
                     KimiMlaLayerState(
                         kv=torch.zeros(
@@ -169,7 +190,8 @@ class KimiStateCache:
                             spec.kv_width,
                             device=self.device,
                             dtype=dtype,
-                        )
+                        ),
+                        index_k=index_k,
                     )
                 )
         # Global token position (advanced by the caller after each forward).
@@ -206,7 +228,11 @@ class KimiStateCache:
                 dst.conv_k[dst_row] = src.conv_k[src_row]
                 dst.conv_v[dst_row] = src.conv_v[src_row]
             elif isinstance(src, KimiMlaLayerState) and isinstance(dst, KimiMlaLayerState):
+                if (src.index_k is None) != (dst.index_k is None):
+                    raise ValueError(f"layer {layer_idx}: only one cache keeps indexer keys")
                 # Capacities may differ (per-request temp vs batched cache);
                 # copy the overlap, which the scheduler bounds by max_seq_len.
                 span = min(src.kv.shape[1], dst.kv.shape[1])
                 dst.kv[dst_row, :span] = src.kv[src_row, :span]
+                if src.index_k is not None and dst.index_k is not None:
+                    dst.index_k[dst_row, :span] = src.index_k[src_row, :span]
