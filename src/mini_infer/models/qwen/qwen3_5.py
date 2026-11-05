@@ -11,9 +11,10 @@ Attention (softmax) layer. For the 27B that is 48 linear and 16 full over
 64 layers.
 
   - **Gated DeltaNet** layers carry a fixed-size recurrent matrix state plus
-    one fused short-convolution tail, not per-token KV. The recurrence
-    itself is `blocks/kda.py` (see `qwen/gdn.py` for why that reuse is
-    exact); this file supplies the projections around it. The 27B broadcasts
+    one fused short-convolution tail, not per-token KV. The one-token
+    recurrence is `blocks/kda.py` (see `qwen/gdn.py` for why that reuse is
+    exact), and prefill runs the scalar-gate chunk form `gdn_chunkwise`;
+    this file supplies the projections around them. The 27B broadcasts
     16 key heads up to 48 value heads, a 3x ratio where the 4B and 9B use 2x,
     so the ratio is always read from the config and never assumed.
   - **Gated Attention** layers are ordinary grouped-query attention with two
@@ -56,12 +57,16 @@ from mini_infer.models.blocks import GemmaRMSNorm, RotaryEmbedding, SwiGLU
 from mini_infer.models.blocks.kda import (
     causal_conv1d_prefill,
     causal_conv1d_step,
-    kda_chunkwise,
     kda_recurrent,
     l2norm,
 )
 from mini_infer.models.blocks.rope import apply_rotary_pos_emb_partial
-from mini_infer.models.qwen.gdn import broadcast_gate, gated_rmsnorm_silu, gdn_gate
+from mini_infer.models.qwen.gdn import (
+    broadcast_gate,
+    gated_rmsnorm_silu,
+    gdn_chunkwise,
+    gdn_gate,
+)
 from mini_infer.models.qwen.gdn_decode_kernel import gdn_decode_step, supports_gdn_decode_kernel
 from mini_infer.models.qwen.qwen3_5_state_cache import (
     Qwen35StateCache,
@@ -372,16 +377,16 @@ class _QwenGatedDeltaNet(nn.Module):
         # the call site so the shared recurrence stays the bare delta rule.
         query = l2norm(query) * (cfg.linear_key_head_dim**-0.5)
         key = l2norm(key)
-        gate_channels = broadcast_gate(gate, cfg.linear_key_head_dim)
 
         initial_state = layer_state.recurrent_state if layer_state is not None else None
         if layer_state is not None and seq_len == 1:
+            gate_channels = broadcast_gate(gate, cfg.linear_key_head_dim)
             core, final_state = kda_recurrent(
                 query, key, value, gate_channels, beta, initial_state=initial_state
             )
         else:
-            core, final_state = kda_chunkwise(
-                query, key, value, gate_channels, beta, initial_state=initial_state
+            core, final_state = gdn_chunkwise(
+                query, key, value, gate, beta, initial_state=initial_state
             )
         if layer_state is not None:
             layer_state.recurrent_state.copy_(final_state)
