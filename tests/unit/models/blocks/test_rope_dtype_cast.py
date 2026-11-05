@@ -162,7 +162,19 @@ def test_bf16_tables_at_long_positions_match_the_fp32_reference() -> None:
     assert (cos_rounded.float() - cos_ref).abs().max().item() > 0.5
 
 
-def test_load_model_rotary_tables_equal_transformers(tmp_path: Path) -> None:
+# The llama3 rescale of the released Llama 3.1 8B / 70B / 405B configs.
+_LLAMA31_ROPE = {
+    "rope_type": "llama3",
+    "rope_theta": _THETA,
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 8192,
+}
+
+
+@pytest.mark.parametrize("rope_type", ["default", "llama3"])
+def test_load_model_rotary_tables_equal_transformers(tmp_path: Path, rope_type: str) -> None:
     """`load_model` in bf16 gives the same fp32 `inv_freq` and the same bf16
     cos/sin at long positions as transformers' `from_pretrained` in bf16."""
     from transformers import LlamaConfig as HFLlamaConfig
@@ -170,6 +182,11 @@ def test_load_model_rotary_tables_equal_transformers(tmp_path: Path) -> None:
 
     from mini_infer.models import load_model
 
+    rope_kwargs: dict[str, object] = (
+        {"rope_parameters": dict(_LLAMA31_ROPE)}
+        if rope_type == "llama3"
+        else {"rope_theta": _THETA}
+    )
     torch.manual_seed(0)
     hf_config = HFLlamaConfig(
         vocab_size=64,
@@ -178,8 +195,8 @@ def test_load_model_rotary_tables_equal_transformers(tmp_path: Path) -> None:
         num_hidden_layers=1,
         num_attention_heads=1,
         num_key_value_heads=1,
-        rope_theta=_THETA,
         tie_word_embeddings=False,
+        **rope_kwargs,
     )
     HFLlamaForCausalLM(hf_config).save_pretrained(tmp_path)
 
