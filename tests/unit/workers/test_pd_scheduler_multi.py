@@ -16,7 +16,8 @@ Every test is parametrized over `mode ∈ {"serial", "parallel"}`:
 Both modes must produce identical tokens (threading only affects
 timing, not output distribution).
 
-Marked `requires_model`: needs a real model load.
+Marked `requires_model`: needs a real model load. The runner is pinned
+to the CPU, where fp32 makes the contract exact; see the fixture.
 """
 
 from __future__ import annotations
@@ -35,7 +36,14 @@ _MODES = ["serial", "parallel"]
 
 @pytest.fixture(scope="module")
 def qwen_runner() -> ModelRunner:
-    return ModelRunner.from_pretrained(MODEL_NAME)
+    # The parity contract is exact at fp32 on the CPU. On MPS in fp16 a
+    # packed forward over the three prompts rounds the two top logits of
+    # "A common greeting is" (ids 330 and 311, 0.0069 apart at fp32, below
+    # the fp16 step of 0.0156 at that magnitude) to the same value, and
+    # argmax then picks the lower id. `ContinuousScheduler` flips the same
+    # way when the prompts share a step, so the flip is a near-tie of the
+    # batch shape, not a PD defect.
+    return ModelRunner.from_pretrained(MODEL_NAME, device="cpu")
 
 
 def _continuous_greedy_tokens(runner: ModelRunner, prompt: str, max_tokens: int) -> list[int]:
