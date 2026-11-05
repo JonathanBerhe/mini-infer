@@ -178,6 +178,38 @@ instead of about 50 small ones
 27B on an A100 a batch-1 step takes 39.6 ms, against 110 ms for the eager
 PyTorch step and a weight-bandwidth bound of about 26 ms.
 
+On CUDA with `flash-attn` installed, the full-attention layers call
+`flash_attn_with_kvcache` instead
+([contiguous_attention.py](../../src/mini_infer/cache/contiguous_attention.py)).
+It reads each row only up to its length, with no mask, and the step still
+captures in the graph. On one H100 this took eager decode at 64k tokens
+from 82 ms to 39 ms per step. `flash-attn` 2 has no wheel past torch 2.8, so
+the main Modal images keep the masked path.
+
+## Latent Sparse Attention
+
+LSA is an opt-in mode of the 16 full-attention layers
+([ADR-056](../decisions/ADR-056-lsa-qwen38.md)). Each query reads at most
+4,612 earlier keys: the keys of the best buckets of 512-key blocks, a
+512-key window and 4 sink keys. Below about 4.6k tokens it equals dense
+attention.
+
+```python
+from mini_infer.models.qwen.lsa import load_index_maps
+
+model.enable_lsa(load_index_maps(path_to_published_maps))
+```
+
+Call `enable_lsa` before you build the state cache, so that the cache gets
+the bucket buffers. The selection in
+[lsa.py](../../src/mini_infer/models/qwen/lsa.py) is bit-equal to the
+authors' reference.
+[scripts/qwen/modal_qwen38_lsa_gate.py](../../scripts/qwen/modal_qwen38_lsa_gate.py)
+compares LSA with dense on the real 27B, and
+[modal_qwen38_lsa_speed.py](../../scripts/qwen/modal_qwen38_lsa_speed.py)
+times both. At 32k and 64k tokens LSA keeps the answers but is slower than
+dense, because its selection and gather run in PyTorch.
+
 ## Validation contract
 
 Bit-parity runs against the pinned transformers implementation of this exact
@@ -237,7 +269,8 @@ rope on purpose, and staying single-rank for this port.
 - ADRs: [ADR-032](../decisions/ADR-032-qwen38-hybrid-port.md) (port),
   [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode),
   [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md) (fused Gated DeltaNet step),
-  [ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md) (scalar-gate prefill)
+  [ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md) (scalar-gate prefill),
+  [ADR-056](../decisions/ADR-056-lsa-qwen38.md) (Latent Sparse Attention)
 - Graph runner: [cuda_graph_decode.py](../../src/mini_infer/engine/cuda_graph_decode.py)
 
 ## What is still open
