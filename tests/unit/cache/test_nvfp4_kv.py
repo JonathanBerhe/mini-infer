@@ -142,21 +142,27 @@ def test_qwen_15b_nvfp4_logits_close_to_bf16() -> None:
     """First-token logits with `kv_quant="nvfp4"` should track bf16 within
     cosine sim > 0.97. NVFP4 is lossier than FP8 but should still preserve
     the relative ordering of top tokens on a 1.5B model. Requires Blackwell
-    (SM_100+); skipped automatically on Hopper or Ampere."""
+    (SM_100+); skipped automatically on Hopper or Ampere.
+
+    The test runs `runner.prefill`, which writes K/V into the paged cache and
+    reads it back, as the FP8 test does. A forward that skips the cache
+    never reads the NVFP4 storage."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("NVFP4 KV requires Blackwell (SM_100+)")
 
+    from mini_infer.cache.flashinfer_backend import supports_flashinfer_backend
     from mini_infer.engine.model_runner import ModelRunner
+
+    if not supports_flashinfer_backend("cuda"):
+        pytest.skip("flashinfer-python not installed")
 
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     prompt = "The capital of France is"
 
     def _first_token_logits(**kwargs: object) -> torch.Tensor:
         runner = ModelRunner.from_pretrained(model_name, **kwargs)
-        input_ids = runner.tokenizer.encode(prompt)
-        x = torch.tensor([input_ids], device=runner.device, dtype=torch.long)
-        with torch.inference_mode():
-            return runner._model(x, use_cache=False).logits[0, -1, :].float().cpu()
+        _, logits = runner.prefill(runner.tokenizer.encode(prompt))
+        return logits.float().cpu()
 
     bf16_logits = _first_token_logits()
     nvfp4_logits = _first_token_logits(kv_quant="nvfp4", attention_backend="flashinfer")
