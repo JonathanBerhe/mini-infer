@@ -9,12 +9,15 @@ transcriptions of the reference formulas.
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from mini_infer.models import REGISTRY
 from mini_infer.models.blocks.activations import situ
@@ -424,6 +427,68 @@ def test_load_weights_rejects_unknown_keys() -> None:
     state["model.layers.0.self_attn.bogus.weight"] = torch.zeros(1)
     with pytest.raises(ValueError, match="unexpected"):
         KimiK3ForConditionalGeneration.load_weights(model, state)
+
+
+def _write_k3_checkpoint(
+    directory: Path, state: dict[str, torch.Tensor], *, split_mxfp4_pairs: bool = False
+) -> None:
+    """A two-shard K3 checkpoint. Each module's tensors share a shard, so an
+    MXFP4 pair stays together, as in the released checkpoint, unless
+    `split_mxfp4_pairs` moves every `weight_scale` to the other shard."""
+    hf_config = {
+        "architectures": ["KimiK3ForConditionalGeneration"],
+        "model_type": "kimi_k3",
+        "text_config": _tiny_text_config(),
+        "vision_config": {"vt_hidden_size": 8},
+    }
+    (directory / "config.json").write_text(json.dumps(hf_config))
+    shard_names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    modules = sorted({key.rsplit(".", 1)[0] for key in state})
+    weight_map: dict[str, str] = {}
+    for key in state:
+        index = modules.index(key.rsplit(".", 1)[0])
+        if split_mxfp4_pairs and key.endswith(".weight_scale"):
+            index += 1
+        weight_map[key] = shard_names[index % 2]
+    for shard in shard_names:
+        save_file(
+            {key: tensor.contiguous() for key, tensor in state.items() if weight_map[key] == shard},
+            str(directory / shard),
+        )
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+def test_from_checkpoint_matches_load_weights(tmp_path: Path) -> None:
+    """K3 inherits `from_checkpoint`. The shard-by-shard load drops the vision
+    tower, strips `language_model.` and dequantizes the MXFP4 experts, and
+    gives the same model as `load_weights`."""
+    state, _ = _checkpoint_state(_tiny_model(), "language_model.")
+    state["vision_tower.encoder.blocks.0.mlp.fc0.weight"] = torch.zeros(4, 4)
+    state["mm_projector.proj.0.weight"] = torch.zeros(4, 4)
+    _write_k3_checkpoint(tmp_path, state)
+    in_memory = _tiny_model(seed=1)
+    KimiK3ForConditionalGeneration.load_weights(in_memory, state)
+
+    streamed = KimiK3ForConditionalGeneration.from_checkpoint(
+        str(tmp_path), device="cpu", dtype=torch.float32
+    )
+
+    assert isinstance(streamed, KimiK3ForConditionalGeneration)
+    in_memory_state = in_memory.state_dict()
+    for key, value in streamed.state_dict().items():
+        assert torch.equal(value, in_memory_state[key]), key
+    ids = torch.randint(0, 96, (1, 6))
+    with torch.inference_mode():
+        assert torch.equal(streamed(ids), in_memory(ids))
+
+
+def test_from_checkpoint_rejects_an_mxfp4_pair_split_across_shards(tmp_path: Path) -> None:
+    state, _ = _checkpoint_state(_tiny_model(), "language_model.")
+    _write_k3_checkpoint(tmp_path, state, split_mxfp4_pairs=True)
+    with pytest.raises(ValueError, match="pairs do not match"):
+        KimiK3ForConditionalGeneration.from_checkpoint(
+            str(tmp_path), device="cpu", dtype=torch.float32
+        )
 
 
 def test_situ_matches_reference_formula() -> None:
