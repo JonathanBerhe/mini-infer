@@ -11,7 +11,13 @@ from mini_infer.models.blocks.mla import MLAAttention
 from mini_infer.models.blocks.moe.glm_moe_gate import GlmMoeFFN, GlmNoAuxTcGate
 from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert, MoEFFN
 from mini_infer.models.blocks.rmsnorm import RMSNorm
-from mini_infer.models.blocks.rope import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
+from mini_infer.models.blocks.rope import (
+    Llama3RopeScaling,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+    read_rope_parameters,
+    rotate_half,
+)
 from mini_infer.models.blocks.swiglu import SwiGLU
 from mini_infer.models.blocks.transformer_block import TransformerBlock, run_decoder_layers
 
@@ -20,6 +26,7 @@ __all__ = [
     "GlmMoeFFN",
     "GlmNoAuxTcGate",
     "GroupedQueryAttention",
+    "Llama3RopeScaling",
     "MLAAttention",
     "MixtralExpert",
     "MoEFFN",
@@ -30,6 +37,7 @@ __all__ = [
     "TransformerBlock",
     "apply_rotary_pos_emb",
     "merge_qkv_weights",
+    "read_rope_parameters",
     "rotate_half",
     "run_decoder_layers",
 ]
