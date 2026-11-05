@@ -521,7 +521,8 @@ class _NemotronMoE(nn.Module):
         flat = hidden.reshape(-1, shape[-1])
         indices, weights = self.gate(flat)
         routed_in = self.fc1_latent_proj(flat) if self.fc1_latent_proj is not None else flat
-        if supports_grouped_experts(flat.device):
+        # An fp32 model keeps the gathered path, which a CUDA graph can capture.
+        if supports_grouped_experts(flat.device, flat.dtype):
             routed = grouped_expert_mlp(
                 routed_in,
                 indices,

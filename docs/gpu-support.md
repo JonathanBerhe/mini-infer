@@ -17,6 +17,7 @@ Each cell has one of these states:
 |---|---|
 | Fast | A recorded run on this GPU used the fastest path that the code has for this GPU. |
 | Fast, old stack | As Fast, but the run used an image from before the CUDA 13.2 stack (torch 2.10 or older). |
+| Runs | The model ran end to end on this GPU and gave the expected text, but the run did not use every part of the fast path (for example no CUDA graph). |
 | Fallback | The model runs, but on a slower path. The cell names the path. |
 | Partial | Only one layer or one kernel ran on this GPU, not the model. |
 | No | The model cannot run on this GPU with the current code or image. |
@@ -38,27 +39,30 @@ kernels.
 
 | Family and model | Fast path | H100 | H200 | B200 | B300 |
 |---|---|---|---|---|---|
-| Qwen2 (Qwen2.5-7B), paged | FlashInfer, decode and prefill CUDA graphs, fused norm, RoPE and SiLU kernels, int8 W8A16 with per-arch tiles | Fast, old stack (2026-11-04, [ADR-053](decisions/ADR-053-paged-prefill-cuda-graph.md)) | Unchecked | Fast (2026-11-05, PR #79) | Fast (2026-11-05, PR #79, within 1% of the B200) |
-| Llama, Mistral, Qwen3, paged | Same code as Qwen2 | Unchecked (the 2-GPU TP smoke of 2026-05-15 loads Qwen2.5-7B) | Unchecked | Unchecked | Unchecked |
+| Qwen2 (Qwen2.5-7B), paged | FlashInfer, decode and prefill CUDA graphs, fused norm, RoPE and SiLU kernels, int8 W8A16 with per-arch tiles | Fast, old stack (2026-11-04, [ADR-053](decisions/ADR-053-paged-prefill-cuda-graph.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Fast (2026-11-05, PR #79) | Fast (2026-11-05, PR #79, within 1% of the B200) |
+| Llama, Mistral, Qwen3, paged | Same code as Qwen2 | Unchecked (the 2-GPU TP smoke of 2026-05-15 loads Qwen2.5-7B) | Runs: Mistral 7B and Qwen3 8B with FlashInfer, no graph (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Llama 3.1 8B loads and generates, but the port ignores its `llama3` RoPE scaling | Unchecked | Unchecked |
 | Mixtral, paged MoE | As Qwen2, plus grouped bf16 expert matmuls (sm_90+) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Unchecked |
-| Gemma 3, paged | FlashInfer with sliding windows | Unchecked | Unchecked | Unchecked | Unchecked |
+| Gemma 3, paged | FlashInfer with sliding windows | Unchecked | Fast (1B, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). The 4B, 12B and 27B checkpoints do not load | Unchecked | Unchecked |
 | Gemma 4 31B, paged | Torch attention (head_dim 512 is above the FlashInfer limit) | Unchecked | Unchecked | Fallback by design, old stack (2026-05-06) | Unchecked |
-| DeepSeek-V2, paged MLA | Torch attention (required), grouped bf16 experts | Unchecked | Unchecked | Unchecked | Unchecked |
+| DeepSeek-V2, paged MLA | Torch attention (required), grouped bf16 experts | Unchecked | Fast (Lite, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Unchecked | Unchecked |
 | DeepSeek-V4-Flash, own cache, 2 GPUs | FP4 experts (W4A8 on sm_100, Gluon or Triton FP4), HC Sinkhorn kernel, fused partial RoPE and norm, decode CUDA graph | Partial (kernels and one layer) | Unchecked | Fast, old stack (2x B200, 2026-10-25, [ADR-046](decisions/ADR-046-v4-tp-decode-host-syncs.md)) | Unchecked |
-| GLM-5.2 and GLM-5.3, paged MLA with DSA | Torch attention (required), grouped FP8 experts (Gluon or Triton) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Unchecked |
+| GLM-5.2 and GLM-5.3, paged MLA with DSA | Torch attention (required), grouped FP8 experts (Gluon or Triton) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Partial (tiny config equal to transformers 5.14, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
 | Inkling, paged | Torch attention (required) | Unchecked | Unchecked | Fallback (tiny weights, 2026-10-19): per-expert MoE loop | Unchecked |
-| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Unchecked | Unchecked |
-| MiniMax-M3 428B, paged, 4 GPUs | Torch attention with the MSA block mask (required), grouped FP8 experts. The MSA decode kernel stays off (0.98x) | No: four 80 GB GPUs are too small | Fast, old stack (4x H200, 2026-07-03, [report](benchmarks/2026-07-03-minimax-m3-428b-gate.md)) | Unchecked (the old image had no sm_100 kernels) | Unchecked |
-| Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Unchecked | Fast (2026-10-21) | Unchecked |
-| Qwen3.8 27B, own cache | Chunkwise GDN prefill, fused GDN decode kernel, decode CUDA graph | Fast, old stack (2026-11-04, [ADR-054](decisions/ADR-054-gdn-scalar-gate-prefill.md)) | Unchecked | Fast, old stack (2026-11-04) | Unchecked |
-| DSpark drafter on Qwen3-4B | Torch attention | Unchecked (L4 only) | Unchecked | Unchecked | Unchecked |
+| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Needs the tokenizer and the loader of the smoke script | Unchecked |
+| MiniMax-M3 428B, paged, 4 GPUs | Torch attention with the MSA block mask (required), grouped FP8 experts. The MSA decode kernel stays off (0.98x) | No: four 80 GB GPUs are too small | Fast, old stack (4x H200, 2026-07-03, [report](benchmarks/2026-07-03-minimax-m3-428b-gate.md)) | Partial (MSA decode kernel only, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Unchecked |
+| Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Unchecked (the 2026-11-05 run stopped at an fp32 unit test, now fixed) | Fast (2026-10-21) | Unchecked |
+| Qwen3.8 27B, own cache | Chunkwise GDN prefill, fused GDN decode kernel, decode CUDA graph | Fast, old stack (2026-11-04, [ADR-054](decisions/ADR-054-gdn-scalar-gate-prefill.md)) | Unchecked | Fast, old stack (2026-11-04) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
+| DSpark drafter on Qwen3-4B | Torch attention | Unchecked (L4 only, main stack passed on 2026-11-05) | Unchecked | Unchecked | Unchecked |
 
 Notes on the matrix:
 
-- The H200 has one run on the main stack: the MoE unit tests passed with
-  `gluon=True` on 2026-11-05 (PR #78). No model ran on it.
+- On 2026-11-05 the H100 ran the GPU unit tests on the main stack: 116
+  passed and 1 failed. The failure (an fp32 Nemotron-H graph test) is fixed
+  in the code, but no GPU run proves the fix yet.
+- The H200 ran the Qwen2.5-7B bench and six paged models on 2026-11-05.
 - The B300 ran 25 of 26 GPU test files on the main stack on 2026-11-05
-  (PR #77), and the Qwen2.5-7B bench of PR #79.
+  (PR #77), the Qwen2.5-7B bench of PR #79, Qwen3.8 27B and the GLM tiny
+  config.
 - On Hopper, DeepSeek-V4 keeps bf16 activations for its FP4 experts, because
   Hopper has no FP4 tensor cores. That is the fastest Hopper path, not a
   fallback.
@@ -73,7 +77,7 @@ Notes on the matrix:
 | Script | Stack | GPUs |
 |---|---|---|
 | `scripts/smoke/modal_gpu_tests.py` | Main stack with FlashInfer. `MINI_INFER_TEST_FLASH_ATTN=1` selects the old torch 2.5.1 image with flash-attn 2.8.3. | All four (the flash-attn image: Hopper only) |
-| `scripts/smoke/modal_smoke.py` | Main stack with FlashInfer, one image for every GPU. State-cache models run through `StateCacheGenerator`. | All four |
+| `scripts/smoke/modal_smoke.py` | Main stack with FlashInfer, one image for every GPU. State-cache models run through `StateCacheGenerator`. Kimi Linear loads with a tokenizer and a loader of the script. | All four |
 | `scripts/bench/modal_openloop_bench.py` | Main stack with FlashInfer. The server takes `MINI_INFER_ATTENTION_BACKEND`. | All four |
 | `scripts/minimax_m3/modal_m3_generate.py`, `modal_msa_kernel_bench.py` | Main stack, `debian_slim` (torch 2.6.0 had no sm_100 kernels) | All four (M3 on H100 needs more than 4 GPUs) |
 | `scripts/glm/modal_glm_smoke.py`, `modal_glm_tp_smoke.py` | Main stack, `debian_slim`, transformers 5.14 as the HF reference | All four |
@@ -125,8 +129,23 @@ These fallbacks are still silent:
   flash-attn or FlashInfer. They test correctness on the torch path.
 - Kimi Linear and Kimi K3 have no GPU kernel for KDA, no grouped MoE path and
   no CUDA graph. Inkling has no grouped MoE path.
-- DeepSeek-V2, Kimi Linear, Llama, Mistral, Qwen3 and Gemma 3 have no
-  recorded run on any of the four GPUs.
+- The Kimi Linear checkpoints ship their tokenizer only as hub code, and
+  `Tokenizer.from_pretrained` runs no hub code. So the API server cannot
+  load Kimi Linear. `modal_smoke.py` loads that tokenizer at a pinned
+  revision in the container.
+- `load_model` builds a model on the host and loads the state dict onto the
+  device, so the device holds two copies of the weights at its peak. A
+  model with its own `from_checkpoint` streams its shards instead. Kimi
+  Linear 48B has none. Two copies of its weights (196 GB) do not fit on one
+  B200 through `StateCacheGenerator.from_pretrained`.
+- The Llama port ignores the `llama3` RoPE scaling of Llama 3.1, 3.2 and
+  3.3. Short prompts change a little, and prompts past 8k tokens are wrong.
+- The Gemma 3 port loads `Gemma3ForCausalLM` (1B) only. The 4B, 12B and 27B
+  checkpoints are `Gemma3ForConditionalGeneration`.
+- DeepSeek-V4 with bf16 experts sends fp32 activations to
+  `functional.grouped_mm`, whose fp32 fallback copies offsets to the host.
+  So an fp32 decode graph of V4 meets the same host copy as Nemotron-H.
+  Production runs bf16.
 
 ## How to fill a cell
 
