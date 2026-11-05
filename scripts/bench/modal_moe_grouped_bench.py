@@ -106,9 +106,13 @@ hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "transformers>=5.14,<5.15",
+        # The Gluon kernels of `fp8_grouped_gluon.py` and `fp4_grouped_gluon.py`
+        # run only with Triton 3.8. With another Triton the MoE blocks fall
+        # back to the Triton kernels, and the header line shows `gluon=False`.
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "accelerate",
         "safetensors",
         "huggingface_hub[hf_xet]",
@@ -1610,10 +1614,13 @@ def moe_grouped_bench(
     import triton
     from huggingface_hub import snapshot_download
 
+    from mini_infer.models.blocks.moe.fp8_grouped_gluon import _GLUON_AVAILABLE
+
     assert torch.cuda.is_available(), "CUDA not available in Modal container"
     header = (
         f"gpu={torch.cuda.get_device_name()} cc={torch.cuda.get_device_capability()} "
-        f"torch={torch.__version__} cuda={torch.version.cuda} triton={triton.__version__}"
+        f"torch={torch.__version__} cuda={torch.version.cuda} triton={triton.__version__} "
+        f"gluon={_GLUON_AVAILABLE}"
     )
     _log(header)
     traces: dict[str, bytes] = {}
