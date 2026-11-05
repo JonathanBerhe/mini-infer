@@ -40,7 +40,7 @@ kernels.
 | Family and model | Fast path | H100 | H200 | B200 | B300 |
 |---|---|---|---|---|---|
 | Qwen2 (Qwen2.5-7B), paged | FlashInfer, decode and prefill CUDA graphs, fused norm, RoPE and SiLU kernels, int8 W8A16 with per-arch tiles | Fast, old stack (2026-11-04, [ADR-053](decisions/ADR-053-paged-prefill-cuda-graph.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Fast (2026-11-05, PR #79) | Fast (2026-11-05, PR #79, within 1% of the B200) |
-| Llama, Mistral, Qwen3, paged | Same code as Qwen2 | Unchecked (the 2-GPU TP smoke of 2026-05-15 loads Qwen2.5-7B) | Runs: Mistral 7B and Qwen3 8B with FlashInfer, no graph (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Llama 3.1 8B loads and generates, but the port ignores its `llama3` RoPE scaling | Unchecked | Unchecked |
+| Llama, Mistral, Qwen3, paged | Same code as Qwen2 | Runs: Llama 3.1 8B with FlashInfer, no graph, matches transformers on a 10240-token prompt (2026-11-05, [report](benchmarks/2026-11-05-llama31-rope-parity.md)) | Runs: Mistral 7B and Qwen3 8B with FlashInfer, no graph (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Llama 3.1 8B loads and generates the text of transformers (run before the `llama3` RoPE fix) | Unchecked | Unchecked |
 | Mixtral, paged MoE | As Qwen2, plus grouped bf16 expert matmuls (sm_90+) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Unchecked |
 | Gemma 3, paged | FlashInfer with sliding windows | Unchecked | Fast (1B, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). The 4B, 12B and 27B checkpoints do not load | Unchecked | Unchecked |
 | Gemma 4 31B, paged | Torch attention (head_dim 512 is above the FlashInfer limit) | Unchecked | Unchecked | Fallback by design, old stack (2026-05-06) | Unchecked |
@@ -130,8 +130,14 @@ These fallbacks are still silent:
   flash-attn or FlashInfer. They test correctness on the torch path.
 - Kimi Linear and Kimi K3 have no GPU kernel for KDA, no grouped MoE path and
   no CUDA graph. Inkling has no grouped MoE path.
-- The Llama port ignores the `llama3` RoPE scaling of Llama 3.1, 3.2 and
-  3.3. Short prompts change a little, and prompts past 8k tokens are wrong.
+- The Llama port applies the `llama3` RoPE scaling of Llama 3.1, 3.2 and
+  3.3. On an H100 it brings the top-1 agreement with transformers on a
+  10240-token prompt from 87% to 98%
+  ([report](benchmarks/2026-11-05-llama31-rope-parity.md)). A config with
+  another `rope_type` (for example "linear" or "yarn") does not load.
+- Llama 3.1 8B Instruct without a chat template continues "The capital of
+  France is" with " a city of romance, art, fashion" in transformers too. So
+  the "Paris" check of `scripts/smoke/modal_smoke.py` fails on this model.
 - The Gemma 3 port loads `Gemma3ForCausalLM` (1B) only. The 4B, 12B and 27B
   checkpoints are `Gemma3ForConditionalGeneration`.
 - DeepSeek-V4 with bf16 experts sends fp32 activations to
