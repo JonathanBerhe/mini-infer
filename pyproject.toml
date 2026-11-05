@@ -60,6 +60,9 @@ dev = [
     # imported by the vendored Kimi Linear reference the parity tests run
     # (third_party/kimi_linear_reference; see tests/unit/models/kimi_linear/_kimi_reference_helpers.py).
     "einops>=0.8.2",
+    # The reference that the tests compare the Kimi fast tokenizer with
+    # (tests/unit/engine/test_hub_tokenizers.py). The library itself does not import it.
+    "tiktoken>=0.7",
 ]
 
 [tool.ruff]
