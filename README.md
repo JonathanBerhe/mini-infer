@@ -21,18 +21,29 @@ Benchmark results are in [docs/benchmarks/](docs/benchmarks/). Design decisions 
 
 ## Performance
 
-mini-infer runs current open models on NVIDIA Hopper and Blackwell GPUs: the H100, H200, B200 and B300. Each result links to the report or ADR that measured it.
+Each model below ran on one NVIDIA H100 and one B200, on `main` on 2026-11-05. Each request has a 1,024-token prompt of real text and up to 128 output tokens, with bf16 weights and greedy sampling.
 
-| Workload | Model | GPU | Result |
-|---|---|---|---|
-| [Serving, 32 requests](docs/benchmarks/2026-11-05-b300-paged-decode.md) | Qwen2.5-7B | B200, B300 | About 4,500 tokens per second |
-| [Serving, 8 requests](docs/decisions/ADR-053-paged-prefill-cuda-graph.md) | Qwen2.5-7B | H100 | 1,251 tokens per second, 3x the eager path. 1,833 with int8 weights |
-| [Prefill, 32k-token prompt](docs/decisions/ADR-054-gdn-scalar-gate-prefill.md) | Qwen3.8-27B | B200 | 12.6x faster: 74.1 s to 5.9 s |
-| [Decode step, 1 request](docs/benchmarks/2026-11-05-gpu-support-gate.md) | Qwen3.8-27B | B300 | 5.6x faster with a CUDA graph and a fused kernel: 80.2 ms to 14.2 ms |
-| [Decode, 16 requests](docs/decisions/ADR-046-v4-tp-decode-host-syncs.md) | DeepSeek-V4-Flash | 2x B200 | 399 tokens per second |
-| [Speculative decoding](docs/benchmarks/2026-10-19-dspark-concurrency.md) | Qwen3-4B with the DSpark drafter | L4 | Decode 2.5x (chat) to 4.5x (math) faster |
-| [FP8 MoE experts](docs/decisions/ADR-038-gluon-fp8-grouped-hopper.md) | GLM-5.3 | H100 | 1.6x faster with Gluon kernels. As fast as bf16 with half the expert memory |
-| [Largest model](docs/benchmarks/2026-07-03-minimax-m3-428b-gate.md) | MiniMax-M3, 428B parameters | 4x H200 | Runs with FP8 experts, 121 GB per GPU |
+- TTFT (time to first token) and decode speed are for one request at a time.
+- Throughput is the total output speed of 16 requests that start together, prefill included.
+
+Each cell shows H100 / B200. The [report](docs/benchmarks/2026-11-05-model-metrics.md) has the method, more columns and the command that reproduces the numbers. The speedup of each optimization is in [docs/benchmarks](docs/benchmarks/README.md).
+
+| Model | Path | TTFT (ms) | Decode (tok/s) | Throughput, 16 requests (tok/s) |
+|---|---|---|---|---|
+| Qwen2.5-7B | Paged, FlashInfer, CUDA graphs | 40 / 29 | 155 / 297 | 1,365 / 2,738 |
+| Qwen3-8B | Paged, FlashInfer, CUDA graphs | 44 / 33 | 143 / 244 | 1,230 / 2,357 |
+| Llama 3.1 8B | Paged, FlashInfer, CUDA graphs | 48 / 34 | 147 / 276 | 1,313 / 2,668 |
+| Mistral 7B v0.3 | Paged, FlashInfer, CUDA graphs | 46 / 33 | 158 / 287 | 1,358 / 2,682 |
+| Gemma 3 1B | Paged, FlashInfer, no graph (sliding window) | 155 / 77 | 40 / 84 | 542 / 1,088 |
+| Gemma 4 31B | Paged, torch attention, no graph | out of memory / 284 | - / 28 | - / 67 |
+| Mixtral 8x7B | Paged, FlashInfer, CUDA graphs | does not fit / 127 | - / 99 | - / 547 |
+| DeepSeek-V2-Lite | Paged, torch attention (MLA), no graph | 590 / 416 | 25 / 36 | 66 / 86 |
+| Qwen3.8-27B | Own cache, decode graph | 217 / 144 | 33 / 50 | 271 / 410 |
+| Nemotron 3.5 Lightning 30B-A3B | Own cache, decode graph | 92 / 61 | 66 / 87 | 457 / 673 |
+| Kimi Linear 48B-A3B | Own cache, no graph | does not fit / 3,375 | - / 2.1 | - / 14 |
+| DeepSeek-V4-Flash | 2x B200, tensor parallel, decode graph | - / 226 | - / 29.5 | - / 240 |
+
+Not measured, because they need more GPUs than this setup or a streaming multi-GPU loader: Kimi K3 and K3.1 Pro (2.8T), Inkling (975B), GLM-5.2 and GLM-5.3 (753B), MiniMax-M3 (428B), DeepSeek-V4-Pro, DeepSeek-V3 and Kimi-K2. The report lists the reason for each.
 
 ## Quickstart
 
