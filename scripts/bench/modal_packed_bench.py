@@ -81,25 +81,27 @@ FLASH_ATTN_WHEEL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/"
     "v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 )
-_IS_BLACKWELL = _BENCH_GPU.upper().startswith("B200")
+_IS_BLACKWELL = _BENCH_GPU.upper().startswith(("B200", "B300"))
 
 if _IS_BLACKWELL:
-    # Blackwell (SM_100) needs the cu128 torch wheel; the cu124 wheel ships
-    # kernels through SM_90 only and fails with "no kernel image is available
-    # for execution on the device" on the first tensor op. flash-attn isn't
-    # used here: B200 runs always go through FlashInfer's paged kernels, and
-    # the prebuilt flash-attn 2.8.3 wheel is pinned to torch 2.5 anyway.
+    # Blackwell (sm_100) needs a torch wheel with sm_100 kernels; the cu124
+    # wheel ships kernels through SM_90 only and fails with "no kernel image
+    # is available for execution on the device" on the first tensor op. The
+    # CUDA 13.2 wheel also covers the B300, which Modal runs only with CUDA
+    # 13.1 or newer. flash-attn isn't used here: Blackwell runs always go
+    # through FlashInfer's paged kernels, and the prebuilt flash-attn 2.8.3
+    # wheel is pinned to torch 2.5 anyway.
     image = (
-        modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
+        modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.11")
         .pip_install(
-            "torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128"
+            "torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132"
         )
         .pip_install(
-            "transformers>=4.40",
+            "transformers==5.14.0",
             "fastapi>=0.110",
             "uvicorn[standard]>=0.27",
             "pydantic>=2.5",
-            "triton==3.6.0",
+            "triton==3.8.0",
         )
         .pip_install("flashinfer-python==0.6.10")
         .add_local_file(

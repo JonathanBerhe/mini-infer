@@ -62,13 +62,16 @@ _PER_TECHNIQUE_TIMEOUT_S = 300.0
 
 app = modal.App("mini-infer-bench-all")
 
-# cu128 wheel + FlashInfer so the FlashInfer attention backend and FP8 / NVFP4
-# KV techniques have their kernels available; matches the V4 smoke image.
+# The CUDA 13.2 torch wheel runs on the H100, the B200 and the B300 (Modal
+# runs a B300 only with CUDA 13.1 or newer). FlashInfer compiles its kernels
+# with the image's nvcc for the attention backend and the FP8 / NVFP4 KV
+# techniques. Same image as the V4 smoke.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
+    modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "transformers>=4.40",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
     )

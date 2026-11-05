@@ -20,11 +20,12 @@ app = modal.App("mini-infer-nvfp4-probe")
 _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "B200")
 
 image = (
-    # CUDA 12.8 devel image; need a Blackwell-aware torch build (the
-    # cu124 wheel only ships kernels through SM_90 / Hopper and would
-    # fail on B200 with "no kernel image" at the first tensor op).
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.10.0+cu128", extra_index_url="https://download.pytorch.org/whl/cu128")
+    # CUDA 13.2 devel image and the CUDA 13.2 torch wheel, which has
+    # Blackwell (sm_100) kernels. Modal runs a B300 only with CUDA 13.1 or
+    # newer, and FlashInfer compiles its kernels with the image's nvcc.
+    modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
+    .pip_install("triton==3.8.0")
     .pip_install("flashinfer-python==0.6.10")
 )
 
