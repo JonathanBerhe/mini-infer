@@ -47,7 +47,10 @@ _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "L40S")
 
 # Torch only. Triton arrives pinned by the torch wheel (3.1.0); the
 # probe deliberately avoids importing mini_infer so the only variables
-# are torch + triton + the kernel source under test.
+# are torch + triton + the kernel source under test. This stack stays on
+# purpose: the probe reproduces a Triton 3.1 compiler crash (ADR-018), so it
+# runs only on GPUs that the cu124 wheel supports (Ampere to Hopper, not
+# Blackwell). `bench_hc_sinkhorn.py` times the shipped kernel on the main stack.
 image = modal.Image.from_registry(
     "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
 ).pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")

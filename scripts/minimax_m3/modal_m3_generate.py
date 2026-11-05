@@ -16,6 +16,10 @@ RAM ~ one shard per rank), then:
 Run with (after staging completes):
     uv run modal run scripts/minimax_m3/modal_m3_generate.py
     M3_GPU=B200:4 uv run modal run scripts/minimax_m3/modal_m3_generate.py
+    M3_GPU=B300:4 uv run modal run scripts/minimax_m3/modal_m3_generate.py
+
+The model takes about 121 GB per rank at 4 ranks, so four 80 GB H100s are
+too small. No run checked a split of the model over 8 ranks.
 """
 
 import os
@@ -31,11 +35,17 @@ _CKPT_DIR = f"{_MOUNT}/MiniMax-M3"
 app = modal.App("mini-infer-m3-generate")
 weights_volume = modal.Volume.from_name(_VOLUME_NAME)
 
+# The main stack. The CUDA 13.2 torch wheel has sm_100 kernels (the B200) and
+# meets the CUDA 13.1+ rule of the Modal B300. M3 runs on the torch attention
+# backend plus one Triton kernel, and Triton brings its own ptxas, so the image
+# needs no nvcc. transformers 5.14 is the version of uv.lock and of the CPU
+# parity tests (`minimax_m3_vl`, with the per-head block selection).
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.6.0", extra_index_url="https://download.pytorch.org/whl/cu124")
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "transformers>=5.12,<5.13",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
     )
@@ -257,8 +267,15 @@ def _run_rank(
                 results[arm] = {"tokens": tokens, "tok_s": tps}
                 del cache
             model.set_decode_kernel(False)
+        import triton
+
         return {
             "rank": rank,
+            "env": (
+                f"gpu={torch.cuda.get_device_name(rank)} x{world_size} "
+                f"cc={torch.cuda.get_device_capability(rank)} torch={torch.__version__} "
+                f"triton={triton.__version__} attention=torch"
+            ),
             "text": text,
             "ab": results,
             "mem_gb": torch.cuda.max_memory_allocated() / 1e9,
@@ -311,8 +328,8 @@ def generate(max_new_tokens: int = 48, ab_context: int = 16384, ab_steps: int = 
     if errors:
         return "FAILED\n" + "\n".join(errors)
 
-    lines = []
     r0 = results[0]
+    lines = [r0["env"]]
     lines.append(f"coherence output (rank 0): {r0['text']!r}")
     same_text = all(results[r]["text"] == r0["text"] for r in results)
     lines.append(f"rank consistency: {'PASS' if same_text else 'FAIL'}")

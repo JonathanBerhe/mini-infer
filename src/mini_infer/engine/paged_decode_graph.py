@@ -28,6 +28,7 @@ from torch.profiler import record_function
 
 from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.flashinfer_backend import plan_static_step
+from mini_infer.cache.packed_attention import effective_attention_backend
 from mini_infer.cache.paged_kv_cache import PagedKVCache, StaticStep
 from mini_infer.device import is_cuda_device
 from mini_infer.engine.device_tokens import DeviceTokens
@@ -46,6 +47,10 @@ def paged_decode_graph_blocker(
         return f"the {name} needs a CUDA device"
     if block_pool.attention_backend != "flashinfer":
         return f"the {name} needs the FlashInfer attention backend"
+    # A FlashInfer request in a process without FlashInfer runs another
+    # backend, which reads the step lengths on the host and cannot replay.
+    if effective_attention_backend("flashinfer", device, block_pool.kv_quant) != "flashinfer":
+        return f"the {name} needs FlashInfer, which this process cannot import"
     if block_pool.kv_quant is not None:
         return f"the {name} writes the uncompressed KV pool only"
     if any(spec != "full" for spec in block_pool.layer_attention):

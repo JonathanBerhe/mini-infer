@@ -8,6 +8,11 @@ GPU selection follows the same `MINI_INFER_BENCH_GPU` env var as
 scripts/bench/modal_packed_bench.py (default A10). Modal 1.4 fixes gpu at
 decorator time.
 
+The image is the main stack (CUDA 13.2, torch 2.14.1, Triton 3.8, FlashInfer),
+so the same script runs on the A10, the H100, the H200, the B200 and the B300.
+It has no flash-attn, so the server runs the FlashInfer backend by default
+(`--attention-backend`). The report header names the backend that ran.
+
 Examples:
 
     # default A10, Qwen-0.5B sweep
@@ -41,29 +46,23 @@ app = modal.App("mini-infer-openloop-bench")
 
 _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "A10")
 
-# Same image base as scripts/bench/modal_packed_bench.py (non-Blackwell path).
-# Pinned torch 2.5.1 + flash-attn 2.8.3 wheel; FlashInfer 0.6.10 JITs prefill
-# kernels on first call, which is why we use the CUDA dev image (nvcc).
-FLASH_ATTN_WHEEL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/"
-    "v2.8.3/flash_attn-2.8.3+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-)
-
+# The main stack. FlashInfer 0.6.10 JITs its prefill kernels on the first
+# call, which is why the image is the CUDA dev image (nvcc). The CUDA 13.2
+# torch wheel has sm_100 kernels and meets the CUDA 13.1+ rule of the B300.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")
+    modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu22.04", add_python="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "transformers>=4.40",
+        "transformers==5.14.0",
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",
-        "triton==3.1.0",
+        "triton==3.8.0",
         # httpx for the open-loop driver. Already a transitive of fastapi
         # in most setups, but pin it explicitly so the script doesn't crash
         # if the image base drops it.
         "httpx>=0.27",
     )
-    .pip_install(FLASH_ATTN_WHEEL)
     .pip_install("flashinfer-python==0.6.10")
     .add_local_file(
         str(Path(__file__).parent.parent / "data" / "technical_passage.md"),
@@ -124,12 +123,16 @@ def run_openloop(
     max_tokens: int,
     num_blocks: int,
     block_size: int,
+    attention_backend: str,
 ) -> str:
     """Boot the server, then drive it with the open-loop bench. All in one container."""
     import torch
 
+    from mini_infer.fast_paths import fast_path_report
+
     assert torch.cuda.is_available()
     gpu_name = torch.cuda.get_device_name()
+    paths = fast_path_report(attention_backend=attention_backend)
 
     env = os.environ.copy()
     env["MINI_INFER_MODEL"] = model
@@ -142,6 +145,7 @@ def run_openloop(
     # against FlashAttention's paged-varlen fast path (needs block_size % 256).
     env["MINI_INFER_NUM_BLOCKS"] = str(num_blocks)
     env["MINI_INFER_BLOCK_SIZE"] = str(block_size)
+    env["MINI_INFER_ATTENTION_BACKEND"] = attention_backend
     env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     # Server logs are best-effort; if the run hangs they help diagnose,
     # otherwise they just clutter the Modal log stream. Inherit stderr/stdout.
@@ -182,7 +186,9 @@ def run_openloop(
             server.kill()
             server.wait(timeout=5.0)
 
-    header = f"GPU: {gpu_name} | model: {model} | rates: {rates} | duration/rate: {duration}s\n"
+    header = (
+        f"GPU: {gpu_name} | model: {model} | rates: {rates} | duration/rate: {duration}s\n{paths}\n"
+    )
     return header + "\n" + body
 
 
@@ -195,6 +201,7 @@ def main(
     max_tokens: int = 128,
     num_blocks: int = 4096,
     block_size: int = 16,
+    attention_backend: str = "flashinfer",
 ) -> None:
     print(
         run_openloop.remote(
@@ -205,5 +212,6 @@ def main(
             max_tokens=max_tokens,
             num_blocks=num_blocks,
             block_size=block_size,
+            attention_backend=attention_backend,
         )
     )

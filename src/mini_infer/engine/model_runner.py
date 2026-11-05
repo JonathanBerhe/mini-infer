@@ -6,8 +6,10 @@ from typing import Any
 import torch
 
 from mini_infer.cache.block_pool import BlockPool
+from mini_infer.cache.packed_attention import effective_attention_backend
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
+from mini_infer.device import is_cuda_device
 from mini_infer.engine.device_tokens import DeviceTokens
 from mini_infer.engine.paged_decode_graph import DEFAULT_BUCKETS, PagedDecodeGraph
 from mini_infer.engine.paged_prefill_graph import (
@@ -140,6 +142,14 @@ class ModelRunner:
                 attention_backend,
             )
             attention_backend = required_backend
+        effective_backend = effective_attention_backend(attention_backend, resolved, kv_quant)
+        if effective_backend != attention_backend and is_cuda_device(resolved):
+            logger.warning(
+                "attention_backend=%r cannot run in this process (FlashInfer or flash-attn "
+                "missing); attention runs on the slower %r path",
+                attention_backend,
+                effective_backend,
+            )
         prefix_cache_obj = PrefixCache(block_size=block_size) if prefix_cache else None
         block_pool = BlockPool(
             num_blocks=num_blocks,
