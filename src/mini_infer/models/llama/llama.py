@@ -5,9 +5,10 @@ derivatives that ship under HF architecture string `LlamaForCausalLM`
 (SmolLM2, TinyLlama, unsloth Llama clones, ...). Pure RMSNorm + RoPE
 + GQA + SwiGLU with no Q/K/V or MLP biases.
 
-Almost identical to `Qwen2ForCausalLM`; the only differences are
-`qkv_bias=False` and the HF architecture key. Parameter names align
-exactly with HF so weight loading is identity rename.
+Almost identical to `Qwen2ForCausalLM`; the differences are
+`qkv_bias=False`, the HF architecture key and the llama3 RoPE rescale
+(`rope_type: "llama3"`) that Llama 3.1, 3.2 and 3.3 configs set.
+Parameter names align exactly with HF so weight loading is identity rename.
 """
 
 from __future__ import annotations
@@ -23,10 +24,12 @@ from mini_infer.distributed.linear import ColumnParallelLinear
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import (
+    Llama3RopeScaling,
     RMSNorm,
     RotaryEmbedding,
     TransformerBlock,
     merge_qkv_weights,
+    read_rope_parameters,
     run_decoder_layers,
 )
 
@@ -49,19 +52,17 @@ class LlamaConfig:
     # Run every RMSNorm as one Triton kernel on CUDA (`RMSNorm(fused=True)`).
     # Its sum runs in another order, so a few outputs differ in the last bit.
     fused_rms_norm: bool = True
+    # The llama3 RoPE rescale of Llama 3.1, 3.2 and 3.3. `None` is plain RoPE
+    # (Llama 2, Llama 3.0, Mistral and most Llama-shape derivatives).
+    rope_scaling: Llama3RopeScaling | None = None
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> LlamaConfig:
         head_dim = getattr(hf_config, "head_dim", None) or (
             hf_config.hidden_size // hf_config.num_attention_heads
         )
-        # transformers 5.x moved `rope_theta` into a `rope_parameters` dict;
-        # 4.x exposed it as a top-level attr. Read whichever is present.
-        rope_params = getattr(hf_config, "rope_parameters", None)
-        if rope_params is not None and "rope_theta" in rope_params:
-            rope_theta = float(rope_params["rope_theta"])
-        else:
-            rope_theta = float(getattr(hf_config, "rope_theta", 10000.0))
+        # Raises on a rope_type other than "default" or "llama3".
+        rope_theta, rope_scaling = read_rope_parameters(hf_config)
         # Some Llama-shape configs allow Q/K/V biases (`attention_bias=True`)
         # or MLP biases (`mlp_bias=True`). Treating those would mean swapping
         # the block constructor's `qkv_bias` and adding biased Linears to
@@ -90,6 +91,7 @@ class LlamaConfig:
             rms_norm_eps=hf_config.rms_norm_eps,
             rope_theta=rope_theta,
             tie_word_embeddings=hf_config.tie_word_embeddings,
+            rope_scaling=rope_scaling,
         )
 
 
@@ -128,7 +130,11 @@ class LlamaForCausalLM(BaseCausalLM):
         super().__init__()
         self.cfg = cfg
         self.model = _LlamaInnerModel(cfg)
-        self.rotary_emb = RotaryEmbedding(cfg.head_dim, base=cfg.rope_theta)
+        # The fused RoPE + paged KV write kernel reads the cos/sin tables this
+        # module builds, so the llama3 rescale reaches the paged path too.
+        self.rotary_emb = RotaryEmbedding(
+            cfg.head_dim, base=cfg.rope_theta, llama3_scaling=cfg.rope_scaling
+        )
         # Column-parallel along the vocab axis; gather_output=True returns the
         # full logits tensor so sampling stays single-tensor.
         self.lm_head = ColumnParallelLinear(

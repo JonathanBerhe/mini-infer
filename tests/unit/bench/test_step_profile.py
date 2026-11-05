@@ -245,6 +245,13 @@ def _tiny_llama_cfg() -> Any:
     return _tiny_llama_state_dict()[0].cfg
 
 
+def _tiny_shape_fields() -> dict[str, Any]:
+    """The tiny Llama shape as keyword arguments that each Llama-shape config takes."""
+    fields = dataclasses.asdict(_tiny_llama_cfg())
+    del fields["rope_scaling"]  # the llama3 rescale is a Llama-only field
+    return fields
+
+
 def _llama() -> torch.nn.Module:
     from tests.unit.distributed.test_distributed_loader import _tiny_llama_state_dict
 
@@ -254,23 +261,21 @@ def _llama() -> torch.nn.Module:
 def _mistral() -> torch.nn.Module:
     from mini_infer.models.mistral.mistral import MistralConfig, MistralForCausalLM
 
-    return MistralForCausalLM(MistralConfig(**dataclasses.asdict(_tiny_llama_cfg())))
+    return MistralForCausalLM(MistralConfig(**_tiny_shape_fields()))
 
 
 def _mixtral() -> torch.nn.Module:
     """The tiny Llama shape with the expert counts of the Mixtral MoE test."""
     from mini_infer.models.mistral.mixtral import MixtralConfig, MixtralForCausalLM
 
-    cfg = MixtralConfig(
-        **dataclasses.asdict(_tiny_llama_cfg()), num_local_experts=4, num_experts_per_tok=2
-    )
+    cfg = MixtralConfig(**_tiny_shape_fields(), num_local_experts=4, num_experts_per_tok=2)
     return MixtralForCausalLM(cfg)
 
 
 def _qwen2() -> torch.nn.Module:
     from mini_infer.models.qwen.qwen2 import Qwen2Config, Qwen2ForCausalLM
 
-    return Qwen2ForCausalLM(Qwen2Config(**dataclasses.asdict(_tiny_llama_cfg())))
+    return Qwen2ForCausalLM(Qwen2Config(**_tiny_shape_fields()))
 
 
 def _qwen3() -> torch.nn.Module:

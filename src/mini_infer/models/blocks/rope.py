@@ -14,10 +14,17 @@ unchanged with the low-frequency components scaled by `1/factor` via a
 smooth linear ramp between two correction-wavelength thresholds —
 preserving short-range positions while preventing aliasing past the
 original training length.
+
+Also includes the **llama3** frequency rescale of Llama 3.1, 3.2 and 3.3
+(`rope_type: "llama3"`): low-frequency `inv_freq` entries are divided by
+`factor`, high-frequency entries stay as they are, and a band in between
+blends the two. `read_rope_parameters` reads it from an HF config.
 """
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -161,6 +168,107 @@ def apply_yarn_correction(
     return inv_freq / scaling_factor * (1.0 - smooth) + inv_freq * smooth
 
 
+@dataclass(frozen=True)
+class Llama3RopeScaling:
+    """The `rope_type: "llama3"` parameters of Llama 3.1, 3.2 and 3.3 configs.
+
+    The released checkpoints use `factor=8` (3.1, 3.3) or `32` (3.2),
+    `low_freq_factor=1`, `high_freq_factor=4` and
+    `original_max_position_embeddings=8192`.
+    """
+
+    factor: float
+    low_freq_factor: float
+    high_freq_factor: float
+    original_max_position_embeddings: int
+
+    def __post_init__(self) -> None:
+        if self.factor <= 0:
+            raise ValueError(f"llama3 rope factor must be positive, got {self.factor}")
+        if self.high_freq_factor <= self.low_freq_factor:
+            raise ValueError(
+                f"llama3 rope needs high_freq_factor > low_freq_factor, got "
+                f"{self.high_freq_factor} <= {self.low_freq_factor}"
+            )
+        if self.original_max_position_embeddings <= 0:
+            raise ValueError(
+                f"llama3 rope original_max_position_embeddings must be positive, "
+                f"got {self.original_max_position_embeddings}"
+            )
+
+
+def apply_llama3_scaling(inv_freq: torch.Tensor, scaling: Llama3RopeScaling) -> torch.Tensor:
+    """Return llama3-rescaled `inv_freq` (transformers' `_compute_llama3_parameters`).
+
+    Each entry has a wavelength `2 * pi / inv_freq`. With
+    `L = original_max_position_embeddings`:
+
+        - wavelength < L / high_freq_factor: kept as is (short range).
+        - wavelength > L / low_freq_factor: divided by `factor` (long range).
+        - in between: `(1 - s) * inv_freq / factor + s * inv_freq`, with
+          `s = (L / wavelength - low_freq_factor) / (high_freq_factor - low_freq_factor)`.
+
+    Same ops in the same order as transformers, so an fp32 input gives the
+    same fp32 table.
+    """
+    old_context_len = scaling.original_max_position_embeddings
+    low_freq_wavelen = old_context_len / scaling.low_freq_factor
+    high_freq_wavelen = old_context_len / scaling.high_freq_factor
+
+    wavelen = 2 * math.pi / inv_freq
+    scaled = torch.where(wavelen > low_freq_wavelen, inv_freq / scaling.factor, inv_freq)
+    smooth = (old_context_len / wavelen - scaling.low_freq_factor) / (
+        scaling.high_freq_factor - scaling.low_freq_factor
+    )
+    smoothed = (1 - smooth) * scaled / scaling.factor + smooth * scaled
+    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    return torch.where(is_medium_freq, smoothed, scaled)
+
+
+def read_rope_parameters(hf_config: Any) -> tuple[float, Llama3RopeScaling | None]:
+    """`(rope_theta, llama3 scaling or None)` from a Llama-shape HF config.
+
+    transformers 5.x keeps the RoPE fields in a `rope_parameters` dict,
+    `rope_theta` included. transformers 4.x and a raw `config.json` keep
+    them in `rope_scaling` (which can be null) next to a top-level
+    `rope_theta`. Older configs name the type `type`, newer ones
+    `rope_type`.
+
+    Raises `NotImplementedError` for a `rope_type` other than "default" or
+    "llama3" (for example "linear", "dynamic" or "yarn"), so a checkpoint
+    never loads with a RoPE table that differs from the one it was trained
+    with.
+    """
+    params = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None)
+    params = dict(params or {})
+    if "rope_theta" in params:
+        rope_theta = float(params["rope_theta"])
+    else:
+        rope_theta = float(getattr(hf_config, "rope_theta", None) or 10000.0)
+
+    rope_type = params.get("rope_type") or params.get("type") or "default"
+    if rope_type == "default":
+        return rope_theta, None
+    if rope_type == "llama3":
+        try:
+            scaling = Llama3RopeScaling(
+                factor=float(params["factor"]),
+                low_freq_factor=float(params["low_freq_factor"]),
+                high_freq_factor=float(params["high_freq_factor"]),
+                original_max_position_embeddings=int(params["original_max_position_embeddings"]),
+            )
+        except KeyError as missing:
+            raise ValueError(
+                f"llama3 rope parameters are missing {missing}; got {sorted(params)}"
+            ) from None
+        return rope_theta, scaling
+    raise NotImplementedError(
+        f"rope_type={rope_type!r} is not supported; only 'default' and 'llama3' are. "
+        f"Loading with plain RoPE would give a different position encoding than "
+        f"the checkpoint was trained with."
+    )
+
+
 class RotaryEmbedding(nn.Module):
     """Computes `(cos, sin)` tables for RoPE on demand.
 
@@ -185,6 +293,7 @@ class RotaryEmbedding(nn.Module):
         yarn_scaling_factor: float = 1.0,
         yarn_beta_fast: int = 32,
         yarn_beta_slow: int = 1,
+        llama3_scaling: Llama3RopeScaling | None = None,
     ) -> None:
         """Build the inverse-frequency table.
 
@@ -212,10 +321,16 @@ class RotaryEmbedding(nn.Module):
             yarn_scaling_factor: ratio between extended and original lengths.
             yarn_beta_fast / yarn_beta_slow: rotation-count thresholds for
                 the smooth blend ramp. Defaults match the YaRN paper.
+
+        llama3 kwarg:
+            llama3_scaling: the Llama 3.1+ rescale (`apply_llama3_scaling`).
+                `None` (default) disables it. It cannot be combined with YaRN.
         """
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+        if llama3_scaling is not None and yarn_original_seq_len > 0:
+            raise ValueError("llama3_scaling and YaRN are two RoPE variants; pick one")
         if not 0.0 < partial_rotary_factor <= 1.0:
             raise ValueError(
                 f"partial_rotary_factor must be in (0, 1]; got {partial_rotary_factor}"
@@ -241,6 +356,8 @@ class RotaryEmbedding(nn.Module):
                 beta_fast=yarn_beta_fast,
                 beta_slow=yarn_beta_slow,
             )
+        if llama3_scaling is not None:
+            rotated = apply_llama3_scaling(rotated, llama3_scaling)
         nope_pad = head_dim // 2 - rope_angles
         if nope_pad > 0:
             inv_freq = torch.cat([rotated, torch.zeros(nope_pad, dtype=torch.float32)])

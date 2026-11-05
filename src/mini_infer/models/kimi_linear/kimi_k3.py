@@ -85,6 +85,11 @@ class KimiK3ForConditionalGeneration(KimiLinearForCausalLM):
             )
         KimiLinearForCausalLM.load_weights(model, text_state_dict_from_k3(hf_state_dict))
 
+    @staticmethod
+    def text_checkpoint_tensors(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Drop the vision tower and strip `language_model.` (the streaming load's hook)."""
+        return text_state_dict_from_k3(hf_tensors)
+
 
 def text_state_dict_from_k3(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Checkpoint tensors -> the text model's checkpoint names.
