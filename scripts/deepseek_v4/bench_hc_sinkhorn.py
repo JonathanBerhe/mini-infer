@@ -47,21 +47,20 @@ import torch
 app = modal.App("mini-infer-hc-sinkhorn-bench")
 _BENCH_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "L40S")
 
-# Lean CUDA image: torch + transformers. Triton arrives pinned by the
-# torch wheel itself (torch 2.5.1 requires triton==3.1.0 on linux);
-# do NOT install triton separately, that risks a version skew against
-# the torch runtime. No flash-attn / FlashInfer needed because this
-# bench only exercises the HC Sinkhorn kernel and its PyTorch oracle.
+# The main stack: torch, the Triton that torch pins, and transformers. The
+# CUDA 13.2 torch wheel runs on every Modal GPU from the L40S to the B300
+# (sm_100 kernels, CUDA 13.1+ rule), so the bench times the kernel under the
+# Triton of the serving images. No flash-attn / FlashInfer needed because this
+# bench only exercises the HC Sinkhorn kernel and its PyTorch oracle, and
+# Triton brings its own ptxas, so the image needs no nvcc.
 # `transformers` is required even though the bench never loads a model:
 # importing any module under `mini_infer.models` fires
 # `_register_builtin_models()`, which imports the cache package, which
 # imports `transformers.DynamicCache`.
-# The cu124 wheel is fine for L40S / H100; a Blackwell GPU would need the
-# CUDA 13.2 image of the other Modal scripts (out of scope for this microbench).
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.5.1", extra_index_url="https://download.pytorch.org/whl/cu124")
-    .pip_install("transformers>=4.40")
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
+    .pip_install("triton==3.8.0", "transformers==5.14.0")
     .add_local_python_source("mini_infer")
 )
 
@@ -283,8 +282,10 @@ def _run_on_modal(
 ) -> None:
     """Modal entrypoint: parity first, then bench, inside one GPU container."""
     device = torch.device("cuda", 0)
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"PyTorch: {torch.__version__}")
+    import triton
+
+    print(f"GPU: {torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}")
+    print(f"PyTorch: {torch.__version__}  Triton: {triton.__version__}")
     print()
     _run_parity(device)
     _run_bench(

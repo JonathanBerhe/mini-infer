@@ -89,9 +89,13 @@ results_vol = modal.Volume.from_name("mini-infer-dspark-results", create_if_miss
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
+    # The main stack: the CUDA 13.2 torch wheel runs on every Modal GPU from
+    # the L4 to the B300 (CUDA 13.1+ rule). DSpark uses the torch attention
+    # backend, so the image needs no FlashInfer and no nvcc.
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "torch==2.9.1",
-        "transformers>=5.14,<5.15",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
         "accelerate>=0.30",

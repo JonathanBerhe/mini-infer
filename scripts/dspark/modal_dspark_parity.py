@@ -59,15 +59,19 @@ hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
+    # The main stack: the CUDA 13.2 torch wheel runs on every Modal GPU from
+    # the L4 to the B300 (CUDA 13.1+ rule). DSpark uses the torch attention
+    # backend, so the image needs no FlashInfer and no nvcc.
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "torch==2.9.1",
+        "triton==3.8.0",
         # DeepSpec pins transformers==5.10.2; mini-infer's dev group pins
         # 5.14.x (bumped for Inkling). Both bumps in that range have already
         # forced numerics realignment in other ported families, so this run
         # deliberately uses OUR pin and reports whether the reference still
         # agrees. A divergence here is itself the finding: it would justify
         # the isolated-venv fixture generation the plan holds in reserve.
-        "transformers>=5.14,<5.15",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
         "accelerate>=0.30",
@@ -142,7 +146,12 @@ def parity() -> dict[str, Any]:
     import transformers
 
     results["transformers_version"] = transformers.__version__
-    print(f"transformers {transformers.__version__}", flush=True)
+    results["torch_version"] = torch.__version__
+    print(
+        f"{torch.cuda.get_device_name()} torch {torch.__version__} "
+        f"transformers {transformers.__version__}",
+        flush=True,
+    )
 
     # ---- weights -----------------------------------------------------------
     target_dir = snapshot_download(_TARGET)

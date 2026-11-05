@@ -111,6 +111,11 @@ if _IS_BLACKWELL:
         .add_local_python_source("mini_infer")
     )
 else:
+    # The flash-attn image of the A10, H100 and H200 runs. It stays on torch
+    # 2.5.1 on purpose: this bench measures the `flash_attn` backend (ADR-007,
+    # ADR-008), and no flash-attn wheel exists for the torch 2.14 / CUDA 13
+    # main stack. The Blackwell branch above has no flash-attn, so there the
+    # header line shows `attention=flash_attn->torch`.
     image = (
         # CUDA dev image (has nvcc) so FlashInfer's JIT-compiled prefill
         # kernels can build at first call. CUDA 12.8 satisfies FlashInfer
@@ -1895,6 +1900,7 @@ def run_bench(
     import torch
 
     from mini_infer.cache.packed_attention import supports_packed_kernel
+    from mini_infer.fast_paths import fast_path_report
 
     assert torch.cuda.is_available()
     gpu_name = torch.cuda.get_device_name()
@@ -1902,6 +1908,7 @@ def run_bench(
 
     header = (
         f"GPU: {gpu_name} | flash_attn={fa_available} | block_size={block_size} | model={model}"
+        f"\n{fast_path_report()}"
     )
 
     if config == "turbo":

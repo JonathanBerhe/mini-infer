@@ -154,10 +154,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # rate sweep that puts dozens of long-prompt requests in flight.
         env_num_blocks = os.environ.get("MINI_INFER_NUM_BLOCKS")
         env_block_size = os.environ.get("MINI_INFER_BLOCK_SIZE")
+        # MINI_INFER_ATTENTION_BACKEND picks the paged attention backend
+        # ("flash_attn", "flashinfer" or "torch"). Images without flash-attn,
+        # such as the CUDA 13 images, take "flashinfer" for the fast path.
         runner = ModelRunner.from_pretrained(
             model_name,
             num_blocks=int(env_num_blocks) if env_num_blocks else DEFAULT_NUM_BLOCKS,
             block_size=int(env_block_size) if env_block_size else DEFAULT_BLOCK_SIZE,
+            attention_backend=os.environ.get("MINI_INFER_ATTENTION_BACKEND", "flash_attn"),
         )
         if _USE_PD:
             logger.info(
