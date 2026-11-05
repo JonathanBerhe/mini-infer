@@ -55,7 +55,18 @@ class Tokenizer:
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "Tokenizer":
-        return cls(AutoTokenizer.from_pretrained(model_name))
+        """Load the tokenizer of a checkpoint directory or an HF Hub repo id.
+
+        A checkpoint that ships its tokenizer only as hub code (Kimi Linear)
+        gets an equivalent fast tokenizer from `hub_tokenizers`. Every other
+        checkpoint loads through `AutoTokenizer`, without hub code.
+        """
+        from mini_infer.engine.hub_tokenizers import load_hub_code_tokenizer
+
+        hf_tokenizer = load_hub_code_tokenizer(model_name)
+        if hf_tokenizer is None:
+            hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        return cls(hf_tokenizer)
 
     def encode(self, text: str) -> list[int]:
         # `add_special_tokens=True` is the HF default and matches each model's

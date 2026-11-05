@@ -48,7 +48,7 @@ kernels.
 | DeepSeek-V4-Flash, own cache, 2 GPUs | FP4 experts (W4A8 on sm_100, Gluon or Triton FP4), HC Sinkhorn kernel, fused partial RoPE and norm, decode CUDA graph | Partial (kernels and one layer) | Unchecked | Fast, old stack (2x B200, 2026-10-25, [ADR-046](decisions/ADR-046-v4-tp-decode-host-syncs.md)) | Unchecked |
 | GLM-5.2 and GLM-5.3, paged MLA with DSA | Torch attention (required), grouped FP8 experts (Gluon or Triton) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Partial (tiny config equal to transformers 5.14, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
 | Inkling, paged | Torch attention (required) | Unchecked | Unchecked | Fallback (tiny weights, 2026-10-19): per-expert MoE loop | Unchecked |
-| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)). Needs the tokenizer and the loader of the smoke script | Unchecked |
+| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | Unchecked | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) with a tokenizer and a loader of the smoke script. The library now has both. The library path is not yet run on a GPU | Unchecked |
 | MiniMax-M3 428B, paged, 4 GPUs | Torch attention with the MSA block mask (required), grouped FP8 experts. The MSA decode kernel stays off (0.98x) | No: four 80 GB GPUs are too small | Fast, old stack (4x H200, 2026-07-03, [report](benchmarks/2026-07-03-minimax-m3-428b-gate.md)) | Partial (MSA decode kernel only, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Unchecked |
 | Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-10-21, [report](benchmarks/2026-10-21-moe-grouped-gemm.md)) | Unchecked (the 2026-11-05 run stopped at an fp32 unit test, now fixed) | Fast (2026-10-21) | Unchecked |
 | Qwen3.8 27B, own cache | Chunkwise GDN prefill, fused GDN decode kernel, decode CUDA graph | Fast, old stack (2026-11-04, [ADR-054](decisions/ADR-054-gdn-scalar-gate-prefill.md)) | Unchecked | Fast, old stack (2026-11-04) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
@@ -77,7 +77,7 @@ Notes on the matrix:
 | Script | Stack | GPUs |
 |---|---|---|
 | `scripts/smoke/modal_gpu_tests.py` | Main stack with FlashInfer. `MINI_INFER_TEST_FLASH_ATTN=1` selects the old torch 2.5.1 image with flash-attn 2.8.3. | All four (the flash-attn image: Hopper only) |
-| `scripts/smoke/modal_smoke.py` | Main stack with FlashInfer, one image for every GPU. State-cache models run through `StateCacheGenerator`. Kimi Linear loads with a tokenizer and a loader of the script. | All four |
+| `scripts/smoke/modal_smoke.py` | Main stack with FlashInfer, one image for every GPU. State-cache models run through `StateCacheGenerator.from_pretrained`, as the API server loads them. | All four |
 | `scripts/bench/modal_openloop_bench.py` | Main stack with FlashInfer. The server takes `MINI_INFER_ATTENTION_BACKEND`. | All four |
 | `scripts/minimax_m3/modal_m3_generate.py`, `modal_msa_kernel_bench.py` | Main stack, `debian_slim` (torch 2.6.0 had no sm_100 kernels) | All four (M3 on H100 needs more than 4 GPUs) |
 | `scripts/glm/modal_glm_smoke.py`, `modal_glm_tp_smoke.py` | Main stack, `debian_slim`, transformers 5.14 as the HF reference | All four |
@@ -129,15 +129,6 @@ These fallbacks are still silent:
   flash-attn or FlashInfer. They test correctness on the torch path.
 - Kimi Linear and Kimi K3 have no GPU kernel for KDA, no grouped MoE path and
   no CUDA graph. Inkling has no grouped MoE path.
-- The Kimi Linear checkpoints ship their tokenizer only as hub code, and
-  `Tokenizer.from_pretrained` runs no hub code. So the API server cannot
-  load Kimi Linear. `modal_smoke.py` loads that tokenizer at a pinned
-  revision in the container.
-- `load_model` builds a model on the host and loads the state dict onto the
-  device, so the device holds two copies of the weights at its peak. A
-  model with its own `from_checkpoint` streams its shards instead. Kimi
-  Linear 48B has none. Two copies of its weights (196 GB) do not fit on one
-  B200 through `StateCacheGenerator.from_pretrained`.
 - The Llama port ignores the `llama3` RoPE scaling of Llama 3.1, 3.2 and
   3.3. Short prompts change a little, and prompts past 8k tokens are wrong.
 - The Gemma 3 port loads `Gemma3ForCausalLM` (1B) only. The 4B, 12B and 27B
