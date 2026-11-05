@@ -3,7 +3,10 @@
 Several GPU paths fall back to a slower one without an error: the Gluon MoE
 kernels need Triton 3.8 and a Hopper or datacenter Blackwell GPU, the
 FlashInfer backend needs `flashinfer-python`, and the `flash_attn` backend
-needs `flash-attn`. Without them the engine still runs, so a benchmark can
+needs `flash-attn`. The Qwen3.8 full-attention layers also need `flash-attn`
+to read each row only up to its length (`cache/contiguous_attention.py`), so
+`flash_attn=none` means that they attend over the whole cache buffer.
+Without them the engine still runs, so a benchmark can
 time the slow path and nobody sees it. Modal scripts print this line at the
 top of their report, so that a fallback shows next to the numbers.
 """
