@@ -169,8 +169,9 @@ class StateCacheGenerator:
 
         Dispatches on the checkpoint's registered architecture: classes with
         their own `from_checkpoint` (DeepSeek-V4's meta-device streaming
-        constructor, the Qwen hybrid's shard-by-shard one) use it; the rest
-        (Kimi Linear) load through the generic `load_model` path. This is the
+        constructor, the shard-by-shard ones of the Qwen hybrid, Nemotron-H
+        and Kimi Linear) use it; the rest load through the generic
+        `load_model` path. This is the
         single-device entry (local CPU/MPS, or one GPU). For multi-GPU tensor
         parallelism, initialise the process group per rank, build the per-rank
         model directly, and construct `StateCacheGenerator(model, tokenizer)`
@@ -185,6 +186,9 @@ class StateCacheGenerator:
         if arch is None:
             raise ValueError(f"checkpoint {name_or_path!r} declares no `architectures`")
         model_cls = REGISTRY.lookup(arch)
+        # The tokenizer loads first: it takes seconds, and its failure then
+        # stops the call before minutes of weight loading.
+        tokenizer = Tokenizer.from_pretrained(name_or_path)
         model: StateCacheModelLike
         if hasattr(model_cls, "from_checkpoint"):
             model = model_cls.from_checkpoint(
@@ -192,7 +196,6 @@ class StateCacheGenerator:
             )
         else:
             model = load_model(name_or_path, dtype=resolved_dtype, device=resolved_device)  # type: ignore[assignment]
-        tokenizer = Tokenizer.from_pretrained(name_or_path)
         return cls(model, tokenizer, device=resolved_device, dtype=resolved_dtype)
 
     @property

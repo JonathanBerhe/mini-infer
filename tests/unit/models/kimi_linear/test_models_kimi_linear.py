@@ -8,15 +8,20 @@ end-to-end serving smoke through `StateCacheGenerator` +
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
+import mini_infer.models as models_module
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
 from mini_infer.engine.tokenizer import Tokenizer
+from mini_infer.models import load_model
 from mini_infer.models.kimi_linear.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM
 from mini_infer.models.kimi_linear.state_cache import (
     KimiKdaLayerState,
@@ -27,6 +32,7 @@ from mini_infer.scheduler.request_state import Request
 from mini_infer.scheduler.state_cache_continuous_scheduler import (
     StateCacheContinuousScheduler,
 )
+from tests.unit._kimi_tokenizer_files import write_kimi_tokenizer_files
 
 
 def _tiny_hf_namespace(**overrides: Any) -> SimpleNamespace:
@@ -240,3 +246,127 @@ def test_scheduler_serving_matches_scalar_oracle() -> None:
         scheduler.stop()
 
     assert [r.text for r in results] == expected
+
+
+def _checkpoint_layout(model: KimiLinearForCausalLM) -> dict[str, torch.Tensor]:
+    """The model's tensors as the released checkpoint stores them.
+
+    Conv1d `(C, 1, W)` taps, `o_norm.weight`, `A_log` as `(1, 1, H, 1)`, the
+    `A_log` / `dt_bias` pair in fp32 and every other tensor in bf16. A tied
+    model stores the embedding only.
+    """
+    state: dict[str, torch.Tensor] = {}
+    for key, value in model.state_dict().items():
+        if key == "lm_head.weight" and model.cfg.tie_word_embeddings:
+            continue
+        if key.endswith(("A_log", "dt_bias")):
+            value = value.float()
+            if key.endswith("A_log"):
+                value = value.reshape(1, 1, -1, 1)
+            state[key] = value.clone()
+            continue
+        value = value.to(torch.bfloat16)
+        if key.endswith(("q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight")):
+            state[key] = value.unsqueeze(1).clone()
+        elif key.endswith("o_norm_weight"):
+            state[key.replace("o_norm_weight", "o_norm.weight")] = value.clone()
+        else:
+            state[key] = value.clone()
+    return state
+
+
+def _write_checkpoint(
+    directory: Path, hf_config: dict[str, Any], state: dict[str, torch.Tensor]
+) -> None:
+    """`config.json`, two safetensors shards and the index, as `iter_safetensors_shards` reads."""
+    (directory / "config.json").write_text(json.dumps(hf_config))
+    shard_names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    weight_map = {key: shard_names[index % 2] for index, key in enumerate(sorted(state))}
+    for shard in shard_names:
+        save_file(
+            {key: tensor.contiguous() for key, tensor in state.items() if weight_map[key] == shard},
+            str(directory / shard),
+        )
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+def _tiny_checkpoint(directory: Path, **overrides: Any) -> KimiLinearForCausalLM:
+    """Write a tiny Kimi Linear checkpoint with random weights; returns the source model."""
+    hf_config = {
+        **vars(_tiny_hf_namespace(**overrides)),
+        "architectures": ["KimiLinearForCausalLM"],
+        "model_type": "kimi_linear",
+    }
+    torch.manual_seed(3)
+    source = KimiLinearForCausalLM(KimiLinearConfig.from_hf(_tiny_hf_namespace(**overrides)))
+    with torch.no_grad():
+        for param in source.parameters():
+            param.uniform_(-0.2, 0.2)
+    _write_checkpoint(directory, hf_config, _checkpoint_layout(source))
+    return source
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [False, True])
+def test_from_checkpoint_matches_load_model(tmp_path: Path, tie_word_embeddings: bool) -> None:
+    """The shard-by-shard load gives the same bf16 model and logits as `load_model`."""
+    _tiny_checkpoint(tmp_path, tie_word_embeddings=tie_word_embeddings)
+
+    reference = load_model(str(tmp_path), dtype=torch.bfloat16, device="cpu")
+    streamed = KimiLinearForCausalLM.from_checkpoint(
+        str(tmp_path), device="cpu", dtype=torch.bfloat16
+    )
+
+    assert isinstance(streamed, KimiLinearForCausalLM)
+    assert not streamed.training
+    # `A_log` and `dt_bias` are fp32 in the constructor and in the checkpoint.
+    assert {param.dtype for param in streamed.parameters()} == {torch.bfloat16}
+    assert {param.dtype for param in reference.parameters()} == {torch.bfloat16}
+    assert torch.get_default_dtype() == torch.float32
+    if tie_word_embeddings:
+        assert streamed.lm_head.weight is streamed.model.embed_tokens.weight
+    reference_state = reference.state_dict()
+    for key, value in streamed.state_dict().items():
+        assert torch.equal(value, reference_state[key]), key
+    ids = torch.randint(0, 96, (2, 7))
+    with torch.inference_mode():
+        assert torch.equal(streamed(ids), reference(ids))
+
+
+def test_from_checkpoint_fails_on_a_missing_tensor(tmp_path: Path) -> None:
+    source = _tiny_checkpoint(tmp_path)
+    state = _checkpoint_layout(source)
+    del state["model.layers.3.self_attn.kv_b_proj.weight"]
+    _write_checkpoint(tmp_path, json.loads((tmp_path / "config.json").read_text()), state)
+    missing = r"missing=\['model.layers.3.self_attn.kv_b_proj.weight'\]"
+    with pytest.raises(ValueError, match=missing):
+        KimiLinearForCausalLM.from_checkpoint(str(tmp_path), device="cpu", dtype=torch.float32)
+
+
+def test_state_cache_generator_loads_kimi_without_hub_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`StateCacheGenerator.from_pretrained` serves a Kimi checkpoint as the API server does.
+
+    The weights load through `from_checkpoint` (not `load_model`), and the
+    tokenizer through the fast Kimi tokenizer (no hub code). The greedy text
+    equals the text of a generator around the `load_model` model.
+    """
+    ranks = write_kimi_tokenizer_files(tmp_path)
+    _tiny_checkpoint(tmp_path, vocab_size=len(ranks) + 258)
+    reference_model = load_model(str(tmp_path), dtype=torch.float32, device="cpu")
+
+    def _no_load_model(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Kimi Linear must load through from_checkpoint")
+
+    monkeypatch.setattr(models_module, "load_model", _no_load_model)
+    generator = StateCacheGenerator.from_pretrained(
+        str(tmp_path), device="cpu", dtype=torch.float32
+    )
+
+    assert isinstance(generator.model, KimiLinearForCausalLM)
+    reference = StateCacheGenerator(
+        cast(Any, reference_model), generator.tokenizer, device="cpu", dtype=torch.float32
+    )
+    prompt = "The capital of France is"
+    text = generator.generate(prompt, max_new_tokens=6)
+    assert text == reference.generate(prompt, max_new_tokens=6)

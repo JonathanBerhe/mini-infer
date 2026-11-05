@@ -50,18 +50,10 @@ image = (
         "fastapi>=0.110",
         "uvicorn[standard]>=0.27",
         "pydantic>=2.5",
-        "tiktoken>=0.7",
     )
     .pip_install("flashinfer-python==0.6.10")
     .add_local_python_source("mini_infer")
 )
-
-# Checkpoints whose tokenizer exists only as hub code. `Tokenizer.from_pretrained`
-# runs no hub code, so it cannot load them. The smoke loads these tokenizers
-# with `trust_remote_code` at a pinned revision, in the container only.
-_HUB_CODE_TOKENIZERS = {
-    "moonshotai/Kimi-Linear-48B-A3B-Instruct": "e1df551a447157d4658b573f9a695d57658590e9",
-}
 
 
 @app.function(
@@ -122,19 +114,7 @@ def _state_cache_smoke(model_name: str, gpu_name: str) -> str:
     from mini_infer.fast_paths import fast_path_report
     from mini_infer.scheduler import Request, StateCacheContinuousScheduler
 
-    revision = _HUB_CODE_TOKENIZERS.get(model_name)
-    if revision is None:
-        generator = StateCacheGenerator.from_pretrained(model_name)
-    else:
-        from transformers import AutoTokenizer
-
-        from mini_infer.engine.tokenizer import Tokenizer
-
-        # The tokenizer loads first, so a failure stops the run before the weights load.
-        hf_tokenizer = AutoTokenizer.from_pretrained(
-            model_name, revision=revision, trust_remote_code=True
-        )
-        generator = StateCacheGenerator(_load_on_one_gpu(model_name), Tokenizer(hf_tokenizer))  # type: ignore[arg-type]
+    generator = StateCacheGenerator.from_pretrained(model_name)
     cuda_graph = supports_decode_cuda_graph(generator.model, generator.device)
     scheduler = StateCacheContinuousScheduler(generator, cuda_graph=cuda_graph)
     scheduler.start()
@@ -154,38 +134,6 @@ def _state_cache_smoke(model_name: str, gpu_name: str) -> str:
         f"OK | model={model_name} | gpu={gpu_name} | state_cache=True | "
         f"cuda_graph={cuda_graph} | {fast_path_report('torch')} | output={text!r}"
     )
-
-
-def _load_on_one_gpu(model_name: str) -> object:
-    """Build the model in bf16 on the GPU, then copy the weights in from host memory.
-
-    `load_model` builds the model on the host and loads the state dict onto
-    the GPU, so the GPU holds two copies of the weights at its peak. Kimi
-    Linear 48B (98 GB in bf16) does not fit on one B200 that way. Kimi Linear
-    has no buffers that its constructor computes, so every value comes from
-    the checkpoint.
-    """
-    import torch
-
-    from mini_infer.models import REGISTRY, _raw_config_namespace
-    from mini_infer.models.loader import load_safetensors_state_dict
-
-    hf_config = _raw_config_namespace(model_name)
-    model_cls = REGISTRY.lookup(hf_config.architectures[0])
-    cfg = model_cls.Config.from_hf(hf_config)  # type: ignore[attr-defined]
-    default_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
-    try:
-        with torch.device("cuda"):
-            # `load_model` casts every parameter to the load dtype, also the
-            # ones that the constructor makes in fp32 (`A_log`, `dt_bias`).
-            model = model_cls(cfg).to(dtype=torch.bfloat16)
-    finally:
-        torch.set_default_dtype(default_dtype)
-    state_dict = load_safetensors_state_dict(model_name, device="cpu", dtype=torch.bfloat16)
-    model_cls.load_weights(model, state_dict)
-    del state_dict
-    return model.eval()
 
 
 @app.local_entrypoint()
