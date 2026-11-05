@@ -1,5 +1,7 @@
 # mini-infer
 
+> mini-infer is a research project. It is not production software, and its APIs can change without notice.
+
 mini-infer is an LLM inference engine, written from scratch. It ports new model architectures soon after they are published. Each port matches the upstream reference implementation bit for bit.
 
 ## Features
