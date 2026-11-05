@@ -167,7 +167,9 @@ def main() -> int:
         f"{text_cfg.num_experts} experts, MXFP4 experts: {text_cfg.mxfp4_weights}"
     )
 
-    if model_cls is KimiK3ForConditionalGeneration:
+    # K3.1 Pro subclasses the K3 wrapper: same layout, one more config block.
+    wrapped = issubclass(model_cls, KimiK3ForConditionalGeneration)
+    if wrapped:
         print(f"\n== 2. text_config against {BASELINE_REPO} @ {BASELINE_REVISION[:8]}")
         baseline = _config_json(BASELINE_REPO, BASELINE_REVISION)
         top_level = _diff(
@@ -183,9 +185,7 @@ def main() -> int:
     print(f"{len(state)} tensors: {dict(dtypes)}")
     with torch.device("meta"):
         model = model_cls(cfg)
-    text_state = (
-        text_state_dict_from_k3(state) if model_cls is KimiK3ForConditionalGeneration else state
-    )
+    text_state = text_state_dict_from_k3(state) if wrapped else state
     remapped = _remap_kimi_state(
         text_state,
         mxfp4_weights=text_cfg.mxfp4_weights,
