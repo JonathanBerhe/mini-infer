@@ -235,6 +235,19 @@ class ModelRunner:
         """
         return "tap_layers" in inspect.signature(self._model.forward).parameters
 
+    @property
+    def supports_last_rows(self) -> bool:
+        """True: `forward_step_packed` takes `last_rows_only`.
+
+        A scheduler reads this before it passes the flag, so a duck-typed
+        runner without it keeps getting the logits of every row.
+        """
+        return True
+
+    def _model_selects_rows(self) -> bool:
+        """Whether the model's forward takes `logits_rows` and runs the head on those rows only."""
+        return "logits_rows" in inspect.signature(self._model.forward).parameters
+
     def forward_step(
         self,
         cache: PagedKVCache,
@@ -244,20 +257,15 @@ class ModelRunner:
     ) -> list[torch.Tensor]:
         """Run ONE packed-varlen forward; return last-position logits per request.
 
-        This is a wrapper over `forward_step_packed`. For request `i`, it takes
-        row `cu_seqlens_q[i + 1] - 1`, at any q-length. The wrappers below and
-        the prefill worker use it. A caller that reads other positions, or that
-        slices the packed tensor itself (the scheduler), calls
-        `forward_step_packed`.
+        This is a wrapper over `forward_step_packed` with `last_rows_only`: for
+        request `i` it returns the logits of row `cu_seqlens_q[i + 1] - 1`, at
+        any q-length. The wrappers below and the prefill worker use it. A
+        caller that reads other positions calls `forward_step_packed`.
         """
         packed_logits = self.forward_step_packed(
-            cache, packed_input_ids, cu_seqlens_q, position_offsets
+            cache, packed_input_ids, cu_seqlens_q, position_offsets, last_rows_only=True
         )
-        per_request_logits: list[torch.Tensor] = []
-        for batch_idx in range(cache.batch_size):
-            last_pos = cu_seqlens_q[batch_idx + 1] - 1
-            per_request_logits.append(packed_logits[0, last_pos, :])
-        return per_request_logits
+        return [packed_logits[0, batch_idx, :] for batch_idx in range(cache.batch_size)]
 
     def forward_step_packed(
         self,
@@ -268,6 +276,7 @@ class ModelRunner:
         *,
         tap_layers: frozenset[int] | None = None,
         hidden_state_sink: dict[int, torch.Tensor] | None = None,
+        last_rows_only: bool = False,
     ) -> torch.Tensor:
         """Run ONE packed-varlen forward; return the raw packed logits.
 
@@ -294,11 +303,17 @@ class ModelRunner:
                 kwargs support it (Qwen3 today); passing them to a model that
                 doesn't will raise, which is the intended loud failure rather
                 than a silently empty sink.
+            last_rows_only: return the logits of each request's last row only.
+                A model whose forward takes `logits_rows` runs its head on
+                those rows alone; for another model the runner computes every
+                row and keeps the last ones. Only a step with this flag can
+                replay the prefill graph, which computes the last rows only.
 
         Returns:
             A `(1, total_q, vocab_size)` tensor with logits at every q
-            position. Spec-decode's verify phase needs all K+1 positions, not
-            just the last; the standard `forward_step` slices the last one.
+            position, or with `last_rows_only` a `(1, batch_size, vocab_size)`
+            tensor whose row `b` is request `b`'s last position. Spec-decode's
+            verify phase needs all K+1 positions, not just the last.
         """
         batch_size = cache.batch_size
         if len(position_offsets) != batch_size:
@@ -321,10 +336,12 @@ class ModelRunner:
         graph = self._decode_graph
         if graph is not None and tap_layers is None and graph.accepts(cu_seqlens_q):
             # One new token per request: the captured step of this batch size.
+            # Every row is a last row, so the logits fit both forms of the result.
             return graph.replay(cache, packed_input_ids, position_offsets)
         prefill = self._prefill_graph
         if (
             prefill is not None
+            and last_rows_only
             and tap_layers is None
             and not isinstance(packed_input_ids, DeviceTokens)
             and prefill.accepts(cu_seqlens_q)
@@ -354,6 +371,16 @@ class ModelRunner:
         if tap_layers is not None:
             extra["tap_layers"] = tap_layers
             extra["hidden_state_sink"] = hidden_state_sink
+        last_rows: torch.Tensor | None = None
+        if last_rows_only:
+            last_rows = torch.tensor(
+                [cu_seqlens_q[i + 1] - 1 for i in range(batch_size)],
+                dtype=torch.long,
+                device=device,
+            )
+            if self._model_selects_rows():
+                extra["logits_rows"] = last_rows
+                last_rows = None
 
         with torch.inference_mode():
             logits: torch.Tensor = self._model(
@@ -363,6 +390,8 @@ class ModelRunner:
                 cu_seqlens_q=cu_seqlens_q_t,
                 **extra,
             )
+            if last_rows is not None:
+                logits = logits.index_select(1, last_rows)
         return logits
 
     def prefill(self, prompt_tokens: list[int]) -> tuple[PagedKVCache, torch.Tensor]:

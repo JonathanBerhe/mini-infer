@@ -35,6 +35,7 @@ class _RecordingRunner(ModelRunner):
         micro, _ = micro_setup(seed=seed)
         super().__init__(micro._model, CharTokenizer(), "cpu", micro.block_pool)  # type: ignore[arg-type]
         self.sources: list[str] = []
+        self.last_rows_only: list[bool] = []
         self.forwards = 0
         self._eos_at = eos_for_slot_0_at
 
@@ -48,6 +49,7 @@ class _RecordingRunner(ModelRunner):
     ) -> torch.Tensor:
         self.forwards += 1
         self.sources.append("device" if isinstance(packed_input_ids, DeviceTokens) else "host")
+        self.last_rows_only.append(bool(kwargs.get("last_rows_only")))
         logits = (
             super()
             .forward_step_packed(cache, packed_input_ids, cu_seqlens_q, position_offsets, **kwargs)
@@ -55,7 +57,8 @@ class _RecordingRunner(ModelRunner):
         )
         logits[..., EOS] = -1e9
         if self._eos_at is not None and self.forwards == self._eos_at:
-            logits[0, cu_seqlens_q[1] - 1, EOS] = logits.max() + 10.0
+            last_row = 0 if kwargs.get("last_rows_only") else cu_seqlens_q[1] - 1
+            logits[0, last_row, EOS] = logits.max() + 10.0
         return logits
 
 
@@ -194,6 +197,35 @@ def test_sampling_rows_keep_their_request_when_a_prefill_shares_the_forward() ->
         for req in (_request("ab", 8), _request(_PROMPTS[2] * 2, 5))
     ]
     _same_results(results, expected)
+
+
+class _FullRowsRunner(_RecordingRunner):
+    """A runner without `last_rows_only`: the scheduler reads the logits of every row."""
+
+    supports_last_rows = False
+
+
+@pytest.mark.parametrize("async_sampling", [False, True])
+def test_last_rows_only_decodes_the_tokens_of_the_full_logits(async_sampling: bool) -> None:
+    """Chunked prefills next to decoders: a scheduler that asks for each request's
+    last row emits the ids of one that reads every row."""
+    requests = [_request(_PROMPTS[0], 6), _request(_PROMPTS[2] * 2, 5), _request("ab", 9)]
+    full_runner = _FullRowsRunner(seed=12)
+    expected = _run_all(
+        ContinuousScheduler(full_runner, async_sampling=async_sampling, chunk_size=4), requests
+    )
+    rows_runner = _RecordingRunner(seed=12)
+    got = _run_all(
+        ContinuousScheduler(rows_runner, async_sampling=async_sampling, chunk_size=4), requests
+    )
+    _same_results(got, expected)
+    assert not any(full_runner.last_rows_only)
+    # Every host-side step asks for the last rows. A device-side step is a pure decode.
+    assert all(
+        last or source == "device"
+        for last, source in zip(rows_runner.last_rows_only, rows_runner.sources, strict=True)
+    )
+    assert rows_runner.last_rows_only.count(True) > 1
 
 
 @pytest.mark.parametrize("async_sampling", [False, True])
