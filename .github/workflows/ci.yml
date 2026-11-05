@@ -11,18 +11,52 @@ jobs:
     name: Lint, type-check, test (CPU only)
     runs-on: ubuntu-latest
     steps:
+      # A pull request that changes only docs/ or Markdown files skips the
+      # steps below and passes at once. The job itself always runs: the
+      # main ruleset requires this check, and a workflow skipped by a path
+      # filter never reports it, so the pull request could not merge.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - name: Detect a docs-only change
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The checkout is the merge commit of the pull request, so its
+          # first parent is the base branch and the diff is the change.
+          code=false
+          while IFS= read -r path; do
+            case "$path" in
+              docs/* | *.md) ;;
+              *) code=true ;;
+            esac
+          done < <(git diff --name-only HEAD^1 HEAD)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = false ]; then
+            echo "Only docs/ or Markdown files changed. The lint, type and test steps are skipped."
+          fi
       - name: Install uv
+        if: steps.changes.outputs.code == 'true'
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - name: Sync deps
+        if: steps.changes.outputs.code == 'true'
         run: uv sync --frozen
       - name: Ruff check
+        if: steps.changes.outputs.code == 'true'
         run: uv run ruff check .
       - name: Ruff format check
+        if: steps.changes.outputs.code == 'true'
         run: uv run ruff format --check .
       - name: Mypy
+        if: steps.changes.outputs.code == 'true'
         run: uv run mypy src/
       - name: Pytest (non-GPU, no model downloads, no CUDA-only tests)
+        if: steps.changes.outputs.code == 'true'
         run: uv run pytest -m "not gpu and not requires_model and not requires_cuda"
