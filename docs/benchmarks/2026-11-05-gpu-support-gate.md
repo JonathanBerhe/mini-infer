@@ -6,7 +6,8 @@ one L4, on Modal
 Software in every run: CUDA 13.2, torch 2.14.1+cu132, Triton 3.8.0,
 transformers 5.14.0, and FlashInfer 0.6.10 where the image has it
 Engine: mini-infer at `b7ad0aa` (branch `feat/gpu-support-matrix`) with the
-changes of this report
+changes of this report. The second Nemotron-H run used `main` at `66a265a`,
+which has these changes
 Matrix: [gpu-support.md](../gpu-support.md)
 
 ## Question
@@ -26,7 +27,7 @@ and one Blackwell result, and they test the images that this change moved.
 | DSpark parity | L4 | `scripts/dspark/modal_dspark_parity.py` | Pass. Draft tokens equal to the reference in every round |
 | Qwen2.5-7B bench | H200 | `scripts/bench/modal_paged_graph_bench.py` | Pass, fast path |
 | Qwen3.8 27B | B300 | `scripts/qwen/modal_qwen38_smoke.py --cuda-graph` | Pass, fast path |
-| Nemotron-H 30B | H200 | `scripts/nemotron_h/modal_nemotron_h_smoke.py` | Stopped at the fp32 unit test, before the model loaded. Needs a rerun with the fix |
+| Nemotron-H 30B | H200 | `scripts/nemotron_h/modal_nemotron_h_smoke.py` | First run stopped at the fp32 unit test. Pass with the fix, fast path |
 | Llama 3.1 8B Instruct | H200 | `scripts/smoke/modal_smoke.py` | Runs, but see the RoPE note |
 | Mistral 7B Instruct v0.3 | H200 | `scripts/smoke/modal_smoke.py` | Pass, FlashInfer |
 | Qwen3 8B | H200 | `scripts/smoke/modal_smoke.py` | Pass, FlashInfer |
@@ -55,7 +56,8 @@ graph capture cannot do that copy. The Nemotron-H run on the H200 stopped at
 the same test, before it loaded the model. `supports_grouped_experts` now
 takes the activation dtype, and an fp32 Nemotron-H model keeps its gathered
 expert path, which needs no host sync. Production on a GPU runs bf16 and did
-not change.
+not change. A second Nemotron-H run on the H200, with the fix, passed (see
+below).
 
 ### GLM tiny config on the B300
 
@@ -121,6 +123,34 @@ checkpoint (`Qwen/Qwen3.8-27B` at `1d4bf0f`):
 
 At batch 4 the fused step with the graph takes 15.3 ms. The graph gives the
 same tokens as eager in every case.
+
+### Nemotron-H 30B on the H200
+
+The first run stopped at the fp32 graph test after 25 seconds. The second
+run used `main` with the fix. All 11 Nemotron-H unit tests passed on the
+H200, the fp32 and bf16 graph tests included. Then the run compared the port
+with transformers on the real checkpoint
+(`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` at `a9904d2`). The
+model took 58.8 GiB of GPU memory after the load.
+
+- Prefill logits: cosine similarity 0.9951 to 0.9993 on four prompts, with
+  the same last top-1 token.
+- Greedy decode, 32 tokens: 32, 7, 2 and 32 tokens equal to the reference.
+  The A100 gate of [ADR-035](../decisions/ADR-035-nemotron-h-port.md) gave
+  31, 7, 2 and 32. ADR-035 traces the early splits to bf16 near-ties, for
+  example in the top-6 expert routing.
+- A batch of two gave the same tokens as batch 1 on three prompts. On the
+  third prompt the tokens were equal for 13 tokens.
+- Serving through the state-cache scheduler with the decode graph: 85.3
+  tokens per second at batch 1 and 119.7 at batch 2. Eager serving at
+  batch 1 gave 25.1 (prefill included).
+
+| Decode step | Eager (ms) | CUDA graph (ms) |
+|---|---:|---:|
+| Batch 1 | 37.0 | 8.5 |
+| Batch 4 | 36.8 | 11.9 |
+
+The graph gives the same tokens as eager at both batch sizes.
 
 ### Paged models on the H200
 
