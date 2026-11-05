@@ -19,19 +19,28 @@ Three questions, one cheap GPU run:
 
 Run with:
     uv run modal run scripts/minimax_m3/modal_msa_kernel_bench.py
+    MINI_INFER_BENCH_GPU=B300 uv run modal run scripts/minimax_m3/modal_msa_kernel_bench.py
 """
+
+import os
 
 import modal
 
-_GPU = "A10"
+# Modal fixes `gpu` when the decorator runs, so the GPU comes from the environment.
+_GPU = os.environ.get("MINI_INFER_BENCH_GPU", "A10")
 
 app = modal.App("mini-infer-msa-kernel-bench")
 
+# The main stack. The CUDA 13.2 torch wheel has sm_100 kernels and meets the
+# CUDA 13.1+ rule of the Modal B300. The kernel is plain Triton and Triton
+# brings its own ptxas, so the image needs no nvcc.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
-    .pip_install("torch==2.6.0", extra_index_url="https://download.pytorch.org/whl/cu124")
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     # mini_infer.cache imports transformers at module level (DynamicCache).
-    .pip_install("transformers>=4.40", "safetensors>=0.4", "huggingface_hub>=0.20")
+    .pip_install(
+        "triton==3.8.0", "transformers==5.14.0", "safetensors>=0.4", "huggingface_hub>=0.20"
+    )
     .add_local_python_source("mini_infer")
 )
 
@@ -404,8 +413,12 @@ def _e2e_ab(ctx_len: int, decode_steps: int) -> list[str]:
 @app.function(gpu=_GPU, image=image, timeout=1500)
 def bench() -> str:
     import torch
+    import triton
 
-    report = [f"GPU: {torch.cuda.get_device_name(0)}"]
+    report = [
+        f"GPU: {torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)} "
+        f"torch={torch.__version__} triton={triton.__version__}"
+    ]
     report.append("== parity ==")
     report.extend(_parity_sweep())
     report.append("== op microbench (64q/4kv/128, topk 16, index block 128) ==")

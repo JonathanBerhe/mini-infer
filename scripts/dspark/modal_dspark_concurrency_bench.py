@@ -47,13 +47,17 @@ app = modal.App("mini-infer-dspark-concurrency-bench")
 hf_cache = modal.Volume.from_name("mini-infer-hf-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("mini-infer-dspark-results", create_if_missing=True)
 
-# The same packages as the batch-1 benchmark, the only stack that ran DSpark on a GPU.
+# The same packages as the batch-1 benchmark.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
+    # The main stack: the CUDA 13.2 torch wheel runs on every Modal GPU from
+    # the L4 to the B300 (CUDA 13.1+ rule). DSpark uses the torch attention
+    # backend, so the image needs no FlashInfer and no nvcc.
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "torch==2.9.1",
-        "transformers>=5.14,<5.15",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
         "accelerate>=0.30",
@@ -120,7 +124,7 @@ def bench(
 
     out_dir = Path("/results/concurrency") / run_tag
     out_dir.mkdir(parents=True, exist_ok=True)
-    gpu_name = torch.cuda.get_device_name()
+    gpu_name = f"{torch.cuda.get_device_name()} torch={torch.__version__} attention=torch"
     t_load = time.perf_counter()
     runner = ModelRunner.from_pretrained(
         _TARGET, dtype=torch.bfloat16, attention_backend="torch", num_blocks=num_blocks

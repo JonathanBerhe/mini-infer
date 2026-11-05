@@ -36,14 +36,20 @@ from mini_infer.models.blocks.moe.fp8_grouped_kernel import block_fp8_grouped_mm
 _DISABLED_FOR_BENCH = False
 
 
-def supports_grouped_experts(device: torch.device | str) -> bool:
+def supports_grouped_experts(device: torch.device | str, dtype: torch.dtype | None = None) -> bool:
     """Whether the MoE blocks route their experts through `grouped_expert_mlp`.
 
     `functional.grouped_mm` runs CUTLASS grouped GEMMs on Hopper and
-    Blackwell. Older GPUs and the CPU get a per-group fallback inside PyTorch
-    that is no faster than the blocks' own loop, so they keep the loop.
+    Blackwell, for bf16 inputs only. Older GPUs, the CPU and other dtypes get
+    a per-group fallback inside PyTorch that is no faster than the blocks' own
+    loop, so they keep the loop. In torch 2.14 that fallback copies the group
+    offsets to the host, so a CUDA graph cannot capture it. `dtype` is the
+    activation dtype of plain expert weights. Leave it out for block-FP8 and
+    FP4 weights, whose kernels are not `functional.grouped_mm`.
     """
     if _DISABLED_FOR_BENCH or not hasattr(functional, "grouped_mm"):
+        return False
+    if dtype is not None and dtype != torch.bfloat16:
         return False
     return is_hopper_or_newer_device(device)
 

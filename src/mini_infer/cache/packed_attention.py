@@ -43,6 +43,32 @@ def supports_packed_kernel(device: torch.device | str) -> bool:
     return is_cuda_device(device)
 
 
+def effective_attention_backend(
+    requested: str, device: torch.device | str, kv_quant: str | None = None
+) -> str:
+    """The backend that `packed_attention_forward` runs for a requested one.
+
+    The dispatcher falls back without an error. A "flashinfer" request in a
+    process without FlashInfer runs flash-attn, and a "flash_attn" request
+    without flash-attn runs the torch reference path, which gathers all K/V of
+    each layer at each step. Run reports print this value, so that a fallback
+    to a slower path shows next to the numbers.
+    """
+    if requested == "torch":
+        return "torch"
+    from mini_infer.cache.flashinfer_backend import supports_flashinfer_backend
+
+    if (
+        requested == "flashinfer"
+        and supports_flashinfer_backend(device)
+        and kv_quant in (None, "fp8", "nvfp4")
+    ):
+        return "flashinfer"
+    if supports_packed_kernel(device):
+        return "flash_attn"
+    return "torch"
+
+
 # FlashAttention's paged varlen API (`flash_attn_varlen_func` + `block_table`)
 # requires the K/V cache block size to be a multiple of this value. Smaller
 # block sizes still work, but go through the materialized varlen path (no

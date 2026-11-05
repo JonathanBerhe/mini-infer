@@ -13,19 +13,29 @@ materialized SDPA path, the index_k cache stream on device, and the bf16 path.
 
 Run with:
     uv run modal run scripts/glm/modal_glm_smoke.py
+    MINI_INFER_TEST_GPU=B300 uv run modal run scripts/glm/modal_glm_smoke.py
 """
+
+import os
 
 import modal
 
-_GPU = "L4"  # cheap, modern, bf16-capable; the synthetic model is tiny
+# The synthetic model is tiny, so any bf16 GPU runs it. Modal fixes `gpu` when
+# the decorator runs, so the GPU comes from the environment.
+_GPU = os.environ.get("MINI_INFER_TEST_GPU", "L4")
 
 app = modal.App("mini-infer-glm-smoke")
 
+# The main stack. The CUDA 13.2 torch wheel has sm_100 kernels (the B200) and
+# meets the CUDA 13.1+ rule of the Modal B300. transformers 5.14 is the HF
+# reference of the CPU parity tests: its GlmMoeDsa indexer uses interleaved
+# RoPE like this port (5.6 and 5.12 ship it non-interleaved).
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "torch==2.11.0",
-        "transformers==5.6.2",  # the version that ships modeling_glm_moe_dsa
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
         "numpy",
@@ -123,7 +133,10 @@ def smoke() -> dict:
 
     device = "cuda"
     assert torch.cuda.is_available(), "no CUDA device in the container"
-    gpu_name = torch.cuda.get_device_name(0)
+    gpu_name = (
+        f"{torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)} "
+        f"torch={torch.__version__} attention=torch"
+    )
     result: dict = {"gpu": gpu_name}
 
     # ---- fp32 full-model prefill + greedy decode parity vs HF ----

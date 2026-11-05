@@ -127,10 +127,14 @@ def bench(
         wanted = set(techniques)
         registry = [technique for technique in registry if technique.name in wanted]
 
+    from mini_infer.fast_paths import fast_path_report
+
     results, skipped = run_suite(workload, registry, per_technique_timeout=technique_timeout)
     lines = [
         f"Workload: model={workload.model} device=cuda "
         f"concurrency={workload.concurrency_levels} max_tokens={workload.max_tokens}",
+        # The attention entry is the workload default; the attn_* techniques set their own.
+        fast_path_report(attention_backend),
         "",
         format_table(results, skipped),
         "",

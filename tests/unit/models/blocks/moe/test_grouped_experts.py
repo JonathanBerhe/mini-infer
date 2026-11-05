@@ -345,6 +345,16 @@ def test_bench_toggle_disables_the_grouped_path(monkeypatch: pytest.MonkeyPatch)
     assert not supports_grouped_experts("cuda")
 
 
+def test_grouped_path_is_bf16_only_for_plain_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Other dtypes take a PyTorch fallback that copies offsets to the host."""
+    monkeypatch.setattr(grouped_experts, "is_hopper_or_newer_device", lambda device: True)
+    assert supports_grouped_experts("cuda", torch.bfloat16)
+    assert not supports_grouped_experts("cuda", torch.float32)
+    assert not supports_grouped_experts("cuda", torch.float16)
+    # Block-FP8 and FP4 callers pass no dtype: their kernels are not `grouped_mm`.
+    assert supports_grouped_experts("cuda")
+
+
 def test_nemotron_moe_grouped_matches_gathered_and_looped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -383,7 +393,9 @@ def test_nemotron_moe_grouped_matches_gathered_and_looped(
             gathered = moe._gathered(flat, indices, weights)
             looped = moe._looped(flat, indices, weights)
             eager = moe(hidden)
-            monkeypatch.setattr(nemotron_h, "supports_grouped_experts", lambda device: True)
+            monkeypatch.setattr(
+                nemotron_h, "supports_grouped_experts", lambda device, dtype=None: True
+            )
             grouped = moe(hidden)
             monkeypatch.undo()
         torch.testing.assert_close(gathered, looped, rtol=1e-5, atol=1e-6)

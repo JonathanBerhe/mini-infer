@@ -14,19 +14,30 @@ the all-reduces (indexer score, MoE routed sum, o_proj) must agree across ranks.
 
 Run with:
     uv run modal run scripts/glm/modal_glm_tp_smoke.py
+    MINI_INFER_TEST_GPU=B300 uv run modal run scripts/glm/modal_glm_tp_smoke.py
 """
+
+import os
 
 import modal
 
-_GPU = "L4:2"
+# Two GPUs of one type. Modal fixes `gpu` when the decorator runs, so the type
+# comes from the environment.
+_GPU_TYPE = os.environ.get("MINI_INFER_TEST_GPU", "L4")
+_GPU = f"{_GPU_TYPE}:2"
 
 app = modal.App("mini-infer-glm-tp-smoke")
 
+# The main stack. The CUDA 13.2 torch wheel has sm_100 kernels (the B200) and
+# meets the CUDA 13.1+ rule of the Modal B300. transformers 5.14 is the HF
+# reference of the CPU parity tests: its GlmMoeDsa indexer uses interleaved
+# RoPE like this port (5.6 and 5.12 ship it non-interleaved).
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.14.1+cu132", extra_index_url="https://download.pytorch.org/whl/cu132")
     .pip_install(
-        "torch==2.11.0",
-        "transformers==5.6.2",
+        "triton==3.8.0",
+        "transformers==5.14.0",
         "safetensors>=0.4",
         "huggingface_hub>=0.20",
         "numpy",
@@ -214,6 +225,10 @@ def smoke() -> dict:
         return float(torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0))
 
     return {
+        "env": (
+            f"{torch.cuda.get_device_name(0)} x2 cc={torch.cuda.get_device_capability(0)} "
+            f"torch={torch.__version__} attention=torch"
+        ),
         "ranks_consistent": bool(torch.allclose(rank0, rank1, atol=1e-4)),
         "rank0_vs_rank1_max_abs_diff": float((rank0 - rank1).abs().max()),
         "rank0_vs_ref_cos_sim": _cos(rank0, ref_logits),
@@ -226,7 +241,8 @@ def smoke() -> dict:
 def main() -> None:
     r = smoke.remote()
     print("=" * 60)
-    print("GLM-MoE-DSA tensor-parallel smoke (2x L4, NCCL, MoE config)")
+    print("GLM-MoE-DSA tensor-parallel smoke (2 GPUs, NCCL, MoE config)")
+    print(f"  {r['env']}")
     print(f"  ranks consistent (rank0==rank1):  {r['ranks_consistent']}")
     print(f"    max abs diff rank0 vs rank1:    {r['rank0_vs_rank1_max_abs_diff']:.2e}")
     print(f"  rank0 vs ws=1 ref cosine sim:     {r['rank0_vs_ref_cos_sim']:.6f}")
