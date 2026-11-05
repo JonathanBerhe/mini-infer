@@ -20,8 +20,10 @@ the config's 1-indexed `kda_layers` / `full_attn_layers` lists):
     rotary embedding exists anywhere in this family; the `qk_rope_head_dim`
     split of q and the shared `kv_a` output is used UNROTATED (all position
     information comes from the KDA layers' decay and convolutions). Cache is
-    the compressed `kv_a_proj_with_mqa` output (`512 + 64` per token),
-    re-decompressed on read like `blocks/mla.py`.
+    the compressed `kv_a_proj_with_mqa` output (`512 + 64` per token, the
+    latent already through `kv_a_layernorm`). A prefill span decompresses it
+    on read like `blocks/mla.py`; a decode step attends to it in the
+    absorbed form, with `kv_b_proj` folded into the query and the output.
 
 The FFN is dense on layer 0 (`first_k_dense_replace = 1`) and a sigmoid-routed
 MoE elsewhere, with an aux-loss-free `e_score_correction_bias`.
@@ -528,10 +530,10 @@ class _KimiDeltaAttention(nn.Module):
 
 
 def _append_rows(
-    buffer: torch.Tensor, values: torch.Tensor, row_starts: torch.Tensor
+    buffer: torch.Tensor, values: torch.Tensor, row_starts: torch.Tensor, end: int
 ) -> torch.Tensor:
     """Write `values` `(B, T, W)` into the state `buffer` `(B, capacity, W)` at
-    `row_starts` and return the history up to the longest row.
+    `row_starts` and return the history up to `end`, the end of the longest row.
 
     One token per row may sit at a different position in each row (ragged
     decode). A multi-token span occurs only in (chunked) prefill, where every
@@ -542,24 +544,46 @@ def _append_rows(
         rows = torch.arange(batch, device=values.device)
         buffer[rows, row_starts] = values[:, 0].to(buffer.dtype)
     else:
-        start = int(row_starts[0])
+        start = end - seq_len
         if not bool((row_starts == start).all()):
             raise ValueError("multi-token MLA spans require uniform row_starts")
-        buffer[:, start : start + seq_len] = values.to(buffer.dtype)
-    lengths = row_starts + seq_len
-    return buffer[:, : int(lengths.max())]
+        buffer[:, start:end] = values.to(buffer.dtype)
+    return buffer[:, :end]
 
 
 class _KimiMlaAttention(nn.Module):
     """One NoPE MLA layer over the compressed-KV state buffer.
 
-    Same decompression math as `blocks/mla.py` (cache the shared
-    `kv_a_proj_with_mqa` output, rebuild per-head K/V on read) but NO rotary
-    embedding anywhere, and reads/writes a dense per-request buffer instead
-    of PagedKVCache streams. K3 adds low-rank Q (`q_lora_rank`) and a sigmoid
-    output gate (`mla_use_output_gate`). K3.1 adds the DSA `indexer`: each
-    query reads only the keys the indexer keeps (`dsa_indexer.py`).
+    The state keeps one shared row per token: the `kv_a_proj_with_mqa`
+    output with its latent part already through `kv_a_layernorm` (the norm
+    acts on each token alone, so normalizing once at write equals
+    normalizing the history at every read). There is NO rotary embedding
+    anywhere, and the layer reads and writes a dense per-request buffer
+    instead of PagedKVCache streams.
+
+    Two forms of the same attention read that buffer:
+
+      - Decompressed (spans, as in `blocks/mla.py`): `kv_b_proj` rebuilds
+        the per-head keys and values of every history token, then the
+        layer attends over them.
+      - Absorbed (decode, one new token per row): `kv_b_proj` folds into
+        the query and the output (DeepSeek-V2, section 2.1.2), so each
+        query scores the shared rows directly and nothing is rebuilt. Per
+        history token this is `heads * (kv_lora_rank + rope + kv_lora_rank)`
+        multiply-adds against `kv_lora_rank * heads * (nope + v)` for the
+        rebuild alone, about 120x fewer on Kimi Linear 48B. A span keeps the
+        decompressed form because it costs fewer operations once a span has
+        more than about 170 queries.
+
+    K3 adds low-rank Q (`q_lora_rank`) and a sigmoid output gate
+    (`mla_use_output_gate`). K3.1 adds the DSA `indexer`: each query reads
+    only the keys the indexer keeps (`dsa_indexer.py`), in both forms.
     """
+
+    # A decode step runs the absorbed form. Tests and
+    # `scripts/kimi_linear/profile_kimi_decode.py` set this to False to run
+    # the decompressed form at decode too and compare the two.
+    absorbed_decode: ClassVar[bool] = True
 
     def __init__(self, cfg: KimiLinearConfig, layer_idx: int) -> None:
         super().__init__()
@@ -630,58 +654,112 @@ class _KimiMlaAttention(nn.Module):
             q_states = self.q_b_proj(q_lora)
         queries = q_states.view(batch, seq_len, self.num_heads, self.qk_head_dim)
 
-        kv_new = self.kv_a_proj_with_mqa(x)  # (batch, seq_len, kv_lora + rope)
+        latent_new, k_rot_new = torch.split(
+            self.kv_a_proj_with_mqa(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        # (batch, seq_len, kv_lora + rope): the row the state keeps per token.
+        kv_new = torch.cat([self.kv_a_layernorm(latent_new), k_rot_new], dim=-1)
         index_new = self.indexer.keys(x) if self.indexer is not None else None
         index_hist = index_new
+        # The one host read of the layer: the end of the longest row.
+        end = int(row_starts.max()) + seq_len
         if layer_state is None:
-            if int(row_starts.max()) != 0:
+            if end != seq_len:
                 raise ValueError("stateless MLA forward requires row_starts == 0")
             kv_hist = kv_new
         else:
             capacity = layer_state.kv.shape[1]
-            if int(row_starts.max()) + seq_len > capacity:
+            if end > capacity:
                 raise ValueError(
                     f"MLA state buffer overflow: writing {seq_len} tokens at "
-                    f"position {int(row_starts.max())} exceeds capacity {capacity}"
+                    f"position {end - seq_len} exceeds capacity {capacity}"
                 )
-            kv_hist = _append_rows(layer_state.kv, kv_new, row_starts).to(x.dtype)
+            kv_hist = _append_rows(layer_state.kv, kv_new, row_starts, end).to(x.dtype)
             if index_new is not None:
                 if layer_state.index_k is None:
                     raise ValueError(
                         "a DSA layer needs a state cache with indexer keys "
                         "(build it with build_kimi_state_cache_specs)"
                     )
-                index_hist = _append_rows(layer_state.index_k, index_new, row_starts).to(x.dtype)
+                index_hist = _append_rows(layer_state.index_k, index_new, row_starts, end).to(
+                    x.dtype
+                )
 
+        # (batch, q, k) causal mask against each row's own length.
+        total_k = kv_hist.shape[1]
+        key_positions = torch.arange(total_k, device=x.device)
+        query_positions = row_starts.view(batch, 1, 1) + torch.arange(
+            seq_len, device=x.device
+        ).view(1, seq_len, 1)
+        valid = key_positions.view(1, 1, total_k) <= query_positions
+        if self.indexer is not None and total_k > self.indexer.index_topk:
+            # With at most `index_topk` keys the indexer keeps every key, so
+            # only a longer history needs the selection.
+            assert q_lora is not None and index_hist is not None
+            valid = self.indexer.select(x, q_lora, index_hist, valid)
+
+        if seq_len == 1 and self.absorbed_decode and self.kv_b_proj.weight.is_floating_point():
+            attn = self._attend_absorbed(queries, kv_hist, valid)
+        else:
+            attn = self._attend_decompressed(queries, kv_hist, valid)
+        attn = attn.reshape(batch, seq_len, -1)
+        if self.use_output_gate:
+            attn = attn * torch.sigmoid(self.g_proj(x))
+        result: torch.Tensor = self.o_proj(attn)
+        return result
+
+    def _attend_decompressed(
+        self, queries: torch.Tensor, kv_hist: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        """Rebuild per-head keys and values, then attend: the span form.
+
+        `queries` `(B, q, heads, qk_head_dim)`, `kv_hist` `(B, k, kv_lora +
+        rope)` state rows, `valid` `(B, q, k)`. Returns `(B, q, heads, v)`.
+        """
+        batch = queries.shape[0]
         kv_latent, k_rot = torch.split(kv_hist, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        decompressed = self.kv_b_proj(self.kv_a_layernorm(kv_latent)).view(
+        decompressed = self.kv_b_proj(kv_latent).view(
             batch, -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope, values = torch.split(decompressed, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         # NoPE: the rope-dim split concatenates UNROTATED, broadcast to heads.
         keys = torch.cat([k_nope, k_rot.unsqueeze(2).expand(-1, -1, self.num_heads, -1)], dim=-1)
-
-        # (batch, heads, q, k) scores; causal against each row's own length.
         scores = torch.einsum("bqhd,bkhd->bhqk", queries.float(), keys.float())
         scores = scores * self.softmax_scale
-        total_k = keys.shape[1]
-        key_positions = torch.arange(total_k, device=x.device)
-        query_positions = row_starts.view(batch, 1, 1, 1) + torch.arange(
-            seq_len, device=x.device
-        ).view(1, 1, seq_len, 1)
-        valid = key_positions.view(1, 1, 1, total_k) <= query_positions
-        if self.indexer is not None and total_k > self.indexer.index_topk:
-            # With at most `index_topk` keys the indexer keeps every key, so
-            # only a longer history needs the selection.
-            assert q_lora is not None and index_hist is not None
-            valid = self.indexer.select(x, q_lora, index_hist, valid[:, 0]).unsqueeze(1)
-        scores = scores.masked_fill(~valid, float("-inf"))
-        weights = scores.softmax(dim=-1).to(x.dtype)
-        attn = torch.einsum("bhqk,bkhd->bqhd", weights, values).reshape(batch, seq_len, -1)
-        if self.use_output_gate:
-            attn = attn * torch.sigmoid(self.g_proj(x))
-        result: torch.Tensor = self.o_proj(attn)
-        return result
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        weights = scores.softmax(dim=-1).to(queries.dtype)
+        return torch.einsum("bhqk,bkhd->bqhd", weights, values)
+
+    def _attend_absorbed(
+        self, queries: torch.Tensor, kv_hist: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        """Attend in the latent space with `kv_b_proj` folded in: the decode form.
+
+        Split `kv_b_proj` per head into `W_UK` (`nope x kv_lora`) and `W_UV`
+        (`v x kv_lora`). For the state row `[c_j, k_rot_j]` of token `j`:
+
+            q_h . k_hj = (W_UK_h^T q_nope_h) . c_j + q_rope_h . k_rot_j
+            out_h      = sum_j p_hj W_UV_h c_j = W_UV_h (sum_j p_hj c_j)
+
+        so each head scores the shared rows with one `kv_lora + rope` dot
+        product and maps the weighted latent through `W_UV_h` once. Same
+        shapes and result as `_attend_decompressed`; the math runs in fp32
+        and the output rounds to the query dtype once.
+        """
+        w_kv = self.kv_b_proj.weight.float().view(
+            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        )
+        w_uk, w_uv = torch.split(w_kv, [self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        q_nope, q_rope = torch.split(
+            queries.float(), [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        q_absorbed = torch.cat([torch.einsum("bqhd,hdc->bqhc", q_nope, w_uk), q_rope], dim=-1)
+        rows = kv_hist.float()
+        scores = torch.einsum("bqhc,bkc->bhqk", q_absorbed, rows) * self.softmax_scale
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        weights = scores.softmax(dim=-1)
+        latent_out = torch.einsum("bhqk,bkc->bqhc", weights, rows[..., : self.kv_lora_rank])
+        return torch.einsum("bqhc,hdc->bqhd", latent_out, w_uv).to(queries.dtype)
 
 
 class _KimiMoeGate(nn.Module):
