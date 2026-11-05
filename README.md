@@ -65,7 +65,8 @@ The engine selects the model class from `config.architectures[0]` in the Hugging
 | `MiniMaxM3SparseForConditionalGeneration` | MiniMax-M3 (text only) | [doc](docs/architectures/minimax-m3.md) |
 | `InklingForConditionalGeneration` | Inkling (text only) | [doc](docs/architectures/inkling.md) |
 | `KimiLinearForCausalLM` | Kimi Linear 48B | [doc](docs/architectures/kimi-linear.md) |
-| `KimiK3ForConditionalGeneration` | Kimi K3, Kimi K3.1 Pro (text only) | [doc](docs/architectures/kimi-k3.md) |
+| `KimiK3ForConditionalGeneration` | Kimi K3 (text only) | [doc](docs/architectures/kimi-k3.md) |
+| `KimiK31ForConditionalGeneration` | Kimi K3.1 Pro (text only) | [doc](docs/architectures/kimi-k3.md) |
 | `NemotronHForCausalLM` | Nemotron 3.5 Lightning 30B-A3B, Nemotron 3 Nano 4B (text only) | [doc](docs/architectures/nemotron-h.md) |
 
 To add a model family, add a folder in `src/mini_infer/models/`. Build the model from the shared blocks in `src/mini_infer/models/blocks/` (RMSNorm, RoPE, attention, MoE). Decorate the class with `@register_model`, and import its module in `_register_builtin_models()` in [`models/__init__.py`](src/mini_infer/models/__init__.py). [mistral.py](src/mini_infer/models/mistral/mistral.py) is the shortest example.

@@ -43,6 +43,12 @@ config-gated additions, each pinned from its reference `modeling_kimi_linear.py`
   - `attn_res_block_size`: AttnRes, attention over residual-stream snapshots
     before every sublayer and before the final norm (`attn_res.py`).
 
+Kimi K3.1 Pro (`moonshotai/Kimi-K3.1-Pro`) is K3 with one more addition,
+`dsa_config`: every MLA layer becomes a DeepSeek Sparse Attention layer. An
+indexer picks the `index_topk` earlier tokens that each query can read
+(`dsa_indexer.py`), and the state cache keeps one indexer key per token
+next to the compressed KV.
+
 Two conventions differ between the two reference files and are selected by
 `KimiLinearConfig.moe_weights_from_biased_scores`: the Kimi Linear file adds
 the correction bias to the sigmoid scores IN PLACE, so the gathered expert
@@ -89,6 +95,7 @@ from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.swiglu import SwiGLU
 from mini_infer.models.kimi_linear.attn_res import AttnResQueryNorm, attn_res_mix
+from mini_infer.models.kimi_linear.dsa_indexer import KimiDsaIndexer
 from mini_infer.models.kimi_linear.state_cache import (
     KimiKdaLayerState,
     KimiKdaStateSpec,
@@ -156,6 +163,11 @@ class KimiLinearConfig:
     # `quantization_config` declares compressed-tensors `mxfp4-pack-quantized`
     # (K3's routed experts); only then does the loader dequantize MXFP4 pairs.
     mxfp4_weights: bool = False
+    # ---- Kimi K3.1: DeepSeek Sparse Attention on every MLA layer ----
+    # From `dsa_config`; None means dense MLA (Kimi Linear, K3).
+    dsa_index_topk: int | None = None
+    dsa_index_num_heads: int = 0
+    dsa_index_head_dim: int = 0
 
     @classmethod
     def from_hf(cls, hf_config: Any) -> KimiLinearConfig:
@@ -217,6 +229,7 @@ class KimiLinearConfig:
                 f"routed_expert_hidden_size must be positive or None, "
                 f"got {routed_expert_hidden_size}"
             )
+        dsa = _read_dsa_config(hf_config, full_layers, q_lora_rank)
         return cls(
             vocab_size=int(hf_config.vocab_size),
             hidden_size=int(hf_config.hidden_size),
@@ -261,7 +274,15 @@ class KimiLinearConfig:
             ),
             moe_weights_from_biased_scores=not _ships_k3_modeling_code(hf_config, linear_attn),
             mxfp4_weights=_declares_mxfp4_weights(hf_config),
+            dsa_index_topk=dsa[0] if dsa is not None else None,
+            dsa_index_num_heads=dsa[1] if dsa is not None else 0,
+            dsa_index_head_dim=dsa[2] if dsa is not None else 0,
         )
+
+    @property
+    def uses_dsa(self) -> bool:
+        """True on Kimi K3.1: every MLA layer is a DeepSeek Sparse Attention layer."""
+        return self.dsa_index_topk is not None
 
     def is_kda_layer(self, layer_idx: int) -> bool:
         """0-indexed layer -> KDA? (the HF lists are 1-indexed, mirrored here)."""
@@ -298,6 +319,49 @@ def _ships_k3_modeling_code(hf_config: Any, linear_attn: dict[str, Any]) -> bool
     )
 
 
+def _read_dsa_config(
+    hf_config: Any, full_attn_layers: list[int], q_lora_rank: Any
+) -> tuple[int, int, int] | None:
+    """`dsa_config` (Kimi K3.1) -> `(index_topk, index_num_heads, index_head_dim)`.
+
+    None when the config has no `dsa_config`. Every setting the port does not
+    implement fails here, before the checkpoint loads. These are the same
+    settings that SGLang's K3.1 support rejects.
+    """
+    dsa = getattr(hf_config, "dsa_config", None)
+    if dsa is None:
+        return None
+    if not isinstance(dsa, dict):
+        dsa = dict(vars(dsa))
+    freq = dsa.get("index_topk_freq", 1)
+    if freq != 1:
+        raise ValueError(
+            f"dsa_config.index_topk_freq must be 1 (every DSA layer runs its own "
+            f"indexer), got {freq}"
+        )
+    rope_dim = dsa.get("index_rope_dim", 0)
+    if rope_dim != 0:
+        raise ValueError(f"dsa_config.index_rope_dim must be 0 (a NoPE indexer), got {rope_dim}")
+    norm_type = dsa.get("index_k_norm_type", "layernorm")
+    if norm_type != "layernorm":
+        raise ValueError(f"dsa_config.index_k_norm_type must be 'layernorm', got {norm_type!r}")
+    dsa_layers = dsa.get("dsa_layers")
+    if dsa_layers is None or sorted(int(i) for i in dsa_layers) != sorted(full_attn_layers):
+        raise ValueError(
+            f"dsa_config.dsa_layers must equal linear_attn_config.full_attn_layers, "
+            f"got dsa_layers={dsa_layers}, full_attn_layers={full_attn_layers}"
+        )
+    if q_lora_rank is None:
+        raise ValueError("dsa_config needs q_lora_rank: the indexer queries read the q latent")
+    values = []
+    for field in ("index_topk", "index_num_heads", "index_head_dim"):
+        value = dsa.get(field)
+        if value is None or int(value) <= 0:
+            raise ValueError(f"dsa_config.{field} must be a positive integer, got {value}")
+        values.append(int(value))
+    return values[0], values[1], values[2]
+
+
 def _declares_mxfp4_weights(hf_config: Any) -> bool:
     """Does `quantization_config` declare compressed-tensors MXFP4 weights?
 
@@ -324,7 +388,8 @@ def build_kimi_state_cache_specs(
     cfg: KimiLinearConfig, *, max_seq_len: int
 ) -> list[KimiStateLayerSpec]:
     """Per-layer `KimiStateCache` specs: constant-size KDA state or a dense
-    `max_seq_len`-capacity compressed-KV buffer for the MLA layers."""
+    `max_seq_len`-capacity compressed-KV buffer for the MLA layers, plus an
+    indexer-key buffer of the same capacity on a DSA model (K3.1)."""
     specs: list[KimiStateLayerSpec] = []
     for layer_idx in range(cfg.num_hidden_layers):
         if cfg.is_kda_layer(layer_idx):
@@ -341,6 +406,7 @@ def build_kimi_state_cache_specs(
                 KimiMlaStateSpec(
                     kv_width=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
                     max_seq_len=max_seq_len,
+                    index_head_dim=cfg.dsa_index_head_dim if cfg.uses_dsa else 0,
                 )
             )
     return specs
@@ -461,6 +527,29 @@ class _KimiDeltaAttention(nn.Module):
         return result
 
 
+def _append_rows(
+    buffer: torch.Tensor, values: torch.Tensor, row_starts: torch.Tensor
+) -> torch.Tensor:
+    """Write `values` `(B, T, W)` into the state `buffer` `(B, capacity, W)` at
+    `row_starts` and return the history up to the longest row.
+
+    One token per row may sit at a different position in each row (ragged
+    decode). A multi-token span occurs only in (chunked) prefill, where every
+    row sits at the same offset.
+    """
+    batch, seq_len, _ = values.shape
+    if seq_len == 1:
+        rows = torch.arange(batch, device=values.device)
+        buffer[rows, row_starts] = values[:, 0].to(buffer.dtype)
+    else:
+        start = int(row_starts[0])
+        if not bool((row_starts == start).all()):
+            raise ValueError("multi-token MLA spans require uniform row_starts")
+        buffer[:, start : start + seq_len] = values.to(buffer.dtype)
+    lengths = row_starts + seq_len
+    return buffer[:, : int(lengths.max())]
+
+
 class _KimiMlaAttention(nn.Module):
     """One NoPE MLA layer over the compressed-KV state buffer.
 
@@ -468,7 +557,8 @@ class _KimiMlaAttention(nn.Module):
     `kv_a_proj_with_mqa` output, rebuild per-head K/V on read) but NO rotary
     embedding anywhere, and reads/writes a dense per-request buffer instead
     of PagedKVCache streams. K3 adds low-rank Q (`q_lora_rank`) and a sigmoid
-    output gate (`mla_use_output_gate`).
+    output gate (`mla_use_output_gate`). K3.1 adds the DSA `indexer`: each
+    query reads only the keys the indexer keeps (`dsa_indexer.py`).
     """
 
     def __init__(self, cfg: KimiLinearConfig, layer_idx: int) -> None:
@@ -505,6 +595,18 @@ class _KimiMlaAttention(nn.Module):
         if self.use_output_gate:
             self.g_proj = nn.Linear(hidden, self.num_heads * self.v_head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
+        self.indexer: KimiDsaIndexer | None = None
+        if cfg.dsa_index_topk is not None:
+            # `from_hf` makes sure that a DSA config has `q_lora_rank`.
+            assert self.q_lora_rank is not None
+            self.indexer = KimiDsaIndexer(
+                hidden_size=hidden,
+                q_lora_rank=self.q_lora_rank,
+                num_heads=cfg.dsa_index_num_heads,
+                head_dim=cfg.dsa_index_head_dim,
+                index_topk=cfg.dsa_index_topk,
+                norm_eps=cfg.rms_norm_eps,
+            )
 
     def forward(
         self,
@@ -514,19 +616,23 @@ class _KimiMlaAttention(nn.Module):
     ) -> torch.Tensor:
         """Args:
         x: `(batch, seq_len, hidden)` new tokens.
-        layer_state: compressed-KV buffer, or None for a stateless
-            full-sequence pass (parity path).
+        layer_state: compressed-KV buffer (and indexer keys on a DSA
+            layer), or None for a stateless full-sequence pass (parity path).
         row_starts: `(batch,)` global position of `x[:, 0]` per row.
             Uniform for (chunked) prefill; per-row for ragged decode.
         """
         batch, seq_len, _ = x.shape
+        q_lora: torch.Tensor | None = None
         if self.q_lora_rank is None:
             q_states = self.q_proj(x)
         else:
-            q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            q_lora = self.q_a_layernorm(self.q_a_proj(x))
+            q_states = self.q_b_proj(q_lora)
         queries = q_states.view(batch, seq_len, self.num_heads, self.qk_head_dim)
 
         kv_new = self.kv_a_proj_with_mqa(x)  # (batch, seq_len, kv_lora + rope)
+        index_new = self.indexer.keys(x) if self.indexer is not None else None
+        index_hist = index_new
         if layer_state is None:
             if int(row_starts.max()) != 0:
                 raise ValueError("stateless MLA forward requires row_starts == 0")
@@ -538,18 +644,14 @@ class _KimiMlaAttention(nn.Module):
                     f"MLA state buffer overflow: writing {seq_len} tokens at "
                     f"position {int(row_starts.max())} exceeds capacity {capacity}"
                 )
-            if seq_len == 1:
-                rows = torch.arange(batch, device=x.device)
-                layer_state.kv[rows, row_starts] = kv_new[:, 0].to(layer_state.kv.dtype)
-            else:
-                # Multi-token spans only occur in (chunked) prefill, where
-                # every row sits at the same offset.
-                start = int(row_starts[0])
-                if not bool((row_starts == start).all()):
-                    raise ValueError("multi-token MLA spans require uniform row_starts")
-                layer_state.kv[:, start : start + seq_len] = kv_new.to(layer_state.kv.dtype)
-            lengths = row_starts + seq_len
-            kv_hist = layer_state.kv[:, : int(lengths.max())].to(x.dtype)
+            kv_hist = _append_rows(layer_state.kv, kv_new, row_starts).to(x.dtype)
+            if index_new is not None:
+                if layer_state.index_k is None:
+                    raise ValueError(
+                        "a DSA layer needs a state cache with indexer keys "
+                        "(build it with build_kimi_state_cache_specs)"
+                    )
+                index_hist = _append_rows(layer_state.index_k, index_new, row_starts).to(x.dtype)
 
         kv_latent, k_rot = torch.split(kv_hist, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         decompressed = self.kv_b_proj(self.kv_a_layernorm(kv_latent)).view(
@@ -568,6 +670,11 @@ class _KimiMlaAttention(nn.Module):
             seq_len, device=x.device
         ).view(1, 1, seq_len, 1)
         valid = key_positions.view(1, 1, 1, total_k) <= query_positions
+        if self.indexer is not None and total_k > self.indexer.index_topk:
+            # With at most `index_topk` keys the indexer keeps every key, so
+            # only a longer history needs the selection.
+            assert q_lora is not None and index_hist is not None
+            valid = self.indexer.select(x, q_lora, index_hist, valid[:, 0]).unsqueeze(1)
         scores = scores.masked_fill(~valid, float("-inf"))
         weights = scores.softmax(dim=-1).to(x.dtype)
         attn = torch.einsum("bhqk,bkhd->bqhd", weights, values).reshape(batch, seq_len, -1)

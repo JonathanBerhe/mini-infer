@@ -22,6 +22,12 @@ dequantizes to BF16 `.weight` with `quant/mxfp4.py` when
 `quantization_config` declares that format. Attention, shared
 experts, the dense MLP, the latent projections, the AttnRes queries and
 `lm_head` ship unquantized.
+
+Kimi K3.1 Pro (`moonshotai/Kimi-K3.1-Pro`, `KimiK31ForConditionalGeneration`)
+uses the same wrapper and the same loader. Its `text_config` adds
+`dsa_config`, which turns every MLA layer into a DeepSeek Sparse Attention
+layer (`dsa_indexer.py`). The checkpoint adds five indexer tensors per DSA
+layer, unquantized, and ships no modeling code.
 """
 
 from __future__ import annotations
@@ -89,6 +95,30 @@ class KimiK3ForConditionalGeneration(KimiLinearForCausalLM):
     def text_checkpoint_tensors(hf_tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Drop the vision tower and strip `language_model.` (the streaming load's hook)."""
         return text_state_dict_from_k3(hf_tensors)
+
+
+@dataclass
+class KimiK31Config(KimiK3Config):
+    """The K3.1 wrapper config: the K3 one, with `text_config.dsa_config` required."""
+
+    @classmethod
+    def from_hf(cls, hf_config: Any) -> KimiK31Config:
+        cfg = super().from_hf(hf_config)
+        if not cfg.text.uses_dsa:
+            raise ValueError(
+                "KimiK31Config requires text_config.dsa_config (the Gated DSA layers); "
+                "a checkpoint without it is Kimi K3"
+            )
+        assert isinstance(cfg, KimiK31Config)
+        return cfg
+
+
+@register_model
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """Text-only Kimi K3.1 Pro: K3 with a DSA indexer on every MLA layer."""
+
+    HF_ARCHITECTURE: ClassVar[str] = "KimiK31ForConditionalGeneration"
+    Config: ClassVar[type] = KimiK31Config
 
 
 def text_state_dict_from_k3(hf_state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
