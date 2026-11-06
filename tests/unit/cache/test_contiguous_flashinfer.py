@@ -328,9 +328,11 @@ def test_the_flashinfer_graph_replays_the_eager_step(build: Any) -> None:
             )
     # Capture first: warmup and capture write into every row of the cache.
     graph = DecodeCudaGraph(model, caches[1], batch_size=2, device="cuda")
-    for cache in caches:
-        for row in range(2):
-            cache.copy_row_from(prefilled, src_row=0, dst_row=row)
+    # The caches were made in inference mode, so only inference mode writes them.
+    with torch.inference_mode():
+        for cache in caches:
+            for row in range(2):
+                cache.copy_row_from(prefilled, src_row=0, dst_row=row)
     tokens = torch.tensor([[3], [5]])
     positions = torch.tensor([37, 30])
     for step in range(6):
