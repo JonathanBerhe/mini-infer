@@ -79,9 +79,14 @@ fp32.
 - Attention: append-only K and V buffers `(max_seq_len, 2, 128)`.
 - MoE and MLP: nothing.
 
-Only the 6 attention layers grow with context. The decode step attends over
-the whole fixed-length buffer and masks the unwritten slots on the device,
-so it has no host sync and runs under the CUDA graph of
+Only the 6 attention layers grow with context. On CUDA with FlashInfer, the
+attention layers view each buffer as FlashInfer pages and read each row
+only up to its length, on a plan made once per step
+([ADR-059](../decisions/ADR-059-state-cache-flashinfer-attention.md)). A
+32k-token step takes 9.3 ms on an H100 and 7.7 ms on a B200, against 13.0
+and 11.6 ms for the masked path. Without FlashInfer, the decode step attends
+over the whole fixed-length buffer and masks the unwritten slots on the
+device. Both paths have no host sync and run under the CUDA graph of
 [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md).
 
 ## Loading

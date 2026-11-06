@@ -40,6 +40,7 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from mini_infer.cache.contiguous_attention import contiguous_backend, plan_contiguous_step
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks.moe.glm_moe_gate import GlmNoAuxTcGate
@@ -396,6 +397,13 @@ class _NemotronAttention(nn.Module):
             rows = torch.arange(batch, device=hidden.device).view(batch, 1)
             layer_state.k[rows, positions] = key.to(layer_state.k.dtype)
             layer_state.v[rows, positions] = value.to(layer_state.v.dtype)
+            if contiguous_backend(layer_state.k) == "flashinfer":
+                # Reads each row only up to its last written key, with no
+                # mask and no per-head copy of K and V.
+                if layer_state.plan is None:
+                    raise RuntimeError("plan the step first (plan_contiguous_step)")
+                attn = layer_state.plan.run(query.transpose(1, 2), layer_state.k, layer_state.v)
+                return self._project(attn)
             if seq_len == 1:
                 return self._project(self._decode_attention(query, layer_state, positions))
             if kv_len is None:
@@ -693,7 +701,9 @@ class NemotronHForCausalLM(BaseCausalLM):
         row_starts = torch.full(
             (batch,), state_cache.start_pos, dtype=torch.long, device=input_ids.device
         )
-        return self._run(input_ids, state_cache, row_starts, state_cache.start_pos + seq_len)
+        end = state_cache.start_pos + seq_len
+        self._plan_attention(state_cache, [end] * batch, seq_len)
+        return self._run(input_ids, state_cache, row_starts, end)
 
     def forward_decode_with_cache(
         self, input_id: torch.Tensor, *, start_pos: int, state_cache: NemotronHStateCache
@@ -707,6 +717,7 @@ class NemotronHForCausalLM(BaseCausalLM):
         state_cache.check_capacity(start_pos + 1)
         batch = input_id.shape[0]
         positions = torch.full((batch,), start_pos, dtype=torch.long, device=input_id.device)
+        self._plan_attention(state_cache, [start_pos + 1] * batch, 1)
         return self._run(input_id, state_cache, positions)
 
     def forward_decode_with_cache_ragged(
@@ -725,7 +736,11 @@ class NemotronHForCausalLM(BaseCausalLM):
         batch = input_id.shape[0]
         if positions.shape != (batch,):
             raise ValueError(f"positions shape {tuple(positions.shape)} != (B={batch},)")
-        state_cache.check_capacity(int(positions.max().item()) + 1)
+        # One sync for the host positions, which the capacity check and the
+        # attention plan both need.
+        host_positions = [int(p) for p in positions.tolist()]
+        state_cache.check_capacity(max(host_positions) + 1)
+        self._plan_attention(state_cache, [p + 1 for p in host_positions], 1)
         return self.decode_step_static(input_id, positions.to(torch.long), state_cache)
 
     def decode_step_static(
@@ -735,8 +750,40 @@ class NemotronHForCausalLM(BaseCausalLM):
 
         `(B, 1)` token ids and `(B,)` int64 positions on the model's device.
         No host sync, no data-dependent shape, and only in-place cache updates.
+        When FlashInfer runs the attention, the caller plans the step first
+        with `before_decode_step`, as `DecodeCudaGraph` does.
         """
         return self._run(input_id, state_cache, positions)
+
+    def _plan_attention(
+        self, state_cache: NemotronHStateCache, lengths: list[int], q_len: int
+    ) -> None:
+        """Plan the FlashInfer attention of one step, when FlashInfer runs it.
+
+        `lengths[b]` is row `b`'s cache length after the span of `q_len`
+        tokens, on the host.
+        """
+        states = [
+            state
+            for state in (state_cache.layer(i) for i in range(state_cache.num_layers))
+            if isinstance(state, NemotronAttentionLayerState)
+        ]
+        plan_contiguous_step(
+            states,
+            lengths,
+            q_len,
+            num_q_heads=self.cfg.num_attention_heads,
+            scale=self.cfg.head_dim**-0.5,
+        )
+
+    def before_decode_step(self, positions: torch.Tensor, state_cache: NemotronHStateCache) -> None:
+        """Plan the attention of the `decode_step_static` call that comes next.
+
+        `DecodeCudaGraph` calls this before every replay, with the positions
+        it replays. Host positions cost no sync.
+        """
+        lengths = [int(p) + 1 for p in positions.tolist()]
+        self._plan_attention(state_cache, lengths, 1)
 
     def _check_cache(self, state_cache: NemotronHStateCache) -> None:
         if state_cache.num_layers != self.cfg.num_hidden_layers:
