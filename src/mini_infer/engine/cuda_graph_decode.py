@@ -11,7 +11,14 @@ The model opts in with `SUPPORTS_DECODE_CUDA_GRAPH = True` and provides
 no host sync and no data-dependent shape, and it must update the cache only
 in place: a replay reads and writes the exact tensors the graph saw at
 capture. A model whose step meets this only on some devices or settings
-also provides `can_capture_decode(device) -> bool`.
+also provides `can_capture_decode(device) -> bool`. A model whose step
+needs host-side work first provides `before_decode_step(positions,
+state_cache)`, which `replay` runs before every replay (the FlashInfer
+attention of Qwen3.8 and Nemotron-H plans the step's row lengths there). A
+model whose step leaves host-side work behind provides
+`after_decode_step(positions, state_cache)`, which `replay` runs after every
+replay (Qwen's Latent Sparse Attention clusters the key blocks a step closed
+there). Both get the positions that `replay` was given.
 
 Warmup and capture run the step for real, so they write into every row of
 the cache. Capture before any request is admitted; the scheduler's admission
@@ -61,8 +68,15 @@ class DecodeCudaGraph:
                 f"{type(model).__name__} on {device} cannot decode through a CUDA graph"
             )
         self._timer = timer
+        self._state_cache = state_cache
+        self._before_step = getattr(model, "before_decode_step", None)
+        self._after_step = getattr(model, "after_decode_step", None)
         self._input_ids = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self._positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+        if self._before_step is not None:
+            # The warmup and the capture run the step at these positions.
+            with torch.inference_mode():
+                self._before_step(self._positions.cpu(), state_cache)
         main_stream = torch.cuda.current_stream(device)
         side_stream = torch.cuda.Stream(device=device)  # type: ignore[no-untyped-call]
         side_stream.wait_stream(main_stream)
@@ -94,9 +108,15 @@ class DecodeCudaGraph:
         # inference mode that fill raises "Inplace update to inference tensor".
         # Newer torch allocates them outside inference mode.
         with torch.inference_mode():
+            if self._before_step is not None:
+                # Queued on the same stream, before the replay reads it.
+                self._before_step(positions, self._state_cache)
             if self._timer is None:
                 self._graph.replay()
             else:
                 with self._timer.step():
                     self._graph.replay()
+            if self._after_step is not None:
+                # Queued on the same stream, after the replay's writes.
+                self._after_step(positions, self._state_cache)
         return self._logits
