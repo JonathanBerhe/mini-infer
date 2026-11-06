@@ -302,18 +302,31 @@ def attention_ab() -> str:
 
     _log("step 0: unit tests on the GPU")
     tests = subprocess.run(
-        [sys.executable, "-m", "pytest", *GPU_TESTS, "-q", "-rfEs", "-p", "no:cacheprovider"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *GPU_TESTS,
+            "-q",
+            "-rfEs",
+            "--tb=short",
+            "-p",
+            "no:cacheprovider",
+        ],
         cwd="/root",
         capture_output=True,
         text=True,
     )
     emit(f"step 0: {tests.stdout.strip().splitlines()[-1]}")
     if tests.returncode != 0:
-        # The names first: a compiler log can push them out of the tail.
-        for line in tests.stdout.splitlines():
+        # The failure section, not the tail: compiler warnings can fill the tail.
+        out = tests.stdout
+        start = out.find("= FAILURES =")
+        end = out.find("short test summary")
+        emit(out[start:end][:8000] if start >= 0 else out[-3000:])
+        for line in out.splitlines():
             if line.startswith(("FAILED", "ERROR")):
                 emit(line[:400])
-        emit(tests.stdout[-3000:])
         return "\n".join(lines)
 
     text = PROSE_PATH.read_text()
