@@ -3,9 +3,10 @@
 Qwen3.8 and Nemotron-H keep each request's attention history in a buffer of
 `max_seq_len` positions. Their PyTorch path reads the whole buffer at every
 decode step and masks the unwritten slots. The FlashInfer path
-(`cache/contiguous_attention.py`) reads each row only up to its length. Both
-paths run here on one model load: `contiguous._DISABLED_FOR_BENCH` switches
-the FlashInfer path off.
+(`cache/contiguous_attention.py`) reads each row only up to its length. Three
+arms run here on one model load (`ARMS`): the PyTorch path, FlashInfer with
+its automatic decode backend (FlashAttention 3 on Hopper), and FlashInfer
+with the FA2 decode backend, which splits a long row across CTAs.
 
 Step 0 runs the unit tests of the path, the CUDA-graph decode tests and the
 GPU tests of both model families, so that a broken kernel call fails before
@@ -112,10 +113,16 @@ def _log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
-def _set_flashinfer(on: bool) -> None:
+# Arm name -> FlashInfer decode backend, or None for the masked PyTorch path.
+ARMS = {"torch": None, "auto": "auto", "fa2": "fa2"}
+
+
+def _set_arm(arm: str) -> None:
     from mini_infer.cache import contiguous_attention
 
-    contiguous_attention._DISABLED_FOR_BENCH = not on
+    backend = ARMS[arm]
+    contiguous_attention._DISABLED_FOR_BENCH = backend is None
+    contiguous_attention._DECODE_BACKEND = backend or "auto"
 
 
 def _placement(model: Any) -> tuple[Any, Any]:
@@ -225,52 +232,60 @@ def run_ab(model: Any, ids: list[int], *, cases: Any, deadline: float, emit: Any
 
     parity = ids[:PARITY_TOKENS]
     results = {}
-    for on in (True, False):
-        _set_flashinfer(on)
+    for arm in ARMS:
+        _set_arm(arm)
         cache, last, _ = _prefill(model, parity, len(parity))
         first = int(last.argmax())
         tokens = _greedy(model, cache, first, len(parity), PARITY_DECODE)
-        results[on] = (last, tokens)
+        results[arm] = (last, tokens)
         del cache
-    cosine = float(functional.cosine_similarity(results[True][0], results[False][0], dim=0))
-    same_top1 = int(results[True][0].argmax()) == int(results[False][0].argmax())
-    equal = sum(a == b for a, b in zip(results[True][1], results[False][1], strict=True))
-    emit(
-        f"parity, {len(parity)} tokens: logits cos {cosine:.5f}, top-1 same {same_top1}, "
-        f"greedy {equal}/{PARITY_DECODE} equal"
-    )
+    reference_last, reference_tokens = results["torch"]
+    for arm in ARMS:
+        if arm == "torch":
+            continue
+        last, tokens = results[arm]
+        cosine = float(functional.cosine_similarity(last, reference_last, dim=0))
+        same_top1 = int(last.argmax()) == int(reference_last.argmax())
+        equal = sum(a == b for a, b in zip(tokens, reference_tokens, strict=True))
+        emit(
+            f"parity {arm} against torch, {len(parity)} tokens: logits cos {cosine:.5f}, "
+            f"top-1 same {same_top1}, greedy {equal}/{PARITY_DECODE} equal"
+        )
 
     mode = "graph" if is_cuda_device(_placement(model)[0]) else "eager"
-    emit(f"prompt | buffer | batch | torch ms/step ({mode}) | flashinfer ms/step | speedup")
+    emit(f"prompt | buffer | batch | ms/step ({mode}): " + " | ".join(ARMS) + " | best gain")
     for prompt_len, buffer, batches in cases:
         for batch in batches:
             if time.monotonic() + ROW_BUDGET_S > deadline:
                 emit(f"{prompt_len} | {buffer} | {batch} | skipped: not enough time left")
                 continue
             times = {}
-            for on in (False, True):
-                _set_flashinfer(on)
+            for arm in ARMS:
+                _set_arm(arm)
                 prefilled, last, _ = _prefill(model, ids[:prompt_len], buffer)
-                times[on] = _decode_ms(model, prefilled, int(last.argmax()), prompt_len, batch)
+                times[arm] = _decode_ms(model, prefilled, int(last.argmax()), prompt_len, batch)
                 del prefilled
+            best = min(times[arm] for arm in ARMS if arm != "torch")
             emit(
-                f"{prompt_len} | {buffer} | {batch} | {times[False]:.2f} | "
-                f"{times[True]:.2f} | {times[False] / times[True]:.2f}x"
+                f"{prompt_len} | {buffer} | {batch} | "
+                + " | ".join(f"{times[arm]:.2f}" for arm in ARMS)
+                + f" | {times['torch'] / best:.2f}x"
             )
     longest = max(prompt_len for prompt_len, _, _ in cases)
     if time.monotonic() + 2 * ROW_BUDGET_S > deadline:
         emit(f"prefill {longest}: skipped: not enough time left")
     else:
+        # The decode backend does not change a prefill of 4096-token chunks.
         seconds = {}
-        for on in (False, True):
-            _set_flashinfer(on)
-            prefilled, _, seconds[on] = _prefill(model, ids[:longest], longest)
+        for arm in ("torch", "auto"):
+            _set_arm(arm)
+            prefilled, _, seconds[arm] = _prefill(model, ids[:longest], longest)
             del prefilled
         emit(
-            f"prefill {longest} tokens: torch {seconds[False]:.2f} s, "
-            f"flashinfer {seconds[True]:.2f} s, {seconds[False] / seconds[True]:.2f}x"
+            f"prefill {longest} tokens: torch {seconds['torch']:.2f} s, "
+            f"flashinfer {seconds['auto']:.2f} s, {seconds['torch'] / seconds['auto']:.2f}x"
         )
-    _set_flashinfer(True)
+    _set_arm("auto")
 
 
 @app.function(

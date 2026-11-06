@@ -65,6 +65,11 @@ PAGE_SIZE = 16
 # kernel and the model takes its PyTorch path.
 _DISABLED_FOR_BENCH = False
 
+# The FlashInfer backend of a one-token step. "auto" picks FlashAttention 3
+# on Hopper, which gives each query tile one CTA and does not split a long
+# row across CTAs. "fa2" splits it.
+_DECODE_BACKEND = "auto"
+
 # FlashInfer keeps its plan and its split-KV scratch in this buffer. The
 # B200 needs more than FlashInfer's default 128 MiB for long rows (see
 # `cache/flashinfer_backend.py`). It is not shared with the paged backend,
@@ -72,7 +77,7 @@ _DISABLED_FOR_BENCH = False
 _WORKSPACE_BYTES = 256 * 1024 * 1024
 _workspace: dict[torch.device, torch.Tensor] = {}
 _prefill_wrappers: dict[torch.device, Any] = {}
-_decode_wrappers: dict[tuple[torch.device, int, int], Any] = {}
+_decode_wrappers: dict[tuple[torch.device, int, int, str], Any] = {}
 
 
 def padded_buffer_len(max_seq_len: int) -> int:
@@ -195,7 +200,7 @@ def _decode_wrapper(device: torch.device, batch: int, pages: int) -> Any:
     of query heads (Qwen3.8 has 6).
     """
     assert flashinfer is not None
-    key = (device, batch, pages)
+    key = (device, batch, pages, _DECODE_BACKEND)
     if key not in _decode_wrappers:
         _decode_wrappers[key] = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             _workspace_for(device),
@@ -205,6 +210,7 @@ def _decode_wrapper(device: torch.device, batch: int, pages: int) -> Any:
             paged_kv_indptr_buf=torch.empty(batch + 1, dtype=torch.int32, device=device),
             paged_kv_indices_buf=torch.empty(pages, dtype=torch.int32, device=device),
             paged_kv_last_page_len_buf=torch.empty(batch, dtype=torch.int32, device=device),
+            backend=_DECODE_BACKEND,
         )
     return _decode_wrappers[key]
 
