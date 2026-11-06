@@ -439,12 +439,12 @@ FAMILIES: dict[str, _Family] = {
     "kimi_linear": _family(
         _kimi_linear,
         (_DENSE - {"RoPE tables"}) | _MOE | {"MoE other", "linear attention"},
-        _STATE_CACHE_METHODS,
+        _STATE_CACHE_METHODS | {"_loop_experts"},
     ),
     "kimi_k3": _family(
         _kimi_k3,
         (_DENSE - {"RoPE tables"}) | _MOE | {"MoE other", "linear attention"},
-        _STATE_CACHE_METHODS,
+        _STATE_CACHE_METHODS | {"_loop_experts"},
     ),
     "minimax_m3": _family(
         _minimax_m3, _DENSE | _MOE | {"MoE other"}, {"_loop_experts", "forward_cached"}
