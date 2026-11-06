@@ -48,7 +48,7 @@ kernels.
 | DeepSeek-V4-Flash, own cache, 2 GPUs | FP4 experts (W4A8 on sm_100, Gluon or Triton FP4), HC Sinkhorn kernel, fused partial RoPE and norm, decode CUDA graph | Partial (kernels and one layer) | Unchecked | Fast (2x B200, 2026-11-05, [metrics](benchmarks/2026-11-05-model-metrics.md)) | Unchecked |
 | GLM-5.2 and GLM-5.3, paged MLA with DSA | Torch attention (required), grouped FP8 experts (Gluon or Triton) | Partial (one layer, 2026-10-21) | Unchecked | Partial (one layer, 2026-10-21) | Partial (tiny config equal to transformers 5.14, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
 | Inkling, paged | Torch attention (required) | Unchecked | Unchecked | Fallback (tiny weights, 2026-10-19): per-expert MoE loop | Unchecked |
-| Kimi Linear and Kimi K3, own cache | None on GPU: KDA in PyTorch, per-expert MoE loop, no CUDA graph | No: 48B in bf16 (98 GB) does not fit one H100 | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md) and [metrics](benchmarks/2026-11-05-model-metrics.md)). A second run loaded it through `StateCacheGenerator.from_pretrained`, as the API server does, with the same output (2026-11-05, PR #83) | Unchecked |
+| Kimi Linear and Kimi K3, own cache | Grouped bf16 experts. KDA in PyTorch, no CUDA graph | No: 48B in bf16 (98 GB) does not fit one H100 | Unchecked | Runs (48B, eager, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md) and [metrics](benchmarks/2026-11-05-model-metrics.md)). A second run loaded it through `StateCacheGenerator.from_pretrained`, as the API server does, with the same output (2026-11-05, PR #83) | Unchecked |
 | MiniMax-M3 428B, paged, 4 GPUs | Torch attention with the MSA block mask (required), grouped FP8 experts. The MSA decode kernel stays off (0.98x) | No: four 80 GB GPUs are too small | Fast, old stack (4x H200, 2026-07-03, [report](benchmarks/2026-07-03-minimax-m3-428b-gate.md)) | Partial (MSA decode kernel only, 2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Unchecked |
 | Nemotron-H 30B-A3B, own cache | Grouped bf16 experts, decode CUDA graph. The Mamba-2 scan is PyTorch | Fast (2026-11-05, [metrics](benchmarks/2026-11-05-model-metrics.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) | Fast (2026-11-05, [metrics](benchmarks/2026-11-05-model-metrics.md)) | Unchecked |
 | Qwen3.8 27B, own cache | Chunkwise GDN prefill, fused GDN decode kernel, decode CUDA graph | Fast (2026-11-05, [metrics](benchmarks/2026-11-05-model-metrics.md)) | Unchecked | Fast (2026-11-05, [metrics](benchmarks/2026-11-05-model-metrics.md)) | Fast (2026-11-05, [gate](benchmarks/2026-11-05-gpu-support-gate.md)) |
@@ -128,8 +128,8 @@ These fallbacks are still silent:
   `modal_llama_tp_smoke.py`, `modal_bench_paged.py` and
   `modal_concurrent_bench.py` request the default backend on an image without
   flash-attn or FlashInfer. They test correctness on the torch path.
-- Kimi Linear and Kimi K3 have no GPU kernel for KDA, no grouped MoE path and
-  no CUDA graph. Inkling has no grouped MoE path.
+- Kimi Linear and Kimi K3 have no GPU kernel for KDA and no CUDA graph.
+  Inkling has no grouped MoE path.
 - The Llama port applies the `llama3` RoPE scaling of Llama 3.1, 3.2 and
   3.3. On an H100 it brings the top-1 agreement with transformers on a
   10240-token prompt from 87% to 98%
