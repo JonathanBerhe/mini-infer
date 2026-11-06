@@ -178,13 +178,16 @@ instead of about 50 small ones
 27B on an A100 a batch-1 step takes 39.6 ms, against 110 ms for the eager
 PyTorch step and a weight-bandwidth bound of about 26 ms.
 
-On CUDA with `flash-attn` installed, the full-attention layers call
-`flash_attn_with_kvcache` instead
-([contiguous_attention.py](../../src/mini_infer/cache/contiguous_attention.py)).
-It reads each row only up to its length, with no mask, and the step still
-captures in the graph. On one H100 this took eager decode at 64k tokens
-from 82 ms to 39 ms per step. `flash-attn` 2 has no wheel past torch 2.8, so
-the main Modal images keep the masked path.
+On CUDA the full-attention layers read each row only up to its length
+instead ([contiguous_attention.py](../../src/mini_infer/cache/contiguous_attention.py)).
+With `flash-attn` installed they call `flash_attn_with_kvcache`. Else they
+view the buffer as FlashInfer pages and run FlashInfer's FA2 kernels on a
+plan made once per step, which `before_decode_step` makes before each graph
+replay ([ADR-059](../decisions/ADR-059-state-cache-flashinfer-attention.md)).
+The main Modal images have FlashInfer and no `flash-attn`. With FlashInfer a
+32k-token step takes 25.6 ms on an H100 and 15.2 ms on a B200, against 51.2
+and 46.8 ms for the masked path. A 2k-token request in a 64k-token buffer
+takes 25.1 and 14.9 ms, against 77.4 and 79.0 ms.
 
 ## Latent Sparse Attention
 
@@ -270,7 +273,8 @@ rope on purpose, and staying single-rank for this port.
   [ADR-033](../decisions/ADR-033-cuda-graph-state-cache-decode.md) (CUDA-graph decode),
   [ADR-034](../decisions/ADR-034-fused-gdn-decode-kernel.md) (fused Gated DeltaNet step),
   [ADR-054](../decisions/ADR-054-gdn-scalar-gate-prefill.md) (scalar-gate prefill),
-  [ADR-056](../decisions/ADR-056-lsa-qwen38.md) (Latent Sparse Attention)
+  [ADR-056](../decisions/ADR-056-lsa-qwen38.md) (Latent Sparse Attention),
+  [ADR-059](../decisions/ADR-059-state-cache-flashinfer-attention.md) (FlashInfer attention)
 - Graph runner: [cuda_graph_decode.py](../../src/mini_infer/engine/cuda_graph_decode.py)
 
 ## What is still open
