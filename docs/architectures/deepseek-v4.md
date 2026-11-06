@@ -582,12 +582,30 @@ Pulled out into [ADR-014](../decisions/ADR-014-deepseek-v4-hybrid-attention.md):
 
 ## What's still open
 
-- **Live V4-Flash forward on 2× B200**. Load is proven; one Modal run
-  remains to close the end-to-end story. Blocked on Modal spend cycle.
-  See `roadmap-2026.md` § Immediate.
-- **Triton port of `hc_split_sinkhorn`**. PyTorch transcription is
-  bit-parity correct but slower than the tilelang reference. Future
-  follow-up when the V4 path is profile-bound.
+The two items that used to be here are done. The live V4-Flash forward
+ran on 2x B200 with tensor parallelism: an 8,192-token prompt and 32
+greedy tokens at perplexity 4.417, in
+[2026-10-19-v4-projection-dtype.md](../benchmarks/2026-10-19-v4-projection-dtype.md).
+The decode step then went from 172.8 to 35.7 ms per step at batch 1 with
+a CUDA graph, in [ADR-042](../decisions/ADR-042-cuda-graph-v4-decode.md)
+through [ADR-046](../decisions/ADR-046-v4-tp-decode-host-syncs.md). The
+Triton port of `hc_split_sinkhorn` is
+[ADR-018](../decisions/ADR-018-hc-sinkhorn-triton-port.md), about 14x
+faster per call than the PyTorch transcription.
+
+Still open:
+
+- **V4-Pro on 8 ranks.** The 862 GB checkpoint needs about 8 ranks and
+  has not run. The loader path is the same as for V4-Flash.
+- **DeepSeek-V4.1-Flash.** A different model: layer roles that share
+  caches, Engram tables, a single-pass hyper-connection order and FP4
+  caches. Its port follows
+  [ADR-047](../decisions/ADR-047-deepseek-v41-flash-design.md).
+- **A fused decode-attention kernel.** The prototype was 1.35 to 1.97x
+  faster per call and 0.997x end to end, and its output diverged, so
+  [ADR-020](../decisions/ADR-020-v4-decode-kernel-and-prefix-sharing.md)
+  rejected it. Revisit it if attention becomes a larger share of the
+  decode step.
 
 ## Adding the next architecture
 
