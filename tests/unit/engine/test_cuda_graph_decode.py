@@ -140,11 +140,32 @@ def test_replay_runs_the_models_after_step_hook_after_the_graph() -> None:
     assert events == ["replay", ([9, 4], True, True)]
 
 
+def test_replay_runs_the_models_before_step_hook_before_the_graph() -> None:
+    """A model that plans its attention per step (FlashInfer over the state
+    cache) plans before each replay, with the positions that replay was given."""
+    events: list[object] = []
+
+    class _Graph:
+        def replay(self) -> None:
+            events.append("replay")
+
+    graph = _replay_side(_Graph(), timed=False)
+    cache = object()
+    graph._state_cache = cache
+    graph._before_step = lambda positions, state_cache: events.append(
+        (positions.tolist(), state_cache is cache, torch.is_inference_mode_enabled())
+    )
+    graph._after_step = lambda positions, state_cache: events.append("after")
+    graph.replay(torch.tensor([[3], [5]]), torch.tensor([9, 4]))
+    assert events == [([9, 4], True, True), "replay", "after"]
+
+
 def _replay_side(cuda_graph: object, *, timed: bool) -> DecodeCudaGraph:
     """The real constructor captures on a CUDA device; build the replay side only."""
     graph = DecodeCudaGraph.__new__(DecodeCudaGraph)
     graph._timer = DecodeStepTimer("cpu") if timed else None
     graph._state_cache = None
+    graph._before_step = None
     graph._after_step = None
     graph._input_ids = torch.zeros(2, 1, dtype=torch.long)
     graph._positions = torch.zeros(2, dtype=torch.long)
