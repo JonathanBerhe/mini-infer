@@ -291,6 +291,14 @@ checkpoint's names `w1`, `w2` and `w3`. The routed outputs add up in fp32, as
 in the reference. The shared expert is one SwiGLU of width 1024, added after
 the routed sum.
 
+On Hopper and newer GPUs with bf16 activations, the routed experts run as two
+grouped matmuls over all (token, expert) pairs (`PackedSwigluExperts`, the
+path of the other MoE families). This path reads nothing back to the host. On
+other devices, `_KimiMoe._loop_experts` sorts the pairs by expert, reads the
+pair count of each expert once, and runs only the experts that got tokens. Its
+result has the same bits as a loop over all 256 experts
+([ADR-058](../decisions/ADR-058-kimi-moe-grouped-experts.md)).
+
 ## Decoder layer assembly
 
 Reference (`KimiDecoderLayer.forward`, L811-870): a pre-norm block. The
@@ -442,7 +450,7 @@ git worktree, symlink it from the main checkout, or run the clone script.
 - The KDA math runs as plain PyTorch loops, with no fused kernel. The MLA
   layer reads `row_starts` on the host (L363, L368, L384), so the decode
   step does not run under a CUDA graph.
-- The MoE runs its experts one at a time in a loop, with no grouped-matmul
-  path.
+- The grouped MoE path runs only on Hopper and newer GPUs with bf16
+  activations. Other devices loop over the experts that got tokens.
 - The Kimi K3 delta (SiTU, gated MLA, AttnRes, latent MoE, MXFP4 experts)
   is in [kimi-k3.md](kimi-k3.md) and ADR-049.
