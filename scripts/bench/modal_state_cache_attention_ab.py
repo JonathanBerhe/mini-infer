@@ -117,12 +117,19 @@ def _log(message: str) -> None:
 ARMS = {"torch": None, "auto": "auto", "fa2": "fa2"}
 
 
-def _set_arm(arm: str) -> None:
+_DEFAULT_DECODE_BACKEND: str | None = None
+
+
+def _set_arm(arm: str | None) -> None:
+    """Switch to an arm, or back to the engine's defaults with None."""
+    global _DEFAULT_DECODE_BACKEND
     from mini_infer.cache import contiguous_attention
 
-    backend = ARMS[arm]
+    if _DEFAULT_DECODE_BACKEND is None:
+        _DEFAULT_DECODE_BACKEND = contiguous_attention._DECODE_BACKEND
+    backend = ARMS[arm] if arm is not None else _DEFAULT_DECODE_BACKEND
     contiguous_attention._DISABLED_FOR_BENCH = backend is None
-    contiguous_attention._DECODE_BACKEND = backend or "auto"
+    contiguous_attention._DECODE_BACKEND = backend or _DEFAULT_DECODE_BACKEND
 
 
 def _placement(model: Any) -> tuple[Any, Any]:
@@ -285,7 +292,7 @@ def run_ab(model: Any, ids: list[int], *, cases: Any, deadline: float, emit: Any
             f"prefill {longest} tokens: torch {seconds['torch']:.2f} s, "
             f"flashinfer {seconds['auto']:.2f} s, {seconds['torch'] / seconds['auto']:.2f}x"
         )
-    _set_arm("auto")
+    _set_arm(None)
 
 
 @app.function(

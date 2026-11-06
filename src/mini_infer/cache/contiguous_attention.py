@@ -65,10 +65,11 @@ PAGE_SIZE = 16
 # kernel and the model takes its PyTorch path.
 _DISABLED_FOR_BENCH = False
 
-# The FlashInfer backend of a one-token step. "auto" picks FlashAttention 3
-# on Hopper, which gives each query tile one CTA and does not split a long
-# row across CTAs. "fa2" splits it.
-_DECODE_BACKEND = "auto"
+# The FlashInfer backend of a one-token step. "fa2" splits a long row across
+# CTAs. "auto" picks FlashAttention 3 on Hopper, which gives each query tile
+# one CTA: a 32k-token Qwen3.8 step took 42.0 ms with it on an H100 and
+# 25.6 ms with "fa2". On Blackwell "auto" is "fa2" (ADR-059).
+_DECODE_BACKEND = "fa2"
 
 # FlashInfer keeps its plan and its split-KV scratch in this buffer. The
 # B200 needs more than FlashInfer's default 128 MiB for long rows (see
