@@ -91,7 +91,8 @@ from mini_infer.models.blocks.kda import (
     kda_recurrent,
     l2norm,
 )
-from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert
+from mini_infer.models.blocks.moe.grouped_experts import supports_grouped_experts
+from mini_infer.models.blocks.moe.mixtral_moe import MixtralExpert, PackedSwigluExperts
 from mini_infer.models.blocks.rmsnorm import RMSNorm
 from mini_infer.models.blocks.swiglu import SwiGLU
 from mini_infer.models.kimi_linear.attn_res import AttnResQueryNorm, attn_res_mix
@@ -748,6 +749,11 @@ class _KimiMoe(nn.Module):
     `shared_experts.gate/up/down_proj`) so loading is a direct copy. Routed
     contributions accumulate in fp32, matching the reference's fp32 combine.
 
+    On Hopper and newer GPUs with bf16 activations the routed experts run as
+    two grouped matmuls (`PackedSwigluExperts`, packed on the first forward),
+    with no host sync. Elsewhere `_loop_experts` runs one expert at a time,
+    with one host read per call.
+
     With `routed_expert_hidden_size` (K3's latent MoE) the routed path runs
     in a narrower latent width: `routed_expert_down_proj` once before
     dispatch, experts at the latent width, an optional RMSNorm on the
@@ -768,6 +774,8 @@ class _KimiMoe(nn.Module):
                 for _ in range(cfg.num_experts)
             ]
         )
+        # Built on the first grouped forward, see `PackedSwigluExperts`.
+        self._expert_pack: PackedSwigluExperts | None = None
         self.gate = _KimiMoeGate(cfg)
         self.shared_experts: SwiGLU | None = (
             SwiGLU(
@@ -789,19 +797,19 @@ class _KimiMoe(nn.Module):
         flat = x.view(-1, x.shape[-1])
         topk_indices, topk_weights = self.gate(flat)
         routed_in = self.routed_expert_down_proj(flat) if self.latent_size is not None else flat
-
-        routed = torch.zeros(routed_in.shape, dtype=torch.float32, device=flat.device)
-        expert_mask = functional.one_hot(topk_indices, num_classes=self.num_experts).permute(
-            2, 1, 0
-        )
-        for expert_idx in range(self.num_experts):
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            if token_idx.numel() == 0:
-                continue
-            weights = topk_weights[token_idx, top_k_pos, None]
-            routed.index_add_(
-                0, token_idx, self.experts[expert_idx](routed_in[token_idx]).float() * weights
+        if supports_grouped_experts(routed_in.device, routed_in.dtype):
+            self._expert_pack = PackedSwigluExperts.current(self._expert_pack, self.experts)
+            routed = self._expert_pack.run(
+                routed_in,
+                topk_indices,
+                topk_weights,
+                num_experts=self.num_experts,
+                expert_start=0,
+                accumulate_dtype=torch.float32,
+                out_dtype=torch.float32,
             )
+        else:
+            routed = self._loop_experts(routed_in, topk_indices, topk_weights)
         out = routed.to(x.dtype)
         if self.latent_size is not None:
             if hasattr(self, "routed_expert_norm"):
@@ -810,6 +818,34 @@ class _KimiMoe(nn.Module):
         if self.shared_experts is not None:
             out = out + self.shared_experts(flat)
         return out.view(input_shape)
+
+    def _loop_experts(
+        self, routed_in: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """The fp32 weighted sum of the routed experts, one expert at a time.
+
+        The (token, slot) pairs are sorted by expert on the device and the pair
+        count of each expert is read back once, so the call has one host read.
+        Only the experts with pairs run. Each expert gets its tokens ordered by
+        top-k slot, then by token, and adds into the sum in expert order, as in
+        a loop of `torch.where` over all experts, so the result has the same bits.
+        """
+        tokens = topk_indices.shape[0]
+        # Pair `slot * tokens + token`: a stable sort keeps the slot-major order.
+        expert_ids = topk_indices.t().reshape(-1)
+        order = torch.argsort(expert_ids, stable=True)
+        counts = torch.bincount(expert_ids, minlength=self.num_experts).tolist()
+        token_idx = order % tokens
+        pair_weights = topk_weights.t().reshape(-1)[order, None]
+        routed = torch.zeros(routed_in.shape, dtype=torch.float32, device=routed_in.device)
+        start = 0
+        for expert_idx, count in enumerate(counts):
+            if count:
+                rows = token_idx[start : start + count]
+                expert_out = self.experts[expert_idx](routed_in[rows]).float()
+                routed.index_add_(0, rows, expert_out * pair_weights[start : start + count])
+            start += count
+        return routed
 
 
 class _KimiDecoderLayer(nn.Module):

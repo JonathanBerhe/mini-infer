@@ -234,4 +234,5 @@ uv run python scripts/kimi_linear/check_kimi_k3_checkpoint.py moonshotai/Kimi-K3
 - The MXFP4 experts dequantize to BF16 at load. A resident FP4 grouped GEMM
   is the DeepSeek-V4 FP4 path and is not wired for this family yet.
 - Everything open for Kimi Linear: single rank, no prefix sharing, dense
-  MLA history, no fused KDA kernel, experts run one at a time.
+  MLA history, no fused KDA kernel. The routed experts run as grouped
+  matmuls in the latent width on Hopper and newer GPUs (ADR-058).
