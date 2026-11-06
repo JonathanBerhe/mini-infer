@@ -61,19 +61,25 @@ def test_buffers_round_up_to_whole_pages_and_keep_their_capacity() -> None:
         cache.check_capacity(101)
 
 
+def _buffer(length: int = 16, head_dim: int = 64, dtype: torch.dtype = torch.bfloat16):
+    return torch.zeros(1, length, 1, head_dim, dtype=dtype)
+
+
 def test_the_backend_is_off_on_the_cpu_and_in_fp32(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert contiguous_backend(torch.zeros(1, 16, 1, 1, dtype=torch.bfloat16)) is None
+    assert contiguous_backend(_buffer()) is None
     monkeypatch.setattr(contiguous, "is_cuda_device", lambda device: True)
     monkeypatch.setattr(contiguous, "_FLASH_ATTN_AVAILABLE", False)
     monkeypatch.setattr(contiguous, "_FLASHINFER_AVAILABLE", True)
-    assert contiguous_backend(torch.zeros(1, 16, 1, 1, dtype=torch.float32)) is None
-    assert contiguous_backend(torch.zeros(1, 16, 1, 1, dtype=torch.bfloat16)) == "flashinfer"
+    assert contiguous_backend(_buffer(dtype=torch.float32)) is None
+    assert contiguous_backend(_buffer()) == "flashinfer"
     # A buffer that is not whole pages cannot be viewed as pages.
-    assert contiguous_backend(torch.zeros(1, 17, 1, 1, dtype=torch.bfloat16)) is None
+    assert contiguous_backend(_buffer(length=17)) is None
+    # FlashInfer has no Hopper kernel for small heads.
+    assert contiguous_backend(_buffer(head_dim=16)) is None
     monkeypatch.setattr(contiguous, "_FLASH_ATTN_AVAILABLE", True)
-    assert contiguous_backend(torch.zeros(1, 16, 1, 1, dtype=torch.bfloat16)) == "flash_attn"
+    assert contiguous_backend(_buffer()) == "flash_attn"
     monkeypatch.setattr(contiguous, "_DISABLED_FOR_BENCH", True)
-    assert contiguous_backend(torch.zeros(1, 16, 1, 1, dtype=torch.bfloat16)) is None
+    assert contiguous_backend(_buffer()) is None
 
 
 class _FakeWrapper:
@@ -145,7 +151,7 @@ def fake_flashinfer(monkeypatch: pytest.MonkeyPatch) -> list[_FakeWrapper]:
     return made
 
 
-def _qwen() -> Qwen35ForConditionalGeneration:
+def _qwen(head_dim: int = 16) -> Qwen35ForConditionalGeneration:
     torch.manual_seed(0)
     cfg = Qwen35Config(
         vocab_size=VOCAB,
@@ -154,7 +160,7 @@ def _qwen() -> Qwen35ForConditionalGeneration:
         num_hidden_layers=4,
         num_attention_heads=6,
         num_key_value_heads=2,
-        head_dim=16,
+        head_dim=head_dim,
         # Two attention layers, so that a shared plan is visible.
         layer_types=["linear_attention", "full_attention"] * 2,
         linear_num_key_heads=2,
@@ -171,7 +177,7 @@ def _qwen() -> Qwen35ForConditionalGeneration:
     return Qwen35ForConditionalGeneration(cfg).eval()
 
 
-def _nemotron() -> NemotronHForCausalLM:
+def _nemotron(head_dim: int = 8) -> NemotronHForCausalLM:
     torch.manual_seed(0)
     cfg = NemotronHConfig.from_hf(
         SimpleNamespace(
@@ -180,7 +186,7 @@ def _nemotron() -> NemotronHForCausalLM:
             layers_block_type=["mamba", "attention", "moe", "attention"],
             num_attention_heads=4,
             num_key_value_heads=2,
-            head_dim=8,
+            head_dim=head_dim,
             mamba_num_heads=4,
             mamba_head_dim=8,
             ssm_state_size=8,
@@ -209,7 +215,11 @@ def _nemotron() -> NemotronHForCausalLM:
 def _serve(model: Any, ids: torch.Tensor, prefill: int) -> torch.Tensor:
     """Chunked prefill of `ids[:, :prefill]`, one decode step per later token,
     then one ragged step with the rows at different positions."""
-    cache = model.build_state_cache(max_seq_len=100, batch_size=ids.shape[0])
+    weight = model.lm_head.weight
+    cache = model.build_state_cache(
+        max_seq_len=100, batch_size=ids.shape[0], device=weight.device, dtype=weight.dtype
+    )
+    ids = ids.to(weight.device)
     logits = []
     for start in range(0, prefill, 13):
         chunk = ids[:, start : min(start + 13, prefill)]
@@ -219,17 +229,19 @@ def _serve(model: Any, ids: torch.Tensor, prefill: int) -> torch.Tensor:
         logits.append(
             model.forward_decode_with_cache_ragged(
                 ids[:, pos : pos + 1],
-                positions=torch.full((ids.shape[0],), pos),
+                positions=torch.full((ids.shape[0],), pos, device=weight.device),
                 state_cache=cache,
             )
         )
     end = ids.shape[1]
     logits.append(
         model.forward_decode_with_cache_ragged(
-            ids[:, :1], positions=torch.tensor([end, end - 21]), state_cache=cache
+            ids[:, :1],
+            positions=torch.tensor([end, end - 21], device=weight.device),
+            state_cache=cache,
         )
     )
-    return torch.cat(logits, dim=1)
+    return torch.cat(logits, dim=1).float().cpu()
 
 
 @pytest.mark.parametrize("build", [_qwen, _nemotron], ids=["qwen3.8", "nemotron-h"])
@@ -259,3 +271,74 @@ def test_a_missing_plan_raises(fake_flashinfer: list[_FakeWrapper]) -> None:
     cache = model.build_state_cache(max_seq_len=32, batch_size=1)
     with torch.inference_mode(), pytest.raises(RuntimeError, match="plan the step first"):
         model.decode_step_static(torch.zeros(1, 1, dtype=torch.long), torch.zeros(1).long(), cache)
+
+
+# The real kernel. These run on Modal; locally they skip.
+_GPU_BUILDS = [
+    pytest.param(lambda: _qwen(head_dim=64), id="qwen3.8"),
+    pytest.param(lambda: _nemotron(head_dim=64), id="nemotron-h"),
+]
+
+
+def _on_gpu(build: Any) -> Any:
+    if not contiguous._FLASHINFER_AVAILABLE:
+        pytest.skip("flashinfer-python is not installed")
+    return build().to(device="cuda", dtype=torch.bfloat16)
+
+
+@pytest.mark.requires_cuda
+@pytest.mark.parametrize("build", _GPU_BUILDS)
+def test_the_flashinfer_kernel_gives_the_sdpa_logits(
+    build: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _on_gpu(build)
+    ids = torch.randint(0, VOCAB, (2, 48), generator=torch.Generator().manual_seed(1))
+    with monkeypatch.context() as off:
+        off.setattr(contiguous, "_DISABLED_FOR_BENCH", True)
+        expected = _serve(model, ids, prefill=40)
+    cuda_cache = model.build_state_cache(max_seq_len=16, device="cuda", dtype=torch.bfloat16)
+    assert contiguous_backend(cuda_cache.layer(1).k) == "flashinfer"
+
+    got = _serve(model, ids, prefill=40)
+
+    # bf16: the two paths sum in another order, so compare directions and picks.
+    cosine = functional.cosine_similarity(got, expected, dim=-1)
+    assert float(cosine.min()) > 0.999
+    agree = (got.argmax(-1) == expected.argmax(-1)).float().mean()
+    assert float(agree) > 0.9
+
+
+@pytest.mark.requires_cuda
+@pytest.mark.parametrize("build", _GPU_BUILDS)
+def test_the_flashinfer_graph_replays_the_eager_step(build: Any) -> None:
+    from mini_infer.engine.cuda_graph_decode import DecodeCudaGraph
+
+    model = _on_gpu(build)
+    prompt = torch.randint(0, VOCAB, (1, 37), generator=torch.Generator().manual_seed(2))
+    caches = []
+    with torch.inference_mode():
+        prefilled = model.build_state_cache(max_seq_len=64, device="cuda", dtype=torch.bfloat16)
+        model.forward_prefill_with_cache(prompt.cuda(), state_cache=prefilled)
+        prefilled.advance_start_pos(prompt.shape[1])
+        for _ in range(2):
+            caches.append(
+                model.build_state_cache(
+                    max_seq_len=64, batch_size=2, device="cuda", dtype=torch.bfloat16
+                )
+            )
+    # Capture first: warmup and capture write into every row of the cache.
+    graph = DecodeCudaGraph(model, caches[1], batch_size=2, device="cuda")
+    for cache in caches:
+        for row in range(2):
+            cache.copy_row_from(prefilled, src_row=0, dst_row=row)
+    tokens = torch.tensor([[3], [5]])
+    positions = torch.tensor([37, 30])
+    for _ in range(6):
+        with torch.inference_mode():
+            eager = model.forward_decode_with_cache_ragged(
+                tokens.cuda(), positions=positions.cuda(), state_cache=caches[0]
+            )
+        replayed = graph.replay(tokens, positions)
+        torch.testing.assert_close(replayed.float(), eager.float(), atol=2e-2, rtol=0)
+        tokens = eager[:, -1].argmax(-1, keepdim=True).cpu()
+        positions = positions + 1
