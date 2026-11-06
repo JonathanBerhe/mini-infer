@@ -51,6 +51,11 @@ except ImportError:
 # Both kernels run in half precision only.
 _HALF_DTYPES = (torch.float16, torch.bfloat16)
 
+# Head sizes that FlashInfer compiles on every target GPU. On Hopper it
+# picks its FlashAttention 3 backend, which has no kernel for smaller heads
+# (the build fails for head size 16). Qwen3.8 has 256, Nemotron-H 128.
+_FLASHINFER_HEAD_DIMS = (64, 128, 256)
+
 # Tokens per FlashInfer page. The paged KV cache uses the same size, which
 # runs on every GPU that mini-infer targets. The state caches round their
 # attention buffers up to a multiple of it (`padded_buffer_len`).
@@ -80,8 +85,9 @@ def contiguous_backend(k_buffer: torch.Tensor) -> str | None:
 
     Single source of truth for the choice, so the models do not test devices
     themselves. "flash_attn" when flash-attn is installed, else "flashinfer"
-    when FlashInfer is installed and the buffer is whole pages, on CUDA with
-    a half-precision buffer. None means the model's PyTorch path.
+    when FlashInfer is installed, the buffer is whole pages and the head size
+    is one that FlashInfer compiles, on CUDA with a half-precision buffer.
+    None means the model's PyTorch path.
     """
     if _DISABLED_FOR_BENCH:
         return None
@@ -89,7 +95,8 @@ def contiguous_backend(k_buffer: torch.Tensor) -> str | None:
         return None
     if _FLASH_ATTN_AVAILABLE:
         return "flash_attn"
-    if _FLASHINFER_AVAILABLE and k_buffer.shape[1] % PAGE_SIZE == 0:
+    whole_pages = k_buffer.shape[1] % PAGE_SIZE == 0
+    if _FLASHINFER_AVAILABLE and whole_pages and k_buffer.shape[3] in _FLASHINFER_HEAD_DIMS:
         return "flashinfer"
     return None
 
