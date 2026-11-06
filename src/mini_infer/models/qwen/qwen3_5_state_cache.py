@@ -20,6 +20,11 @@ which fits the paged one-entry-per-token KV model:
     subtle part: the stored keys are already positioned, so a decode step
     only has to position its own new query.
 
+    With Latent Sparse Attention on (`qwen/lsa.py`), each of these layers
+    also keeps the buckets of its closed key blocks: one centroid and one
+    member list per bucket. They are written once, when a block closes, and
+    only read after that.
+
 This mirrors `KimiStateCache` in lifecycle: one instance per request slot
 (or one batched instance whose rows are slots), a global `start_pos` the
 model reads at decode time, and `copy_row_from` so the continuous-batching
@@ -39,6 +44,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+
+from mini_infer.cache.contiguous_attention import ContiguousFlashInferPlan, padded_buffer_len
+from mini_infer.models.qwen.lsa import LsaConfig
 
 
 @dataclass(frozen=True)
@@ -73,11 +81,14 @@ class QwenAttentionStateSpec:
         max_seq_len: hard bound on positions this cache can hold. Admission
             has to respect it, because unlike the linear layers these buffers
             grow with context.
+        lsa: Latent Sparse Attention sizes when the layer selects its keys,
+            else None. It sizes the bucket buffers.
     """
 
     num_kv_heads: int
     head_dim: int
     max_seq_len: int
+    lsa: LsaConfig | None = None
 
 
 QwenStateLayerSpec = QwenGdnStateSpec | QwenAttentionStateSpec
@@ -95,8 +106,17 @@ class QwenGdnLayerState:
 class QwenAttentionLayerState:
     """Mutable per-request state of one gated full-attention layer."""
 
-    k: torch.Tensor  # (B, max_seq_len, num_kv_heads, head_dim), post-norm and post-rope
-    v: torch.Tensor  # (B, max_seq_len, num_kv_heads, head_dim)
+    # The buffers hold `padded_buffer_len(max_seq_len)` positions, whole
+    # FlashInfer pages. Positions past `max_seq_len` are never written.
+    k: torch.Tensor  # (B, buffer_len, num_kv_heads, head_dim), post-norm and post-rope
+    v: torch.Tensor  # (B, buffer_len, num_kv_heads, head_dim)
+    # LSA buckets of the closed blocks, block after block. A bucket row is
+    # valid once its block closes. A query never reads a later one.
+    lsa_centroids: torch.Tensor | None = None  # (B, buckets, index_dim) fp32
+    lsa_members: torch.Tensor | None = None  # (B, buckets, bucket_cap) int32, -1 padded
+    # The FlashInfer plan of the current step, shared by every attention
+    # layer of the cache (see `cache/contiguous_attention.py`).
+    plan: ContiguousFlashInferPlan | None = None
 
 
 QwenLayerState = QwenGdnLayerState | QwenAttentionLayerState
@@ -154,13 +174,31 @@ class Qwen35StateCache:
             else:
                 if spec.max_seq_len <= 0:
                     raise ValueError(f"max_seq_len must be positive, got {spec.max_seq_len}")
-                shape = (batch_size, spec.max_seq_len, spec.num_kv_heads, spec.head_dim)
-                self._layers.append(
-                    QwenAttentionLayerState(
-                        k=torch.zeros(shape, device=self.device, dtype=dtype),
-                        v=torch.zeros(shape, device=self.device, dtype=dtype),
-                    )
+                buffer_len = padded_buffer_len(spec.max_seq_len)
+                shape = (batch_size, buffer_len, spec.num_kv_heads, spec.head_dim)
+                state = QwenAttentionLayerState(
+                    k=torch.zeros(shape, device=self.device, dtype=dtype),
+                    v=torch.zeros(shape, device=self.device, dtype=dtype),
                 )
+                if spec.lsa is not None:
+                    # Only whole blocks close, so a trailing partial block
+                    # never needs bucket rows.
+                    buckets = spec.max_seq_len // spec.lsa.window_size
+                    buckets *= spec.lsa.block_bucket_count
+                    state.lsa_centroids = torch.zeros(
+                        batch_size,
+                        buckets,
+                        spec.lsa.index_dim,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    state.lsa_members = torch.full(
+                        (batch_size, buckets, spec.lsa.bucket_cap),
+                        -1,
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                self._layers.append(state)
         # Global token position (advanced by the caller after each forward).
         self.start_pos = 0
 
@@ -226,3 +264,10 @@ class Qwen35StateCache:
                 copy_len = min(dst.k.shape[1], src.k.shape[1])
                 dst.k[dst_row, :copy_len] = src.k[src_row, :copy_len]
                 dst.v[dst_row, :copy_len] = src.v[src_row, :copy_len]
+                if (src.lsa_centroids is None) != (dst.lsa_centroids is None):
+                    raise ValueError(f"layer {layer_idx}: only one cache holds LSA buckets")
+                if src.lsa_centroids is not None and dst.lsa_centroids is not None:
+                    assert src.lsa_members is not None and dst.lsa_members is not None
+                    rows = min(dst.lsa_centroids.shape[1], src.lsa_centroids.shape[1])
+                    dst.lsa_centroids[dst_row, :rows] = src.lsa_centroids[src_row, :rows]
+                    dst.lsa_members[dst_row, :rows] = src.lsa_members[src_row, :rows]

@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from mini_infer.api.server import _unhandled_exception_handler, completions
 from mini_infer.engine.state_cache_generator import StateCacheGenerator
+from mini_infer.models.qwen.lsa import LsaConfig
 from mini_infer.models.qwen.qwen3_5 import Qwen35Config, Qwen35ForConditionalGeneration
 from mini_infer.scheduler import StateCacheContinuousScheduler
 
@@ -75,9 +76,33 @@ class _FakeTokenizer:
 
 @pytest.fixture
 def qwen_client() -> Iterator[TestClient]:
-    cfg = _make_config()
     torch.manual_seed(0)
-    model = Qwen35ForConditionalGeneration(cfg).eval()
+    yield from _serve(Qwen35ForConditionalGeneration(_make_config()).eval())
+
+
+@pytest.fixture
+def qwen_lsa_client() -> Iterator[TestClient]:
+    """The same model with Latent Sparse Attention on, at sizes where a
+    40-token completion closes several key blocks."""
+    torch.manual_seed(0)
+    model = Qwen35ForConditionalGeneration(_make_config()).eval()
+    lsa = LsaConfig(
+        window_size=8,
+        sink_size=2,
+        top_k=8,
+        top_p=2,
+        index_dim=8,
+        pool_size=2,
+        bucket_size=4,
+        bucket_cap=8,
+    )
+    # 2 KV heads of 16 - 4 rotary dims each.
+    model.enable_lsa({i: (torch.randn(24, 8), torch.randn(24, 8)) for i in (3, 7)}, lsa)
+    yield from _serve(model)
+
+
+def _serve(model: Qwen35ForConditionalGeneration) -> Iterator[TestClient]:
+    cfg = model.cfg
     scheduler = StateCacheContinuousScheduler(  # type: ignore[arg-type]
         StateCacheGenerator(model, _FakeTokenizer(cfg.vocab_size)),
         max_batch_size=4,
@@ -150,4 +175,18 @@ def test_qwen_hybrid_serves_concurrent_requests(qwen_client: TestClient) -> None
         bodies.append(response.json())
     for body in bodies:
         assert body["usage"]["completion_tokens"] == 5
+        assert body["choices"][0]["text"]
+
+
+def test_qwen_hybrid_serves_with_lsa(qwen_lsa_client: TestClient) -> None:
+    """LSA decode runs eagerly through the scheduler and closes key blocks
+    as the completion grows, for requests of different lengths."""
+    for prompt, max_tokens in (("The capital of France is", 40), ("hi", 12)):
+        response = qwen_lsa_client.post(
+            "/v1/completions",
+            json={"model": "synthetic-qwen3-5", "prompt": prompt, "max_tokens": max_tokens},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["usage"]["completion_tokens"] == max_tokens
         assert body["choices"][0]["text"]

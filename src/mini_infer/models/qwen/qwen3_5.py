@@ -32,6 +32,10 @@ Serving: `USES_STATE_CACHE = True` routes this family to the per-request
 `Qwen35StateCache` and the state-cache scheduler, the same seam the Kimi
 Linear port generalized.
 
+Latent Sparse Attention (`qwen/lsa.py`) is opt-in through `enable_lsa`. Each
+full-attention layer then reads only the keys its index selects, on the
+cached prefill and decode paths. The stateless `forward` stays dense.
+
 Text only. The released checkpoints bundle a vision tower and a
 multi-token-prediction head; both are dropped at load. The text backbone's
 rotary embedding is nominally a three-component mrope, but for text-only
@@ -44,6 +48,7 @@ equivalence against the reference.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -51,6 +56,11 @@ import torch
 from torch import nn
 from torch.nn import functional
 
+from mini_infer.cache.contiguous_attention import (
+    contiguous_attention,
+    contiguous_backend,
+    plan_contiguous_step,
+)
 from mini_infer.models import register_model
 from mini_infer.models.base import BaseCausalLM, KVCacheDims
 from mini_infer.models.blocks import GemmaRMSNorm, RotaryEmbedding, SwiGLU
@@ -68,6 +78,15 @@ from mini_infer.models.qwen.gdn import (
     gdn_gate,
 )
 from mini_infer.models.qwen.gdn_decode_kernel import gdn_decode_step, supports_gdn_decode_kernel
+from mini_infer.models.qwen.lsa import (
+    IndexProjection,
+    LsaConfig,
+    attend_selected,
+    cluster_blocks,
+    index_key_input,
+    index_query_input,
+    select_keys,
+)
 from mini_infer.models.qwen.qwen3_5_state_cache import (
     Qwen35StateCache,
     QwenAttentionLayerState,
@@ -86,6 +105,9 @@ _DROP_RE = re.compile(r"^(model\.visual\.|mtp\.)")
 # The multimodal checkpoint nests the text backbone one level deeper than a
 # text-only one would.
 _LANGUAGE_MODEL_PREFIX = "model.language_model."
+# Bytes one LSA prefill sub-chunk may use. Each query reads its own key list,
+# so a chunk of S queries gathers S full lists of keys and values.
+_LSA_CHUNK_BYTES = 1 << 28
 
 
 @dataclass
@@ -240,9 +262,12 @@ class _DictNamespace:
 
 
 def build_qwen35_state_cache_specs(
-    cfg: Qwen35Config, *, max_seq_len: int
+    cfg: Qwen35Config, *, max_seq_len: int, lsa: LsaConfig | None = None
 ) -> list[QwenStateLayerSpec]:
-    """One cache spec per decoder layer, keyed off `cfg.layer_types`."""
+    """One cache spec per decoder layer, keyed off `cfg.layer_types`.
+
+    `lsa` gives every full-attention layer its bucket buffers.
+    """
     specs: list[QwenStateLayerSpec] = []
     for kind in cfg.layer_types:
         if kind == LINEAR_ATTENTION:
@@ -261,6 +286,7 @@ def build_qwen35_state_cache_specs(
                     num_kv_heads=cfg.num_key_value_heads,
                     head_dim=cfg.head_dim,
                     max_seq_len=max_seq_len,
+                    lsa=lsa,
                 )
             )
     return specs
@@ -420,6 +446,15 @@ class _QwenGatedAttention(nn.Module):
         self.q_norm = GemmaRMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps)
         self.rotary = RotaryEmbedding(cfg.rotary_dim, base=cfg.rope_theta)
+        # Latent Sparse Attention, set by `enable_lsa`.
+        self.lsa: LsaConfig | None = None
+        self.lsa_projection: IndexProjection | None = None
+
+    def enable_lsa(self, lsa: LsaConfig, query_map: torch.Tensor, key_map: torch.Tensor) -> None:
+        """Read only the keys LSA selects, with these `[input_dim, index_dim]` maps."""
+        self.lsa = lsa
+        device = self.k_proj.weight.device
+        self.lsa_projection = IndexProjection(query_map.to(device), key_map.to(device))
 
     def forward(
         self,
@@ -427,11 +462,14 @@ class _QwenGatedAttention(nn.Module):
         layer_state: QwenAttentionLayerState | None,
         row_starts: torch.Tensor,
         kv_len: int | None,
+        host_starts: list[int] | None = None,
     ) -> torch.Tensor:
         """`kv_len` is the cache length after this span, known on the host.
 
         A cached span longer than one token (prefill or a prefill chunk) needs
         it to slice the K/V buffers. A one-token step with a cache ignores it.
+        `host_starts` is each row's first position, known on the host. LSA
+        needs it to cluster the key blocks this span closes.
         """
         cfg = self.cfg
         batch, seq_len, _ = hidden.shape
@@ -465,6 +503,26 @@ class _QwenGatedAttention(nn.Module):
             rows = torch.arange(batch, device=hidden.device).view(batch, 1)
             layer_state.k[rows, positions] = key.transpose(1, 2).to(layer_state.k.dtype)
             layer_state.v[rows, positions] = value.transpose(1, 2).to(layer_state.v.dtype)
+            if self.lsa is not None:
+                attn = self._lsa_attention(query, layer_state, positions, kv_len, host_starts)
+                return self._gated_output(attn, gate)
+            # Both kernels read each row only up to its last written key,
+            # with no mask and no per-head copy of K and V.
+            backend = contiguous_backend(layer_state.k)
+            if backend == "flash_attn":
+                attn = contiguous_attention(
+                    query.transpose(1, 2),
+                    layer_state.k,
+                    layer_state.v,
+                    positions[:, -1] + 1,
+                    head_dim**-0.5,
+                )
+                return self._gated_output(attn, gate)
+            if backend == "flashinfer":
+                if layer_state.plan is None:
+                    raise RuntimeError("plan the step first (plan_contiguous_step)")
+                attn = layer_state.plan.run(query.transpose(1, 2), layer_state.k, layer_state.v)
+                return self._gated_output(attn, gate)
             if seq_len == 1:
                 attn = self._decode_attention(query, layer_state, positions)
                 return self._gated_output(attn, gate)
@@ -522,6 +580,105 @@ class _QwenGatedAttention(nn.Module):
         )
         return attn.reshape(batch, cfg.num_attention_heads, 1, head_dim).transpose(1, 2)
 
+    def _lsa_attention(
+        self,
+        query: torch.Tensor,
+        layer_state: QwenAttentionLayerState,
+        positions: torch.Tensor,
+        kv_len: int | None,
+        host_starts: list[int] | None,
+    ) -> torch.Tensor:
+        """Attention over the keys Latent Sparse Attention selects.
+
+        `query` is `(batch, heads, seq_len, head_dim)` and the span's K/V are
+        already in the cache. With `host_starts`, the blocks this span closes
+        are clustered first, so a later query of the same span can read them.
+        Without it they must already be clustered.
+
+        A prefill span runs in sub-chunks, because each query gathers its own
+        key list. A decode step keeps the full list width and every bucket
+        row, so its shapes do not depend on the context length.
+
+        Returns `(batch, seq_len, heads, head_dim)`, the layout
+        `_gated_output` takes.
+        """
+        cfg, lsa, projection = self.cfg, self.lsa, self.lsa_projection
+        assert lsa is not None and projection is not None
+        centroids, members = layer_state.lsa_centroids, layer_state.lsa_members
+        if centroids is None or members is None:
+            raise ValueError(
+                "LSA is on but the state cache has no bucket buffers; "
+                "build the cache after enable_lsa"
+            )
+        seq_len = query.shape[2]
+        if host_starts is not None:
+            self._lsa_close_blocks(layer_state, host_starts, seq_len)
+        query = query.transpose(1, 2)
+        index_queries = projection.index_queries(
+            index_query_input(query, cfg.num_key_value_heads, cfg.rotary_dim)
+        )
+
+        width = lsa.list_width
+        if seq_len > 1 and kv_len is not None:
+            # No query of this span sees a block past the one before its
+            # last key, and no list is longer than the cache.
+            rows = (kv_len - 1) // lsa.window_size * lsa.block_bucket_count
+            centroids, members = centroids[:, :rows], members[:, :rows]
+            width = min(width, kv_len)
+        # Per query: the gathered keys and values, the int64 candidate keys
+        # with their running count and destination, and the sorted scores.
+        gathered = 2 * width * cfg.num_key_value_heads * cfg.head_dim * layer_state.k.element_size()
+        candidates = 24 * lsa.top_p * lsa.bucket_cap + 16 * centroids.shape[1]
+        span = max(1, _LSA_CHUNK_BYTES // (query.shape[0] * (gathered + candidates)))
+
+        outputs = []
+        for start in range(0, seq_len, span):
+            stop = min(start + span, seq_len)
+            selected, _ = select_keys(
+                index_queries[:, start:stop], positions[:, start:stop], centroids, members, lsa
+            )
+            outputs.append(
+                attend_selected(
+                    query[:, start:stop],
+                    layer_state.k,
+                    layer_state.v,
+                    selected[..., :width],
+                    cfg.head_dim**-0.5,
+                )
+            )
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+
+    def _lsa_close_blocks(
+        self, layer_state: QwenAttentionLayerState, host_starts: list[int], seq_len: int
+    ) -> None:
+        """Cluster the key blocks that the span `[start, start + seq_len)` of each row closes.
+
+        A block closes when its last key is written. Every block before a
+        query's own block is then clustered before the query reads.
+        """
+        lsa, projection = self.lsa, self.lsa_projection
+        assert lsa is not None and projection is not None
+        assert layer_state.lsa_centroids is not None and layer_state.lsa_members is not None
+        window = lsa.window_size
+        closing = [
+            (row, block)
+            for row, start in enumerate(host_starts)
+            for block in range(start // window, (start + seq_len) // window)
+        ]
+        if not closing:
+            return
+        device = layer_state.k.device
+        rows = torch.tensor([row for row, _ in closing], device=device).view(-1, 1)
+        blocks = torch.tensor([block for _, block in closing], device=device)
+        key_positions = blocks.view(-1, 1) * window + torch.arange(window, device=device)
+        keys = layer_state.k[rows, key_positions]  # (blocks, window, kv_heads, head_dim)
+        index_keys = projection.index_keys(index_key_input(keys, self.cfg.rotary_dim))
+        buckets = cluster_blocks(index_keys, blocks * window, lsa)
+        count = lsa.block_bucket_count
+        bucket_rows = blocks.view(-1, 1) * count + torch.arange(count, device=device)
+        layer_state.lsa_centroids[rows, bucket_rows] = buckets.centroids
+        layer_state.lsa_members[rows, bucket_rows] = buckets.members
+
     def _gated_output(self, attn: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """`attn` is `(batch, seq_len, heads, head_dim)`; apply the sigmoid gate and project."""
         batch, seq_len = attn.shape[:2]
@@ -550,9 +707,14 @@ class _QwenDecoderLayer(nn.Module):
         layer_state: QwenGdnLayerState | QwenAttentionLayerState | None,
         row_starts: torch.Tensor,
         kv_len: int | None,
+        host_starts: list[int] | None = None,
     ) -> torch.Tensor:
-        mixer = self.linear_attn if self.layer_kind == LINEAR_ATTENTION else self.self_attn
-        hidden = hidden + mixer(self.input_layernorm(hidden), layer_state, row_starts, kv_len)
+        normed = self.input_layernorm(hidden)
+        if self.layer_kind == LINEAR_ATTENTION:
+            mixed = self.linear_attn(normed, layer_state, row_starts, kv_len)
+        else:
+            mixed = self.self_attn(normed, layer_state, row_starts, kv_len, host_starts)
+        hidden = hidden + mixed
         out: torch.Tensor = hidden + self.mlp(self.post_attention_layernorm(hidden))
         return out
 
@@ -582,6 +744,111 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        # Latent Sparse Attention sizes once `enable_lsa` ran, else None.
+        self.lsa: LsaConfig | None = None
+
+    def enable_lsa(
+        self,
+        maps: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
+        lsa: LsaConfig | None = None,
+    ) -> None:
+        """Make every full-attention layer read only the keys LSA selects.
+
+        Call it before building a state cache, which then gets the bucket
+        buffers. A captured decode step cannot cluster the key blocks it
+        closes, so `after_decode_step` does that after each step.
+
+        Args:
+            maps: decoder layer index -> `(query_map, key_map)`, each
+                `[num_key_value_heads * (head_dim - rotary_dim), index_dim]`.
+                Every full-attention layer needs a pair. Other entries are
+                ignored.
+            lsa: selection sizes, the served flat design by default.
+        """
+        lsa = lsa or LsaConfig()
+        cfg = self.cfg
+        input_dim = cfg.num_key_value_heads * (cfg.head_dim - cfg.rotary_dim)
+        full = [i for i, kind in enumerate(cfg.layer_types) if kind == FULL_ATTENTION]
+        missing = sorted(set(full) - set(maps))
+        if missing:
+            raise ValueError(f"LSA maps are missing full-attention layers {missing}")
+        for layer_idx in full:
+            for name, tensor in zip(("query", "key"), maps[layer_idx], strict=True):
+                if tuple(tensor.shape) != (input_dim, lsa.index_dim):
+                    raise ValueError(
+                        f"layer {layer_idx} {name} map is {tuple(tensor.shape)}, "
+                        f"expected ({input_dim}, {lsa.index_dim})"
+                    )
+        for layer_idx in full:
+            attention = self.model.layers[layer_idx].self_attn
+            assert isinstance(attention, _QwenGatedAttention)
+            query_map, key_map = maps[layer_idx]
+            attention.enable_lsa(lsa, query_map, key_map)
+        self.lsa = lsa
+
+    def disable_lsa(self) -> None:
+        """Go back to dense attention in every full-attention layer.
+
+        A state cache built while LSA was on no longer fits the model, so
+        build a new one.
+        """
+        for layer in self.model.layers:
+            attention = getattr(layer, "self_attn", None)
+            if isinstance(attention, _QwenGatedAttention):
+                attention.lsa = None
+                attention.lsa_projection = None
+        self.lsa = None
+
+    def _plan_attention(
+        self, state_cache: Qwen35StateCache, lengths: list[int], q_len: int
+    ) -> None:
+        """Plan the FlashInfer attention of one step, when FlashInfer runs it.
+
+        `lengths[b]` is row `b`'s cache length after the span of `q_len`
+        tokens, on the host. LSA layers select their own keys and need no plan.
+        """
+        if self.lsa is not None:
+            return
+        states = [
+            state
+            for state in (state_cache.layer(i) for i in range(state_cache.num_layers))
+            if isinstance(state, QwenAttentionLayerState)
+        ]
+        plan_contiguous_step(
+            states,
+            lengths,
+            q_len,
+            num_q_heads=self.cfg.num_attention_heads,
+            scale=self.cfg.head_dim**-0.5,
+        )
+
+    def before_decode_step(self, positions: torch.Tensor, state_cache: Qwen35StateCache) -> None:
+        """Plan the attention of the `decode_step_static` call that comes next.
+
+        `DecodeCudaGraph` calls this before every replay, with the positions
+        it replays. Host positions cost no sync.
+        """
+        lengths = [int(p) + 1 for p in positions.tolist()]
+        self._plan_attention(state_cache, lengths, 1)
+
+    def after_decode_step(self, positions: torch.Tensor, state_cache: Qwen35StateCache) -> None:
+        """Cluster the LSA key blocks that a `decode_step_static` call closed.
+
+        The static step writes each row's key at `positions[b]` but cannot
+        cluster, because Ward merging decides its rounds on the host. A row
+        closes a block when its position is the block's last. `DecodeCudaGraph`
+        calls this after every replay, with the positions it replayed. Host
+        positions cost no sync. Without LSA this does nothing.
+        """
+        if self.lsa is None:
+            return
+        host_starts = [int(p) for p in positions.tolist()]
+        for layer_idx, layer in enumerate(self.model.layers):
+            attention = getattr(layer, "self_attn", None)
+            if isinstance(attention, _QwenGatedAttention):
+                layer_state = state_cache.layer(layer_idx)
+                assert isinstance(layer_state, QwenAttentionLayerState)
+                attention._lsa_close_blocks(layer_state, host_starts, 1)
 
     def _run(
         self,
@@ -589,12 +856,17 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         state_cache: Qwen35StateCache | None,
         row_starts: torch.Tensor,
         kv_len: int | None = None,
+        host_starts: list[int] | None = None,
     ) -> torch.Tensor:
-        """`kv_len`: cache length after this span, for cached spans of 2+ tokens."""
+        """`kv_len`: cache length after this span, for cached spans of 2+ tokens.
+
+        `host_starts`: each row's first position on the host, which LSA
+        layers need to cluster the key blocks the span closes.
+        """
         hidden = self.model.embed_tokens(input_ids)
         for layer_idx, layer_module in enumerate(self.model.layers):
             layer_state = state_cache.layer(layer_idx) if state_cache is not None else None
-            hidden = layer_module(hidden, layer_state, row_starts, kv_len)
+            hidden = layer_module(hidden, layer_state, row_starts, kv_len, host_starts)
         hidden = self.model.norm(hidden)
         logits: torch.Tensor = self.lm_head(hidden)
         return logits
@@ -643,7 +915,7 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         dtype: torch.dtype = torch.float32,
     ) -> Qwen35StateCache:
         return Qwen35StateCache(
-            build_qwen35_state_cache_specs(self.cfg, max_seq_len=max_seq_len),
+            build_qwen35_state_cache_specs(self.cfg, max_seq_len=max_seq_len, lsa=self.lsa),
             batch_size=batch_size,
             device=device,
             dtype=dtype,
@@ -668,7 +940,15 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         row_starts = torch.full(
             (batch,), state_cache.start_pos, dtype=torch.long, device=input_ids.device
         )
-        return self._run(input_ids, state_cache, row_starts, state_cache.start_pos + seq_len)
+        end = state_cache.start_pos + seq_len
+        self._plan_attention(state_cache, [end] * batch, seq_len)
+        return self._run(
+            input_ids,
+            state_cache,
+            row_starts,
+            end,
+            [state_cache.start_pos] * batch,
+        )
 
     def forward_decode_with_cache(
         self,
@@ -686,7 +966,8 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         state_cache.check_capacity(start_pos + 1)
         batch = input_id.shape[0]
         positions = torch.full((batch,), start_pos, dtype=torch.long, device=input_id.device)
-        return self._run(input_id, state_cache, positions)
+        self._plan_attention(state_cache, [start_pos + 1] * batch, 1)
+        return self._run(input_id, state_cache, positions, host_starts=[start_pos] * batch)
 
     def forward_decode_with_cache_ragged(
         self,
@@ -709,7 +990,19 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         batch = input_id.shape[0]
         if positions.shape != (batch,):
             raise ValueError(f"positions shape {tuple(positions.shape)} != (B={batch},)")
-        state_cache.check_capacity(int(positions.max().item()) + 1)
+        if self.lsa is not None:
+            # LSA clusters the blocks this step closes, which needs every
+            # row's position on the host. This is the step's one sync.
+            host_starts = [int(p) for p in positions.tolist()]
+            state_cache.check_capacity(max(host_starts) + 1)
+            return self._run(
+                input_id, state_cache, positions.to(torch.long), host_starts=host_starts
+            )
+        # One sync for the host positions, which the capacity check and the
+        # attention plan both need.
+        host_positions = [int(p) for p in positions.tolist()]
+        state_cache.check_capacity(max(host_positions) + 1)
+        self._plan_attention(state_cache, [p + 1 for p in host_positions], 1)
         return self.decode_step_static(input_id, positions.to(torch.long), state_cache)
 
     def decode_step_static(
@@ -723,7 +1016,10 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
         `(B, 1)` token ids and `(B,)` int64 positions, both on the model's
         device. It has no host sync and no data-dependent shape, and it
         updates `state_cache` only in place, so `DecodeCudaGraph` can capture
-        it. The caller checks capacity and shapes.
+        it. The caller checks capacity and shapes. When FlashInfer runs the
+        attention, the caller plans the step first with `before_decode_step`.
+        With LSA on, the caller also runs `after_decode_step` after each step.
+        `DecodeCudaGraph` does both.
         """
         return self._run(input_id, state_cache, positions)
 
@@ -733,6 +1029,12 @@ class Qwen35ForConditionalGeneration(BaseCausalLM):
                 f"state_cache has {state_cache.num_layers} layers, "
                 f"model has {self.cfg.num_hidden_layers}"
             )
+        for spec in state_cache.layer_specs:
+            if isinstance(spec, QwenAttentionStateSpec) and spec.lsa != self.lsa:
+                raise ValueError(
+                    f"state_cache was built for LSA {spec.lsa}, model runs LSA {self.lsa}; "
+                    "rebuild the cache after enable_lsa"
+                )
 
     def expected_missing_state_keys(self) -> set[str]:
         return {"lm_head.weight"} if self.cfg.tie_word_embeddings else set()

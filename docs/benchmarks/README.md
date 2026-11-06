@@ -22,3 +22,6 @@ Each row links to the report or ADR that measured it.
 | [Speculative decoding](2026-10-19-dspark-concurrency.md) | Qwen3-4B with the DSpark drafter | L4 | Decode 2.5x (chat) to 4.5x (math) faster |
 | [FP8 MoE experts](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) | GLM-5.3 | H100 | 1.6x faster with Gluon kernels. As fast as bf16 with half the expert memory |
 | [Largest model](2026-07-03-minimax-m3-428b-gate.md) | MiniMax-M3, 428B parameters | 4x H200 | Runs with FP8 experts, 121 GB per GPU |
+| [Decode step, 32k-token request](2026-11-06-state-cache-flashinfer.md) | Qwen3.8-27B | B200 | 3.1x faster with FlashInfer: 46.8 ms to 15.2 ms |
+| [Decode step, 2k request in a 64k buffer](2026-11-06-state-cache-flashinfer.md) | Qwen3.8-27B | B200 | 5.3x faster with FlashInfer: 79.0 ms to 14.9 ms |
+| [Decode step, 32k-token request](2026-11-06-state-cache-flashinfer.md) | Nemotron-H 30B | B200 | 1.5x faster with FlashInfer: 11.6 ms to 7.7 ms |
