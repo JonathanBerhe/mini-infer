@@ -14,9 +14,8 @@ in every MLA layer. That rebuilt the keys and values of 32 heads for each
 history token, about 4.2M multiply-adds per token, and ran `kv_a_layernorm`
 over the history again.
 
-The step read the buffer up to the end of the longest row of the batch, not
-up to its capacity. So the cost grew with the history: on the CPU one layer
-took 6.2 ms at 256 tokens and 142 ms at 16,384 tokens, at any capacity.
+The step read the buffer up to the end of its longest row, not up to its
+capacity. So the cost grew with the history, at any capacity.
 
 ## Decision
 
@@ -45,36 +44,40 @@ took 6.2 ms at 256 tokens and 142 ms at 16,384 tokens, at any capacity.
 
 ## Alternatives Considered
 
-- The FlashInfer MLA decode kernel. Its head sizes (512 latent, 64 rope)
-  match Kimi, and it takes the length of each row, so it reads only the
-  filled positions of each row. It needs a page layout of the state, a GPU
-  run to validate, and it has no sparse mask for the K3.1 selection. The
-  PyTorch absorbed form is the first step and the oracle for that kernel.
-- A loop over the rows with each row's own length. It needs one host read
-  per row and layer, and more kernel launches per step.
+- The FlashInfer MLA decode kernel. Its head sizes (512, 64) match Kimi,
+  and it reads only the filled positions of each row. It needs a page
+  layout of the state and has no sparse mask for the K3.1 selection. The
+  PyTorch absorbed form is its oracle.
+- A loop over the rows with each row's own length: one host read per row
+  and layer, and more launches.
 - A state of rebuilt keys and values, like the reference `KimiDynamicCache`.
   It holds 10,240 values per token and layer instead of 576.
+- The decompressed form for short histories. In eager mode on the H100 it
+  is 0.05 to 0.09 ms faster per layer at 1,024 tokens and below. A switch
+  by length changes the rounding of a request in the middle of its output,
+  and a decode CUDA graph removes the launch cost behind the difference.
 
 ## Consequences
 
-Measured on an M1 Pro CPU in fp32, one MLA layer at the Kimi Linear 48B
-widths, the main commit against this change. The full tables are in the
+One MLA layer at the Kimi Linear 48B widths, decompressed form against
+absorbed form (H100, bf16) and main against this change (M1 Pro CPU, fp32).
+The full tables are in the
 [profile report](../benchmarks/2026-11-06-kimi-mla-decode-profile.md).
 
-| Batch | History | Before | After | Speedup |
-|---|---|---:|---:|---:|
-| 1 | 1,024 | 13.1 ms | 4.9 ms | 2.7x |
-| 1 | 4,096 | 37.2 ms | 5.5 ms | 6.8x |
-| 1 | 16,384 | 141.9 ms | 6.9 ms | 20.7x |
-| 8, ragged | longest 4,096 | 507.4 ms | 14.6 ms | 34.8x |
+| Batch | History | H100 before | H100 after | CPU before | CPU after |
+|---|---|---:|---:|---:|---:|
+| 1 | 1,024 | 0.46 ms | 0.51 ms | 13.1 ms | 4.9 ms |
+| 1 | 4,096 | 0.59 ms | 0.49 ms | 37.2 ms | 5.5 ms |
+| 1 | 16,384 | 1.42 ms | 0.48 ms | 141.9 ms | 6.9 ms |
+| 8, ragged | longest 4,096 | 4.61 ms | 0.63 ms | 507.4 ms | 14.6 ms |
 
-- The layer time is now almost constant in the history, because the fixed
-  projections take most of it.
+- The layer time is now almost constant in the history. On the H100 the
+  absorbed layer is bound by kernel launches at every length measured.
 - In fp32 the two forms agree to 1e-5 on Kimi Linear, K3 and K3.1, and the
   reference parity tests pass with the absorbed decode. In bf16 both forms
   stay within the bf16 tolerance of fp32.
 - The MLA layers are not the main cost of the 2.1 tokens per second of Kimi
-  Linear 48B on one B200. The MoE block calls `torch.where` for each of its
-  256 experts, a host sync on a GPU: about 6,700 per step (an estimate from
-  the code).
-- No GPU run measured this change yet.
+  Linear 48B on one B200. On the H100 a 4-layer slice with 256 experts
+  takes 30 ms per eager step for 8 ms of GPU work, and 768 of its 769 host
+  syncs come from the `torch.where` of each expert in the MoE. For the full
+  model that is about 6,700 syncs per step (an estimate).

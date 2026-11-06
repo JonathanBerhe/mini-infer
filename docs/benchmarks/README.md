@@ -17,6 +17,7 @@ Each row links to the report or ADR that measured it.
 | [Serving, 8 requests](../decisions/ADR-053-paged-prefill-cuda-graph.md) | Qwen2.5-7B | H100 | 1,251 tokens per second, 3x the eager path. 1,833 with int8 weights |
 | [Prefill, 32k-token prompt](../decisions/ADR-054-gdn-scalar-gate-prefill.md) | Qwen3.8-27B | B200 | 12.6x faster: 74.1 s to 5.9 s |
 | [Decode step, 1 request](2026-11-05-gpu-support-gate.md) | Qwen3.8-27B | B300 | 5.6x faster with a CUDA graph and a fused kernel: 80.2 ms to 14.2 ms |
+| [MLA decode, 16k-token history](2026-11-06-kimi-mla-decode-profile.md) | Kimi Linear 48B layer widths | H100 | 3x faster per MLA layer in the absorbed form: 1.42 ms to 0.48 ms |
 | [Decode, 16 requests](../decisions/ADR-046-v4-tp-decode-host-syncs.md) | DeepSeek-V4-Flash | 2x B200 | 399 tokens per second |
 | [Speculative decoding](2026-10-19-dspark-concurrency.md) | Qwen3-4B with the DSpark drafter | L4 | Decode 2.5x (chat) to 4.5x (math) faster |
 | [FP8 MoE experts](../decisions/ADR-038-gluon-fp8-grouped-hopper.md) | GLM-5.3 | H100 | 1.6x faster with Gluon kernels. As fast as bf16 with half the expert memory |
