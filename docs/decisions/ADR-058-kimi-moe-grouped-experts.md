@@ -57,14 +57,21 @@ GPUs, with no host sync.
   counts the ops that read a value back to the host. At the 48B widths with
   256 experts, one MoE layer went from 258 such ops to 0, and from 636 ATen
   ops to 133. The CPU count does not see the one `tolist` per layer.
-- On one H100, PR #93 measured the old loop on a 4-layer slice with 256
-  experts: 769 host syncs per step, 768 of them from the loop, and 30 to
-  35 ms per eager step for 8 ms of GPU work.
+- On one H100 in bf16, an eager decode step of a 4-layer slice of the 48B
+  shape (3 MoE layers, 256 experts, random weights, 1,024 history tokens):
+
+  | Batch | Step, before | after | GPU work, before | after | Host syncs, before | after |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 1 | 30.5 ms | 6.0 ms | 7.9 ms | 1.6 ms | 770 | 2 |
+  | 8 | 54.9 ms | 7.4 ms | 14.4 ms | 3.8 ms | 770 | 2 |
+
+  At batch 1 the kernels per step went from 3,789 to 519, and the MoE GPU
+  time from 6.8 ms to 0.5 ms. The 2 syncs left come from the MLA layer.
 - The first forward copies the experts of each MoE layer into the stacks.
   For a 48B layer that is 3.6 GB more for a moment. The old tensors are
   freed when the experts point at the stacks.
-- The MoE of the decode step no longer blocks a CUDA graph on Hopper and
-  newer GPUs. The MLA layers still read `row_starts` on the host, so a graph
-  for the Kimi decode is a separate change.
-- No GPU run in this change. The grouped path is the one that the other
-  families already run on H100, H200, B200 and B300.
+- The step is still host-bound: 6.0 ms for 1.6 ms of GPU work. The MoE no
+  longer blocks a CUDA graph, but the MLA layers still read `row_starts` on
+  the host, so a graph for the Kimi decode is a separate change.
+- Measured on an H100 only, without the real checkpoint. The grouped path
+  is the one that the other families already run on H200, B200 and B300.
