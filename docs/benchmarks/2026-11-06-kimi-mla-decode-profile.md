@@ -1,16 +1,19 @@
 # Kimi Linear decode profile and the absorbed MLA decode
 
 - Date: 2026-11-06
-- Hardware: Apple M1 Pro, 10 CPU cores (8 threads used), 16 GB, PyTorch CPU
-- Model: Kimi-Linear-48B-A3B layer widths with random weights, fp32 (hidden
-  2304, 32 MLA heads, `kv_lora_rank` 512, 32 KDA heads of 128, experts of
-  1024). The step profile uses a 4-layer slice (3 KDA layers, 1 MLA layer,
-  layer 0 dense, 32 experts, a vocabulary of 32,000) so that it fits 16 GB.
+- Hardware: one H100 80GB on Modal (CUDA 13.2, torch 2.14.1), bf16. Also an
+  Apple M1 Pro CPU (8 threads, 16 GB), fp32.
+- Model: Kimi-Linear-48B-A3B layer widths with random weights (hidden 2304,
+  32 MLA heads, `kv_lora_rank` 512, 32 KDA heads of 128, experts of 1024).
+  The step profile uses a 4-layer slice: 3 KDA layers, 1 MLA layer, layer 0
+  dense, 3 MoE layers, a vocabulary of 32,000. The slice has 256 experts on
+  the H100 and 32 on the CPU, so that it fits 16 GB.
 - Workload: one decode step after a prefill, greedy, batch 1 unless the
   table says otherwise
 - Engine: main at 4ab26ed against the branch of
   [ADR-057](../decisions/ADR-057-kimi-mla-absorbed-decode.md)
-- Script: `scripts/kimi_linear/profile_kimi_decode.py`
+- Scripts: `scripts/kimi_linear/profile_kimi_decode.py`, and
+  `scripts/kimi_linear/modal_kimi_mla_decode.py` for the H100
 
 ## Question
 
@@ -23,30 +26,48 @@ How much does the absorbed MLA decode save?
 ## Result
 
 - The MLA decode cost grew with the history, not with the buffer capacity.
-  The old step read the buffer up to the end of its longest row. At 1,024
-  history tokens one layer took 12.6, 12.6 and 12.4 ms at capacities of
-  2,048, 8,192 and 32,768.
-- The absorbed decode makes one MLA layer 2.7x faster at 1,024 history
-  tokens (13.1 to 4.9 ms) and 20.7x faster at 16,384 (141.9 to 6.9 ms). A
-  ragged batch of 8 with a longest row of 4,096 tokens goes from 507.4 to
-  14.6 ms.
-- After the change the layer time is almost flat in the history. The fixed
-  projections (`q_proj`, `kv_a_proj_with_mqa`, `o_proj`) take most of it.
-  Inside a full decode step at 8,192 history tokens, the MLA layer goes
-  from 70.4 to 6.3 ms, and it reads 1 value back to the host instead of 2.
-- On the CPU the KDA layers take more than 95 percent of the whole step,
-  because PyTorch runs their depthwise convolution as one small convolution
-  per channel (12,288 calls per layer and step). This is a CPU-only effect.
-- On a GPU the largest item is very likely the MoE, not the MLA. The MoE
-  block runs one `torch.where`, a host sync on a GPU, for each of the 256
-  experts in each of the 26 MoE layers. That is about 6,700 syncs per step
-  (an estimate from the op count, not measured on a GPU).
+  The old step read the buffer up to the end of its longest row.
+- On the H100, the absorbed decode makes one MLA layer 3.0x faster at
+  16,384 history tokens (1.42 to 0.48 ms) and 7.3x faster for a ragged batch
+  of 8 with a longest row of 4,096 tokens (4.61 to 0.63 ms). At 1,024
+  tokens and below it is 0.05 to 0.09 ms slower per layer, because it
+  launches 4 more kernels and the layer is then bound by launches, not by
+  work.
+- On the CPU, where the work sets the time, the absorbed layer is 2.7x
+  faster at 1,024 tokens (13.1 to 4.9 ms) and 20.7x faster at 16,384 (141.9
+  to 6.9 ms).
+- The eager decode step on the H100 is host-bound. The 4-layer slice takes
+  30 to 35 ms per step for 8 ms of GPU work. 768 of its 769 host syncs per
+  step come from the MoE: one `aten::nonzero` per expert and layer.
+- For the real model, 26 MoE layers of 256 experts, that is about 6,700
+  syncs per step (an estimate scaled from the slice). The MoE expert loop is
+  the main cost of the 2.1 tokens per second, not the MLA layers.
 
-## One MLA layer
+## One MLA layer on the H100
 
-One `_KimiMlaAttention` decode call, median of 16 calls. "Before" is main.
+One `_KimiMlaAttention` decode call in bf16, median of 32 calls.
 "Decompressed" and "absorbed" are the two forms of this branch on one set of
-weights.
+weights. The decompressed form is the main path without its norm of the
+history at every read. The last column is the largest difference between
+the outputs of the two forms.
+
+| Batch | History | Capacity | Decompressed (ms) | Absorbed (ms) | Largest difference |
+|---|---:|---:|---:|---:|---:|
+| 1 | 256 | 32,768 | 0.46 | 0.55 | 2.4e-4 |
+| 1 | 1,024 | 32,768 | 0.46 | 0.51 | 2.4e-4 |
+| 1 | 4,096 | 32,768 | 0.59 | 0.49 | 1.2e-4 |
+| 1 | 16,384 | 32,768 | 1.42 | 0.48 | 1.2e-4 |
+| 1 | 1,024 | 2,048 | 0.39 | 0.48 | 2.4e-4 |
+| 1 | 1,024 | 8,192 | 0.41 | 0.48 | 2.4e-4 |
+| 1 | 1,024 | 32,768 | 0.41 | 0.48 | 2.4e-4 |
+| 8, ragged | longest 1,024 | 8,192 | 1.40 | 0.50 | 4.9e-4 |
+| 8, ragged | longest 4,096 | 8,192 | 4.61 | 0.63 | 2.4e-4 |
+
+In the ragged rows, row `b` of 8 holds `history * (b + 1) / 8` tokens.
+
+## One MLA layer on the CPU
+
+The same call in fp32, median of 16 calls. "Before" is main.
 
 | Batch | History | Capacity | Before (ms) | Decompressed (ms) | Absorbed (ms) |
 |---|---:|---:|---:|---:|---:|
@@ -60,14 +81,30 @@ weights.
 | 8, ragged | longest 1,024 | 8,192 | 112.20 | 115.20 | 8.14 |
 | 8, ragged | longest 4,096 | 8,192 | 507.42 | 647.09 | 14.57 |
 
-In the ragged rows, row `b` of 8 holds `history * (b + 1) / 8` tokens.
+In fp32 the two forms differ by at most 6e-8.
 
-## Decode step by part of the model
+## Decode step on the H100
 
-The 4-layer slice: 3 KDA layers, 1 MLA layer, 3 MoE layers of 32 experts
-and 1 dense MLP. The parts are host time per step under the profiler, the
-mean of 4 profiled steps. The step column is the median of 16 steps without
-the profiler.
+The 4-layer slice with 256 experts, bf16. The step column is the median of
+16 steps without the profiler. The other columns come from 4 profiled steps:
+GPU busy is the union of the kernel times, and the parts are GPU time.
+
+| History | MLA form | Step (ms) | GPU busy (ms) | Kernels | Host syncs | MLA (ms) | KDA, 3 layers (ms) | MoE, 3 layers (ms) |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | decompressed | 30.0 | 8.0 | 3,788 | 769 | 0.16 | 0.68 | 6.87 |
+| 1,024 | absorbed | 31.1 | 7.9 | 3,792 | 769 | 0.12 | 0.68 | 6.87 |
+| 8,192 | decompressed | 35.4 | 8.4 | 3,788 | 769 | 0.66 | 0.68 | 6.86 |
+| 8,192 | absorbed | 35.1 | 7.9 | 3,791 | 769 | 0.16 | 0.68 | 6.85 |
+
+The sync sites per step are the same in all four runs: 768 in
+`block_sparse_moe` (`aten::nonzero`) and 1 in the MLA layer
+(`aten::_local_scalar_dense`, the end of the longest row). The step changes
+by about 1 ms between the forms, which is the noise of a host-bound step.
+
+## Decode step on the CPU
+
+The 4-layer slice with 32 experts, fp32. The parts are host time per step,
+the mean of 4 profiled steps.
 
 | History | Code | Step (ms) | KDA, 3 layers (ms) | MLA, 1 layer (ms) | MoE, 3 layers (ms) |
 |---:|---|---:|---:|---:|---:|
@@ -76,64 +113,58 @@ the profiler.
 | 8,192 | main | 1,751 | 1,783.3 | 70.4 | 28.8 |
 | 8,192 | absorbed | 1,228 | 1,379.4 | 6.3 | 29.2 |
 
-The KDA time changes by up to 40 percent between runs of the same code, so
-the step column does not show the MLA change. The MLA column does.
-
-Operations and host reads per step, from the same profile:
-
-| Part | ATen ops | Host reads |
-|---|---:|---:|
-| KDA, 3 layers | 390 | 0 |
-| MLA, 1 layer, main | 48 | 2 |
-| MLA, 1 layer, absorbed | 49 | 1 |
-| MoE, 3 layers of 32 experts | 564 | 102 |
-
-Each MoE layer reads 34 values back to the host: one `aten::nonzero` per
-expert and 2 more. For the real model, 26 MoE layers of 256 experts, that is
-about 6,700 host reads per step (an estimate from this count).
+On the CPU, PyTorch runs the depthwise convolution of the KDA layers as one
+small convolution per channel (12,288 calls per layer and step). That takes
+more than 95 percent of the step and changes by up to 40 percent between
+runs, so the step column does not show the MLA change. The MLA column does.
+The MLA layer reads 1 value back to the host per step, against 2 on main.
 
 ## What to optimize first
 
-1. The MoE of the Kimi family (estimate). `_KimiMoe.forward` loops over all
-   experts and calls `torch.where` on each expert's mask. On a GPU each call
-   waits for the device. With 256 experts and 26 MoE layers that is about
-   6,700 syncs per step. At 20 to 60 microseconds each, that is 130 to
-   400 ms of the 476 ms step that the B200 measured (an estimate). The
-   grouped expert path of `MoEFFN` (`PackedSwigluExperts`) has no per-expert
-   sync.
-2. The KDA layers on the CPU only. The decode step of the short convolution
+1. The MoE of the Kimi family. `_KimiMoe.forward` loops over all experts
+   and calls `torch.where` on the mask of each expert, which syncs on a GPU.
+   On the H100 the slice spends 30 ms per step for 8 ms of GPU work, with
+   768 MoE syncs. The grouped expert path of `MoEFFN`
+   (`PackedSwigluExperts`) has no per-expert sync.
+2. A decode CUDA graph for the family, after the MoE change. Under a graph
+   the launch cost of the absorbed MLA form goes away, and its smaller GPU
+   work stays.
+3. The KDA layers on the CPU only. The decode step of the short convolution
    can use `causal_conv1d_step` from `blocks/kda.py` instead of a depthwise
-   `conv1d`. This matters for CPU runs, not for the GPU targets.
-3. The MLA decode on a GPU. After this change, the next step is a kernel
-   that reads only the filled positions of each row, for example the
-   FlashInfer MLA decode, whose head sizes (512 and 64) match Kimi.
+   `conv1d`.
+4. An MLA decode kernel that reads only the filled positions of each row,
+   for example the FlashInfer MLA decode, whose head sizes (512 and 64)
+   match Kimi.
 
 ## How it is measured
 
 - `mla`: one MLA layer with random weights and a random state buffer. The
-  call writes the same slot at every step, so the history stays fixed.
-  Two warm-up calls, then the median of 16 timed calls.
+  call writes the same slot at every step, so the history stays fixed. Two
+  warm-up calls, then the median of the timed calls, with a device sync
+  after each call on the GPU.
 - `split`: a prefill of the history in chunks of 1,024 tokens, 4 warm-up
-  steps, 16 timed steps, then 4
-  steps under `torch.profiler` with every module labelled
-  (`mini_infer.bench.step_profile`). The host time of a part is the time
-  inside its labelled ranges. The op count is the number of top-level ATen
-  ops, which stands in for the kernel launches of a GPU run. A host read is
-  one `aten::_local_scalar_dense` or `aten::nonzero` op. On a GPU each one
-  is a sync.
+  steps, 16 timed steps, then 4 steps under `torch.profiler` with every
+  module labelled (`mini_infer.bench.step_profile`). On the GPU each kernel
+  belongs to the labelled range that launched it. On the CPU the time of a
+  part is the host time inside its ranges, and a host read is one
+  `aten::_local_scalar_dense` or `aten::nonzero` op.
+- Both forms run in one process on one set of weights, switched with
+  `_KimiMlaAttention.absorbed_decode`.
 
 ## Limits
 
-- CPU only. The CPU is compute-bound, while a GPU decode step of this model
-  is bound by kernel launches and host syncs. So the CPU speedups of one
-  layer do not predict the GPU speedup of a step.
-- The whole-step wall time on the CPU varies by up to 2x between runs,
-  because the slow KDA convolution dominates it. Only the per-part times and
-  the single-layer table compare well.
+- One H100, eager mode, batch 1 for the step. No B200, H200 or B300 run, and
+  no run with the real checkpoint.
+- The step profile is a 4-layer slice. The numbers for the full 48B are
+  estimates scaled from it.
 - Random weights. The time does not depend on the values. The unit and
   parity tests compare the outputs.
 
 ## Reproduce
+
+```bash
+uv run modal run scripts/kimi_linear/modal_kimi_mla_decode.py
+```
 
 ```bash
 uv run python scripts/kimi_linear/profile_kimi_decode.py mla --mla-path absorbed
