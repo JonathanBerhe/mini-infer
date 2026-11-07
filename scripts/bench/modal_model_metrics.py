@@ -40,6 +40,7 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -204,8 +205,13 @@ def _workload(scheduler: Any, tokenizer: Any, emit: Emit) -> None:
     )
 
 
-def _measure(key: str, gpu: str) -> list[dict[str, Any]]:
-    """One model on one GPU, through the scheduler that the API server picks for it."""
+def _measure(key: str, gpu: str, compare_attention: bool = False) -> list[dict[str, Any]]:
+    """One model on one GPU, through the scheduler that the API server picks for it.
+
+    With `compare_attention`, a state-cache model runs the workload twice on
+    one load: first with the masked PyTorch attention, then with the default
+    path. Each row then carries `attention`.
+    """
     import time
 
     import torch
@@ -216,6 +222,7 @@ def _measure(key: str, gpu: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     emit = _emitter(key, gpu, results)
     started = time.perf_counter()
+    variants: tuple[str | None, ...] = (None,)
     if architecture_uses_state_cache(spec.repo):
         from mini_infer.engine.cuda_graph_decode import supports_decode_cuda_graph
         from mini_infer.engine.state_cache_generator import StateCacheGenerator
@@ -223,12 +230,17 @@ def _measure(key: str, gpu: str) -> list[dict[str, Any]]:
 
         generator = StateCacheGenerator.from_pretrained(spec.repo)
         cuda_graph = supports_decode_cuda_graph(generator.model, generator.device)
-        scheduler: Any = StateCacheContinuousScheduler(
-            generator,
-            max_batch_size=CONCURRENCY,
-            max_seq_len=MAX_SEQ_LEN,
-            cuda_graph=cuda_graph,
-        )
+
+        def make_scheduler() -> Any:
+            return StateCacheContinuousScheduler(
+                generator,
+                max_batch_size=CONCURRENCY,
+                max_seq_len=MAX_SEQ_LEN,
+                cuda_graph=cuda_graph,
+            )
+
+        if compare_attention:
+            variants = ("masked", "default")
         tokenizer = generator.tokenizer
         path = f"state cache, decode graph {'on' if cuda_graph else 'off'}"
     else:
@@ -249,7 +261,11 @@ def _measure(key: str, gpu: str) -> list[dict[str, Any]]:
                 graphs.append(name)
             except ValueError as error:
                 emit("info", note=f"{name} graph off: {error}")
-        scheduler = ContinuousScheduler(runner, max_concurrent=CONCURRENCY)
+        paged_scheduler = ContinuousScheduler(runner, max_concurrent=CONCURRENCY)
+
+        def make_scheduler() -> Any:
+            return paged_scheduler
+
         tokenizer = runner.tokenizer
         backend = runner.block_pool.attention_backend
         path = f"paged, {backend} attention, graphs: {', '.join(graphs) or 'none'}"
@@ -259,11 +275,21 @@ def _measure(key: str, gpu: str) -> list[dict[str, Any]]:
         load_s=round(time.perf_counter() - started, 1),
         allocated_gib=round(torch.cuda.memory_allocated() / 2**30, 1),
     )
-    scheduler.start()
-    try:
-        _workload(scheduler, tokenizer, emit)
-    finally:
-        scheduler.stop()
+    from mini_infer.cache import contiguous_attention
+
+    for variant in variants:
+        # Build the scheduler after the switch: it captures its decode graph.
+        contiguous_attention._DISABLED_FOR_BENCH = variant == "masked"
+        scheduler = make_scheduler()
+        variant_emit = emit if variant is None else partial(emit, attention=variant)
+        scheduler.start()
+        try:
+            _workload(scheduler, tokenizer, variant_emit)
+        finally:
+            scheduler.stop()
+            contiguous_attention._DISABLED_FOR_BENCH = False
+        del scheduler
+        torch.cuda.empty_cache()
     return results
 
 
@@ -372,9 +398,9 @@ def _measure_tp(key: str, gpu: str) -> list[dict[str, Any]]:
     return next(payload for status, payload in replies if status == "ok" and payload is not None)
 
 
-def _guarded(measure: Callable[[str, str], list[dict[str, Any]]], key: str, gpu: str) -> Any:
+def _guarded(measure: Callable[..., list[dict[str, Any]]], key: str, gpu: str, *args: Any) -> Any:
     try:
-        return measure(key, gpu)
+        return measure(key, gpu, *args)
     except Exception as error:
         # One model's failure must not hide the results of the others.
         row = {"kind": "error", "model": key, "gpu": gpu, "error": repr(error)[:800]}
@@ -386,6 +412,8 @@ _COMMON: dict[str, Any] = dict(
     image=image,
     # A cost cap, not an expected duration: a hung container bills the whole cap.
     timeout=1200,
+    # FlashInfer compiles its kernels with nvcc on first use, which needs host memory.
+    memory=65536,
     secrets=_SECRETS,
     volumes={"/root/.cache/huggingface": _HF_CACHE},
 )
@@ -393,13 +421,13 @@ _COMMON: dict[str, Any] = dict(
 
 # "H100!" forbids Modal's upgrade to an H200, which would change the numbers.
 @app.function(gpu="H100!", **_COMMON)
-def measure_h100(key: str) -> list[dict[str, Any]]:
-    return _guarded(_measure, key, "h100")
+def measure_h100(key: str, compare_attention: bool = False) -> list[dict[str, Any]]:
+    return _guarded(_measure, key, "h100", compare_attention)
 
 
 @app.function(gpu="B200", **_COMMON)
-def measure_b200(key: str) -> list[dict[str, Any]]:
-    return _guarded(_measure, key, "b200")
+def measure_b200(key: str, compare_attention: bool = False) -> list[dict[str, Any]]:
+    return _guarded(_measure, key, "b200", compare_attention)
 
 
 @app.function(gpu="B200:2", **{**_COMMON, "timeout": 1800})
@@ -408,7 +436,9 @@ def measure_b200x2(key: str) -> list[dict[str, Any]]:
 
 
 @app.local_entrypoint()
-def main(models: str = "all", gpus: str = "h100,b200", out: str = "") -> None:
+def main(
+    models: str = "all", gpus: str = "h100,b200", out: str = "", compare_attention: bool = False
+) -> None:
     keys = list(MODELS) if models == "all" else [k.strip() for k in models.split(",")]
     calls = []
     for key in keys:
@@ -418,10 +448,10 @@ def main(models: str = "all", gpus: str = "h100,b200", out: str = "") -> None:
                 print(f"skip {key} on {gpu}: the bf16 weights do not fit")
                 continue
             if spec.tensor_parallel == 2:
-                function = measure_b200x2
+                calls.append((key, gpu, measure_b200x2.spawn(key)))
             else:
                 function = {"h100": measure_h100, "b200": measure_b200}[gpu]
-            calls.append((key, gpu, function.spawn(key)))
+                calls.append((key, gpu, function.spawn(key, compare_attention)))
     rows: list[dict[str, Any]] = []
     for key, gpu, call in calls:
         try:
