@@ -40,6 +40,37 @@ dynamic; retry later if none is free. If Colab keeps refusing to align, use
 the GCP Cloud TPU path below: a fresh VM installs a matched `jax[tpu]` and
 avoids the skew entirely.
 
+## TorchTPU: run the engine on the TPU
+
+TorchTPU is the PyTorch backend that adds a `tpu` device.
+`scripts/tpu/run_torchtpu_spike.py` uses it to run the engine itself
+(`ModelRunner`, `PagedKVCache`, torch attention) on the TPU. It compares each
+decode step with a CPU run, then calls the Pallas kernels on torch tensors
+through `torch.tpu.pallas.jax_op`.
+
+A TPU accepts one process only, and the notebook above gives the TPU to JAX.
+Thus, use a new runtime for this run, not the notebook above.
+
+1. Open a new Colab notebook and set **Runtime -> Change runtime type -> TPU**.
+2. Paste this cell and run it. Set `BRANCH` to the branch under test.
+
+```python
+BRANCH = "feat/torchtpu-pytorch-evaluation-a3611a"
+!pip uninstall -q -y torch_xla  # the old PyTorch/XLA backend also drives the TPU
+!pip install -q torch_tpu --extra-index-url https://download.pytorch.org/whl/cpu
+!git clone -q --depth 1 --branch {BRANCH} https://github.com/JonathanBerhe/mini-infer.git
+%cd mini-infer
+!PYTHONPATH=src python scripts/tpu/run_torchtpu_spike.py
+```
+
+The script prints one line for each check when the check ends, and a summary
+line at the end. A failed check prints its traceback and the other checks
+continue. On a laptop, `--dry-run` runs the same checks on the CPU:
+
+```bash
+PYTHONPATH=src uv run --extra tpu python scripts/tpu/run_torchtpu_spike.py --dry-run --model Qwen/Qwen2.5-0.5B-Instruct
+```
+
 ## Scriptable alternative: Google Cloud TPU (paid, gcloud, closest to `modal run`)
 
 Needs a GCP account with billing (a card, no Persona). A `v5litepod-1` for a few
