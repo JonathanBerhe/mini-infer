@@ -20,6 +20,12 @@ or on localhost, so these guards are belt-and-suspenders):
   `server_error` (or an SSE error event). Only the server log holds the exception text.
 - Requests wait for output on the event loop (`RequestHandle.get_step_async`),
   so no thread pool limits the requests in flight. See ADR-029.
+- `/health` and `/metrics` need no API key, as in vLLM, so that probes and
+  Prometheus can read them. They return no request content.
+
+Router integration (llm-d and other routers that read vLLM servers): `/metrics`
+uses vLLM's metric names, and `MINI_INFER_KV_EVENTS_ENDPOINT` publishes
+KV-cache events in vLLM's ZMQ format. See docs/llm-d.md.
 """
 
 import asyncio
@@ -33,9 +39,12 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Request as FastAPIRequest
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from mini_infer.api.kv_events_publisher import ZmqKVEventPublisher
+from mini_infer.api.metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
+from mini_infer.api.metrics import render_metrics
 from mini_infer.api.schemas import (
     CompletionChoice,
     CompletionChunk,
@@ -85,6 +94,22 @@ if _PD_MODE not in {"serial", "parallel"}:
 # pressure. No effect on the PagedKVCache path (which has its own prefix cache).
 _PREFIX_SHARING = os.environ.get("MINI_INFER_PREFIX_SHARING", "1").lower() in {"1", "true", "yes"}
 
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes"}
+
+
+# The lifespan reads the settings below when the server starts, so tests can set them:
+#   - MINI_INFER_SERVED_MODEL_NAME: the name that clients send in the `model` field.
+#     `/v1/models`, the `/metrics` labels and the default KV-event topic report it.
+#     A router matches requests to servers by this name. Default: MINI_INFER_MODEL.
+#   - MINI_INFER_PREFIX_CACHE=1: give the paged path a prefix cache, so a request
+#     reuses the KV blocks of an earlier prompt with the same start.
+#   - MINI_INFER_KV_EVENTS_ENDPOINT: a ZMQ endpoint for KV-cache events (for example
+#     `tcp://*:5557`). Setting it also turns on the prefix cache, because the events
+#     report its blocks. MINI_INFER_KV_EVENTS_TOPIC sets the topic (default
+#     `kv@<served model name>`).
+
 # Default bind is loopback; set MINI_INFER_HOST=0.0.0.0 (or a specific
 # interface) to expose. Pairing with MINI_INFER_API_KEY for any non-loopback
 # bind is strongly recommended; the server logs a warning at startup if you
@@ -123,8 +148,17 @@ async def _verify_auth(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     model_name = os.environ.get("MINI_INFER_MODEL", DEFAULT_MODEL)
+    served_model_name = os.environ.get("MINI_INFER_SERVED_MODEL_NAME", model_name)
+    kv_events_endpoint = os.environ.get("MINI_INFER_KV_EVENTS_ENDPOINT") or None
+    kv_events_topic = os.environ.get("MINI_INFER_KV_EVENTS_TOPIC", f"kv@{served_model_name}")
+    publisher: ZmqKVEventPublisher | None = None
     scheduler: ContinuousScheduler | PDScheduler | StateCacheContinuousScheduler
     if architecture_uses_state_cache(model_name):
+        if kv_events_endpoint is not None:
+            raise ValueError(
+                f"MINI_INFER_KV_EVENTS_ENDPOINT needs a paged-KV model; {model_name} uses "
+                "the state cache, which publishes no KV-cache events"
+            )
         # StateCache models (DeepSeek-V4) don't use PagedKVCache; serve them via
         # the StateCacheContinuousScheduler, which decodes a running batch of
         # requests at their own positions through one ragged forward per step
@@ -154,6 +188,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # rate sweep that puts dozens of long-prompt requests in flight.
         env_num_blocks = os.environ.get("MINI_INFER_NUM_BLOCKS")
         env_block_size = os.environ.get("MINI_INFER_BLOCK_SIZE")
+        prefix_cache = _env_flag("MINI_INFER_PREFIX_CACHE") or kv_events_endpoint is not None
+        if prefix_cache and _USE_PD:
+            raise ValueError(
+                "MINI_INFER_PREFIX_CACHE and MINI_INFER_KV_EVENTS_ENDPOINT do not work with "
+                "MINI_INFER_USE_PD: the prefill and decode workers have no prefix cache"
+            )
         # MINI_INFER_ATTENTION_BACKEND picks the paged attention backend
         # ("flash_attn", "flashinfer" or "torch"). Images without flash-attn,
         # such as the CUDA 13 images, take "flashinfer" for the fast path.
@@ -162,7 +202,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             num_blocks=int(env_num_blocks) if env_num_blocks else DEFAULT_NUM_BLOCKS,
             block_size=int(env_block_size) if env_block_size else DEFAULT_BLOCK_SIZE,
             attention_backend=os.environ.get("MINI_INFER_ATTENTION_BACKEND", "flash_attn"),
+            prefix_cache=prefix_cache,
         )
+        if kv_events_endpoint is not None:
+            block_prefix_cache = runner.block_pool.prefix_cache
+            assert block_prefix_cache is not None
+            # Attach before the engine starts, so the router sees every block.
+            publisher = ZmqKVEventPublisher(kv_events_endpoint, kv_events_topic)
+            block_prefix_cache.set_event_listener(publisher)
         if _USE_PD:
             logger.info(
                 "Backing /v1/completions with PDScheduler (mode=%s; MINI_INFER_USE_PD set)",
@@ -173,10 +220,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             scheduler = ContinuousScheduler(runner)
     scheduler.start()
     app.state.scheduler = scheduler
+    app.state.served_model_name = served_model_name
     try:
         yield
     finally:
         scheduler.stop()
+        if publisher is not None:
+            publisher.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -194,6 +244,49 @@ async def _unhandled_exception_handler(_request: FastAPIRequest, exc: Exception)
     return JSONResponse(
         status_code=503,
         content={"error": {"type": "internal_error", "message": "engine error"}},
+    )
+
+
+@app.get("/health")
+async def health(fastapi_req: FastAPIRequest) -> Response:
+    """Return 200 while the engine thread runs, and 503 after it stops or crashes."""
+    if not fastapi_req.app.state.scheduler.is_running:
+        return _engine_unavailable_response()
+    return Response(status_code=200)
+
+
+@app.get("/metrics")
+async def metrics(fastapi_req: FastAPIRequest) -> Response:
+    """Prometheus gauges for routers and dashboards. See `mini_infer.api.metrics`.
+
+    The StateCache and prefill/decode schedulers report no load yet, so for them
+    the response holds no samples.
+    """
+    load_stats = getattr(fastapi_req.app.state.scheduler, "load_stats", None)
+    load = load_stats() if load_stats is not None else None
+    return Response(
+        render_metrics(load, fastapi_req.app.state.served_model_name),
+        media_type=METRICS_CONTENT_TYPE,
+    )
+
+
+@app.get("/v1/models")
+async def models(
+    fastapi_req: FastAPIRequest,
+    _auth: None = Depends(_verify_auth),
+) -> JSONResponse:
+    """List the one model this server serves, in the OpenAI format."""
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": [
+                {
+                    "id": fastapi_req.app.state.served_model_name,
+                    "object": "model",
+                    "owned_by": "mini-infer",
+                }
+            ],
+        }
     )
 
 

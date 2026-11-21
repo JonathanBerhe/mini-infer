@@ -21,11 +21,17 @@ Refcount lifecycle:
 The cache is a pure data structure: it does not own block storage and does
 not call into BlockPool. The integration layer (BlockPool / PagedKVCache)
 wires `evict_lru` into the allocate path and `decref` into the free path.
+
+An optional event listener (`set_event_listener`) receives a `BlockStored`
+event for each new block and a `BlockRemoved` event for each eviction, for a
+KV-cache-aware router. See `mini_infer.cache.kv_events`.
 """
 
 import dataclasses
 import hashlib
 from collections import OrderedDict
+
+from mini_infer.cache.kv_events import BlockRemoved, BlockStored, KVEventListener
 
 # 128-bit blake2b digest. Collision probability among N entries is ~N^2 / 2^128;
 # at N=2^32 that is 2^-64, which is far below any realistic concern. We still
@@ -58,6 +64,15 @@ class PrefixCache:
         # Insertion order tracks decref-time order; popitem(last=False) gives
         # the oldest evictable block.
         self._evictable: OrderedDict[int, None] = OrderedDict()
+        self._event_listener: KVEventListener | None = None
+
+    def set_event_listener(self, listener: KVEventListener | None) -> None:
+        """Send block events to `listener` from now on (None stops them).
+
+        The cache calls the listener on the thread that changes it, which is the
+        engine thread in a server.
+        """
+        self._event_listener = listener
 
     @property
     def block_size(self) -> int:
@@ -131,9 +146,18 @@ class PrefixCache:
         return result
 
     def publish(
-        self, block_hash: bytes, token_ids: tuple[int, ...], block_id: int
+        self,
+        block_hash: bytes,
+        token_ids: tuple[int, ...],
+        block_id: int,
+        *,
+        parent_hash: bytes | None = None,
     ) -> tuple[int, bool]:
         """Register a fresh block under (block_hash, token_ids).
+
+        `parent_hash` is the hash of the block before this one in the chain (None
+        for the first block). The cache uses it only for the `BlockStored` event,
+        so a caller with an event listener must pass it.
 
         Returns `(canonical_block_id, was_duplicate)`:
           - If `block_hash` is new: the block enters the cache with refcount=1
@@ -166,6 +190,16 @@ class PrefixCache:
         self._entries[block_hash] = entry
         self._block_to_hash[block_id] = block_hash
         # refcount=1 means not evictable yet; nothing to add to _evictable.
+        if self._event_listener is not None:
+            # A duplicate publish sends no event: the router already has the block.
+            self._event_listener(
+                BlockStored(
+                    block_hashes=(block_hash,),
+                    parent_block_hash=parent_hash,
+                    token_ids=token_ids,
+                    block_size=self._block_size,
+                )
+            )
         return block_id, False
 
     def incref(self, block_id: int) -> None:
@@ -201,6 +235,8 @@ class PrefixCache:
         block_id, _ = self._evictable.popitem(last=False)
         block_hash = self._block_to_hash.pop(block_id)
         del self._entries[block_hash]
+        if self._event_listener is not None:
+            self._event_listener(BlockRemoved(block_hashes=(block_hash,)))
         return block_id
 
     def is_cached(self, block_id: int) -> bool:

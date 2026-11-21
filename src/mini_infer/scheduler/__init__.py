@@ -1,4 +1,5 @@
 from mini_infer.scheduler.continuous_scheduler import ContinuousScheduler
+from mini_infer.scheduler.load import SchedulerLoad
 from mini_infer.scheduler.request_state import (
     GenerationResult,
     GenerationStep,
@@ -19,6 +20,7 @@ __all__ = [
     "Request",
     "RequestHandle",
     "RequestState",
+    "SchedulerLoad",
     "StateCacheContinuousScheduler",
     "TensorParallelStateCacheContinuousScheduler",
     "TensorParallelStateCacheScheduler",
