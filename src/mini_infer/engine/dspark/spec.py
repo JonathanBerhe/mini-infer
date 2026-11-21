@@ -22,6 +22,7 @@ from mini_infer.engine.dspark.sampling import (
     sample_from_probs,
     sample_residual,
 )
+from mini_infer.engine.dspark.verify_scheduler import CapacityCurve
 
 
 @dataclasses.dataclass
@@ -46,6 +47,8 @@ class DSparkStats:
     # The batch-1 runner never shortens a round, so both stay 0 there.
     room_clamped_rounds: int = 0
     room_clamped_committed: int = 0
+    # Drafted tokens that the verify-length scheduler removed before the forward.
+    scheduler_cut_tokens: int = 0
 
     @property
     def mean_acceptance_length(self) -> float:
@@ -96,6 +99,7 @@ class DSparkStats:
             survived_by_position=tuple(survived),
             room_clamped_rounds=self.room_clamped_rounds,
             room_clamped_committed=self.room_clamped_committed,
+            scheduler_cut=self.scheduler_cut_tokens,
         )
 
 
@@ -112,6 +116,9 @@ class SpecSummary:
     With room for n more tokens, the scheduler offers at most n - 1 drafts, so
     `max_tokens` never drops a committed token. Those last rounds commit less and
     lower `tau`. `tau_unclamped` excludes them: compare it with batch-1 and the paper.
+
+    `scheduler_cut` counts the drafted tokens that the verify-length scheduler
+    removed. `offered` counts the tokens that went to verify after that cut.
     """
 
     rounds: int
@@ -123,6 +130,7 @@ class SpecSummary:
     survived_by_position: tuple[int, ...]
     room_clamped_rounds: int = 0
     room_clamped_committed: int = 0
+    scheduler_cut: int = 0
 
     @property
     def tau(self) -> float:
@@ -161,6 +169,7 @@ class SpecSummary:
             ),
             room_clamped_rounds=sum(s.room_clamped_rounds for s in summaries),
             room_clamped_committed=sum(s.room_clamped_committed for s in summaries),
+            scheduler_cut=sum(s.scheduler_cut for s in summaries),
         )
 
 
@@ -294,11 +303,17 @@ class DSparkSpec:
     costs `len(target_layer_ids) * hidden_size * dtype_bytes`, so a 1024-token prompt
     costs ~26 MB per request at Qwen3-4B shapes (5 taps, hidden 2560, bf16). After the
     first verify, the buffer holds at most `block_size + 1` rows.
+
+    `capacity` turns on the batch-global verify-length scheduler (ADR-061). Each
+    step, after admission, it cuts every proposal to the length that maximizes
+    the expected tokens per second of the step, against this profiled forward
+    time. None keeps every proposal at the length that the threshold gives.
     """
 
     drafter: Qwen3DSparkDrafter
     confidence_threshold: float = 0.0
     max_spec_prompt_tokens: int = 1024
+    capacity: CapacityCurve | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence_threshold <= 1.0:
@@ -309,6 +324,11 @@ class DSparkSpec:
             raise ValueError(
                 "confidence_threshold > 0 requires a drafter with a confidence head; "
                 "this checkpoint has enable_confidence_head=False"
+            )
+        if self.capacity is not None and self.drafter.confidence_head is None:
+            raise ValueError(
+                "the verify-length scheduler (capacity) requires a drafter with a "
+                "confidence head; this checkpoint has enable_confidence_head=False"
             )
         if self.max_spec_prompt_tokens < 1:
             raise ValueError(

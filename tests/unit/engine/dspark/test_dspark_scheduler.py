@@ -20,6 +20,8 @@ token equality cannot see a hole of unwritten K/V in a random model.
 
 from __future__ import annotations
 
+import itertools
+import math
 import queue
 from collections.abc import Callable
 from pathlib import Path
@@ -32,6 +34,7 @@ from mini_infer.cache.block_pool import BlockPool
 from mini_infer.cache.paged_kv_cache import PagedKVCache
 from mini_infer.cache.prefix_cache import PrefixCache
 from mini_infer.engine.dspark import (
+    CapacityCurve,
     DSparkSpec,
     Qwen3DSparkDrafter,
     SpecSummary,
@@ -1026,3 +1029,188 @@ def test_rounds_shortened_for_room_are_counted_apart() -> None:
     assert summary.tau_unclamped == 4.0  # the clamped round left out
     pooled = SpecSummary.pool([summary, summary])
     assert pooled.room_clamped_rounds == 2 and pooled.tau_unclamped == 4.0
+
+
+# ── Batch-global verify-length scheduler (ADR-061) ──
+
+# Extra tokens cost nothing, so every draft position with a positive survival is verified.
+_FLAT = CapacityCurve(token_counts=(1,), step_seconds=(1.0,))
+# Each extra token costs a full step, so no draft position is worth verifying.
+_STEEP = CapacityCurve(token_counts=(1, 2), step_seconds=(1.0, 2.0))
+
+
+def _free_up_to(width: int) -> CapacityCurve:
+    """Forwards of up to `width` tokens take 1 s, and one more token takes 1000 s."""
+    return CapacityCurve(token_counts=(1, width, width + 1), step_seconds=(1.0, 1.0, 1000.0))
+
+
+class _ConfidentSpec(_ScriptedSpec):
+    """A scripted spec with a confidence head and a capacity curve.
+
+    Every draft position reports the conditional survival probability `confidence`.
+    """
+
+    def __init__(
+        self, script: list[list[int]], *, capacity: CapacityCurve, confidence: float = 0.9
+    ) -> None:
+        DSparkSpec.__init__(
+            self,
+            drafter=Qwen3DSparkDrafter(_drafter_config(confidence=True)).eval(),
+            capacity=capacity,
+        )
+        self.script = list(script)
+        self.propose_calls = 0
+        self.confidence_logit = math.log(confidence / (1.0 - confidence))
+
+    def propose(
+        self,
+        *,
+        anchor: int,
+        context: torch.Tensor,
+        start: int,
+        draft_cache: DSparkDraftCache,
+        temperature: float,
+    ) -> tuple[list[int], torch.Tensor | None, torch.Tensor]:
+        offered, _, draft_probs = super().propose(
+            anchor=anchor,
+            context=context,
+            start=start,
+            draft_cache=draft_cache,
+            temperature=temperature,
+        )
+        return offered, torch.full((1, self.block_size), self.confidence_logit), draft_probs
+
+
+def _capacity_sched(
+    script: list[list[int]], capacity: CapacityCurve
+) -> tuple[ContinuousScheduler, _ScriptedRunner, _ConfidentSpec]:
+    runner = _ScriptedRunner(_next_token)
+    spec = _ConfidentSpec(script, capacity=capacity)
+    sched = ContinuousScheduler(runner, dspark=spec)  # type: ignore[arg-type]
+    return sched, runner, spec
+
+
+def _widths(cu_seqlens_q: list[int]) -> list[int]:
+    return [b - a for a, b in itertools.pairwise(cu_seqlens_q)]
+
+
+def test_capacity_requires_a_confidence_head() -> None:
+    drafter = Qwen3DSparkDrafter(_drafter_config(confidence=False)).eval()
+    with pytest.raises(ValueError, match="confidence head"):
+        DSparkSpec(drafter=drafter, capacity=_FLAT)
+
+
+def test_flat_capacity_verifies_the_whole_proposal() -> None:
+    sched, runner, _spec = _capacity_sched([[42, 43, 44]], _FLAT)
+    req = _enqueue(sched, "ab", 16)
+
+    sched._step()  # prefill
+    sched._step()  # anchor 41, draft, schedule, verify
+
+    assert runner.calls[1]["cu_seqlens_q"] == [0, 4]
+    assert req.tokens_generated == [41, 42, 43, 44, 45]
+    assert req.spec is not None and req.spec.stats.scheduler_cut_tokens == 0
+
+
+def test_steep_capacity_verifies_the_anchor_alone_and_counts_the_cut() -> None:
+    """A cut proposal still commits the bonus, so greedy output does not change."""
+    sched, runner, _spec = _capacity_sched([[42, 43, 44], [43, 44, 45]], _STEEP)
+    req = _enqueue(sched, "ab", 8)
+    _run_to_done(sched, [req])
+
+    assert req.tokens_generated == [41, 42, 43, 44, 45, 46, 47, 48]
+    decode_widths = [_widths(c["cu_seqlens_q"]) for c in runner.calls[1:]]
+    assert decode_widths == [[1]] * len(decode_widths)
+    summary = RequestHandle(req).wait().spec_summary
+    assert summary is not None
+    # Round 1 drafted 3 tokens and round 2 drafted 3, and the scheduler cut them all.
+    assert summary.scheduler_cut == 6 and summary.offered == 0
+    assert SpecSummary.pool([summary, summary]).scheduler_cut == 12
+
+
+def test_forward_width_counts_the_prefill_chunk_of_a_new_request() -> None:
+    """A request admitted in this step adds its chunk to B before the verify lengths are set."""
+    # B = anchor (1) + prefill chunk "cdefg" (5) = 6 before any draft. Up to 8 tokens are
+    # free, so the speculator verifies 2 of its 3 drafts.
+    sched, runner, _spec = _capacity_sched([[42, 43, 44]], _free_up_to(8))
+    spec_req = _enqueue(sched, "ab", 16)
+    sched._step()  # prefill "ab" alone
+    _enqueue(sched, "cdefg", 4, SamplingParams(temperature=0.0, top_k=5))
+    sched._step()
+
+    assert _widths(runner.calls[1]["cu_seqlens_q"]) == [3, 5]
+    assert spec_req.tokens_generated == [41, 42, 43, 44]
+
+
+def test_forward_width_counts_plain_decoders() -> None:
+    """A plain decoder adds its token to B: with 3 free tokens, the speculator verifies 1 draft."""
+    sched, runner, _spec = _capacity_sched([[42, 43, 44]], _free_up_to(3))
+    spec_req = _enqueue(sched, "ab", 16)
+    _enqueue(sched, "cd", 4, SamplingParams(temperature=0.0, top_k=5))
+    sched._step()  # both prefill
+    sched._step()
+
+    assert _widths(runner.calls[1]["cu_seqlens_q"]) == [2, 1]
+    assert spec_req.tokens_generated == [41, 42, 43]
+
+
+def test_retry_schedules_the_kept_prefix_again_without_double_counting() -> None:
+    """After an OOM, the retry reuses the cut proposal. A second schedule keeps it as it is."""
+    sched, _runner, spec = _capacity_sched([[42, 43, 44]], _free_up_to(2))
+    req = _enqueue(sched, "ab", 16)
+    sched._step()  # prefill
+
+    for _ in range(2):
+        tokens = sched._draft_speculators()
+        sched._schedule_verify_lengths([req], tokens, 0.0)
+        assert tokens[id(req)] == [41, 42]
+
+    assert spec.propose_calls == 1
+    assert req.spec is not None and req.spec.stats.scheduler_cut_tokens == 2
+
+
+@pytest.mark.parametrize(
+    "capacity",
+    [_FLAT, _STEEP, CapacityCurve(token_counts=(1, 64), step_seconds=(0.010, 0.0325))],
+    ids=["flat", "steep", "linear"],
+)
+def test_capacity_scheduler_matches_plain_scheduler_greedy(capacity: CapacityCurve) -> None:
+    """Greedy output does not depend on the verify lengths (CPU fp32, real micro models)."""
+    runner, drafter = _micro_setup(seed=4, confidence=True)
+    prompts = ["the capital of", "abcdefg", "xy"]
+
+    plain = ContinuousScheduler(runner)  # type: ignore[arg-type]
+    baseline = _generate(plain, prompts, max_tokens=12)
+
+    sched = ContinuousScheduler(
+        runner,  # type: ignore[arg-type]
+        dspark=DSparkSpec(drafter=drafter, capacity=capacity),
+    )
+    reqs = [_enqueue(sched, p, 12) for p in prompts]
+    _run_to_done(sched, reqs)
+
+    assert [list(r.tokens_generated) for r in reqs] == baseline
+    summaries = [RequestHandle(r).wait().spec_summary for r in reqs]
+    assert all(s is not None for s in summaries)
+    cut = sum(s.scheduler_cut for s in summaries if s is not None)
+    if capacity is _STEEP:
+        assert cut > 0
+    if capacity is _FLAT:
+        assert cut == 0
+
+
+def test_capacity_scheduler_temperature_smoke() -> None:
+    runner, drafter = _micro_setup(seed=5, confidence=True)
+    sched = ContinuousScheduler(
+        runner,  # type: ignore[arg-type]
+        dspark=DSparkSpec(
+            drafter=drafter,
+            capacity=CapacityCurve(token_counts=(1, 64), step_seconds=(0.010, 0.0325)),
+        ),
+    )
+    torch.manual_seed(11)
+    req = _enqueue(sched, "sample me", 8, SamplingParams(temperature=0.8))
+    _run_to_done(sched, [req])
+
+    assert req.finish_reason in ("stop", "length")
+    assert 0 < len(req.tokens_generated) <= 8

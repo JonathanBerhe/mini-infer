@@ -12,9 +12,9 @@ is pure waste.
 `deepspec/eval/dspark/draft_ops.py::_confident_prefix_length`: keep the
 proposal's prefix up to the first position whose predicted survival
 probability falls below a threshold, drop the rest. The paper's full
-scheduler is the batch-global version, solving for verification lengths
-across all in-flight requests against a profiled hardware curve; that needs
-multi-request speculative decoding we don't have yet (ADR-027, Stage D).
+scheduler is the batch-global version in `verify_scheduler.py`: it sets the
+verify lengths of all requests in flight against a profiled forward-time
+curve (ADR-061). When both are on, the threshold cuts first.
 
 Truncation cannot change greedy output. It only shortens a round: the tokens
 it removes were never committed, and the target still emits its own argmax at

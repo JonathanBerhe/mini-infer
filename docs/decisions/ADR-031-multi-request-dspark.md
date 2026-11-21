@@ -75,4 +75,5 @@ once.
 - The tap buffer is outside the block pool, so its OOM is not recoverable.
 - A `turbo3` run uses the materialized attention path on every verify step.
 - Deferred: the confidence scheduler, batched drafter forwards, top-k and
-  top-p under speculation, and `PDScheduler` support.
+  top-p under speculation, and `PDScheduler` support. The confidence
+  scheduler landed in [ADR-061](ADR-061-dspark-verify-length-scheduler.md).
