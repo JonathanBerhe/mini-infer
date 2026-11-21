@@ -38,6 +38,13 @@ cuda = [
 tpu = [
     "jax>=0.4",
 ]
+# KV-cache events for a KV-cache-aware router such as llm-d
+# (src/mini_infer/api/kv_events_publisher.py, MINI_INFER_KV_EVENTS_ENDPOINT).
+# Imports are guarded, so the base install still serves without them.
+kv-events = [
+    "pyzmq>=26",
+    "msgpack>=1.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mini_infer"]
@@ -63,6 +70,9 @@ dev = [
     # The reference that the tests compare the Kimi fast tokenizer with
     # (tests/unit/engine/test_hub_tokenizers.py). The library itself does not import it.
     "tiktoken>=0.7",
+    # The kv-events extra, so the KV-event publisher tests run in CI.
+    "pyzmq>=26",
+    "msgpack>=1.0",
 ]
 
 [tool.ruff]
@@ -114,6 +124,11 @@ follow_imports = "skip"
 module = ["flash_attn", "flash_attn.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
+
+# msgpack ships no type information.
+[[tool.mypy.overrides]]
+module = ["msgpack"]
+ignore_missing_imports = true
 
 # JAX/Pallas is the optional TPU backend SDK (the `tpu` extra). Treated like
 # triton/flash_attn: an import-guarded accelerator dependency whose kernel DSL

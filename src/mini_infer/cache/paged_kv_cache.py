@@ -946,7 +946,9 @@ class PagedKVCache(DynamicCache):  # type: ignore[misc]
             tokens = tuple(prompt[token_start:token_end])
             block_hash = PrefixCache.hash_block(parent_hash, tokens)
             block_id = self._block_ids[batch_idx][block_idx_in_slot]
-            canonical_id, was_dup = self._prefix_cache.publish(block_hash, tokens, block_id)
+            canonical_id, was_dup = self._prefix_cache.publish(
+                block_hash, tokens, block_id, parent_hash=parent_hash
+            )
             if was_dup:
                 self._layout_changed()
                 self._pool.free(block_id)
