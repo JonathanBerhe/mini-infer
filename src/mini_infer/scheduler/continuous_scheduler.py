@@ -74,6 +74,7 @@ from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample, sample_batch, sample_tokens
 from mini_infer.engine.tokenizer import TextStream
 from mini_infer.exceptions import EngineNotRunningError, OutOfMemoryError
+from mini_infer.scheduler.load import SchedulerLoad
 from mini_infer.scheduler.request_state import (
     FinishReason,
     GenerationResult,
@@ -275,6 +276,28 @@ class ContinuousScheduler:
         if self._trace_events is not None and self._trace_out is not None:
             with open(self._trace_out, "w") as f:
                 json.dump({"traceEvents": self._trace_events}, f)
+
+    def load_stats(self) -> SchedulerLoad:
+        """Return the queue lengths and KV-cache use now, for `/metrics`.
+
+        Safe to call from any thread. It reads the engine's state without a lock,
+        so a value can be one step old.
+        """
+        pool = self._runner.block_pool
+        prefix_cache = pool.prefix_cache
+        free_blocks = pool.num_free_blocks
+        if prefix_cache is not None:
+            free_blocks += prefix_cache.num_evictable
+        # `list()` copies in one step, so the engine thread cannot change the
+        # list while this counts it.
+        running = sum(1 for r in list(self._running) if r.state != RequestState.DONE)
+        return SchedulerLoad(
+            num_waiting=self._waiting.qsize(),
+            num_running=running,
+            kv_cache_usage=1.0 - free_blocks / pool.num_blocks,
+            block_size=pool.block_size,
+            num_blocks=pool.num_blocks,
+        )
 
     def submit(self, request: Request) -> RequestHandle:
         """Enqueue a request and return a handle the caller drains for output.

@@ -147,6 +147,10 @@ The `/v1/completions` endpoint supports a subset of the OpenAI Completions API. 
 * `MINI_INFER_MODEL`: the Hugging Face model ID. The default is `Qwen/Qwen2.5-0.5B-Instruct`.
 * `MINI_INFER_USE_PD=1`: use separate prefill and decode workers.
 * `MINI_INFER_PD_MODE`: `serial` or `parallel`.
+* `MINI_INFER_PREFIX_CACHE=1`: reuse the KV blocks of an earlier prompt with the same start.
+* `MINI_INFER_KV_EVENTS_ENDPOINT`: publish KV-cache events for a KV-cache-aware router, such as the llm-d router.
+
+The server also has `/health`, `/metrics` (with vLLM's metric names) and `/v1/models`. [docs/llm-d.md](docs/llm-d.md) tells how to run mini-infer behind the llm-d router.
 
 ```bash
 MINI_INFER_MODEL="Qwen/Qwen2.5-7B-Instruct" uv run python -m mini_infer.api.server
