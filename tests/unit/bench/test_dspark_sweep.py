@@ -64,8 +64,8 @@ def test_timed_point_attributes_time_without_changing_output() -> None:
     assert untimed.phases is None and untimed.steps
     assert timed.phases is not None and timed.steps
     assert timed.phases.forward_s > 0 and timed.phases.draft_s > 0
-    # Each step that forwards runs four phases, with a sync before and after each.
-    assert calls >= 8 * len(timed.steps)
+    # Each step that forwards runs five phases, with a sync before and after each.
+    assert calls >= 10 * len(timed.steps)
     for step in timed.steps:
         assert step.batch >= 1 and step.n_verify <= step.batch <= step.total_q
     # At concurrency 1, only a verify window feeds more than one token after prefill.
@@ -188,6 +188,42 @@ def test_sweep_measures_the_grid_and_resumes_without_rerunning(tmp_path: Path) -
     again = run_sweep(runner, drafter, {"a": ["hello", "xyz"]}, **grid)  # type: ignore[arg-type]
     assert commits == len(expected)
     assert set(again) == expected
+
+
+def test_sweep_with_a_capacity_curve_adds_the_scheduler_arm(tmp_path: Path) -> None:
+    """With a curve, the sweep also measures the verify-length scheduler and stores the curve."""
+    from mini_infer.bench.dspark_sweep import run_sweep
+    from mini_infer.engine.dspark import CapacityCurve
+
+    runner, drafter = micro_setup(seed=12, confidence=True)
+    curve = CapacityCurve(token_counts=(1, 64), step_seconds=(0.010, 0.0325))
+
+    points = run_sweep(
+        runner,  # type: ignore[arg-type]
+        drafter,
+        {"a": ["hello", "xyz"]},
+        out_dir=tmp_path,
+        max_tokens=6,
+        concurrencies=[2],
+        thresholds=[0.0],
+        timed_concurrencies=[2],
+        capacity=curve,
+    )
+
+    assert set(points) == {
+        "a-plain-c2",
+        "a-dspark-t0.0-c2",
+        "a-dspark-sched-c2",
+        "a-timed-plain-c2",
+        "a-timed-dspark-c2",
+        "a-timed-dspark-sched-c2",
+    }
+    sched = points["a-dspark-sched-c2"]
+    assert sched["verify_scheduler"] is True
+    assert points["a-dspark-t0.0-c2"]["verify_scheduler"] is False
+    assert CapacityCurve.from_json(sched["capacity"]) == curve
+    assert sched["agreement_vs_plain"]["exact_matches"] == 2
+    assert points["a-timed-dspark-sched-c2"]["phases"]["schedule_s"] > 0
 
 
 def test_sweep_refuses_a_dspark_point_that_did_not_speculate(tmp_path: Path) -> None:

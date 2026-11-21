@@ -27,6 +27,9 @@ Speculators add two phases:
 
 1b. `_draft_speculators`: draft a block from the anchor and the injected
     context (target hidden states at the tap layers).
+3b. `_schedule_verify_lengths` (only with `DSparkSpec.capacity`): after
+    admission, cut each proposal to the verify length that maximizes the
+    expected tokens per second of the step (ADR-061).
 5b. `_verify_speculators`: accept a prefix of the draft plus one bonus token,
     emit them, roll the slot back to the committed length, and take the next
     injected context from this forward.
@@ -69,6 +72,10 @@ from mini_infer.engine.dspark.spec import (
     SpecDecodeState,
     context_window,
     verify_block,
+)
+from mini_infer.engine.dspark.verify_scheduler import (
+    schedule_verify_lengths,
+    survival_probabilities,
 )
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import sample, sample_batch, sample_tokens
@@ -462,7 +469,9 @@ class ContinuousScheduler:
             self._async_decode_step(step_start)
             return
         sampled_decode_tokens = self._sample_decoders()
+        draft_start = time.perf_counter()
         sampled_decode_tokens.update(self._draft_speculators())
+        draft_seconds = time.perf_counter() - draft_start
         self._reap_done()
         self._admit_waiting()
         # Admission ends rejected, empty, and already-cancelled requests on the
@@ -479,6 +488,8 @@ class ContinuousScheduler:
                 RequestState.DECODING,
             )
         ]
+        # The batch is final only after admission, so the verify lengths come last.
+        self._schedule_verify_lengths(alive, sampled_decode_tokens, draft_seconds)
 
         # Snapshot the phase BEFORE `_packed_forward` mutates request states
         # (e.g. PREFILLING -> DECODING when the last chunk lands).
@@ -969,6 +980,70 @@ class ContinuousScheduler:
             out[id(req)] = [spec.anchor, *spec.offered]
         return out
 
+    def _chunk_end(self, req: RunningRequest) -> int:
+        """The end of the prompt chunk that a prefilling request feeds to the next forward."""
+        return min(req.tokens_prefilled + self._chunk_size, len(req.prompt_token_ids))
+
+    def _schedule_verify_lengths(
+        self,
+        alive: list[RunningRequest],
+        sampled_decode_tokens: dict[int, list[int]],
+        fixed_seconds: float,
+    ) -> None:
+        """Cut each proposal to the verify length of the batch-global scheduler (ADR-061).
+
+        The forward width `B` counts every query token of the coming forward:
+        the prefill chunks, the token of each plain decoder, and the anchor plus
+        the kept drafts of each speculator. Each decoding request commits at
+        least one token, so `base_tau` counts them. A finishing prefill commits
+        no token in this step. `fixed_seconds` is the drafter time of this step,
+        which does not change with `B`.
+
+        A cut keeps a prefix, so the draft probs and the confidence still line
+        up with `offered`. A retry after a recoverable OOM schedules the kept
+        prefix again, and a second cut can only shorten it.
+        """
+        if self._dspark is None or self._dspark.capacity is None:
+            return
+        speculators = [r for r in alive if r.spec is not None and r.spec.offered is not None]
+        if not speculators:
+            return
+        base_tokens = 0
+        base_tau = 0
+        for req in alive:
+            if req.state in (RequestState.PREFILLING, RequestState.CHUNKED_PREFILLING):
+                base_tokens += self._chunk_end(req) - req.tokens_prefilled
+            elif req.spec is not None:
+                base_tokens += 1
+                base_tau += 1
+            else:
+                base_tokens += len(sampled_decode_tokens[id(req)])
+                base_tau += 1
+
+        survival: list[list[float]] = []
+        for req in speculators:
+            spec = req.spec
+            assert spec is not None and spec.offered is not None
+            # `DSparkSpec` refuses a capacity curve for a drafter with no confidence head.
+            assert spec.confidence is not None, "the verify-length scheduler needs confidences"
+            survival.append(survival_probabilities(spec.confidence, len(spec.offered)))
+        lengths = schedule_verify_lengths(
+            survival,
+            base_tokens=base_tokens,
+            base_tau=base_tau,
+            curve=self._dspark.capacity,
+            fixed_seconds=fixed_seconds,
+        )
+        for req, length in zip(speculators, lengths, strict=True):
+            spec = req.spec
+            assert spec is not None and spec.offered is not None and spec.anchor is not None
+            cut = len(spec.offered) - length
+            if cut == 0:
+                continue
+            spec.offered = spec.offered[:length]
+            spec.stats.scheduler_cut_tokens += cut
+            sampled_decode_tokens[id(req)] = [spec.anchor, *spec.offered]
+
     def _packed_forward(
         self, alive: list[RunningRequest], sampled_decode_tokens: dict[int, list[int]]
     ) -> tuple[torch.Tensor, list[int], dict[int, torch.Tensor] | None]:
@@ -1006,8 +1081,7 @@ class ContinuousScheduler:
                     f"prefill at {chunk_start} disagrees with slot length "
                     f"{cache_seq_lens[req.batch_idx]}"
                 )
-                chunk_end = min(chunk_start + self._chunk_size, len(req.prompt_token_ids))
-                chunk_tokens = req.prompt_token_ids[chunk_start:chunk_end]
+                chunk_tokens = req.prompt_token_ids[chunk_start : self._chunk_end(req)]
                 # With no rows, the last-position slice reads a neighbor's logits.
                 # Admission and the prefix cache keep at least one token here.
                 assert chunk_tokens, "prefilling request contributed no tokens"

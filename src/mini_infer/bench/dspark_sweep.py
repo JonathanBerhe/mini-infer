@@ -29,6 +29,7 @@ import torch
 
 from mini_infer.engine.dspark.drafter import Qwen3DSparkDrafter
 from mini_infer.engine.dspark.spec import DSparkSpec, SpecSummary
+from mini_infer.engine.dspark.verify_scheduler import CapacityCurve
 from mini_infer.engine.model_runner import ModelRunner
 from mini_infer.engine.sampler import SamplingParams
 from mini_infer.scheduler.continuous_scheduler import ContinuousScheduler
@@ -46,6 +47,7 @@ class PhaseTimes:
 
     sample_s: float = 0.0
     draft_s: float = 0.0
+    schedule_s: float = 0.0
     forward_s: float = 0.0
     verify_s: float = 0.0
 
@@ -143,6 +145,19 @@ class InstrumentedScheduler(ContinuousScheduler):
         out: dict[int, list[int]] = self._phase("draft_s", super()._draft_speculators)
         return out
 
+    def _schedule_verify_lengths(
+        self,
+        alive: list[RunningRequest],
+        sampled_decode_tokens: dict[int, list[int]],
+        fixed_seconds: float,
+    ) -> None:
+        self._phase(
+            "schedule_s",
+            lambda: super(InstrumentedScheduler, self)._schedule_verify_lengths(
+                alive, sampled_decode_tokens, fixed_seconds
+            ),
+        )
+
     def _packed_forward(
         self, alive: list[RunningRequest], sampled_decode_tokens: dict[int, list[int]]
     ) -> tuple[torch.Tensor, list[int], dict[int, torch.Tensor] | None]:
@@ -183,6 +198,8 @@ class SweepPoint:
     the whole run. `steady_tokens_per_s` covers only the steps in which a prompt
     still waited, so it compares the arms while admission was full.
     `mean_in_flight` shows how far the whole run fell below `concurrency`.
+    `verify_scheduler` is True when the batch-global verify-length scheduler
+    set the verify lengths (ADR-061).
     """
 
     arm: str
@@ -198,6 +215,7 @@ class SweepPoint:
     finish_reasons: dict[str, int]
     phases: PhaseTimes | None
     steps: list[StepRecord]
+    verify_scheduler: bool = False
 
     @property
     def tokens_per_s(self) -> float:
@@ -311,6 +329,7 @@ def run_point(
         },
         phases=sched.phases if timed else None,
         steps=list(sched.steps),
+        verify_scheduler=dspark is not None and dspark.capacity is not None,
     )
 
 
@@ -371,12 +390,15 @@ def run_sweep(
     timeout_s: float = 1800.0,
     max_spec_prompt_tokens: int = 1024,
     identity: str = "",
+    capacity: CapacityCurve | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Measure every point of the grid, and write one JSON file per point to `out_dir`.
 
     Per dataset and concurrency, it runs the plain arm, then the dspark arm at
     each threshold, and stores the dspark speedup and token agreement against
-    plain. Then a timed pass runs both arms (dspark at threshold 0) at each of
+    plain. With `capacity`, a `dspark-sched` arm also runs the verify-length
+    scheduler (ADR-061) at threshold 0, and its file stores the curve. Then a
+    timed pass runs every arm (dspark at threshold 0) at each of
     `timed_concurrencies`.
 
     The sweep resumes: it skips a point whose file exists. `on_checkpoint` runs
@@ -408,11 +430,12 @@ def run_sweep(
         if on_checkpoint is not None:
             on_checkpoint()
 
-    def spec_for(threshold: float) -> DSparkSpec:
+    def spec_for(threshold: float, curve: CapacityCurve | None = None) -> DSparkSpec:
         return DSparkSpec(
             drafter,
             confidence_threshold=threshold,
             max_spec_prompt_tokens=max_spec_prompt_tokens,
+            capacity=curve,
         )
 
     for name, prompts in prompts_by_dataset.items():
@@ -427,8 +450,10 @@ def run_sweep(
                 _require_complete(plain_key, plain_point)
                 plain = plain_point.to_json()
                 store(plain_key, plain)
-            for t in thresholds:
-                key = f"{name}-dspark-t{t}-c{c}"
+            arms = [(f"{name}-dspark-t{t}-c{c}", spec_for(t)) for t in thresholds]
+            if capacity is not None:
+                arms.append((f"{name}-dspark-sched-c{c}", spec_for(0.0, capacity)))
+            for key, spec in arms:
                 if stored(key) is not None:
                     continue
                 point = run_point(
@@ -436,11 +461,13 @@ def run_sweep(
                     prompts,
                     concurrency=c,
                     max_tokens=max_tokens,
-                    dspark=spec_for(t),
+                    dspark=spec,
                     timeout_s=timeout_s,
                 )
                 _require_complete(key, point)
                 payload = point.to_json()
+                if spec.capacity is not None:
+                    payload["capacity"] = spec.capacity.to_json()
                 agreement = token_agreement(plain["tokens"], point.tokens)
                 payload["agreement_vs_plain"] = {
                     "exact_matches": agreement.exact_matches,
@@ -457,8 +484,14 @@ def run_sweep(
                 )
                 store(key, payload)
 
+        timed_arms: list[tuple[str, DSparkSpec | None]] = [
+            ("plain", None),
+            ("dspark", spec_for(0.0)),
+        ]
+        if capacity is not None:
+            timed_arms.append(("dspark-sched", spec_for(0.0, capacity)))
         for c in timed_concurrencies:
-            for arm, dspark in (("plain", None), ("dspark", spec_for(0.0))):
+            for arm, dspark in timed_arms:
                 key = f"{name}-timed-{arm}-c{c}"
                 if stored(key) is not None:
                     continue

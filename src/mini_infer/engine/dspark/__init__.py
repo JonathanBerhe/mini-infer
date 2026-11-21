@@ -25,8 +25,14 @@ from mini_infer.engine.dspark.spec import (
     verify_block,
 )
 from mini_infer.engine.dspark.speculative import DSparkSpeculativeRunner
+from mini_infer.engine.dspark.verify_scheduler import (
+    CapacityCurve,
+    schedule_verify_lengths,
+    survival_probabilities,
+)
 
 __all__ = [
+    "CapacityCurve",
     "ConfidenceHead",
     "DSparkDraftCache",
     "DSparkSpec",
@@ -40,5 +46,7 @@ __all__ = [
     "confident_prefix_length",
     "context_window",
     "propose_block",
+    "schedule_verify_lengths",
+    "survival_probabilities",
     "verify_block",
 ]
