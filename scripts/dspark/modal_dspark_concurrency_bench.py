@@ -2,9 +2,13 @@
 
 `modal_dspark_bench.py` measures one request at a time. Here several requests share each step.
 The benchmark reports acceptance, the speedup over plain decoding per concurrency level, and
-where the step time goes. It also records the forward cost per query-token width, the capacity
-curve that a batch-global confidence scheduler needs. `mini_infer.bench.dspark_sweep.run_point`
-measures each point in-process, as a closed loop. See ADR-031.
+where the step time goes. `mini_infer.bench.dspark_sweep.run_point` measures each point
+in-process, as a closed loop. See ADR-031.
+
+With `--schedule` (the default), the run first profiles the target's capacity curve: the
+forward time per query-token width, with the drafter's taps on. The curve goes to
+`capacity.json` in the run folder, and a resumed run loads it, so every scheduler point of a
+run uses the same curve. See ADR-061.
 
 Per dataset and concurrency level it runs:
 
@@ -12,6 +16,7 @@ Per dataset and concurrency level it runs:
 - the DSpark arm at each confidence threshold, with tau, per-position survival, and token
   agreement with the plain arm. bf16 matmuls of a different shape flip near-ties, so agreement
   is statistical.
+- with `--schedule`, the DSpark arm with the batch-global verify-length scheduler.
 - a timed pass at a few levels. Its CUDA syncs at every phase boundary slow the step, so
   throughput comes from the untimed points only.
 
@@ -107,6 +112,8 @@ def bench(
     timed_concurrencies: list[int],
     num_blocks: int,
     run_tag: str,
+    schedule: bool,
+    capacity_context: int,
 ) -> dict[str, Any]:
     """Run the sweep on the GPU and return the metadata and all points.
 
@@ -119,7 +126,16 @@ def bench(
     from safetensors.torch import load_file
 
     from mini_infer.bench.dspark_sweep import run_point, run_sweep
-    from mini_infer.engine.dspark import DSparkSpec, Qwen3DSparkConfig, Qwen3DSparkDrafter
+    from mini_infer.engine.dspark import (
+        CapacityCurve,
+        DSparkSpec,
+        Qwen3DSparkConfig,
+        Qwen3DSparkDrafter,
+    )
+    from mini_infer.engine.dspark.capacity_profile import (
+        default_token_counts,
+        profile_capacity_curve,
+    )
     from mini_infer.engine.model_runner import ModelRunner
 
     out_dir = Path("/results/concurrency") / run_tag
@@ -174,6 +190,29 @@ def bench(
         runner, warm, concurrency=2, max_tokens=16, dspark=DSparkSpec(drafter), timeout_s=600.0
     )
 
+    capacity: CapacityCurve | None = None
+    if schedule:
+        meta["capacity_context"] = capacity_context
+        curve_path = out_dir / "capacity.json"
+        if curve_path.exists():
+            capacity = CapacityCurve.from_json(json.loads(curve_path.read_text()))
+            print(f"loaded the capacity curve of this run from {curve_path}", flush=True)
+        else:
+            t_profile = time.perf_counter()
+            capacity = profile_capacity_curve(
+                runner,
+                token_counts=default_token_counts(max(concurrencies), cfg.block_size),
+                max_requests=max(concurrencies),
+                context_len=capacity_context,
+                tap_layers=DSparkSpec(drafter).tap_layers,
+                sync=torch.cuda.synchronize,
+            )
+            curve_path.write_text(json.dumps(capacity.to_json()))
+            results_vol.commit()
+            print(f"profiled the capacity curve in {time.perf_counter() - t_profile:.0f}s")
+        for width in (1, 8, 16, 32, 64, 128):
+            print(f"  B={width:>3}: {capacity.seconds(width) * 1e3:.2f} ms", flush=True)
+
     points = run_sweep(
         runner,
         drafter,
@@ -190,6 +229,7 @@ def bench(
         # A longer point has stalled, so stop it before it wastes more GPU time.
         timeout_s=900.0,
         identity=json.dumps(meta, sort_keys=True),
+        capacity=capacity,
     )
     for key, point in points.items():
         line = f"{key}: {point['tokens_per_s']:.1f} tok/s"
@@ -214,6 +254,8 @@ def main(
     timed_concurrencies: str = "1,4,16",
     num_blocks: int = 2560,
     run_tag: str = "main",
+    schedule: bool = True,
+    capacity_context: int = 256,
 ) -> None:
     result = bench.remote(
         datasets=[d for d in datasets.split(",") if d],
@@ -224,6 +266,8 @@ def main(
         timed_concurrencies=[int(c) for c in timed_concurrencies.split(",") if c],
         num_blocks=num_blocks,
         run_tag=run_tag,
+        schedule=schedule,
+        capacity_context=capacity_context,
     )
     out = Path("docs/benchmarks/data") / f"dspark-concurrency-{run_tag}.json"
     out.write_text(json.dumps(result, indent=1))
